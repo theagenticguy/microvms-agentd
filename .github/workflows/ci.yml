@@ -9,8 +9,8 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  model:
-    name: model check
+  rust:
+    name: lint, model, and test tiers
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -20,9 +20,39 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all -- --check
       - run: cargo clippy --all-targets -- -D warnings
-      # Enumerates every reachable state of the bootstrap and exec lifecycle and
-      # checks the safety properties in model/src/lib.rs.
+      # One command covers all four tiers: the daemon's unit tests, the
+      # stateright model over every reachable state, the proptest tar-confinement
+      # properties, and the turmoil transport-fault simulation.
       - run: cargo test --all
+
+  build:
+    name: static aarch64 binary
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@v2
+      # aarch64 musl is the shipping target: every MicroVM we have run is ARM64,
+      # and a static binary is what lets the daemon bake into a task's own base
+      # image without depending on an interpreter that image may not have.
+      - name: install cross linker
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools gcc-aarch64-linux-gnu
+      - name: build
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: aarch64-linux-gnu-gcc
+        run: cargo build --release -p agentd --target aarch64-unknown-linux-musl
+      - name: report size and linkage
+        run: |
+          ls -l target/aarch64-unknown-linux-musl/release/agentd
+          file target/aarch64-unknown-linux-musl/release/agentd
+      - uses: actions/upload-artifact@v4
+        with:
+          name: agentd-aarch64-musl
+          path: target/aarch64-unknown-linux-musl/release/agentd
 
   spec:
     name: requirements verification

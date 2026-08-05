@@ -10,19 +10,37 @@ one we wrote — 787 lines of Python inside Harbor PR #2469 — accumulated 28 r
 findings across six rounds, nearly all of them in that daemon or in the service's
 lifecycle semantics. This project exists so the next team does not repeat it.
 
-**Status: verification harness first, daemon to follow.** What is here now is the
-part that is cheapest to get wrong later: a model-checked specification of the
-bootstrap and exec lifecycle, a machine-verified requirements document, and the
-measured platform facts that constrain any implementation. The daemon itself is
-specified in `docs/PROTOCOL.md` and not yet written.
+**Status: the daemon runs and every protocol rule is verified locally. It has
+never run inside a real MicroVM.** The four verification tiers are green and the
+bootstrap, exec, and file-transfer paths were exercised against the running binary
+over HTTP. What has not happened: any execution against the actual Lambda MicroVMs
+service, cross-compilation to `aarch64-unknown-linux-musl` outside CI, and the
+live conformance suite. Treat the AWS-facing behavior as specified rather than
+proven.
 
 ## What is in the repo
 
 ```
+agentd/   the daemon: axum router, one-shot bootstrap, exec engine, fs engine
+          tests/proptest_tar.rs      — tar confinement properties
+          tests/turmoil_transport.rs — deterministic transport faults
 model/    stateright model of bootstrap + exec lifecycle, with safety properties
 spec/     symspec requirements document, Z3-verified consistent
 docs/     PROTOCOL.md (wire contract) and PLATFORM.md (measured AWS behavior)
 ```
+
+### `agentd/` — the daemon
+
+A static binary intended to run as the container `CMD`. Release build is 1.5 MB on
+x86-64 with the workspace's size-tuned profile; the shipping target is
+`aarch64-unknown-linux-musl`, built in CI.
+
+The module seams follow the defect classes rather than the HTTP surface:
+`state.rs` owns the one-shot bootstrap, `auth.rs` decides authorization before any
+body byte is read, `exec.rs` owns idempotent exec with pipe-based output capture,
+`fs.rs` owns streaming tar with CPython `data`-filter parity, and `serve.rs` is
+generic over the listener so the transport tier can substitute a simulated network
+without touching production code.
 
 ### `model/` — the state machine, checked
 
@@ -106,11 +124,19 @@ into hyper, which is where roughly a quarter of the PR's defects lived.
 ## Running the checks
 
 ```bash
-cargo test -p agentd-model                    # model checking
-symspec check spec/agentd.symspec.json --strict  # requirements verification
+cargo test --all                                 # all four tiers, ~11s
+cargo clippy --all-targets -- -D warnings
+symspec check spec/agentd.symspec.json --strict   # requirements verification
 ```
 
-Both are also wired into CI (`.github/workflows/ci.yml`).
+`cargo test --all` currently runs 81 tests: 57 daemon unit tests, 8 tar
+properties, 10 transport-fault simulations, and 6 model checks. Every guard in the
+suite was verified to fail against the code without its fix; a property that
+passes either way is a false answer, not a passing test.
+
+All of it is wired into CI (`.github/workflows/ci.yml`), which also
+cross-compiles the `aarch64-unknown-linux-musl` binary and uploads it as an
+artifact.
 
 ## License
 

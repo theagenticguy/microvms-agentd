@@ -1,3 +1,4 @@
 # Matches at any depth: the model crate has its own target/ directory.
 target/
 Cargo.lock.orig
+.erpaval/sessions/

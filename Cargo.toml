@@ -1,5 +1,5 @@
 [workspace]
-members = ["model"]
+members = ["agentd","model"]
 resolver = "3"
 
 # The daemon crate lands here as `agentd/` once the model settles. Keeping the

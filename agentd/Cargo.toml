@@ -1,0 +1,47 @@
+[package]
+name = "agentd"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Exec and file-transfer daemon for AWS Lambda MicroVMs"
+
+[dependencies]
+axum = "0.8.9"
+# tower-http 0.7 is a breaking line; axum 0.8.9 pins ^0.6.8 internally, so we
+# stay on 0.6 to keep one version of the middleware types in the tree.
+tower-http = { version = "0.6", features = ["limit"] }
+tokio = { version = "1.53", features = [
+    "rt",
+    "macros",
+    "net",
+    "process",
+    "fs",
+    "io-util",
+    "time",
+    "signal",
+    "sync",
+] }
+http-body-util = "0.1"
+bytes = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# >= 0.4.45 is required: RUSTSEC-2026-0068 fixed a PAX size-header desync that
+# let one archive parse differently across extractors.
+tar = "0.4.46"
+subtle = "2.6"
+nix = { version = "0.31", features = ["signal"] }
+tempfile = "3"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
+futures-util = "0.3"
+tokio-util = { version = "0.7", features = ["io"] }
+
+[dev-dependencies]
+proptest = "1.11"
+hyper = { version = "1.11", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["client", "client-legacy", "tokio"] }
+turmoil = "0.7.2"
+tower = "0.5"
+pin-project-lite = "0.2"
+tempfile = "3"
