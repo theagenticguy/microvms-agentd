@@ -2,3 +2,8 @@
 target/
 Cargo.lock.orig
 .erpaval/sessions/
+# Terraform working state: the conformance stack is created and destroyed per
+# run, so its state is never worth committing.
+conformance/infra/.terraform/
+conformance/infra/.terraform.lock.hcl
+conformance/infra/terraform.tfstate*

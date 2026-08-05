@@ -10,13 +10,23 @@ one we wrote — 787 lines of Python inside Harbor PR #2469 — accumulated 28 r
 findings across six rounds, nearly all of them in that daemon or in the service's
 lifecycle semantics. This project exists so the next team does not repeat it.
 
-**Status: the daemon runs and every protocol rule is verified locally. It has
-never run inside a real MicroVM.** The four verification tiers are green and the
-bootstrap, exec, and file-transfer paths were exercised against the running binary
-over HTTP. What has not happened: any execution against the actual Lambda MicroVMs
-service, cross-compilation to `aarch64-unknown-linux-musl` outside CI, and the
-live conformance suite. Treat the AWS-facing behavior as specified rather than
-proven.
+**Status: proven against the real service.** On 2026-08-05 the daemon was
+cross-compiled to a 1.36 MB static `aarch64-unknown-linux-musl` binary, baked into
+a MicroVM image as the container `CMD`, launched in us-east-1, and driven through
+every protocol rule via the platform's own endpoint: 38 checks passed, none
+failed, and teardown left the account clean. The four local verification tiers are
+green alongside it.
+
+The live run found three defects that no local tier could have caught, all of them
+wrong assumptions about the service rather than bugs in the daemon's logic: the
+lifecycle hooks live under a fixed `/aws/lambda-microvms/runtime/v1/` prefix, two
+of them (`ready`, `validate`) are called at image-build time, and `runHookPayload`
+arrives wrapped in an envelope rather than as the request body. Each is now
+recorded in `docs/PLATFORM.md` with its date, and the transport tier was corrected
+so it would fail against the old behavior.
+
+Not yet done: a repeat run in a second region, and the CI cross-compile job has
+never executed (there is no git remote).
 
 ## What is in the repo
 

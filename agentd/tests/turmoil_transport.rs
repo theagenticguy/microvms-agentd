@@ -60,7 +60,11 @@ use turmoil::net::{TcpListener, TcpStream};
 /// default so nothing about the routing under test is special-cased.
 const PORT: u16 = 9000;
 
-/// The token the platform's `/run` hook installs. Long enough that a truncating
+/// The platform's run-hook path. Fixed by the service, so a test that uses a
+/// bare `/run` would pass against a daemon the platform cannot bootstrap.
+const RUN_HOOK: &str = "/aws/lambda-microvms/runtime/v1/run";
+
+/// The token the platform's run hook installs. Long enough that a truncating
 /// comparison would not accidentally match.
 const TOKEN: &str = "sim-agent-token-0123456789";
 
@@ -209,12 +213,20 @@ impl Client {
     }
 }
 
-/// A `POST /run` carrying `token`.
+/// A `POST` to the platform's run hook carrying `token`.
+///
+/// The double encoding is the platform's, not ours: the `runHookPayload` string
+/// passed to `RunMicrovm` arrives wrapped as
+/// `{"runHookPayload": "<that string>"}`. Building the body any other way makes
+/// this whole tier pass against a daemon the platform cannot bootstrap, which is
+/// exactly what happened before a live run reported
+/// "Run lifecycle hook returned HTTP status 400".
 fn run_hook(token: &str) -> Request<Full<Bytes>> {
-    let body = format!(r#"{{"agent_token":"{token}"}}"#);
+    let inner = format!(r#"{{"agent_token":"{token}"}}"#);
+    let body = serde_json::json!({ "runHookPayload": inner }).to_string();
     Request::builder()
         .method("POST")
-        .uri("/run")
+        .uri(RUN_HOOK)
         .header("host", "localhost")
         .header("content-type", "application/json")
         .body(Full::new(Bytes::from(body)))
@@ -812,7 +824,7 @@ fn a_mid_body_disconnect_does_not_take_the_daemon_down() -> turmoil::Result {
             // the receive buffer is empty and a RST when it is not; the daemon
             // has to survive either, so which one this is need not be pinned.
             stream
-                .write_all(&head_with_length("POST", "/run", None, 4096))
+                .write_all(&head_with_length("POST", RUN_HOOK, None, 4096))
                 .await?;
             stream.write_all(&[b'{'; 16]).await?;
             stream.flush().await?;

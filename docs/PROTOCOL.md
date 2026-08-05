@@ -6,12 +6,18 @@ Everything this project owns lives under `/v1/`. Every response carries a
 
 ## Routes
 
+Hooks are served under `/aws/lambda-microvms/runtime/v1/`, abbreviated `HOOKS`
+below. That prefix is fixed by the service, so a daemon serving a bare `/run`
+never gets bootstrapped.
+
 | Route | Auth | Purpose |
 | --- | --- | --- |
-| `POST /run` | none (platform hook) | one-shot token bootstrap from `runHookPayload` |
-| `POST /suspend` | none (platform hook) | acknowledged and logged |
-| `POST /resume` | none (platform hook) | acknowledged; signals in-memory state loss |
-| `POST /terminate` | none (platform hook) | acknowledged; begins graceful shutdown |
+| `POST HOOKS/ready` | none (platform hook) | image-build readiness probe |
+| `POST HOOKS/validate` | none (platform hook) | image-build validation probe |
+| `POST HOOKS/run` | none (platform hook) | one-shot token bootstrap from `runHookPayload` |
+| `POST HOOKS/suspend` | none (platform hook) | acknowledged and logged |
+| `POST HOOKS/resume` | none (platform hook) | acknowledged; signals in-memory state loss |
+| `POST HOOKS/terminate` | none (platform hook) | acknowledged; begins graceful shutdown |
 | `POST /v1/exec/start` | bearer | start a command under a caller-minted `exec_id` |
 | `GET /v1/exec/{id}` | bearer | poll status and output; never mutates |
 | `POST /v1/exec/{id}/ack` | bearer | release output, enter TTL collection |

@@ -1,0 +1,14 @@
+# aarch64 musl is the shipping target: MicroVMs are ARM_64 only, and a static
+# binary is what lets the daemon bake into a task's own base image without
+# depending on an interpreter or libc that image may not have.
+#
+# rust-lld is used deliberately rather than an external cross toolchain. Without
+# it the build fails at link time and the error names a missing `cc`, which reads
+# as a broken machine rather than a missing linker choice.
+[target.aarch64-unknown-linux-musl]
+linker = "rust-lld"
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.x86_64-unknown-linux-musl]
+linker = "rust-lld"
+rustflags = ["-C", "target-feature=+crt-static"]

@@ -21,6 +21,69 @@ WebSocket, and the documentation scopes it to debugging while recommending it be
 disabled in production. The name suggests a programmatic exec path that it is
 not.
 
+## Hooks are served under a fixed prefix, and two of them are build-time
+
+Measured 2026-08-05. The platform calls
+`POST /aws/lambda-microvms/runtime/v1/<hook>`, where `<hook>` is one of `ready`,
+`validate`, `run`, `resume`, `suspend`, `terminate`. A daemon serving a bare
+`/run` is never bootstrapped.
+
+`ready` and `validate` are image-*build* hooks: the build calls them to decide
+whether the snapshot it just produced is usable, before any instance exists and
+therefore before any token has been delivered. They must answer 200 without
+regard to bootstrap state. Gating them on a token fails the build rather than the
+run, which is a confusing place to discover the mistake.
+
+## `runHookPayload` arrives wrapped, not as the body
+
+Measured 2026-08-05, and it cost a full build-and-run cycle to find. The string
+passed to `RunMicrovm` as `runHookPayload` is not delivered as the request body.
+The platform wraps it, so the body is:
+
+```json
+{"runHookPayload": "{\"agent_token\": \"...\"}"}
+```
+
+The caller's own JSON is one `serde_json`/`json.loads` deeper. A daemon that reads
+its fields from the top level answers 400, and the platform then terminates the VM
+with `Run lifecycle hook returned HTTP status 400. Please check your hook endpoint
+and application logs for more details.` before forwarding any traffic — so the
+failure is invisible from outside the VM, and the VM is gone before you can look
+inside it. Read `GetMicrovm`'s `stateReason` first when a launch dies young.
+
+## Network connectors are ARNs
+
+Measured 2026-08-05. `ingressNetworkConnectors` takes
+`arn:aws:lambda:<region>:aws:network-connector:aws-network-connector:ALL_INGRESS`,
+not the bare string `ALL_INGRESS`, which is rejected with
+`Malformed network connector ARN`. Egress uses the same shape with
+`INTERNET_EGRESS`, and omitting egress entirely is how you get a VM with no
+outbound network.
+
+## `CreateMicrovmAuthToken` returns a header map
+
+Measured 2026-08-05. The `authToken` field is a map of header name to value, not a
+string: the API is shaped for schemes needing more than one header. Read
+`authToken["X-aws-proxy-auth"]`. Requests also need `X-aws-proxy-port` naming
+which of the token's allowed ports the request targets.
+
+## MicroVM states, and the one that matters
+
+`PENDING → RUNNING → SUSPENDING/SUSPENDED → TERMINATING → TERMINATED`. A VM that
+reaches any terminal state *before* `RUNNING` died during startup, which for a
+hook-serving daemon almost always means a lifecycle hook failed. Poll for
+`RUNNING` and fail fast on the terminal states with `stateReason` attached;
+polling through them wastes minutes and then reports a connection error that hides
+the cause.
+
+## The build log group survives Terraform
+
+Measured 2026-08-05. The service creates `/aws/lambda-microvms/<image-name>`
+itself, so a Terraform stack never owns it and `terraform destroy` leaves it
+behind. It is storage-only cost, but "the stack destroyed cleanly" is not the same
+as "the account is clean" — query for the log group separately, or delete it in
+teardown.
+
 ## Traffic ordering around the `/run` hook
 
 Documented (`microvms-launching.html`): "Your MicroVM begins receiving external
