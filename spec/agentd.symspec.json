@@ -1,0 +1,117 @@
+{
+  "antonyms": [],
+  "glossary": [
+    {
+      "aliases": [
+        "install the agent token"
+      ],
+      "canonical": "accept the bootstrap request"
+    }
+  ],
+  "requirements": {
+    "17ee4127-2c73-4196-9e08-2c6b50b49893": {
+      "createdAt": "2026-08-05T17:40:49.657Z",
+      "derives": [],
+      "id": "17ee4127-2c73-4196-9e08-2c6b50b49893",
+      "negated": false,
+      "patternType": "event-driven",
+      "priority": "medium",
+      "refines": [],
+      "satisfies": [],
+      "sentence": "When a bootstrap request presents a token equal to the installed agent token, the agentd shall accept the bootstrap request.",
+      "status": "draft",
+      "systemName": "agentd",
+      "systemResponse": "accept the bootstrap request",
+      "trigger": "a bootstrap request presents a token equal to the installed agent token",
+      "updatedAt": "2026-08-05T17:40:49.657Z",
+      "verifies": []
+    },
+    "64c3f6b9-b3e1-459f-95db-969638de56e6": {
+      "createdAt": "2026-08-05T17:40:49.854Z",
+      "derives": [],
+      "id": "64c3f6b9-b3e1-459f-95db-969638de56e6",
+      "negated": false,
+      "patternType": "event-driven",
+      "priority": "medium",
+      "refines": [],
+      "satisfies": [],
+      "sentence": "When a control request presents a token equal to the installed agent token, the agentd shall accept the control request.",
+      "status": "draft",
+      "systemName": "agentd",
+      "systemResponse": "accept the control request",
+      "trigger": "a control request presents a token equal to the installed agent token",
+      "updatedAt": "2026-08-05T17:40:49.854Z",
+      "verifies": []
+    },
+    "692cc585-d872-4e9e-bd14-ec068780d90c": {
+      "createdAt": "2026-08-05T17:40:49.360Z",
+      "derives": [],
+      "id": "692cc585-d872-4e9e-bd14-ec068780d90c",
+      "negated": false,
+      "patternType": "state-driven",
+      "preCondition": "the agent token is not installed",
+      "priority": "medium",
+      "refines": [],
+      "satisfies": [],
+      "sentence": "While the agent token is not installed, the agentd shall reject the control request.",
+      "status": "draft",
+      "systemName": "agentd",
+      "systemResponse": "reject the control request",
+      "updatedAt": "2026-08-05T17:40:49.360Z",
+      "verifies": []
+    },
+    "6c8fafac-7f77-4b1d-ab08-0f0668160fde": {
+      "createdAt": "2026-08-05T17:40:49.555Z",
+      "derives": [],
+      "id": "6c8fafac-7f77-4b1d-ab08-0f0668160fde",
+      "negated": false,
+      "patternType": "event-driven",
+      "priority": "medium",
+      "refines": [],
+      "satisfies": [],
+      "sentence": "When a bootstrap request presents a token that differs from the installed agent token, the agentd shall reject the bootstrap request.",
+      "status": "draft",
+      "systemName": "agentd",
+      "systemResponse": "reject the bootstrap request",
+      "trigger": "a bootstrap request presents a token that differs from the installed agent token",
+      "updatedAt": "2026-08-05T17:40:49.555Z",
+      "verifies": []
+    },
+    "70eed926-78da-4b53-8f5c-13d4a575f520": {
+      "createdAt": "2026-08-05T17:40:49.456Z",
+      "derives": [],
+      "id": "70eed926-78da-4b53-8f5c-13d4a575f520",
+      "negated": false,
+      "patternType": "event-driven",
+      "priority": "medium",
+      "refines": [],
+      "satisfies": [],
+      "sentence": "When a bootstrap request presents a token and the agent token is not installed, the agentd shall install the agent token.",
+      "status": "draft",
+      "systemName": "agentd",
+      "systemResponse": "install the agent token",
+      "trigger": "a bootstrap request presents a token and the agent token is not installed",
+      "updatedAt": "2026-08-05T17:40:49.456Z",
+      "verifies": []
+    },
+    "d8f5ac1b-42e0-44bc-aa05-6eb2a0586847": {
+      "createdAt": "2026-08-05T17:40:49.757Z",
+      "derives": [],
+      "id": "d8f5ac1b-42e0-44bc-aa05-6eb2a0586847",
+      "negated": false,
+      "patternType": "event-driven",
+      "priority": "medium",
+      "refines": [],
+      "satisfies": [],
+      "sentence": "When a control request presents a token that differs from the installed agent token, the agentd shall reject the control request.",
+      "status": "draft",
+      "systemName": "agentd",
+      "systemResponse": "reject the control request",
+      "trigger": "a control request presents a token that differs from the installed agent token",
+      "updatedAt": "2026-08-05T17:40:49.757Z",
+      "verifies": []
+    }
+  },
+  "schemaVersion": 2,
+  "waivers": []
+}

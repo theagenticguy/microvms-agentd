@@ -1,0 +1,43 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  model:
+    name: model check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --all-targets -- -D warnings
+      # Enumerates every reachable state of the bootstrap and exec lifecycle and
+      # checks the safety properties in model/src/lib.rs.
+      - run: cargo test --all
+
+  spec:
+    name: requirements verification
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: install symspec
+        run: npm install -g symspec
+      # symspec downloads a sha256-pinned local embedding model for its
+      # meaning-similarity tier, then runs fully offline.
+      - run: symspec download-model
+      # --strict exits 3 when nothing was proven wrong but the document could not
+      # be verified, which is the outcome we want to fail on: an unverifiable
+      # spec is not a passing spec.
+      - run: symspec check spec/agentd.symspec.json --strict

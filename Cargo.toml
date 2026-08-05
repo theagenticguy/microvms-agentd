@@ -1,0 +1,21 @@
+[workspace]
+members = ["model"]
+resolver = "3"
+
+# The daemon crate lands here as `agentd/` once the model settles. Keeping the
+# workspace in place from the first commit means adding it is a one-line change
+# rather than a restructure.
+
+[workspace.package]
+edition = "2024"
+license = "Apache-2.0"
+repository = "https://github.com/theagenticguy/microvms-agentd"
+
+# Tuned for the shipping artifact: one static binary, small enough to bake into
+# any task base image, with no interpreter or runtime dependency.
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+opt-level = "z"
