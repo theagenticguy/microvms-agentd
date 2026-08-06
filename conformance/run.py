@@ -345,6 +345,15 @@ def drive_protocol(session: Session, results: Results) -> None:
         repr(verified),
     )
 
+    # Identity repair is the one guard whose unit tests inject a fake layout, so
+    # this is the only place the real bind mount over real procfs is exercised.
+    # Measured 2026-08-06: without `additionalOsCapabilities: ["ALL"]` the
+    # hostname and boot_id steps fail with EPERM even though the daemon is root,
+    # and `identity_degraded` is how that surfaces. Asserting it here is what
+    # makes the capability requirement impossible to drop by accident.
+    results.eq("identity repair completed every step", health.identity_degraded, False)
+    results.eq("identity repair actually ran", health.identity_repaired, True)
+
     print("\n-- streaming --")
     # Streaming is the capability an agent harness needs and the one no local tier
     # can fully validate: the question is whether AWS's endpoint proxy actually
@@ -666,6 +675,11 @@ def main() -> int:
             memory_mib=BASELINE_MEMORY_MIB,
             hooks=default_hooks(AGENT_PORT, HOOK_TIMEOUT_SEC),
             tags={"agentd:purpose": "conformance", "agentd:run": run_id},
+            # Identity repair needs CAP_SYS_ADMIN for `sethostname` and for the bind
+            # mount over `boot_id`. Without it those two steps fail with EPERM even
+            # though the daemon runs as root, and the run reports
+            # identity_degraded. Measured 2026-08-06, us-east-1.
+            os_capabilities=["ALL"],
             build_timeout_sec=IMAGE_BUILD_TIMEOUT_SEC,
             # Scoped to this run, never a pure function of the artifact's content. A
             # content-derived token is a permanent idempotency key: delete the image

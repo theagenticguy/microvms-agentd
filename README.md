@@ -10,10 +10,10 @@ one we wrote — 787 lines of Python inside Harbor PR #2469 — accumulated 28 r
 findings across six rounds, nearly all of them in that daemon or in the service's
 lifecycle semantics. This project exists so the next team does not repeat it.
 
-**Status: proven against the real service.** On 2026-08-05 the daemon was
+**Status: proven against the real service.** Most recently on 2026-08-06 the daemon was
 cross-compiled to a 1.41 MB static `aarch64-unknown-linux-musl` binary, baked into
 a MicroVM image as the container `CMD`, launched in us-east-1, and driven through
-every protocol rule via the platform's own endpoint: 54 checks passed, none
+every protocol rule via the platform's own endpoint: 56 checks passed, none
 failed, and teardown left the account clean. 155 Rust tests across six local
 tiers and 83 Python client tests are green alongside it.
 
@@ -21,12 +21,14 @@ That live run covers the things only the real service can answer, including
 Server-Sent Events surviving the endpoint proxy, stdin round-tripping through a
 child, and a suspend/resume cycle preserving everything.
 
-Two rounds of live runs found five defects no local tier could have caught, all of
+Three rounds of live runs found six defects no local tier could have caught, all of
 them wrong assumptions about the service rather than bugs in the daemon's logic:
 the lifecycle hooks live under a fixed `/aws/lambda-microvms/runtime/v1/` prefix,
 two of them (`ready`, `validate`) are called at image-build time, `runHookPayload`
 arrives wrapped in an envelope rather than as the request body, network connectors
-are ARNs, and `CreateMicrovmAuthToken` returns a header map. Each is recorded in
+are ARNs, `CreateMicrovmAuthToken` returns a header map, and a guest running as
+root still needs `additionalOsCapabilities: ["ALL"]` before `sethostname` or a
+bind mount over `boot_id` will work. Each is recorded in
 `docs/PLATFORM.md` with its date, and the transport tier was corrected so it fails
 against the old behavior.
 

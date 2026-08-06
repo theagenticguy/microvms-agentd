@@ -32,14 +32,43 @@ class StreamKind(StrEnum):
 
 @dataclass(frozen=True)
 class Health:
+    """A `GET /v1/health` response.
+
+    The disk and identity fields exist so an orchestrator can *watch* two
+    conditions rather than discover them: a filesystem filling up, and a VM
+    serving with identity it shares with every sibling derived from the same
+    snapshot.
+
+    `identity_degraded` and `identity_repaired` are separate on purpose.
+    Repair-was-skipped (a deployment that wants stable identity) and
+    repair-was-attempted-and-partly-failed are different situations, and a single
+    boolean would collapse a deliberate choice into an alarm. Fields default so an
+    older daemon that omits them still parses.
+    """
+
     version: str
     bootstrapped: bool
+    available_bytes: int | None = None
+    reserve_bytes: int | None = None
+    under_pressure: bool = False
+    identity_degraded: bool = False
+    identity_repaired: bool = False
 
     @classmethod
     def from_json(cls, data: dict[str, Any]) -> Health:
+        disk = data.get("disk") or {}
+        available = disk.get("available_bytes")
         return cls(
             version=str(data.get("version", "")),
             bootstrapped=bool(data.get("bootstrapped")),
+            # `None` and zero are different: unmeasurable is not full.
+            available_bytes=None if available is None else int(available),
+            reserve_bytes=(
+                None if disk.get("reserve_bytes") is None else int(disk["reserve_bytes"])
+            ),
+            under_pressure=bool(disk.get("under_pressure")),
+            identity_degraded=bool(data.get("identity_degraded")),
+            identity_repaired=bool(data.get("identity_repaired")),
         )
 
 

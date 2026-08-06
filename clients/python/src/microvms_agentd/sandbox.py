@@ -215,6 +215,7 @@ class Sandbox:
         memory_mib: int = DEFAULT_MEMORY_MIB,
         hooks: dict[str, Any] | None = None,
         tags: dict[str, str] | None = None,
+        os_capabilities: list[str] | None = None,
         build_timeout_sec: float = DEFAULT_IMAGE_BUILD_TIMEOUT_SEC,
         client_token: str | None = None,
     ) -> Image:
@@ -232,6 +233,19 @@ class Sandbox:
             resources=[{"minimumMemoryInMiB": memory_mib}],
             hooks=hooks or default_hooks(self.port),
             tags=tags or {},
+            # Measured 2026-08-06, us-east-1: without this, a guest running as root
+            # still gets EPERM from `sethostname` and from a bind mount over
+            # `/proc/sys/kernel/random/boot_id`, because the MicroVM drops
+            # CAP_SYS_ADMIN by default. Writing `/etc/machine-id` needs no
+            # capability and succeeds either way, which is what makes the gap easy
+            # to miss: identity repair looks like it works until you check the two
+            # steps that need the kernel's permission rather than the filesystem's.
+            #
+            # "ALL" is the only accepted value in the 2025-09-09 API — there is no
+            # way to request CAP_SYS_ADMIN alone — so a caller who does not need
+            # hostname or boot_id repair should leave this unset rather than widen
+            # the guest for nothing.
+            **({"additionalOsCapabilities": os_capabilities} if os_capabilities else {}),
             # A clientToken must never be a pure function of content or of a stable
             # resource identity. It is a *permanent* idempotency key: delete an
             # image and recreate it from the same bytes under the same name, and

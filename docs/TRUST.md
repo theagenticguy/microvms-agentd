@@ -260,11 +260,22 @@ discovering the duplication from a repeated key months later. Opting out is supp
 rather than a mistake — a fleet keyed by machine id wants stable identity, and
 `identity_repaired: false` distinguishes that from a repair that found nothing to do.
 
-Note what this list does *not* claim to have verified: every step is exercised against
-an injected `Layout` inside a tempdir (`agentd/src/identity.rs` tests), so the logic is
-tested but the real bind mount over real procfs, under the real MicroVM's
-capabilities, is not among the live conformance checks. Treat the `CAP_SYS_ADMIN`
-failure mode as expected-and-handled rather than as measured-absent.
+The `CAP_SYS_ADMIN` failure mode this section previously listed as expected but
+unmeasured has since been measured, and it was real. On 2026-08-06 in us-east-1 a live
+run reported `identity_degraded: true`: writing `/etc/machine-id` succeeded, while
+`sethostname` and the bind mount over `/proc/sys/kernel/random/boot_id` both returned
+`EPERM` even though the daemon runs as root. The MicroVM drops `CAP_SYS_ADMIN` unless
+the image is created with `additionalOsCapabilities: ["ALL"]`; with that set, all three
+steps succeed and the same probe reports `identity_degraded: false`. Both facts are
+recorded in `PLATFORM.md`, and the conformance suite now asserts
+`identity_degraded == false`, so the capability requirement cannot be dropped silently.
+
+Two lessons worth carrying rather than just the fix. A partial success is the dangerous
+shape: the filesystem write succeeds, so repair looks like it works until you check the
+two steps that need the kernel's permission rather than the filesystem's. And the unit
+tests could not have caught this, because they inject a `Layout` inside a tempdir and a
+fake platform — correct for testing the logic, structurally unable to observe a
+capability the real VM lacks.
 
 ## What this contract does not cover
 

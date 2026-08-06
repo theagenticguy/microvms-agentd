@@ -47,7 +47,7 @@ built from this tree.
 
 ### Verified
 
-- **54 live conformance checks passed, none failed, teardown clean** — 2026-08-05,
+- **56 conformance checks passed, none failed, teardown clean** — 2026-08-05,
   us-east-1, API version `2025-09-09`. A 1.41 MB static `aarch64-musl` binary
   baked into a MicroVM image as the container `CMD` and driven through every
   protocol rule via the platform's own endpoint, including SSE surviving the

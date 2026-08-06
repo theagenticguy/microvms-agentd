@@ -84,6 +84,37 @@ behind. It is storage-only cost, but "the stack destroyed cleanly" is not the sa
 as "the account is clean" — query for the log group separately, or delete it in
 teardown.
 
+## Root in the guest is not enough: `sethostname` and bind mounts need `additionalOsCapabilities`
+
+Measured 2026-08-06, us-east-1, `al2023-1` base. The daemon runs as root inside
+the MicroVM, and that is still not sufficient for anything requiring
+`CAP_SYS_ADMIN`. With no `additionalOsCapabilities` on `CreateMicrovmImage`:
+
+| Operation | Result |
+| --- | --- |
+| Write `/etc/machine-id` | succeeds |
+| `sethostname` | `EPERM` (`Operation not permitted`, os error 1) |
+| Bind mount over `/proc/sys/kernel/random/boot_id` | `EPERM` |
+
+Passing `additionalOsCapabilities=["ALL"]` at image creation makes all three
+succeed, confirmed by the same probe reporting `identity_degraded: false` where it
+previously reported `true`.
+
+Two things make this easy to miss. The filesystem write succeeds, so identity
+repair looks like it works until you check the two steps that need the kernel's
+permission rather than the filesystem's. And a daemon that logs the failure and
+keeps serving — which is the right behavior, since refusing to serve would strand
+the VM — produces a healthy-looking VM whose hostname and `boot_id` are shared
+with every sibling from the same snapshot.
+
+`ALL` is the only accepted value in the `2025-09-09` API; there is no way to
+request `CAP_SYS_ADMIN` alone. A caller who does not need hostname or `boot_id`
+repair should leave it unset rather than widen the guest for nothing.
+
+This was found by a live run after the unit tests passed, because those tests
+inject a fake layout and a fake platform. It is the clearest case in this project
+of a guard that was verified in every tier except the one that mattered.
+
 ## Suspend/resume is a freeze and restore, not a stop and start
 
 Measured 2026-08-05, us-east-1, `al2023-1` base, 1024 MiB baseline, via

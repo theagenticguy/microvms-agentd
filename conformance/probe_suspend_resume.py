@@ -183,6 +183,9 @@ def wait_for_state(
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--binary", required=True, type=Path)
+    # Identity repair reports which step failed only in the daemon's logs, and
+    # teardown deletes the log group. A diagnostic run needs it kept.
+    parser.add_argument("--keep-logs", action="store_true")
     args = parser.parse_args()
 
     repo = Path(__file__).resolve().parent.parent
@@ -219,6 +222,10 @@ def main() -> int:
             buildRoleArn=build_role,
             codeArtifact={"uri": f"s3://{bucket}/{key}"},
             cpuConfigurations=[{"architecture": "ARM_64"}],
+            # Without this the guest gets EPERM from `sethostname` and from the
+            # bind mount over `boot_id`, even as root: the MicroVM drops
+            # CAP_SYS_ADMIN by default. Measured 2026-08-06, us-east-1.
+            additionalOsCapabilities=["ALL"],
             resources=[{"minimumMemoryInMiB": BASELINE_MEMORY_MIB}],
             hooks={
                 "port": AGENT_PORT,
@@ -445,6 +452,9 @@ def main() -> int:
         # to it while an image is still deleting, so removing it before the image is
         # gone leaves it behind — which is exactly how one leaked from an earlier run.
         try:
+            if args.keep_logs:
+                print(f"  KEEPING log group /aws/lambda-microvms/{image_name}")
+                raise RuntimeError("kept by request")
             logs.delete_log_group(logGroupName=f"/aws/lambda-microvms/{image_name}")
             print("  deleted log group")
         except Exception as exc:  # noqa: BLE001 - cleanup must not mask the finding
