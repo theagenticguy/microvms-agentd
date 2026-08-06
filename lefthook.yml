@@ -1,0 +1,55 @@
+# Git hooks via lefthook, managed through mise.
+#
+# Install once per clone: `mise run install`.
+#
+# Everything goes through `mise run` so the mise-pinned tool versions are used
+# rather than whatever happens to be on PATH. The full gate is `mise run check`;
+# hooks exist to catch the cheap failures before they reach a reviewer.
+#
+# What is deliberately NOT here: the live AWS suites. They create billable
+# MicroVMs and take about fifteen minutes, and a hook that spends money on every
+# push is a hook people disable with --no-verify — which then also skips the
+# checks that were worth having. Run `mise run live` deliberately, or dispatch the
+# live-conformance workflow.
+
+pre-commit:
+  parallel: true
+  jobs:
+    - name: format
+      run: mise run lint
+      # Only when Rust or Python actually changed; a docs-only commit should not
+      # pay for a clippy pass.
+      glob: "*.{rs,py,toml,tf}"
+
+pre-push:
+  # Sequential: the point is to fail on the first cheap gate rather than to make
+  # a fast green run faster.
+  piped: true
+  jobs:
+    - name: local gate
+      # `check` is lint + all 155 Rust tests + the Python client + schema
+      # freshness + the aarch64 cross-compile. Around forty seconds warm, and it
+      # catches the great majority of what would otherwise fail in CI.
+      run: mise run check
+
+    - name: live-suite staleness
+      # Advisory, never blocking. The local tiers cannot see a platform change:
+      # every AWS-facing defect this project has hit was invisible until a real
+      # run. So if the daemon changed since the last live run, say so — and let
+      # the human decide, because only they know whether the change could touch
+      # the platform boundary.
+      run: |
+        marker=.git/agentd-last-live-run
+        if [ ! -f "$marker" ]; then
+          echo "note: no live AWS run recorded in this clone."
+          echo "      \`mise run live\` before merging anything that touches the"
+          echo "      platform boundary — hooks, bootstrap, image build, identity."
+          exit 0
+        fi
+        changed=$(git diff --name-only "$(cat "$marker")" HEAD -- agentd/src conformance clients/python 2>/dev/null | head -5)
+        if [ -n "$changed" ]; then
+          echo "note: the daemon or its clients changed since the last live run:"
+          echo "$changed" | sed 's/^/        /'
+          echo "      consider \`mise run live\` (billable, ~15 min)."
+        fi
+        exit 0

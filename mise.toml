@@ -1,0 +1,127 @@
+# The command surface for this repo. `mise run check` is the definition of done.
+#
+# Two tiers, split by cost rather than by kind:
+#
+#   mise run check   every local gate. No network, no AWS, no money. ~40s.
+#   mise run live    the suites that talk to real AWS. Billable, ~15 min.
+#
+# `live` is never wired to a hook or to push. It creates real MicroVMs in the
+# caller's account, and a gate that spends money on every push is a gate people
+# disable. It is a deliberate command and a manual CI dispatch.
+
+[tools]
+# `rust = "stable"` makes mise provide the toolchain via rustup, which then honors
+# `rust-toolchain.toml` — and that file is the only place that can declare the
+# cross-compile *targets*. Pinning an exact version here instead (we tried 1.97)
+# gives a compiler with no `aarch64-unknown-linux-musl`, so the build fails with
+# "can't find crate for `std`" and a suggestion naming a toolchain the reader did
+# not know they were using. Removing the entry entirely is worse: cargo then
+# leaves mise's PATH and every task fails with "command not found".
+rust = "stable"
+uv = "latest"
+ruff = "latest"
+terraform = "latest"
+lefthook = "latest"
+node = "22"
+
+[env]
+# The shipping target. MicroVMs are ARM64-only, and a static binary is what lets
+# the daemon bake into any task image without depending on an interpreter or libc
+# that image may not have. Linker choice lives in .cargo/config.toml.
+AGENTD_TARGET = "aarch64-unknown-linux-musl"
+
+# ── local gates ─────────────────────────────────────────────────────────────
+
+[tasks.fmt]
+description = "Format everything (writes)"
+run = [
+  "cargo fmt --all",
+  "ruff format clients/python conformance scripts",
+  "terraform -chdir=conformance/infra fmt",
+]
+
+[tasks.lint]
+description = "Format check + clippy + ruff, no writes"
+run = [
+  "cargo fmt --all -- --check",
+  "cargo clippy --all-targets -- -D warnings",
+  "ruff check clients/python conformance scripts",
+  "ruff format --check clients/python conformance scripts",
+  "terraform -chdir=conformance/infra fmt -check",
+]
+
+[tasks.test]
+description = "All six Rust tiers: unit, model, proptest, turmoil, panic, schema"
+run = "cargo test --all"
+
+[tasks."test:python"]
+description = "Client library tests against a fake daemon over a real socket"
+run = "uv run --with pytest --with httpx --with boto3 pytest clients/python -q"
+
+[tasks.schema]
+description = "Regenerate docs/schema.json from the serde types"
+run = "cargo run -q -p agentd --bin schema"
+
+[tasks."schema:check"]
+description = "Fail if the committed schema no longer matches what is served"
+# A stale generated artifact is worse than none: consumers trust it *because* it
+# is generated, and a diff never reveals that it describes a protocol nobody
+# serves.
+run = "cargo run -q -p agentd --bin schema -- --check"
+
+[tasks.spec]
+description = "Requirements consistency via symspec + Z3"
+# Not in `check`'s dependency list: symspec is a global npm install plus a
+# downloaded embedding model, so a fresh clone should not fail on its absence.
+run = "symspec check spec/agentd.symspec.json --strict"
+
+[tasks.build]
+description = "Release build for the shipping target"
+run = "cargo build --release -p agentd --target $AGENTD_TARGET"
+
+[tasks.check]
+description = "The full local gate — the definition of done"
+depends = ["lint", "test", "test:python", "schema:check", "build"]
+
+# ── live AWS suites (billable, manual) ──────────────────────────────────────
+
+[tasks."live:infra"]
+description = "Apply the conformance stack (idempotent)"
+run = "terraform -chdir=conformance/infra init -input=false && terraform -chdir=conformance/infra apply -auto-approve -input=false"
+
+[tasks."live:conformance"]
+description = "56 checks against a real MicroVM through the platform endpoint"
+depends = ["build", "live:infra"]
+run = "./conformance/run.py --binary target/$AGENTD_TARGET/release/agentd"
+
+[tasks."live:probe"]
+description = "Measure what a real suspend/resume cycle preserves"
+depends = ["build", "live:infra"]
+run = "./conformance/probe_suspend_resume.py --binary target/$AGENTD_TARGET/release/agentd"
+
+[tasks."live:verify-clean"]
+description = "Ask the account what leaked, rather than trusting teardown"
+# Independent of the code that did the cleanup, which is the whole point:
+# `terraform destroy` once reported success while six service-created log groups
+# survived, because Terraform never owned them.
+run = "./scripts/verify-clean"
+
+[tasks.live]
+description = "Every live suite, then an independent leak check. BILLABLE."
+depends = ["live:conformance", "live:probe", "live:verify-clean"]
+# Records the commit that was last proven against real AWS. The pre-push hook
+# reads it to tell you whether the daemon has changed since — advisory only,
+# because only a human knows whether a given change could touch the platform
+# boundary. Lives in .git/ so it is per-clone and never committed: a marker
+# claiming someone else's run is worse than no marker.
+run = "git rev-parse HEAD > .git/agentd-last-live-run && echo 'recorded this commit as live-verified'"
+
+[tasks."live:destroy"]
+description = "Tear down the conformance stack"
+run = "terraform -chdir=conformance/infra destroy -auto-approve"
+
+# ── setup ───────────────────────────────────────────────────────────────────
+
+[tasks.install]
+description = "Install git hooks"
+run = "lefthook install"

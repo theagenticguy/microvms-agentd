@@ -8,6 +8,27 @@ contract you must not silently change, and `docs/TRUST.md` for the threat model.
 
 ## Running the verification tiers
 
+## The command surface
+
+`mise` is the front door. One command is the definition of done:
+
+```bash
+mise run install   # once per clone: installs the git hooks
+mise run check     # every local gate. ~45s, no network, no AWS, no cost.
+mise run live      # the real-AWS suites. BILLABLE, ~15 min. Deliberate only.
+mise tasks         # everything else
+```
+
+`check` is what the pre-push hook runs, and what CI runs. `live` is never wired
+to a hook: it launches real MicroVMs, and a gate that spends money on every push
+is a gate people disable with `--no-verify`, which then also skips the checks
+worth having. The hook does print an advisory when the daemon has changed since
+the last recorded live run, because no local tier can see a platform change —
+every AWS-facing defect this project has hit was invisible until a real run.
+
+The tiers below are what `check` composes, and each is runnable alone when you
+want a tighter loop.
+
 Five tiers, each owning a defect class the others cannot see. `cargo test --all`
 runs all of them; run them individually while iterating.
 

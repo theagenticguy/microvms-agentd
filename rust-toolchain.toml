@@ -1,0 +1,16 @@
+# Declaring the toolchain here rather than pinning `rust` in mise.toml, because
+# this file is the one thing that also declares the *target*.
+#
+# The failure it prevents: a toolchain pin alone gives you a compiler without
+# `aarch64-unknown-linux-musl`, and the cross-compile then fails with "can't find
+# crate for `std`" plus a suggestion to run `rustup target add` — for a toolchain
+# the reader did not know they were using. Listing the target here makes rustup
+# install it on first use, for every contributor and for CI, with no setup step.
+#
+# aarch64 is the shipping target because Lambda MicroVMs are ARM64-only. The x86
+# musl target is here for local experiments on this box; it costs a download and
+# saves the same confusing failure.
+[toolchain]
+channel = "stable"
+components = ["clippy", "rustfmt"]
+targets = ["aarch64-unknown-linux-musl", "x86_64-unknown-linux-musl"]

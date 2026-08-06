@@ -166,9 +166,10 @@ into hyper, which is where roughly a quarter of the PR's defects lived.
 ## Running the checks
 
 ```bash
-cargo test --all                                 # all four tiers, ~11s
-cargo clippy --all-targets -- -D warnings
-symspec check spec/agentd.symspec.json --strict   # requirements verification
+mise run install   # once per clone: installs the git hooks
+mise run check     # every local gate: lint, 155 tests, schema, cross-compile
+mise run live      # the real-AWS suites. BILLABLE, ~15 min.
+mise tasks         # everything else
 ```
 
 `cargo test --all` runs 155 tests across six targets: 107 daemon unit tests, 5
@@ -177,11 +178,14 @@ panic-containment tests, 8 tar-confinement properties, 11 schema-artifact checks
 verified to fail against the code without its fix; a property that passes either
 way is a false answer, not a passing test.
 
-CI (`.github/workflows/ci.yml`) runs the Rust gates, the schema staleness check,
-the symspec requirements gate, and an `aarch64-unknown-linux-musl` cross-compile.
-It does **not** yet run the Python client's tests or ruff — run those locally per
-`CONTRIBUTING.md` until a job exists. CI has also never executed, because the
-repository has no remote.
+CI (`.github/workflows/ci.yml`) runs the same gates in four jobs: Rust lint and
+tests plus the schema staleness check, the `aarch64-unknown-linux-musl`
+cross-compile, the Python client's tests and ruff, and the symspec requirements
+gate. A fifth workflow, `live-conformance.yml`, runs the real-AWS suites — manual
+dispatch only, behind a GitHub environment so a human approves each run, using
+OIDC rather than a stored key.
+
+Neither workflow has ever executed, because the repository has no remote yet.
 
 ## License
 

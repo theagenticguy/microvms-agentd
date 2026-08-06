@@ -1,0 +1,107 @@
+name: live conformance
+
+# Manual only, and deliberately so. This workflow launches real MicroVMs in a
+# real account: it costs money, it takes about fifteen minutes, and it needs
+# credentials that can create IAM roles. None of that belongs on a push trigger.
+#
+# The `environment:` below is the actual gate. Configure it in repository settings
+# with a required reviewer, and no fork, no bot, and no compromised token can
+# spend money here without a human approving the run.
+on:
+  workflow_dispatch:
+    inputs:
+      region:
+        description: "AWS region (must be a Lambda MicroVMs region)"
+        required: true
+        default: us-east-1
+        type: choice
+        options: [us-east-1, us-west-2]
+      destroy_after:
+        description: "Destroy the Terraform stack when finished"
+        required: true
+        default: true
+        type: boolean
+
+# One at a time. Two concurrent runs would race on the same Terraform state and
+# on the same account, and the loser would report failures that are really
+# collisions.
+concurrency:
+  group: live-conformance
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  id-token: write # for OIDC; no long-lived key is stored
+
+jobs:
+  live:
+    name: real AWS
+    runs-on: ubuntu-latest
+    environment: live-aws
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        # rust-toolchain.toml declares the aarch64-musl target, so it installs
+        # without a step here.
+
+      - uses: Swatinem/rust-cache@v2
+      - uses: astral-sh/setup-uv@v5
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+
+      # OIDC rather than a stored access key: the credentials exist for the life
+      # of this job and cannot be exfiltrated from a log for later use. The role
+      # needs to create MicroVM images, run MicroVMs, and manage the conformance
+      # stack's bucket and roles.
+      - name: assume AWS role
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.LIVE_CONFORMANCE_ROLE_ARN }}
+          aws-region: ${{ inputs.region }}
+
+      - name: build the shipping binary
+        run: cargo build --release -p agentd --target aarch64-unknown-linux-musl
+
+      - name: apply the conformance stack
+        env:
+          AWS_REGION: ${{ inputs.region }}
+        run: |
+          terraform -chdir=conformance/infra init -input=false
+          terraform -chdir=conformance/infra apply -auto-approve -input=false
+
+      - name: conformance suite
+        env:
+          AWS_REGION: ${{ inputs.region }}
+        run: ./conformance/run.py --binary target/aarch64-unknown-linux-musl/release/agentd
+
+      - name: suspend/resume probe
+        env:
+          AWS_REGION: ${{ inputs.region }}
+        run: ./conformance/probe_suspend_resume.py --binary target/aarch64-unknown-linux-musl/release/agentd
+
+      # `if: always()` on both cleanup steps: a failed suite is exactly when
+      # resources are most likely to survive, so cleanup must not be skipped by
+      # the failure that made it necessary.
+      - name: verify nothing leaked
+        if: always()
+        env:
+          AWS_REGION: ${{ inputs.region }}
+        run: ./scripts/verify-clean
+
+      - name: destroy the stack
+        if: always() && inputs.destroy_after
+        env:
+          AWS_REGION: ${{ inputs.region }}
+        run: terraform -chdir=conformance/infra destroy -auto-approve
+
+      # Re-checked after the destroy, because "terraform destroy succeeded" and
+      # "the account is clean" are different claims — six service-created log
+      # groups once survived a successful destroy.
+      - name: verify again after destroy
+        if: always() && inputs.destroy_after
+        env:
+          AWS_REGION: ${{ inputs.region }}
+        run: ./scripts/verify-clean
