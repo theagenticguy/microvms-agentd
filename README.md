@@ -11,22 +11,44 @@ findings across six rounds, nearly all of them in that daemon or in the service'
 lifecycle semantics. This project exists so the next team does not repeat it.
 
 **Status: proven against the real service.** On 2026-08-05 the daemon was
-cross-compiled to a 1.36 MB static `aarch64-unknown-linux-musl` binary, baked into
+cross-compiled to a 1.41 MB static `aarch64-unknown-linux-musl` binary, baked into
 a MicroVM image as the container `CMD`, launched in us-east-1, and driven through
-every protocol rule via the platform's own endpoint: 38 checks passed, none
-failed, and teardown left the account clean. The four local verification tiers are
-green alongside it.
+every protocol rule via the platform's own endpoint: 54 checks passed, none
+failed, and teardown left the account clean. 111 Rust tests across four local
+tiers and 83 Python client tests are green alongside it.
 
-The live run found three defects that no local tier could have caught, all of them
-wrong assumptions about the service rather than bugs in the daemon's logic: the
-lifecycle hooks live under a fixed `/aws/lambda-microvms/runtime/v1/` prefix, two
-of them (`ready`, `validate`) are called at image-build time, and `runHookPayload`
-arrives wrapped in an envelope rather than as the request body. Each is now
-recorded in `docs/PLATFORM.md` with its date, and the transport tier was corrected
-so it would fail against the old behavior.
+That live run covers the things only the real service can answer, including
+Server-Sent Events surviving the endpoint proxy, stdin round-tripping through a
+child, and a suspend/resume cycle preserving everything.
 
-Not yet done: a repeat run in a second region, and the CI cross-compile job has
-never executed (there is no git remote).
+Two rounds of live runs found five defects no local tier could have caught, all of
+them wrong assumptions about the service rather than bugs in the daemon's logic:
+the lifecycle hooks live under a fixed `/aws/lambda-microvms/runtime/v1/` prefix,
+two of them (`ready`, `validate`) are called at image-build time, `runHookPayload`
+arrives wrapped in an envelope rather than as the request body, network connectors
+are ARNs, and `CreateMicrovmAuthToken` returns a header map. Each is recorded in
+`docs/PLATFORM.md` with its date, and the transport tier was corrected so it fails
+against the old behavior.
+
+Not yet done: a repeat run in a second region, the CI cross-compile job has never
+executed (there is no git remote), and `Sandbox` in the Python client is verified
+only against fakes plus the conformance run.
+
+## Suspend and resume preserve everything
+
+Measured 2026-08-05, and it inverted what this project previously assumed.
+`SuspendMicrovm` then `ResumeMicrovm` is a freeze and restore: the in-memory agent
+token, the filesystem, exec records including unacked output, and even running
+background processes all survive, and the endpoint URL is unchanged. The evidence
+is a ticker writing epoch seconds once a second, showing a single 46-second gap
+across a 40-second suspension and then resuming its count.
+
+So a warm pool of suspended sandboxes needs no token re-delivery and no
+re-bootstrap: suspend an idle VM instead of terminating it, and the next task lands
+in one that still has its filesystem, installed tools, and credentials. The one
+caveat is that a guest process observes the suspension as a single jump in wall
+time, so anything holding a timeout, lease, or session across a suspend sees it
+expire at once.
 
 ## What is in the repo
 

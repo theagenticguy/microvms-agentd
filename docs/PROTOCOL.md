@@ -20,6 +20,8 @@ never gets bootstrapped.
 | `POST HOOKS/terminate` | none (platform hook) | acknowledged; begins graceful shutdown |
 | `POST /v1/exec/start` | bearer | start a command under a caller-minted `exec_id` |
 | `GET /v1/exec/{id}` | bearer | poll status and output; never mutates |
+| `GET /v1/exec/{id}/stream?offset=` | bearer | follow output as SSE from a byte offset |
+| `POST /v1/exec/{id}/stdin` | bearer | write to a child's stdin, or signal EOF |
 | `POST /v1/exec/{id}/ack` | bearer | release output, enter TTL collection |
 | `POST /v1/exec/{id}/kill` | bearer | signal escalation to the process group |
 | `PUT /v1/fs/tar` | bearer | streaming tar upload and confined extraction |
@@ -92,6 +94,37 @@ OOM-killed daemon is unrecoverable. It also measured archive size inside the gzi
 
 **Output is bounded with an explicit truncation marker,** and a post-exit linger
 deadline bounds how long the daemon waits on grandchildren still holding the pipe.
+
+## Streaming and stdin
+
+Both exist for one consumer: an agent harness running inside the VM, which emits
+output for minutes and may need a prompt written to it. Polling re-sends the whole
+buffer each time and truncates at the output cap, which is wrong for both.
+
+**The stream is a view, never the object.** An exec is a server-side record keyed
+by its caller-minted `exec_id`. Attaching, detaching, or dropping a connection
+must not affect the command, and both views must keep working: poll returns the
+buffer, stream follows it, and neither disturbs the other.
+
+**Resume is by byte offset.** `?offset=N` yields exactly the bytes after N. This is
+the difference between a working reconnect and a broken one: E2B's offset-less
+reattach loses everything produced during the gap. A reattach past the retained
+window gets an explicit `gap` event naming the range, because silently skipping
+bytes while appearing to stream is worse than admitting the loss.
+
+**The terminal event is the point of using SSE.** A raw chunked byte stream cannot
+distinguish a finished command from a dropped connection — the bytes are
+identical. So the stream emits a typed `exit` event carrying the status and *then*
+ends. Keep-alive comments fill silences, because an agent harness thinking for two
+minutes must not look like a dead connection.
+
+**stdin is opt-in and a separate request.** A command that does not ask for stdin
+gets `Stdio::null()`, so nothing inherits a surprise descriptor; asking for it and
+then writing to a command that did not request it is 409. Writes go to
+`POST /v1/exec/{id}/stdin`, never multiplexed onto the output connection, which is
+what makes a dropped attach harmless. EOF is an explicit signal rather than
+inferred, because a child reading stdin cannot exit until the daemon drops its own
+handle — `Child::wait()` drops the child's copy, not ours.
 
 ## Trust boundary
 

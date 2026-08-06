@@ -36,6 +36,11 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
 futures-util = "0.3"
 tokio-util = { version = "0.7", features = ["io"] }
+# Exec output is arbitrary bytes and a JSON string cannot hold arbitrary bytes, so
+# both the SSE output events and the stdin write body carry base64. Pinned to the
+# 0.23 line, the current one; the `Engine` trait replaced the old free functions in
+# 0.21, so `encode`/`decode` are called through `general_purpose::STANDARD`.
+base64 = "0.23"
 
 [dev-dependencies]
 proptest = "1.11"

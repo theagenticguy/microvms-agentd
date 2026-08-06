@@ -7,6 +7,7 @@ name = "agentd"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "base64",
  "bytes",
  "futures-util",
  "http-body-util",
@@ -127,6 +128,12 @@ dependencies = [
  "tower-service",
  "tracing",
 ]
+
+[[package]]
+name = "base64"
+version = "0.23.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ac07cdecf99051d9a5238b80f35af32cdeba5b336e55d957b318b50137e18da5"
 
 [[package]]
 name = "bit-set"

@@ -84,6 +84,37 @@ behind. It is storage-only cost, but "the stack destroyed cleanly" is not the sa
 as "the account is clean" — query for the log group separately, or delete it in
 teardown.
 
+## Suspend/resume is a freeze and restore, not a stop and start
+
+Measured 2026-08-05, us-east-1, `al2023-1` base, 1024 MiB baseline, via
+`conformance/probe_suspend_resume.py`. `SuspendMicrovm`, held 45 seconds, then
+`ResumeMicrovm`. Everything survived:
+
+| What | Result |
+| --- | --- |
+| In-memory agent token | survived — `/v1/health` reports `bootstrapped: true` |
+| Filesystem | survived |
+| Exec records, including unacked output | survived |
+| A backgrounded process | survived and kept running after resume |
+| Endpoint URL | unchanged |
+
+The decisive evidence is a ticker writing `date +%s` once a second: the largest gap
+between consecutive ticks was 51 seconds, matching the suspension plus transition
+time, and the tick file grew by 6 lines over 6 seconds after resume. So the guest
+is frozen rather than killed, and it resumes mid-stride.
+
+Two consequences. Pause/resume needs no token re-delivery and no re-bootstrap,
+which makes a warm suspended sandbox pool viable: suspend an idle VM instead of
+terminating it and the next task lands in a VM that still has its filesystem, its
+installed tools, and its credentials. And a guest process that measures wall time
+sees the suspension as a single jump — anything holding a timeout, a lease, or a
+TLS session across a suspend will observe it expire at once.
+
+This corrects an earlier claim in the daemon's own resume-hook docstring, which
+asserted that bootstrap state being in memory made a resumed VM unable to serve the
+control API. That was reasoning from where the state lives rather than from a
+measurement, and it was wrong.
+
 ## Traffic ordering around the `/run` hook
 
 Documented (`microvms-launching.html`): "Your MicroVM begins receiving external

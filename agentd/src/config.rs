@@ -37,6 +37,28 @@ pub struct Config {
     pub max_tar_members: u64,
     /// Maximum total uncompressed bytes across an archive's members.
     pub max_tar_bytes: u64,
+    /// Bytes of recent output each exec keeps for stream replay. Independent of
+    /// `max_output_bytes`: that one caps the *head* of the log for the polled
+    /// result, this one caps the *tail* for a reattaching stream. A reattach past
+    /// this window gets an explicit gap event rather than silently-missing bytes.
+    pub stream_buffer_bytes: usize,
+    /// Slots in an exec's live fan-out channel. A subscriber that falls this far
+    /// behind is told it lagged and re-reads the ring from its last good offset,
+    /// so the bound costs a re-read rather than lost output.
+    pub stream_channel_capacity: usize,
+    /// Interval between SSE keep-alive comments. Needed because an exec can be
+    /// silent for minutes — an agent harness thinking, a build linking — and an
+    /// idle connection through a proxy is indistinguishable from a dead one.
+    pub sse_keepalive: Duration,
+    /// Largest single decoded stdin write accepted. Bounded for the same reason
+    /// every other buffer here is: the write is held in memory before it reaches
+    /// the pipe.
+    pub max_stdin_write_bytes: usize,
+    /// How long a stdin write may block on the pipe before the request gives up.
+    /// A child that has stopped reading fills the 64 KiB pipe buffer and then the
+    /// write blocks forever; without this bound one wedged child pins a request
+    /// (and a connection) for the life of the VM.
+    pub stdin_write_timeout: Duration,
 }
 
 impl Default for Config {
@@ -51,6 +73,11 @@ impl Default for Config {
             kill_grace: Duration::from_secs(10),
             max_tar_members: 100_000,
             max_tar_bytes: 8 * 1024 * 1024 * 1024,
+            stream_buffer_bytes: 1024 * 1024,
+            stream_channel_capacity: 256,
+            sse_keepalive: Duration::from_secs(15),
+            max_stdin_write_bytes: 1024 * 1024,
+            stdin_write_timeout: Duration::from_secs(5),
         }
     }
 }
@@ -76,6 +103,18 @@ impl Config {
         }
         if let Some(secs) = env_parse::<u64>("AGENTD_EXEC_TTL_SECS") {
             cfg.exec_ttl = Duration::from_secs(secs);
+        }
+        if let Some(bytes) = env_parse("AGENTD_STREAM_BUFFER_BYTES") {
+            cfg.stream_buffer_bytes = bytes;
+        }
+        if let Some(slots) = env_parse("AGENTD_STREAM_CHANNEL_CAPACITY") {
+            cfg.stream_channel_capacity = slots;
+        }
+        if let Some(secs) = env_parse::<u64>("AGENTD_SSE_KEEPALIVE_SECS") {
+            cfg.sse_keepalive = Duration::from_secs(secs);
+        }
+        if let Some(bytes) = env_parse("AGENTD_MAX_STDIN_WRITE_BYTES") {
+            cfg.max_stdin_write_bytes = bytes;
         }
         cfg
     }

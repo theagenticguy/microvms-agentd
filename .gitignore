@@ -7,3 +7,9 @@ Cargo.lock.orig
 conformance/infra/.terraform/
 conformance/infra/.terraform.lock.hcl
 conformance/infra/terraform.tfstate*
+# Python build and test artifacts from the client library.
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+*.egg-info/

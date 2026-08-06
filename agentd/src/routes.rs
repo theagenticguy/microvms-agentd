@@ -51,6 +51,12 @@ pub fn app(state: AppState) -> Router {
     let control = Router::new()
         .route("/v1/exec/start", post(exec::start))
         .route("/v1/exec/{id}", get(exec::poll))
+        // The streaming attach is registered as a sibling of the poll route
+        // rather than replacing it: poll is what the conformance suite and every
+        // existing client use, and streaming is an additional view onto the same
+        // server-side object. Detaching from one does not affect the other.
+        .route("/v1/exec/{id}/stream", get(exec::stream))
+        .route("/v1/exec/{id}/stdin", post(exec::write_stdin))
         .route("/v1/exec/{id}/ack", post(exec::ack))
         .route("/v1/exec/{id}/kill", post(exec::kill))
         .route("/v1/fs/file", get(fs::read_file).put(fs::write_file))
@@ -181,15 +187,31 @@ async fn suspend_hook() -> StatusCode {
 
 /// Resume acknowledgement.
 ///
-/// Bootstrap state is held in memory, so a resumed VM has no token and cannot
-/// serve the control API. The hook still answers 200 because refusing it would
-/// not restore the token, and the honest signal is in the log plus the
-/// `bootstrapped: false` that `/v1/health` will report.
+/// Suspend is a freeze and restore, not a stop and start: measured 2026-08-05 in
+/// us-east-1, the in-memory agent token, the filesystem, exec records, and even
+/// backgrounded processes all survive a suspend/resume cycle, and the endpoint URL
+/// is unchanged. So the normal case here is a VM that is already bootstrapped and
+/// needs nothing.
+///
+/// An earlier version of this docstring claimed the opposite — that in-memory
+/// bootstrap state made a resumed VM unable to serve the control API. That was
+/// inferred from where the state lives rather than measured, and it was wrong. See
+/// `docs/PLATFORM.md`.
+///
+/// The one thing that does change across a suspend is the guest's view of time: it
+/// observes the whole suspension as a single jump, so any timeout, lease, or
+/// session held by a running command expires at once on resume.
 async fn resume_hook(State(state): State<AppState>) -> StatusCode {
-    if !state.is_bootstrapped() {
+    if state.is_bootstrapped() {
+        tracing::info!("resumed with bootstrap state intact");
+    } else {
+        // Unexpected given the measurement above, and worth saying loudly rather
+        // than treating as routine: it would mean this resume behaved like a cold
+        // start, and every in-flight exec record is gone with it.
         tracing::warn!(
-            "resumed without an installed token: bootstrap state is in memory, so the \
-             control API is unavailable until a fresh /run arrives"
+            "resumed WITHOUT an installed token — this contradicts the measured \
+             suspend/resume behavior; the control API stays closed until a fresh \
+             run hook arrives"
         );
     }
     StatusCode::OK

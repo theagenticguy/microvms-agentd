@@ -1,7 +1,10 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["boto3>=1.40", "httpx>=0.27"]
+# dependencies = ["microvms-agentd-client", "boto3>=1.40", "httpx>=0.27"]
+#
+# [tool.uv.sources]
+# microvms-agentd-client = { path = "../clients/python" }
 # ///
 """Live conformance run for microvms-agentd against real Lambda MicroVMs.
 
@@ -15,6 +18,13 @@ endpoint proxy auth, whether an omitted cwd really inherits the image WORKDIR,
 and whether the daemon survives whatever the platform does to its port before
 bootstrap.
 
+Every HTTP interaction goes through `clients/python`, so this run is also the
+best available evidence that the library is usable: if a check here needs to
+reach around the library, the library's API is wrong. Two places do reach around
+it deliberately, and both are noted where they happen — the platform's own
+`/run` hook route, which no consumer should ever call, and the raw
+`transport.request` used where the *status code itself* is the assertion.
+
 Usage:
     conformance/run.py --binary target/aarch64-unknown-linux-musl/release/agentd
 """
@@ -23,20 +33,31 @@ from __future__ import annotations
 
 import argparse
 import io
+import itertools
 import json
 import os
 import secrets
 import subprocess
 import sys
 import time
-import zipfile
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 import boto3
-import httpx
 from botocore.config import Config as BotoConfig
+from microvms_agentd import (
+    AgentdError,
+    Conflict,
+    NotFound,
+    ProtocolError,
+    Sandbox,
+    Session,
+    Unauthorized,
+    default_dockerfile,
+    default_hooks,
+)
 
 SERVICE = "lambda-microvms"
 REGION = os.environ.get("AWS_REGION", "us-east-1")
@@ -47,13 +68,10 @@ HOOK_TIMEOUT_SEC = 30
 # memory bounds.
 BASELINE_MEMORY_MIB = 1024
 IMAGE_BUILD_TIMEOUT_SEC = 45 * 60
-STALL_GRACE_SEC = 240
-# The Lambda-managed connector that lets the endpoint proxy forward inbound
-# traffic to the VM. Egress is deliberately omitted: the daemon needs no outbound
-# network, and leaving it off is one less thing a task workload can reach.
-ALL_INGRESS_ARN = (
-    f"arn:aws:lambda:{REGION}:aws:network-connector:aws-network-connector:ALL_INGRESS"
-)
+# A baked WORKDIR is the only way to test cwd inheritance: every public ARM64 base
+# image we checked leaves WorkingDir empty, so there would otherwise be nothing to
+# inherit.
+BAKED_WORKDIR = "/opt/baked-workdir"
 
 
 @dataclass
@@ -73,352 +91,457 @@ class Results:
         return ok
 
     def eq(self, name: str, actual: Any, expected: Any) -> bool:
-        return self.check(name, actual == expected, f"expected {expected!r}, got {actual!r}")
+        return self.check(
+            name, actual == expected, f"expected {expected!r}, got {actual!r}"
+        )
+
+    def raises(
+        self, name: str, expected: type[Exception], call: Callable[[], Any]
+    ) -> bool:
+        """Asserts a call raises exactly `expected`.
+
+        This is how the client library expresses a protocol rule, and asserting on
+        the *type* rather than on a status integer is strictly stronger: it checks
+        both that the daemon chose the right status and that the library maps it to
+        the type a consumer will catch. A 404 arriving where a 400 belongs fails
+        here as loudly as it should, which is the whole point of the taxonomy.
+        """
+        try:
+            call()
+        except expected as exc:
+            return self.check(name, True, f"{type(exc).__name__}")
+        except Exception as exc:  # noqa: BLE001 - any other error is the finding
+            return self.check(
+                name, False, f"expected {expected.__name__}, raised {exc!r}"
+            )
+        return self.check(name, False, f"expected {expected.__name__}, nothing raised")
+
+    def ok(self, name: str, call: Callable[[], Any]) -> bool:
+        """Asserts a call succeeds, which for this library means "does not raise"."""
+        try:
+            call()
+        except Exception as exc:  # noqa: BLE001 - any error is the finding
+            return self.check(name, False, repr(exc))
+        return self.check(name, True)
 
 
 def sh(cmd: list[str], cwd: Path | None = None) -> str:
-    proc = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
+    proc = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, check=False)
     if proc.returncode != 0:
         raise RuntimeError(f"{' '.join(cmd)} failed:\n{proc.stdout}\n{proc.stderr}")
     return proc.stdout
 
 
-def build_artifact(binary: Path) -> bytes:
-    """Zips the daemon with a Dockerfile that makes it the container CMD.
+def conformance_dockerfile() -> str:
+    """The library's default image recipe, with a WORKDIR baked in for this suite.
 
     `ENTRYPOINT []` plus `CMD ["/agentd"]` is the deployment invariant the trust
-    boundary rests on: it is what guarantees no task workload runs before the
-    platform's run hook lands. It is also what makes an omitted `cwd` inherit the
-    image WORKDIR, since the daemon's own cwd is the image's.
+    boundary rests on, and it is also what makes an omitted `cwd` inherit the image
+    WORKDIR. Both come from the library so that a consumer following the README
+    gets the same guarantees this run verifies.
     """
-    dockerfile = "\n".join(
-        [
-            "FROM public.ecr.aws/amazonlinux/amazonlinux:2023-minimal",
-            "COPY agentd /agentd",
-            "RUN chmod 0755 /agentd",
-            # A baked WORKDIR is the only way to test cwd inheritance: every
-            # public ARM64 base image we checked leaves WorkingDir empty, so
-            # there would otherwise be nothing to inherit.
-            "RUN mkdir -p /opt/baked-workdir",
-            "WORKDIR /opt/baked-workdir",
-            f"ENV AGENTD_PORT={AGENT_PORT}",
-            "ENV AGENTD_LOG=info",
-            f"EXPOSE {AGENT_PORT}",
-            "ENTRYPOINT []",
-            'CMD ["/agentd"]',
-            "",
-        ]
+    return default_dockerfile(port=AGENT_PORT, workdir=BAKED_WORKDIR)
+
+
+def post_run_hook(session: Session, token: str) -> int:
+    """Posts the platform's run hook and returns the raw status.
+
+    The library deliberately does not wrap this route: the only callers are the
+    platform itself and an attacker inside the VM, so an affordance for it in a
+    client library would be a footgun with no legitimate use. Reaching through to
+    the transport here is correct rather than a gap.
+
+    The body is the platform's envelope, not our payload directly: the string given
+    to RunMicrovm arrives wrapped as {"runHookPayload": "<it>"}.
+    """
+    response = session.transport.request(
+        "POST",
+        "/aws/lambda-microvms/runtime/v1/run",
+        token=None,
+        json={"runHookPayload": json.dumps({"agent_token": token})},
     )
-    buffer = io.BytesIO()
-    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
-        archive.writestr("Dockerfile", dockerfile)
-        info = zipfile.ZipInfo("agentd")
-        info.external_attr = 0o755 << 16
-        archive.writestr(info, binary.read_bytes())
-    return buffer.getvalue()
+    return response.status_code
 
 
-def wait_for_image(mv: Any, image_id: str, *, deadline: float) -> dict[str, Any]:
-    """Waits for an image to reach CREATED, distinguishing stalled from slow.
-
-    An image state of CREATING covers both a build in progress and a build the
-    service never scheduled. The second happens when a clientToken replays a
-    create that was already satisfied, and the resulting image can never be
-    deleted — its state forbids deletion and its only version cannot be dropped
-    because it is the last one. Probing the build list after a grace period turns
-    a 45-minute silent wait into an actionable failure.
-    """
-    started = time.time()
-    probed = False
-    while time.time() < deadline:
-        image = mv.get_microvm_image(imageIdentifier=image_id)
-        state = image.get("state")
-        if state in ("CREATED", "ACTIVE", "AVAILABLE"):
-            return image
-        if state and "FAILED" in state:
-            raise RuntimeError(f"image build failed: {state} {image.get('stateReason')}")
-
-        elapsed = time.time() - started
-        if not probed and elapsed > STALL_GRACE_SEC:
-            probed = True
-            try:
-                versions = mv.list_microvm_image_versions(imageIdentifier=image_id)
-                version = versions["items"][0]["imageVersion"]
-                builds = mv.list_microvm_image_builds(
-                    imageIdentifier=image_id, imageVersion=version
-                )
-                states = [b.get("state") for b in builds.get("items", [])]
-                if states and all(s == "PENDING" for s in states):
-                    raise RuntimeError(
-                        f"build never scheduled after {elapsed:.0f}s: all builds "
-                        f"still PENDING ({states}). This is the clientToken replay "
-                        "signature — the image is wedged and cannot be deleted."
-                    )
-                print(f"    build states after {elapsed:.0f}s: {states}")
-            except RuntimeError:
-                raise
-            except Exception as exc:  # best-effort probe; never break the wait
-                print(f"    (build probe failed, continuing: {exc})")
-
-        print(f"    image {state} ({elapsed:.0f}s)")
-        time.sleep(15)
-    raise RuntimeError(f"image did not reach CREATED within {IMAGE_BUILD_TIMEOUT_SEC}s")
-
-
-class Endpoint:
-    """HTTP client for a MicroVM endpoint, minting proxy auth as needed.
-
-    Every request needs an `X-aws-proxy-auth` JWE scoped to this MicroVM and this
-    port set, valid at most 60 minutes. Minting sits inside the request path
-    because a long run crosses that ceiling, and a mint failure has to be
-    retryable rather than fatal.
-    """
-
-    def __init__(self, mv: Any, microvm_id: str, endpoint: str, agent_token: str) -> None:
-        self.mv = mv
-        self.microvm_id = microvm_id
-        self.base = endpoint if endpoint.startswith("http") else f"https://{endpoint}"
-        self.agent_token = agent_token
-        self._proxy: str | None = None
-        self._minted_at = 0.0
-
-    def _proxy_auth(self) -> str:
-        if self._proxy is None or time.time() - self._minted_at > 30 * 60:
-            token = self.mv.create_microvm_auth_token(
-                microvmIdentifier=self.microvm_id,
-                expirationInMinutes=60,
-                allowedPorts=[{"port": AGENT_PORT}],
-            )
-            # `authToken` is a map of header name to value, not a bare string:
-            # the API is shaped for schemes that need more than one header.
-            self._proxy = token["authToken"]["X-aws-proxy-auth"]
-            self._minted_at = time.time()
-        return self._proxy
-
-    def request(
-        self,
-        method: str,
-        path: str,
-        *,
-        token: str | None = "",
-        json_body: Any = None,
-        content: bytes | None = None,
-        timeout: float = 60.0,
-    ) -> httpx.Response:
-        # The port header is not optional: the proxy needs to know which of the
-        # token's allowed ports this request is for.
-        headers: dict[str, Any] = {
-            "X-aws-proxy-auth": self._proxy_auth(),
-            "X-aws-proxy-port": str(AGENT_PORT),
-        }
-        bearer = self.agent_token if token == "" else token
-        if bearer is not None:
-            # Bytes, not str: httpx encodes str headers as ASCII and refuses
-            # anything else, which would make the hostile-header check
-            # unreachable. The daemon's whole point here is that it compares
-            # header bytes without decoding them.
-            value = bearer.encode("utf-8") if isinstance(bearer, str) else bearer
-            headers["Authorization"] = b"Bearer " + value
-        with httpx.Client(timeout=timeout, verify=True) as client:
-            return client.request(
-                method,
-                f"{self.base}{path}",
-                headers=headers,
-                json=json_body,
-                content=content,
-            )
-
-
-def drive_protocol(ep: Endpoint, results: Results) -> None:
+def drive_protocol(session: Session, results: Results) -> None:
     """Exercises every protocol rule the real service can validate."""
 
     print("\n-- bootstrap and authorization --")
-    health = ep.request("GET", "/v1/health", token=None)
-    results.eq("health reachable through the endpoint", health.status_code, 200)
-    body = health.json() if health.status_code == 200 else {}
+    health = session.health()
+    results.check(
+        "health reachable through the endpoint", True, f"version {health.version}"
+    )
     # The platform delivered the token through runHookPayload before forwarding
     # any external traffic, so by the time we can reach the VM at all it must
     # already be bootstrapped. This single assertion is the hook-ordering
     # guarantee, observed rather than quoted from documentation.
-    results.eq("platform ran the run hook before forwarding traffic", body.get("bootstrapped"), True)
-
-    # The hook body is the platform's envelope, not our payload directly: the
-    # string given to RunMicrovm arrives wrapped as {"runHookPayload": "<it>"}.
-    def hook_body(token: str) -> dict[str, str]:
-        return {"runHookPayload": json.dumps({"agent_token": token})}
-
-    hijack = ep.request(
-        "POST",
-        "/aws/lambda-microvms/runtime/v1/run",
-        token=None,
-        json_body=hook_body("attacker-token"),
+    results.eq(
+        "platform ran the run hook before forwarding traffic", health.bootstrapped, True
     )
-    results.eq("post-bootstrap hijack refused with 409", hijack.status_code, 409)
 
-    replay = ep.request(
-        "POST",
-        "/aws/lambda-microvms/runtime/v1/run",
-        token=None,
-        json_body=hook_body(ep.agent_token),
+    results.eq(
+        "post-bootstrap hijack refused with 409",
+        post_run_hook(session, "attacker-token"),
+        409,
     )
-    results.eq("identical bootstrap replay accepted", replay.status_code, 200)
+    results.eq(
+        "identical bootstrap replay accepted",
+        post_run_hook(session, session.agent_token),
+        200,
+    )
 
-    unauth = ep.request("GET", "/v1/exec/nope", token="wrong-token")
-    results.eq("wrong token refused with 401", unauth.status_code, 401)
-
-    hostile = ep.request("GET", "/v1/exec/nope", token="tökén")
-    results.check(
+    # Both of these use the token override rather than a second Session: it is the
+    # same connection pool and the same proxy token, so a difference in outcome can
+    # only be the bearer credential.
+    results.raises(
+        "wrong token refused with 401",
+        Unauthorized,
+        lambda: session.transport.send("GET", "/v1/exec/nope", token="wrong-token"),
+    )
+    # The daemon's stated property is that it compares header *bytes* without
+    # decoding them; the library encodes the bearer to bytes for exactly this
+    # reason, so a non-ASCII token is sendable at all.
+    results.raises(
         "non-ASCII token header answered, not a dropped connection",
-        hostile.status_code == 401,
-        f"status {hostile.status_code}",
+        Unauthorized,
+        lambda: session.transport.send("GET", "/v1/exec/nope", token="tökén"),
     )
 
     print("\n-- exec --")
-    started = ep.request(
-        "POST", "/v1/exec/start", json_body={"exec_id": "c1", "command": ["/bin/sh", "-c", "echo live; pwd; id -u"]}
+    results.ok(
+        "exec start accepted",
+        lambda: session.run(["/bin/sh", "-c", "echo live; pwd; id -u"], exec_id="c1"),
     )
-    results.eq("exec start accepted", started.status_code, 200)
-    outcome = await_exec(ep, "c1")
-    results.eq("exec exited 0", outcome.get("exit_code"), 0)
-    stdout = outcome.get("stdout", "")
+    outcome = session.exec("c1").wait(timeout=60, interval=2)
+    results.eq("exec exited 0", outcome.exit_code, 0)
+    stdout = outcome.stdout or ""
     results.check("exec captured stdout", "live" in stdout, repr(stdout))
     # The daemon is the container CMD, so its cwd is the image WORKDIR and an
     # omitted cwd must land there rather than at /.
     results.check(
-        "omitted cwd inherits the image WORKDIR",
-        "/opt/baked-workdir" in stdout,
-        repr(stdout),
+        "omitted cwd inherits the image WORKDIR", BAKED_WORKDIR in stdout, repr(stdout)
     )
 
-    retry = ep.request(
-        "POST", "/v1/exec/start", json_body={"exec_id": "c1", "command": ["/bin/sh", "-c", "echo MUST_NOT_RUN"]}
+    results.ok(
+        "retried start accepted",
+        lambda: session.run(["/bin/sh", "-c", "echo MUST_NOT_RUN"], exec_id="c1"),
     )
-    results.eq("retried start accepted", retry.status_code, 200)
-    after = ep.request("GET", "/v1/exec/c1").json()
+    after = session.exec("c1").poll()
     results.check(
         "retried start did not spawn a second child",
-        "MUST_NOT_RUN" not in after.get("stdout", ""),
-        repr(after.get("stdout")),
+        "MUST_NOT_RUN" not in (after.stdout or ""),
+        repr(after.stdout),
     )
 
-    for name, command in [("empty", [""]), ("comment-only", ["# nothing"]), ("unbalanced brace", ["echo A } echo B"])]:
+    for name, script in [
+        ("empty", ""),
+        ("comment-only", "# nothing"),
+        ("unbalanced brace", "echo A } echo B"),
+    ]:
         exec_id = f"sh-{name.split()[0]}"
-        ep.request("POST", "/v1/exec/start", json_body={"exec_id": exec_id, "command": command, "shell": True})
-        got = await_exec(ep, exec_id)
-        results.eq(f"{name} shell command exits 0", got.get("exit_code"), 0)
+        session.run(script, shell=True, exec_id=exec_id)
+        got = session.exec(exec_id).wait(timeout=60, interval=2)
+        results.eq(f"{name} shell command exits 0", got.exit_code, 0)
         if name == "unbalanced brace":
             results.check(
                 "unbalanced brace did not escape into a second command",
-                got.get("stdout", "").strip() == "A } echo B",
-                repr(got.get("stdout")),
+                (got.stdout or "").strip() == "A } echo B",
+                repr(got.stdout),
             )
 
-    ack = ep.request("POST", "/v1/exec/c1/ack")
-    results.eq("ack accepted", ack.status_code, 200)
-    reack = ep.request("POST", "/v1/exec/c1/ack")
-    results.eq("second ack refused with 409", reack.status_code, 409)
+    results.ok("ack accepted", session.exec("c1").ack)
+    results.raises("second ack refused with 409", Conflict, session.exec("c1").ack)
 
-    unknown = ep.request("GET", "/v1/exec/never-existed")
-    results.eq("unknown exec id is 404", unknown.status_code, 404)
-    malformed = ep.request("POST", "/v1/exec/start", json_body={"bogus": True})
-    results.eq("malformed body is 400, not 404", malformed.status_code, 400)
+    results.raises(
+        "unknown exec id is 404", NotFound, session.exec("never-existed").poll
+    )
+    # 400 and never 404: a client that maps 404 onto "missing artifact" would report
+    # a phantom absent thing for what is really a protocol typo.
+    results.raises(
+        "malformed body is 400, not 404",
+        ProtocolError,
+        lambda: session.transport.send("POST", "/v1/exec/start", json={"bogus": True}),
+    )
 
     print("\n-- large output --")
-    ep.request(
-        "POST",
-        "/v1/exec/start",
-        json_body={
-            "exec_id": "noisy",
-            # 32 MiB against an 8 MiB cap: the daemon must truncate and stay up,
-            # not grow until the VM's OOM killer takes it.
-            "command": ["/bin/sh", "-c", "dd if=/dev/zero bs=1M count=32 2>/dev/null | tr '\\0' 'x'"],
-        },
+    # 32 MiB against an 8 MiB cap: the daemon must truncate and stay up, not grow
+    # until the VM's OOM killer takes it.
+    session.run(
+        ["/bin/sh", "-c", "dd if=/dev/zero bs=1M count=32 2>/dev/null | tr '\\0' 'x'"],
+        exec_id="noisy",
     )
-    noisy = await_exec(ep, "noisy", timeout=180)
-    results.eq("noisy command still exits 0", noisy.get("exit_code"), 0)
-    results.check("output past the cap was truncated", noisy.get("truncated") is True, str(noisy.get("truncated")))
+    noisy = session.exec("noisy").wait(timeout=180, interval=2)
+    results.eq("noisy command still exits 0", noisy.exit_code, 0)
     results.check(
-        "daemon survived the truncation",
-        ep.request("GET", "/v1/health", token=None).status_code == 200,
-        "health after truncation",
+        "output past the cap was truncated",
+        noisy.truncated is True,
+        str(noisy.truncated),
     )
+    results.ok("daemon survived the truncation", session.health)
 
     print("\n-- file transfer --")
-    wrote = ep.request(
-        "PUT", "/v1/fs/file?path=/tmp/live.txt&mode=644", content=b"written through the endpoint"
+    results.ok(
+        "single file write accepted",
+        lambda: session.upload_file(
+            "/tmp/live.txt", b"written through the endpoint", mode="644"
+        ),
     )
-    results.check("single file write accepted", wrote.status_code in (200, 204), str(wrote.status_code))
-    read = ep.request("GET", "/v1/fs/file?path=/tmp/live.txt")
-    results.eq("single file read returns the bytes", read.content, b"written through the endpoint")
     results.eq(
-        "read of an absent file is 404",
-        ep.request("GET", "/v1/fs/file?path=/tmp/absent").status_code,
-        404,
+        "single file read returns the bytes",
+        session.download_file("/tmp/live.txt"),
+        b"written through the endpoint",
     )
-    results.eq("missing path key is 400", ep.request("GET", "/v1/fs/file").status_code, 400)
+    results.raises(
+        "read of an absent file is 404",
+        NotFound,
+        lambda: session.download_file("/tmp/absent"),
+    )
+    # A missing path key cannot be produced through `download_file`, which always
+    # sends one — that is the library doing its job. Dropped to the transport to
+    # reach the rule at all.
+    results.raises(
+        "missing path key is 400",
+        ProtocolError,
+        lambda: session.transport.send("GET", "/v1/fs/file"),
+    )
 
     # A symlink must survive the round trip: harnesses pack them deliberately,
     # and a daemon that refuses links breaks real uploads.
-    ep.request(
-        "POST",
-        "/v1/exec/start",
-        json_body={
-            "exec_id": "mktree",
-            "command": ["mkdir -p /tmp/tree/sub && echo payload > /tmp/tree/a.txt && ln -sf a.txt /tmp/tree/link && echo deep > /tmp/tree/sub/b.txt"],
-            "shell": True,
-        },
+    session.run(
+        "mkdir -p /tmp/tree/sub && echo payload > /tmp/tree/a.txt && "
+        "ln -sf a.txt /tmp/tree/link && echo deep > /tmp/tree/sub/b.txt",
+        shell=True,
+        exec_id="mktree",
     )
-    results.eq("tree created for the round trip", await_exec(ep, "mktree").get("exit_code"), 0)
-
-    archive = ep.request("GET", "/v1/fs/tar?path=/tmp/tree")
-    results.eq("tar download succeeded", archive.status_code, 200)
-    uploaded = ep.request("PUT", "/v1/fs/tar?path=/tmp/dest", content=archive.content)
-    results.check("tar upload accepted", uploaded.status_code in (200, 204), str(uploaded.status_code))
-
-    ep.request(
-        "POST",
-        "/v1/exec/start",
-        json_body={
-            "exec_id": "verify",
-            "command": ["readlink /tmp/dest/link; cat /tmp/dest/link; cat /tmp/dest/sub/b.txt"],
-            "shell": True,
-        },
+    results.eq(
+        "tree created for the round trip",
+        session.exec("mktree").wait(timeout=60, interval=2).exit_code,
+        0,
     )
-    verify = await_exec(ep, "verify")
+
+    archive = b""
+    try:
+        archive = session.download_tar("/tmp/tree")
+        results.check("tar download succeeded", bool(archive), f"{len(archive)} bytes")
+    except AgentdError as exc:
+        results.check("tar download succeeded", False, repr(exc))
+    results.ok("tar upload accepted", lambda: session.upload_tar("/tmp/dest", archive))
+
+    session.run(
+        "readlink /tmp/dest/link; cat /tmp/dest/link; cat /tmp/dest/sub/b.txt",
+        shell=True,
+        exec_id="verify",
+    )
+    verify = session.exec("verify").wait(timeout=60, interval=2)
+    verified = verify.stdout or ""
     results.check(
         "symlink survived the round trip as a symlink",
-        verify.get("stdout", "").startswith("a.txt"),
-        repr(verify.get("stdout")),
+        verified.startswith("a.txt"),
+        repr(verified),
     )
     results.check(
         "symlink still resolves to its target's content",
-        "payload" in verify.get("stdout", ""),
-        repr(verify.get("stdout")),
+        "payload" in verified,
+        repr(verified),
+    )
+
+    print("\n-- streaming --")
+    # Streaming is the capability an agent harness needs and the one no local tier
+    # can fully validate: the question is whether AWS's endpoint proxy actually
+    # forwards Server-Sent Events rather than buffering them until the command
+    # ends. Documentation says it does; this is the check.
+    session.run(
+        "for i in 1 2 3 4 5; do echo chunk-$i; done; echo done-streaming",
+        shell=True,
+        exec_id="stream1",
+    )
+    handle = session.exec("stream1")
+    chunks: list[bytes] = []
+    exit_event = None
+    gaps: list[Any] = []
+    for event in handle.stream(timeout=120):
+        kind = type(event).__name__
+        if kind == "OutputChunk":
+            chunks.append(event.data)
+        elif kind == "Gap":
+            gaps.append(event)
+        elif kind == "Exit":
+            exit_event = event
+
+    streamed = b"".join(chunks).decode(errors="replace")
+    results.check(
+        "SSE reached us through the endpoint proxy",
+        bool(chunks),
+        f"{len(chunks)} chunk(s), {sum(len(c) for c in chunks)} bytes",
+    )
+    results.check(
+        "streamed output is complete and ordered",
+        "chunk-1" in streamed
+        and "chunk-5" in streamed
+        and "done-streaming" in streamed,
+        repr(streamed[:120]),
+    )
+    results.check(
+        "no gap was reported for a small stream", not gaps, f"{len(gaps)} gap(s)"
+    )
+    # The terminal event is why SSE was chosen over a raw byte stream: without it a
+    # client cannot tell a finished command from a dropped connection.
+    results.check(
+        "the terminal exit event carried the real exit code",
+        exit_event is not None and exit_event.exit_code == 0,
+        repr(exit_event),
+    )
+    # Streaming must not consume the exec: poll is a separate view onto the same
+    # server-side object, and the conformance suite's own `truncated` assertions
+    # depend on that staying true.
+    polled = handle.poll()
+    results.check(
+        "the exec survived being streamed and is still pollable",
+        (polled.stdout or "").find("done-streaming") >= 0,
+        repr((polled.stdout or "")[:80]),
+    )
+
+    print("\n-- stdin --")
+    # `cat` cannot exit until stdin closes, so this check fails by hanging if EOF
+    # never reaches the child — which is exactly the trap where `Child::wait()`
+    # drops its own stdin handle but not ours.
+    session.run(["cat"], exec_id="cat1", stdin=True)
+    cat = session.exec("cat1")
+    results.ok("stdin write accepted", lambda: cat.write_stdin(b"hello via stdin\n"))
+    results.ok("stdin close accepted", cat.close_stdin)
+    echoed = cat.wait(timeout=60, interval=2)
+    results.eq("a child reading stdin exits once stdin closes", echoed.exit_code, 0)
+    results.eq(
+        "stdin round-tripped through the child", echoed.stdout, "hello via stdin\n"
+    )
+
+    # Opt-in matters: a command that did not ask for stdin must not have one, or
+    # every task command inherits a surprise open descriptor.
+    session.run(["true"], exec_id="nostdin")
+    results.raises(
+        "writing stdin to a command that did not request it is refused",
+        Conflict,
+        lambda: session.exec("nostdin").write_stdin(b"x"),
     )
 
     print("\n-- hostile archives --")
-    for name, archive_bytes, expect in build_hostile_archives():
-        response = ep.request("PUT", "/v1/fs/tar?path=/tmp/hostile", content=archive_bytes)
-        results.check(
+    for name, archive_bytes, expected in build_hostile_archives():
+        results.raises(
             f"hostile archive refused: {name}",
-            response.status_code == expect,
-            f"expected {expect}, got {response.status_code}: {response.text[:120]}",
+            expected,
+            lambda b=archive_bytes: session.upload_tar("/tmp/hostile", b),
         )
 
-    ep.request(
-        "POST",
-        "/v1/exec/start",
-        json_body={"exec_id": "escaped", "command": ["ls /escaped.txt /tmp/escaped.txt 2>&1 | head -3; echo done"], "shell": True},
+    session.run(
+        "ls /escaped.txt /tmp/escaped.txt 2>&1 | head -3; echo done",
+        shell=True,
+        exec_id="escaped",
     )
-    escaped = await_exec(ep, "escaped")
+    escaped = session.exec("escaped").wait(timeout=60, interval=2)
+    listing = escaped.stdout or ""
     results.check(
         "nothing escaped the extraction root",
-        "No such file" in escaped.get("stdout", "") or "cannot access" in escaped.get("stdout", ""),
-        repr(escaped.get("stdout")),
+        "No such file" in listing or "cannot access" in listing,
+        repr(listing),
     )
 
 
-def build_hostile_archives() -> list[tuple[str, bytes, int]]:
+def drive_suspend_resume(box: Sandbox, session: Session, results: Results) -> None:
+    """Checks that a suspended sandbox comes back whole.
+
+    Measured 2026-08-05: suspend is a freeze and restore, not a stop and start —
+    the in-memory agent token, the filesystem, exec records, and even running
+    processes survive. That is what makes a warm pool of suspended sandboxes
+    viable, so it is worth a standing assertion rather than a one-off probe: if a
+    future platform change turned suspend into a cold start, every consumer built
+    on the warm-pool assumption would break at once, and this is where that shows
+    up.
+
+    The evidence is a ticker writing epoch seconds once a second. A gap in *its*
+    timestamps is the suspension as the guest experienced it, which distinguishes
+    a frozen guest from one that kept running.
+    """
+    session.run(
+        "nohup sh -c 'i=0; while [ $i -lt 3000 ]; do date +%s >> /tmp/ticks.txt; "
+        "i=$((i+1)); sleep 1; done' >/dev/null 2>&1 & echo started",
+        shell=True,
+        exec_id="ticker",
+    )
+    session.exec("ticker").wait(timeout=60, interval=2)
+    session.upload_file("/tmp/survives.txt", b"written before the suspend")
+    time.sleep(5)
+
+    print("  suspending")
+    box.suspend()
+    # Long enough that a frozen guest and a running one are distinguishable: a live
+    # ticker would add roughly 40 entries across this window.
+    time.sleep(40)
+    print("  resuming")
+    session = box.resume()
+
+    # `resume()` hands back a fresh Session deliberately: a resume can return a
+    # different endpoint, and a proxy token minted against the pre-suspend instance
+    # may no longer be valid. Taking the new one unconditionally means a stale-token
+    # failure cannot be misread as the daemon having lost its state.
+
+    health = None
+    for _ in range(12):
+        try:
+            health = session.health()
+            break
+        except AgentdError as exc:
+            print(f"    health after resume: {type(exc).__name__}")
+            time.sleep(5)
+    results.check("the daemon answers after a resume", health is not None, repr(health))
+    # The load-bearing one. If this is False, every consumer needs token
+    # re-delivery plumbing and a suspended sandbox is worthless.
+    results.eq(
+        "the agent token survived the suspend",
+        health.bootstrapped if health else None,
+        True,
+    )
+    results.eq(
+        "the filesystem survived the suspend",
+        session.download_file("/tmp/survives.txt"),
+        b"written before the suspend",
+    )
+    results.ok(
+        "an exec record from before the suspend survived",
+        lambda: session.exec("ticker").poll(),
+    )
+
+    session.run("cat /tmp/ticks.txt | tr '\\n' ' '", shell=True, exec_id="ticks")
+    dump = session.exec("ticks").wait(timeout=60, interval=2)
+    stamps = [int(x) for x in (dump.stdout or "").split() if x.isdigit()]
+    gaps = [b - a for a, b in itertools.pairwise(stamps)]
+    largest = max(gaps) if gaps else 0
+    results.check(
+        "the guest observed the suspension as a single gap in its own clock",
+        largest >= 30,
+        f"largest gap {largest}s across a ~40s suspension",
+    )
+
+    # Differential liveness: two counts a few seconds apart. `pgrep` would need a
+    # pattern threaded through two layers of shell quoting, where a false negative
+    # is indistinguishable from a real one.
+    first = session.run("wc -l < /tmp/ticks.txt", shell=True, exec_id="live1")
+    n1 = int(
+        (session.exec("live1").wait(timeout=60, interval=2).stdout or "0").strip() or 0
+    )
+    time.sleep(6)
+    session.run("wc -l < /tmp/ticks.txt", shell=True, exec_id="live2")
+    n2 = int(
+        (session.exec("live2").wait(timeout=60, interval=2).stdout or "0").strip() or 0
+    )
+    del first
+    results.check(
+        "a backgrounded process resumed and kept running",
+        n2 - n1 >= 3,
+        f"ticks grew by {n2 - n1} over 6s after resume",
+    )
+
+
+def build_hostile_archives() -> list[tuple[str, bytes, type[Exception]]]:
     """Archives hand-built with tarfile, since GNU tar sanitizes several of these."""
     import tarfile
 
@@ -440,33 +563,31 @@ def build_hostile_archives() -> list[tuple[str, bytes, int]]:
                     tar.addfile(info)
         return buffer.getvalue()
 
+    # Every one of these is a refused *member*, which the daemon answers 400 for and
+    # the library maps to ProtocolError. A 413 would be a cap violation instead, and
+    # the distinction matters: one means "this archive is hostile", the other means
+    # "this archive is merely too big".
     return [
-        ("parent traversal", make([("../../escaped.txt", "file", None, b"pwned")]), 400),
-        ("absolute link target", make([("link", "sym", "/etc/passwd", b"")]), 400),
+        (
+            "parent traversal",
+            make([("../../escaped.txt", "file", None, b"pwned")]),
+            ProtocolError,
+        ),
+        (
+            "absolute link target",
+            make([("link", "sym", "/etc/passwd", b"")]),
+            ProtocolError,
+        ),
         (
             "symlink redirect",
             make([("s", "sym", "..", b""), ("s/escaped.txt", "file", None, b"pwned")]),
-            400,
+            ProtocolError,
         ),
-        ("character device", make([("dev", "dev", None, b"")]), 400),
+        ("character device", make([("dev", "dev", None, b"")]), ProtocolError),
     ]
 
 
-def await_exec(ep: Endpoint, exec_id: str, timeout: float = 60.0) -> dict[str, Any]:
-    deadline = time.time() + timeout
-    last: dict[str, Any] = {}
-    while time.time() < deadline:
-        response = ep.request("GET", f"/v1/exec/{exec_id}")
-        if response.status_code != 200:
-            return {"error": response.status_code, "body": response.text[:200]}
-        last = response.json()
-        if last.get("phase") in ("exited", "acked"):
-            return last
-        time.sleep(2)
-    return last | {"error": "timeout"}
-
-
-def read_daemon_logs(logs: Any, image_name: str, microvm_id: str) -> list[str]:
+def read_daemon_logs(logs: Any, image_name: str) -> list[str]:
     """Pulls the daemon's own log lines, which carry the loopback measurement."""
     lines: list[str] = []
     for group in (f"/aws/lambda-microvms/{image_name}", "/aws/lambda-microvms"):
@@ -485,7 +606,7 @@ def read_daemon_logs(logs: Any, image_name: str, microvm_id: str) -> list[str]:
             if lines:
                 print(f"    log group {group}: {len(lines)} lines")
                 return lines
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - a missing group is data, not a crash
             print(f"    log group {group} unavailable: {type(exc).__name__}")
     return lines
 
@@ -493,12 +614,16 @@ def read_daemon_logs(logs: Any, image_name: str, microvm_id: str) -> list[str]:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--binary", required=True, type=Path)
-    parser.add_argument("--keep", action="store_true", help="skip teardown (leaks resources)")
+    parser.add_argument(
+        "--keep", action="store_true", help="skip teardown (leaks resources)"
+    )
     args = parser.parse_args()
 
     repo = Path(__file__).resolve().parent.parent
     infra = repo / "conformance" / "infra"
-    binary = (repo / args.binary).resolve() if not args.binary.is_absolute() else args.binary
+    binary = (
+        (repo / args.binary).resolve() if not args.binary.is_absolute() else args.binary
+    )
     if not binary.exists():
         print(f"binary not found: {binary}")
         return 2
@@ -509,112 +634,69 @@ def main() -> int:
     execution_role = outputs["execution_role_arn"]["value"]
     print(f"infra: bucket={bucket}")
 
-    session = boto3.Session(region_name=REGION)
-    mv = session.client(SERVICE, config=BotoConfig(retries={"max_attempts": 10, "mode": "standard"}))
-    s3 = session.client("s3")
-    logs = session.client("logs")
+    aws = boto3.Session(region_name=REGION)
+    boto_config = BotoConfig(retries={"max_attempts": 10, "mode": "standard"})
+    mv = aws.client(SERVICE, config=boto_config)
+    logs = aws.client("logs")
 
     run_id = secrets.token_hex(4)
     image_name = f"agentd-conformance-{run_id}"
     agent_token = secrets.token_urlsafe(32)
     results = Results()
-    image_id: str | None = None
-    microvm_id: str | None = None
+
+    # The library owns the whole AWS lifecycle: artifact zip, image build with the
+    # stalled-build probe, RunMicrovm with the token in runHookPayload, the wait to
+    # RUNNING that fails fast on a terminal state, and teardown.
+    box = Sandbox(
+        region=REGION,
+        port=AGENT_PORT,
+        microvm_client=mv,
+        logs_client=logs,
+        s3_client=aws.client("s3"),
+    )
 
     try:
-        print("\n== artifact ==")
-        artifact = build_artifact(binary)
-        key = f"{image_name}.zip"
-        s3.put_object(Bucket=bucket, Key=key, Body=artifact)
-        artifact_uri = f"s3://{bucket}/{key}"
-        print(f"  uploaded {len(artifact)} bytes to {artifact_uri}")
-
         print("\n== image ==")
-        created = mv.create_microvm_image(
+        image = box.build_image(
             name=image_name,
-            baseImageArn="arn:aws:lambda:us-east-1:aws:microvm-image:al2023-1",
-            buildRoleArn=build_role,
-            codeArtifact={"uri": artifact_uri},
-            cpuConfigurations=[{"architecture": "ARM_64"}],
-            resources=[{"minimumMemoryInMiB": BASELINE_MEMORY_MIB}],
-            hooks={
-                "port": AGENT_PORT,
-                "microvmImageHooks": {
-                    "ready": "ENABLED",
-                    "readyTimeoutInSeconds": HOOK_TIMEOUT_SEC,
-                    "validate": "ENABLED",
-                    "validateTimeoutInSeconds": HOOK_TIMEOUT_SEC,
-                },
-                "microvmHooks": {
-                    "run": "ENABLED",
-                    "runTimeoutInSeconds": HOOK_TIMEOUT_SEC,
-                    "terminate": "ENABLED",
-                    "terminateTimeoutInSeconds": HOOK_TIMEOUT_SEC,
-                },
-            },
+            binary=binary,
+            bucket=bucket,
+            build_role_arn=build_role,
+            dockerfile=conformance_dockerfile(),
+            memory_mib=BASELINE_MEMORY_MIB,
+            hooks=default_hooks(AGENT_PORT, HOOK_TIMEOUT_SEC),
             tags={"agentd:purpose": "conformance", "agentd:run": run_id},
-            # Scoped to this run, never a pure function of the artifact's
-            # content. A content-derived token is a permanent idempotency key:
-            # delete the image and rebuild the same bytes, and the service
-            # replays the original create as a no-op, wedging an image that then
-            # cannot be deleted at all.
-            clientToken=f"create-{image_name}-{run_id}",
+            build_timeout_sec=IMAGE_BUILD_TIMEOUT_SEC,
+            # Scoped to this run, never a pure function of the artifact's content. A
+            # content-derived token is a permanent idempotency key: delete the image
+            # and rebuild the same bytes, and the service replays the original
+            # create as a no-op, wedging an image that then cannot be deleted at all.
+            client_token=f"create-{image_name}-{run_id}",
         )
-        image_id = created.get("imageIdentifier") or created.get("imageArn")
-        print(f"  image {image_id} state={created.get('state')}")
-        wait_for_image(mv, image_id, deadline=time.time() + IMAGE_BUILD_TIMEOUT_SEC)
-        print("  image CREATED")
+        print(f"  image {image.identifier} CREATED")
 
         print("\n== run ==")
-        run = mv.run_microvm(
-            imageIdentifier=image_id,
-            executionRoleArn=execution_role,
-            # Connectors are ARNs, not bare names: the literal "ALL_INGRESS" is
-            # rejected with "Malformed network connector ARN".
-            ingressNetworkConnectors=[ALL_INGRESS_ARN],
-            idlePolicy={
-                # Bounds the cost of a crash in this script: an abandoned VM
-                # suspends and then terminates instead of billing to the ceiling.
-                "maxIdleDurationSeconds": 600,
-                "suspendedDurationSeconds": 600,
-                "autoResumeEnabled": False,
-            },
-            maximumDurationInSeconds=3600,
-            runHookPayload=json.dumps({"agent_token": agent_token}),
-            clientToken=f"run-{image_name}-{run_id}",
+        session = box.run(
+            execution_role_arn=execution_role,
+            agent_token=agent_token,
+            # Bounds the cost of a crash in this script: an abandoned VM suspends
+            # and then terminates instead of billing to the ceiling.
+            max_idle_sec=600,
+            suspended_sec=600,
+            auto_resume=False,
+            max_duration_sec=3600,
+            client_token=f"run-{image_name}-{run_id}",
         )
-        microvm_id = run["microvmId"]
-        endpoint = run.get("endpoint", "")
-        print(f"  microvm {microvm_id} state={run.get('state')} endpoint={endpoint}")
+        print(f"  microvm {box.microvm_id} RUNNING endpoint={session.endpoint}")
 
-        # States are PENDING -> RUNNING -> SUSPENDING/TERMINATING -> TERMINATED.
-        # Anything terminal before RUNNING means the VM died during startup,
-        # which for this daemon almost always means a lifecycle hook failed.
-        # Polling through it would waste minutes and then report a connection
-        # error, hiding the actual cause.
-        for _ in range(60):
-            got = mv.get_microvm(microvmIdentifier=microvm_id)
-            state = got.get("state")
-            if state == "RUNNING":
-                endpoint = got.get("endpoint", endpoint)
-                print(f"  microvm RUNNING endpoint={endpoint}")
-                break
-            if state in ("TERMINATED", "TERMINATING", "SUSPENDED", "SUSPENDING"):
-                raise RuntimeError(
-                    f"microvm reached {state} before RUNNING: "
-                    f"{got.get('stateReason') or 'no stateReason'}"
-                )
-            print(f"    microvm {state}")
-            time.sleep(5)
-        else:
-            raise RuntimeError("microvm never reached RUNNING")
-
-        ep = Endpoint(mv, microvm_id, endpoint, agent_token)
         print("\n== protocol ==")
-        drive_protocol(ep, results)
+        drive_protocol(session, results)
+
+        print("\n== suspend / resume ==")
+        drive_suspend_resume(box, session, results)
 
         print("\n== daemon logs ==")
-        lines = read_daemon_logs(logs, image_name, microvm_id)
+        lines = read_daemon_logs(logs, image_name)
         hook_lines = [line for line in lines if "hook" in line.lower()]
         for line in hook_lines[:10]:
             print(f"    {line.strip()[:200]}")
@@ -629,41 +711,17 @@ def main() -> int:
             print("\n== teardown SKIPPED (--keep) ==")
         else:
             print("\n== teardown ==")
-            if microvm_id:
-                try:
-                    mv.terminate_microvm(microvmIdentifier=microvm_id)
-                    print(f"  terminated {microvm_id}")
-                except Exception as exc:
-                    print(f"  terminate failed: {exc}")
-            # The service creates the build log group itself, so Terraform never
-            # owns it and `destroy` leaves it behind. Six of them accumulated
-            # across the runs that built this script before anyone noticed —
-            # storage-only cost, but a leak is a leak, and "the stack destroyed
-            # cleanly" was the wrong conclusion to draw from Terraform's output.
-            try:
-                group = f"/aws/lambda-microvms/{image_name}"
-                logs.delete_log_group(logGroupName=group)
-                print(f"  deleted log group {group}")
-            except Exception as exc:
-                print(f"  log group delete skipped: {type(exc).__name__}")
-
-            if image_id:
-                for _ in range(20):
-                    try:
-                        versions = mv.list_microvm_image_versions(imageIdentifier=image_id)
-                        for item in versions.get("items", [])[1:]:
-                            mv.delete_microvm_image_version(
-                                imageIdentifier=image_id, imageVersion=item["imageVersion"]
-                            )
-                        mv.delete_microvm_image(imageIdentifier=image_id)
-                        print(f"  deleted image {image_id}")
-                        break
-                    except Exception as exc:
-                        # An image in CREATING refuses deletion, and a VM still
-                        # terminating holds a reference. Retrying is the whole
-                        # difference between a clean account and a billed leak.
-                        print(f"  image delete retry: {type(exc).__name__}")
-                        time.sleep(15)
+            # `terminate` is best-effort and never raises, because it runs here: an
+            # exception would replace the real failure with a teardown failure.
+            #
+            # The log group is deleted separately because the service creates it
+            # itself, so Terraform never owns it and `destroy` leaves it behind. Six
+            # of them accumulated across the runs that built this script before
+            # anyone noticed — storage-only cost, but a leak is a leak, and "the
+            # stack destroyed cleanly" was the wrong conclusion to draw from
+            # Terraform's output.
+            box.terminate(delete_image=True, delete_log_group=True)
+            print(f"  terminated {box.microvm_id}, image and log group deleted")
 
     print("\n== summary ==")
     print(f"  passed: {len(results.passed)}")

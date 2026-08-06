@@ -1,0 +1,63 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "microvms-agentd-client"
+version = "0.1.0"
+description = "Python client for microvms-agentd: exec and file transfer inside AWS Lambda MicroVMs"
+readme = "README.md"
+requires-python = ">=3.11"
+# The text lives at the repo root, which is outside this package's build root, so
+# it is named rather than included — hatchling refuses a path above the project.
+license = "Apache-2.0"
+dependencies = [
+    "httpx>=0.27",
+    # Only `Sandbox` needs it, and it is imported lazily there, so `Session`
+    # works without AWS credentials. Still a hard dependency: a lifecycle helper
+    # that fails at first call on a missing extra is worse than one that installs
+    # 15 MB nobody asked for.
+    "boto3>=1.40",
+]
+classifiers = [
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Typing :: Typed",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "ruff>=0.6"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/microvms_agentd"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "UP", "B", "SIM", "RUF", "BLE", "TID"]
+ignore = [
+    # N818 wants an `Error` suffix on every exception. Refused: the taxonomy is
+    # named after the daemon's own statuses, so `except NotBootstrapped` reads as
+    # the protocol rule it is. `NotBootstrappedError` would be nine characters of
+    # noise on every call site.
+    "N818",
+]
+
+[tool.ruff.lint.isort]
+# `fake_daemon` is a sibling module in tests/, not a third-party package.
+known-first-party = ["microvms_agentd", "fake_daemon"]
+
+[tool.ruff.lint.per-file-ignores]
+# The stdlib's own do_GET/do_POST naming, which a handler subclass cannot rename.
+"tests/fake_daemon.py" = ["N802"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+# So the suite runs against the source tree with no install step. `pytest
+# clients/python` from the repo root finds this file as the rootdir config, which
+# is what makes the one-liner in the README work.
+pythonpath = ["src"]
