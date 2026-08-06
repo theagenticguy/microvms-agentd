@@ -51,11 +51,42 @@ use axum::extract::{Request, State};
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use futures_util::TryStreamExt;
+use schemars::JsonSchema;
 use serde::Deserialize;
 use tar::EntryType;
 use tokio_util::io::{ReaderStream, StreamReader};
 
+use crate::disk::{self, CopyError};
 use crate::state::AppState;
+
+/// The refusal a write gets when the target filesystem is under the configured
+/// reserve.
+///
+/// 507 rather than 500, and the numbers are in the body. A 500 is
+/// indistinguishable from a daemon defect, so a client retries it — which is
+/// correct for a defect and actively harmful for a full disk. 507 is
+/// `Insufficient Storage`, is not in any client's retry set, and naming the actual
+/// free space is what turns "it failed" into "the disk is nearly full", which is
+/// the whole reason this guard exists. See `disk`.
+fn insufficient_storage(path: &Path, reading: disk::Reading) -> Response {
+    tracing::warn!(
+        path = %path.display(),
+        available = reading.available,
+        reserve = reading.reserve,
+        "refusing a write: the target filesystem is under the disk reserve",
+    );
+    (
+        StatusCode::INSUFFICIENT_STORAGE,
+        format!(
+            "refusing to write {}: {} bytes available on the target filesystem, \
+             below the {} byte reserve",
+            path.display(),
+            reading.available,
+            reading.reserve,
+        ),
+    )
+        .into_response()
+}
 
 /// Query string for every route in this module.
 ///
@@ -63,7 +94,7 @@ use crate::state::AppState;
 /// onto `FileNotFoundError`, so answering 404 for a protocol typo made a missing
 /// query key look like an absent artifact — that is how one defect hid for a full
 /// review round.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct FsQuery {
     pub path: String,
     /// Octal mode for a written file, carried as a string so `0644` and `644`
@@ -82,6 +113,10 @@ enum Refusal {
     Member { member: String, reason: String },
     /// The archive exceeded a configured cap. 413.
     TooLarge(String),
+    /// The target filesystem crossed the disk reserve partway through. 507. Carries
+    /// the path so the response can name the filesystem that filled rather than
+    /// just the archive.
+    Pressure(PathBuf, disk::Reading),
     /// Filesystem or stream failure. 500.
     Io(io::Error),
 }
@@ -114,6 +149,11 @@ impl Refusal {
                 tracing::warn!(detail, "archive over cap");
                 (StatusCode::PAYLOAD_TOO_LARGE, detail).into_response()
             }
+            // 507 rather than 413: the archive is not too big for the *protocol*,
+            // it is too big for this filesystem right now. The distinction is
+            // actionable — a caller retries a 507 after freeing space, and never
+            // retries a 413.
+            Refusal::Pressure(path, reading) => insufficient_storage(&path, reading),
             Refusal::Io(err) => {
                 tracing::error!(%err, "tar operation failed");
                 (StatusCode::INTERNAL_SERVER_ERROR, "tar operation failed").into_response()
@@ -230,7 +270,12 @@ struct Caps {
 ///
 /// Synchronous on purpose: `tar`'s reader is blocking, so callers hand this to
 /// `spawn_blocking` rather than pretending it is async.
-fn extract_into(root: &Path, archive: impl Read, caps: Caps) -> Result<u64, Refusal> {
+fn extract_into(
+    root: &Path,
+    archive: impl Read,
+    caps: Caps,
+    guard: &disk::Guard,
+) -> Result<u64, Refusal> {
     std::fs::create_dir_all(root)?;
 
     let mut ar = tar::Archive::new(archive);
@@ -249,6 +294,10 @@ fn extract_into(root: &Path, archive: impl Read, caps: Caps) -> Result<u64, Refu
     let mut deferred: HashMap<PathBuf, u32> = HashMap::new();
     let mut members = 0u64;
     let mut total = 0u64;
+    // `max_tar_bytes` defaults to 8 GiB, which is far more than the default reserve,
+    // so the size cap does not imply the disk survives the extraction. The pacer
+    // re-checks as members land.
+    let mut pacer = disk::Pacer::new(*guard);
 
     for entry in ar.entries()? {
         let mut entry = entry?;
@@ -379,10 +428,21 @@ fn extract_into(root: &Path, archive: impl Read, caps: Caps) -> Result<u64, Refu
                 // apply no confinement at all, and `unpack_in` applies a
                 // link-target policy that differs from ours — it rejects targets
                 // this contract must preserve.
-                io::copy(&mut entry, &mut file)?;
+                let written = io::copy(&mut entry, &mut file)?;
 
                 if let Ok(mode) = entry.header().mode() {
                     deferred.insert(dest, mode);
+                }
+
+                // Checked after the member landed, so a member that fits is never
+                // refused, and the refusal names the extraction root because that is
+                // the filesystem that filled. Members already extracted are left in
+                // place: extraction is not transactional by design — the module's
+                // existing contract is that a partial extraction "should converge"
+                // on retry — and deleting a tree the caller may have had other
+                // members in is a worse failure than a partial one they can inspect.
+                if let Some(reading) = pacer.record(written, root) {
+                    return Err(Refusal::Pressure(root.to_path_buf(), reading));
                 }
             }
         }
@@ -448,18 +508,45 @@ fn parse_mode(raw: &str) -> Option<u32> {
 ///
 /// The spool is a `tempfile::tempfile()`, which is unlinked at creation, so a
 /// crash mid-upload leaks no path and the kernel reclaims the space.
-async fn spool_body(body: Body) -> io::Result<std::fs::File> {
+async fn spool_body(body: Body, guard: &disk::Guard) -> Result<std::fs::File, SpoolError> {
     let stream = body.into_data_stream().map_err(io::Error::other);
     let mut reader = StreamReader::new(stream);
 
     let spool = tempfile::tempfile()?;
     let mut writer = tokio::fs::File::from_std(spool.try_clone()?);
-    tokio::io::copy(&mut reader, &mut writer).await?;
+
+    // The spool's own filesystem is what this copy fills, and it is not necessarily
+    // the extraction root's. `tempfile()` honors TMPDIR and falls back to /tmp, so
+    // that is the path the guard measures. Measuring `root` here instead would watch
+    // the wrong filesystem run out.
+    let spool_dir = std::env::temp_dir();
+    disk::copy_guarded(&mut reader, &mut writer, guard, &spool_dir)
+        .await
+        // The partial spool needs no cleanup: `tempfile()` unlinks at creation, so
+        // dropping the handle returns every byte to the filesystem.
+        .map_err(|(_written, err)| match err {
+            CopyError::Pressure(reading) => SpoolError::Pressure(reading),
+            CopyError::Io(err) => SpoolError::Io(err),
+        })?;
     tokio::io::AsyncWriteExt::flush(&mut writer).await?;
 
     let mut spool = spool;
     spool.seek(SeekFrom::Start(0))?;
     Ok(spool)
+}
+
+/// Why spooling stopped. Separates "the disk filled" from "the wire failed", which
+/// the caller maps to 507 and 400 respectively.
+#[derive(Debug)]
+enum SpoolError {
+    Pressure(disk::Reading),
+    Io(io::Error),
+}
+
+impl From<io::Error> for SpoolError {
+    fn from(err: io::Error) -> Self {
+        SpoolError::Io(err)
+    }
 }
 
 /// Reads one file. 404 only when the path is genuinely absent.
@@ -510,11 +597,12 @@ pub async fn read_file(request: Request) -> Response {
 }
 
 /// Writes one file. Not confined to a root; see the module comment.
-pub async fn write_file(request: Request) -> Response {
+pub async fn write_file(State(state): State<AppState>, request: Request) -> Response {
     let Ok(query) = axum::extract::Query::<FsQuery>::try_from_uri(request.uri()) else {
         return (StatusCode::BAD_REQUEST, "path query parameter is required").into_response();
     };
     let path = PathBuf::from(&query.path);
+    let guard = state.disk_guard();
 
     // Mode is parsed before a single byte lands. The predecessor validated after
     // writing, so a bad mode answered 400 while leaving the file behind.
@@ -533,6 +621,14 @@ pub async fn write_file(request: Request) -> Response {
             }
         },
     };
+
+    // Checked before the parent directory is created and before the file is
+    // opened, so a refused write leaves nothing behind — not even an empty file
+    // where the caller's data was supposed to go. An empty file at the target path
+    // is worse than no file: it reads as a successful zero-byte transfer.
+    if let Some(reading) = guard.preflight(&path) {
+        return insufficient_storage(&path, reading);
+    }
 
     if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty())
         && let Err(err) = tokio::fs::create_dir_all(parent).await
@@ -564,9 +660,38 @@ pub async fn write_file(request: Request) -> Response {
         .map_err(io::Error::other);
     let mut reader = StreamReader::new(stream);
 
-    if let Err(err) = tokio::io::copy(&mut reader, &mut file).await {
-        tracing::warn!(path = %path.display(), %err, "write failed mid-stream");
-        return (StatusCode::INTERNAL_SERVER_ERROR, "cannot write file").into_response();
+    // Guarded rather than a plain copy, because pre-flight alone cannot hold the
+    // line: `max_body_bytes` defaults to 512 MiB, so one accepted request can be
+    // twice the default reserve and fill the disk on its own.
+    if let Err((written, err)) = disk::copy_guarded(&mut reader, &mut file, &guard, &path).await {
+        match err {
+            CopyError::Pressure(reading) => {
+                // The partial file is removed. A truncated file left at the
+                // caller's path is the worst of the options: it looks like a
+                // complete artifact to anything that reads it later, and the
+                // caller has already been told the write failed. Deleting it also
+                // returns the bytes, which is the point of refusing. A failure to
+                // remove is logged and not escalated — the 507 is still the honest
+                // answer to the request.
+                if let Err(err) = tokio::fs::remove_file(&path).await {
+                    tracing::warn!(
+                        path = %path.display(),
+                        %err,
+                        "cannot remove the partial file after a disk-pressure refusal",
+                    );
+                }
+                tracing::warn!(
+                    path = %path.display(),
+                    written,
+                    "aborted a write mid-stream: the filesystem crossed the disk reserve",
+                );
+                return insufficient_storage(&path, reading);
+            }
+            CopyError::Io(err) => {
+                tracing::warn!(path = %path.display(), %err, written, "write failed mid-stream");
+                return (StatusCode::INTERNAL_SERVER_ERROR, "cannot write file").into_response();
+            }
+        }
     }
 
     // An existing file opened with an explicit mode keeps its old permissions,
@@ -741,10 +866,23 @@ pub async fn write_tar(State(state): State<AppState>, request: Request) -> Respo
         max_members: state.config().max_tar_members,
         max_bytes: state.config().max_tar_bytes,
     };
+    let guard = state.disk_guard();
 
-    let spool = match spool_body(request.into_body()).await {
+    // Checked against the extraction root before the body is spooled, so an upload
+    // aimed at a full filesystem is refused without first spending the disk and the
+    // wire time to receive it.
+    if let Some(reading) = guard.preflight(&root) {
+        return insufficient_storage(&root, reading);
+    }
+
+    let spool = match spool_body(request.into_body(), &guard).await {
         Ok(spool) => spool,
-        Err(err) => {
+        // The spool is what fills up first on this path: the archive lands there in
+        // full before a single member is extracted, so the spool's own filesystem is
+        // the one that runs out. It is usually /tmp and need not be the same
+        // filesystem as `root`, which is why both are checked.
+        Err(SpoolError::Pressure(reading)) => return insufficient_storage(&root, reading),
+        Err(SpoolError::Io(err)) => {
             // A body that dies on the wire, including the 413 the body-limit layer
             // injects, arrives here as an io error. 400 rather than 500: nothing on
             // this side failed.
@@ -753,9 +891,10 @@ pub async fn write_tar(State(state): State<AppState>, request: Request) -> Respo
         }
     };
 
-    let extracted =
-        tokio::task::spawn_blocking(move || extract_into(&root, spool, caps).map(|n| (root, n)))
-            .await;
+    let extracted = tokio::task::spawn_blocking(move || {
+        extract_into(&root, spool, caps, &guard).map(|n| (root, n))
+    })
+    .await;
 
     match extracted {
         Ok(Ok((root, members))) => {
@@ -773,6 +912,7 @@ pub async fn write_tar(State(state): State<AppState>, request: Request) -> Respo
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Config;
     use tar::{Builder, Header};
     use tempfile::TempDir;
 
@@ -872,10 +1012,32 @@ mod tests {
         }
     }
 
+    /// A probe reporting plenty of space, so no test about extraction semantics can
+    /// be perturbed by the host's real free disk. The disk guard has its own tests
+    /// in `disk` and one end-to-end test below.
+    fn roomy_probe(_path: &Path) -> io::Result<u64> {
+        Ok(u64::MAX)
+    }
+
+    fn roomy_guard() -> disk::Guard {
+        disk::Guard {
+            probe: roomy_probe,
+            reserve: 1 << 20,
+        }
+    }
+
     fn extract(archive: Vec<u8>, caps: Caps) -> (TempDir, Result<u64, Refusal>) {
+        extract_with(archive, caps, roomy_guard())
+    }
+
+    fn extract_with(
+        archive: Vec<u8>,
+        caps: Caps,
+        guard: disk::Guard,
+    ) -> (TempDir, Result<u64, Refusal>) {
         let dir = TempDir::new().expect("tempdir");
         let root = dir.path().join("root");
-        let result = extract_into(&root, archive.as_slice(), caps);
+        let result = extract_into(&root, archive.as_slice(), caps, &guard);
         (dir, result)
     }
 
@@ -1321,5 +1483,161 @@ mod tests {
 
         let io = Refusal::Io(io::Error::other("disk")).into_response();
         assert_eq!(io.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+        // 507, not 413. The archive is not too big for the protocol, it is too big
+        // for this filesystem right now — and a caller retries the first and not the
+        // second.
+        let pressure = Refusal::Pressure(
+            PathBuf::from("/data"),
+            disk::Reading {
+                available: 10,
+                reserve: 100,
+            },
+        )
+        .into_response();
+        assert_eq!(pressure.status(), StatusCode::INSUFFICIENT_STORAGE);
+    }
+
+    /// A probe that reports a fixed value the test chooses, so the verdict never
+    /// depends on the host's real free space.
+    fn full_probe(_path: &Path) -> io::Result<u64> {
+        Ok(1)
+    }
+
+    #[tokio::test]
+    async fn a_write_to_a_full_filesystem_is_refused_before_the_file_is_created() {
+        // The incident shape: proceeding here is what produces an ENOSPC that
+        // surfaces as an indistinguishable 500 after a partial file already exists.
+        let dir = TempDir::new().expect("tempdir");
+        let target = dir.path().join("nested/payload.bin");
+
+        let state = AppState::with_probe(
+            Config {
+                disk_reserve_bytes: 1 << 30,
+                ..Config::default()
+            },
+            full_probe,
+            crate::identity::Report::skipped(),
+        );
+
+        let request = axum::http::Request::builder()
+            .method("PUT")
+            .uri(format!("/v1/fs/file?path={}", target.display()))
+            .body(Body::from("payload"))
+            .expect("request");
+
+        let response = write_file(State(state), request).await;
+        assert_eq!(response.status(), StatusCode::INSUFFICIENT_STORAGE);
+
+        // Nothing was left behind. An empty or partial file at the target path is
+        // worse than none: it reads as a successful transfer to whatever comes next.
+        assert!(!target.exists(), "a refused write creates no file");
+        assert!(
+            !dir.path().join("nested").exists(),
+            "and it does not create the parent directory either",
+        );
+    }
+
+    #[tokio::test]
+    async fn the_refusal_body_names_the_actual_free_space() {
+        // "It failed" sends the caller reading their own code. "3 bytes available,
+        // below the 500 byte reserve" tells them the disk is full, which is the whole
+        // reason to report a number instead of a status alone.
+        let dir = TempDir::new().expect("tempdir");
+        let target = dir.path().join("f.bin");
+
+        fn three_bytes_free(_path: &Path) -> io::Result<u64> {
+            Ok(3)
+        }
+
+        let state = AppState::with_probe(
+            Config {
+                disk_reserve_bytes: 500,
+                ..Config::default()
+            },
+            three_bytes_free,
+            crate::identity::Report::skipped(),
+        );
+        let request = axum::http::Request::builder()
+            .method("PUT")
+            .uri(format!("/v1/fs/file?path={}", target.display()))
+            .body(Body::from("x"))
+            .expect("request");
+
+        let response = write_file(State(state), request).await;
+        assert_eq!(response.status(), StatusCode::INSUFFICIENT_STORAGE);
+
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("body");
+        let text = String::from_utf8_lossy(&body);
+        assert!(text.contains('3'), "names the free space: {text}");
+        assert!(text.contains("500"), "names the reserve: {text}");
+        assert!(text.contains("f.bin"), "names the path: {text}");
+    }
+
+    #[tokio::test]
+    async fn a_write_with_room_is_not_refused() {
+        // The guard is not vacuous: with space available the same request succeeds
+        // and every byte lands.
+        let dir = TempDir::new().expect("tempdir");
+        let target = dir.path().join("ok.bin");
+
+        let state = AppState::with_probe(
+            Config::default(),
+            roomy_probe,
+            crate::identity::Report::skipped(),
+        );
+        let request = axum::http::Request::builder()
+            .method("PUT")
+            .uri(format!("/v1/fs/file?path={}", target.display()))
+            .body(Body::from("payload"))
+            .expect("request");
+
+        let response = write_file(State(state), request).await;
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert_eq!(std::fs::read(&target).expect("written"), b"payload");
+    }
+
+    #[test]
+    fn extraction_stops_when_the_root_filesystem_crosses_the_reserve() {
+        // Members are copied one at a time, so `copy_guarded` cannot span them; this
+        // covers the `Pacer` path. `max_tar_bytes` defaults to 8 GiB, far more than
+        // the reserve, so the size cap alone does not imply the disk survives.
+        //
+        // The probe interval is 8 MiB, so the archive has to exceed it for a check to
+        // fire at all — which is itself the property being pinned.
+        let member = vec![b'x'; 3 * 1024 * 1024];
+        let archive = Archive::new()
+            .file("a", &member)
+            .file("b", &member)
+            .file("c", &member)
+            .file("d", &member)
+            .bytes();
+
+        let caps = Caps {
+            max_members: 100,
+            max_bytes: 64 * 1024 * 1024,
+        };
+        let guard = disk::Guard {
+            probe: full_probe,
+            reserve: 1 << 30,
+        };
+
+        match extract_with(archive.clone(), caps, guard).1 {
+            Err(Refusal::Pressure(_, reading)) => assert_eq!(reading.available, 1),
+            other => panic!("expected a pressure refusal, got {other:?}"),
+        }
+
+        // And with room the same archive extracts fully, so the guard is not simply
+        // rejecting every archive over 8 MiB.
+        let (dir, result) = extract_with(archive, caps, roomy_guard());
+        assert_eq!(result.expect("room means no refusal"), 4);
+        assert_eq!(
+            std::fs::metadata(dir.path().join("root/d"))
+                .expect("last member landed")
+                .len(),
+            member.len() as u64,
+        );
     }
 }

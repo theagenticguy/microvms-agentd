@@ -1,0 +1,90 @@
+# Security
+
+## Reporting a vulnerability
+
+Report privately through **GitHub Security Advisories** on this repository
+("Security" → "Report a vulnerability"). There is no security email address for
+this project, and inventing one would be worse than saying so: use the advisory
+form, which is the only private channel that exists.
+
+Include the daemon version or commit, the region and API version if AWS behavior
+is involved, and a reproduction. There is no funded response SLA — this is an
+unpaid reference implementation, and an honest "no promised turnaround" is more
+useful than a number nobody is accountable for.
+
+Do not open a public issue for a suspected vulnerability. Do open one for
+anything in "Not vulnerabilities" below.
+
+## Threat model
+
+`docs/TRUST.md` is the threat model: what the daemon guarantees when the workload
+is hostile by assumption, and what it explicitly does not. Read it before filing.
+`docs/PROTOCOL.md` states the enforced rules and `model/` checks the safety
+properties over every reachable state.
+
+## In scope
+
+- Reaching a bearer-authenticated control route without presenting the installed
+  agent token. `/v1/health` and `/v1/schema` are deliberately open — see
+  `docs/TRUST.md` for why an orchestrator needs an unauthenticated liveness probe
+  during the window before bootstrap; every other `/v1` route is not.
+- Replacing or reading the installed agent token from inside the VM after
+  bootstrap — for example a bootstrap race that lets a second caller win, or the
+  token leaking into an exec'd child's environment.
+- Escaping the extraction root during a tar upload: a member that writes outside
+  the target directory, or a symlink or hard link that redirects a later member
+  out of it.
+- Crashing the daemon from an unauthenticated request. The daemon is the only
+  channel into the VM, so a dead daemon means an unreachable VM with whatever
+  work was in it.
+- Making an unauthenticated caller allocate: authorization is decided before any
+  request body byte is read, and a bypass of that ordering is a denial-of-service
+  finding on a VM whose baseline can be 512 MiB.
+- Anything in `docs/PROTOCOL.md` stated as enforced that is not.
+
+## Not vulnerabilities
+
+**A token holder running arbitrary code as root is the product.** `POST
+/v1/exec/start` runs commands as root by design. Everything that follows from
+that capability is intended:
+
+- Reading, writing, or deleting any path in the VM via `/v1/exec` or the
+  single-file `/v1/fs/file` routes. Those routes are deliberately not confined to
+  a root, because a token holder can already reach every byte with one exec call,
+  and a confinement check there would be a comforting fiction rather than a
+  control. "Path traversal via `/v1/exec`" is not a finding.
+- Exhausting CPU, memory, or disk from an exec'd child. Resource bounds belong to
+  the VM configuration.
+- Escalating from a demoted exec user back to root. Demotion is convenience, not
+  a boundary.
+
+**Loopback source addresses.** The platform's own lifecycle hooks arrive from
+`127.0.0.1`, indistinguishable at the socket level from an in-VM process
+(measured; see `docs/PLATFORM.md`). A source-address rule on those routes is
+actively wrong, not merely missing — it would reject the platform's legitimate
+bootstrap and break every launch. Reports proposing one will be closed with that
+measurement.
+
+**The unenforced deployment invariant.** The daemon must be the container `CMD`,
+and the harness must issue its first exec only after readiness. A base image that
+starts its own background process before bootstrap breaks the trust boundary.
+This is stated rather than enforced, and `model/` runs that configuration and
+reports the counterexample path so the cost is a checked fact. Enforcing it
+belongs to whoever builds the image.
+
+## One genuinely open question
+
+The `/run` lifecycle hook is **unauthenticated**, and not by preference. The
+platform presents no credential when it calls the hook, so there is nothing for
+the daemon to verify, and a source-address rule is ruled out by the measurement
+above. The only available defense is that bootstrap succeeds exactly once: the
+first caller installs the token, an identical replay returns 200, and a different
+token returns 409 without changing state. The endpoint does not forward external
+traffic until `/run` returns 200 (documented), which closes the race through the
+endpoint but says nothing about a process already running inside the VM.
+
+That leaves the one-shot property carrying the whole route. If you can defeat it —
+win the race against the platform, or replace an installed token — that is a real
+vulnerability and we want it. If you have a defense that does not require a
+credential the platform does not have, open a public issue; that is a design
+discussion, not a disclosure.

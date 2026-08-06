@@ -29,9 +29,12 @@
 
 pub mod auth;
 pub mod config;
+pub mod disk;
 pub mod exec;
 pub mod fs;
+pub mod identity;
 pub mod routes;
+pub mod schema;
 pub mod serve;
 pub mod state;
 

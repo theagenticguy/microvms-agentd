@@ -16,6 +16,24 @@ repository = "https://github.com/theagenticguy/microvms-agentd"
 [profile.release]
 lto = true
 codegen-units = 1
-panic = "abort"
+# `unwind`, deliberately, reversing an earlier `panic = "abort"`.
+#
+# `abort` is the right default for most small binaries — it drops the landing pads
+# and shrinks the artifact. It is wrong here, and quietly so. The daemon is the only
+# channel into the VM: no SSH, no supervisor, no console, and nothing inside that
+# will restart a dead process. Under `abort`, one panicking request handler kills the
+# whole daemon and the VM is unreachable forever with whatever work was in it.
+#
+# It also silently defeats two guards that only exist because of that. `tower_http`'s
+# `CatchPanicLayer` is implemented with `catch_unwind`, which never runs when a panic
+# aborts, and the poisoned-lock recovery in `state.rs` presumes a panic unwinds far
+# enough to poison a lock rather than taking the process with it. Both would compile,
+# both would pass their tests (the test profile unwinds), and both would be dead code
+# in the shipped binary — which is the worst of the available outcomes, because the
+# tests would report the guard as working.
+#
+# The cost is a modestly larger binary. That is a fine trade against an unrecoverable
+# VM.
+panic = "unwind"
 strip = true
 opt-level = "z"

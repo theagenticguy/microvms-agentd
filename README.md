@@ -14,7 +14,7 @@ lifecycle semantics. This project exists so the next team does not repeat it.
 cross-compiled to a 1.41 MB static `aarch64-unknown-linux-musl` binary, baked into
 a MicroVM image as the container `CMD`, launched in us-east-1, and driven through
 every protocol rule via the platform's own endpoint: 54 checks passed, none
-failed, and teardown left the account clean. 111 Rust tests across four local
+failed, and teardown left the account clean. 155 Rust tests across six local
 tiers and 83 Python client tests are green alongside it.
 
 That live run covers the things only the real service can answer, including
@@ -53,19 +53,27 @@ expire at once.
 ## What is in the repo
 
 ```
-agentd/   the daemon: axum router, one-shot bootstrap, exec engine, fs engine
+agentd/   the daemon: axum router, one-shot bootstrap, exec engine, fs engine,
+          disk-pressure guard, identity repair, generated schema
+          tests/panic_guard.rs       — a panic must not strand the VM
           tests/proptest_tar.rs      — tar confinement properties
+          tests/schema_artifact.rs   — the published schema cannot go stale
           tests/turmoil_transport.rs — deterministic transport faults
+clients/  python/ — session library: proxy-token refresh, streaming with
+          offset reconnect, typed error taxonomy, AWS lifecycle helper
+conformance/  live AWS suite plus the suspend/resume probe, and its Terraform
 model/    stateright model of bootstrap + exec lifecycle, with safety properties
 spec/     symspec requirements document, Z3-verified consistent
-docs/     PROTOCOL.md (wire contract) and PLATFORM.md (measured AWS behavior)
+docs/     PROTOCOL.md (wire contract), PLATFORM.md (measured AWS behavior),
+          TRUST.md (threat model and identity repair), STRATEGY.md, schema.json
 ```
 
 ### `agentd/` — the daemon
 
-A static binary intended to run as the container `CMD`. Release build is 1.5 MB on
-x86-64 with the workspace's size-tuned profile; the shipping target is
-`aarch64-unknown-linux-musl`, built in CI.
+A static binary intended to run as the container `CMD`. With the workspace's
+size-tuned profile the release build is 1.41 MB for
+`aarch64-unknown-linux-musl` — the shipping target, since MicroVMs are ARM64
+only — and 1.98 MB on x86-64.
 
 The module seams follow the defect classes rather than the HTTP surface:
 `state.rs` owns the one-shot bootstrap, `auth.rs` decides authorization before any
@@ -137,7 +145,7 @@ Five tiers, each owning a defect class the others cannot see:
 | --- | --- | --- |
 | Requirements | symspec + Z3 | contradictions between stated requirements |
 | Design | stateright | unsafe interleavings of hooks, client, and attacker |
-| Wire contract | schemars + OpenAPI | client/server drift on request and response shapes |
+| Wire contract | schemars + JSON Schema | client/server drift on request and response shapes; `docs/schema.json` is generated and CI fails if it goes stale |
 | Transport | turmoil | deterministic network and time faults: framing, mid-body disconnect, token expiry mid-exec |
 | Filesystem | proptest | tar extraction confinement and stdlib `data`-filter parity |
 
@@ -161,14 +169,17 @@ cargo clippy --all-targets -- -D warnings
 symspec check spec/agentd.symspec.json --strict   # requirements verification
 ```
 
-`cargo test --all` currently runs 81 tests: 57 daemon unit tests, 8 tar
-properties, 10 transport-fault simulations, and 6 model checks. Every guard in the
-suite was verified to fail against the code without its fix; a property that
-passes either way is a false answer, not a passing test.
+`cargo test --all` runs 155 tests across six targets: 107 daemon unit tests, 5
+panic-containment tests, 8 tar-confinement properties, 11 schema-artifact checks,
+18 transport-fault simulations, and 6 model checks. Every guard in the suite was
+verified to fail against the code without its fix; a property that passes either
+way is a false answer, not a passing test.
 
-All of it is wired into CI (`.github/workflows/ci.yml`), which also
-cross-compiles the `aarch64-unknown-linux-musl` binary and uploads it as an
-artifact.
+CI (`.github/workflows/ci.yml`) runs the Rust gates, the schema staleness check,
+the symspec requirements gate, and an `aarch64-unknown-linux-musl` cross-compile.
+It does **not** yet run the Python client's tests or ruff — run those locally per
+`CONTRIBUTING.md` until a job exists. CI has also never executed, because the
+repository has no remote.
 
 ## License
 

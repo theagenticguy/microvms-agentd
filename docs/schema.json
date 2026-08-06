@@ -1,0 +1,1115 @@
+{
+  "$defs": {
+    "DiskHealth": {
+      "description": "The disk half of [`Health`].",
+      "properties": {
+        "available_bytes": {
+          "description": "Bytes available to an unprivileged writer, from `statvfs` `f_bavail`.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "reserve_bytes": {
+          "description": "Bytes that must stay free before a write is refused. Zero means the guard is\ndisabled.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "under_pressure": {
+          "description": "Whether a write would be refused right now. Precomputed rather than left to\nthe client, so every consumer applies the same comparison the write path does.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "available_bytes",
+        "reserve_bytes",
+        "under_pressure"
+      ],
+      "type": "object"
+    },
+    "ExitEvent": {
+      "description": "The terminal `exit` SSE event. Emitted before the stream ends, so a client\nthat sees the body close without one knows the connection failed rather than\nthe command finishing.",
+      "properties": {
+        "exit_code": {
+          "format": "int32",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "offset": {
+          "description": "Total bytes published, so a client can assert it saw all of them.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "signal": {
+          "format": "int32",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "truncated": {
+          "type": "boolean"
+        },
+        "writers_may_be_alive": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "exit_code",
+        "signal",
+        "truncated",
+        "writers_may_be_alive",
+        "offset"
+      ],
+      "type": "object"
+    },
+    "FsQuery": {
+      "description": "Query string for every route in this module.\n\n`path` is required. A request missing it is 400, never 404: clients map 404\nonto `FileNotFoundError`, so answering 404 for a protocol typo made a missing\nquery key look like an absent artifact — that is how one defect hid for a full\nreview round.",
+      "properties": {
+        "mode": {
+          "default": null,
+          "description": "Octal mode for a written file, carried as a string so `0644` and `644`\nboth parse and neither is read as decimal 644.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "path": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "path"
+      ],
+      "type": "object"
+    },
+    "GapEvent": {
+      "description": "One `gap` SSE event: the byte range a lagging or late subscriber lost.",
+      "properties": {
+        "from": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "to": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "from",
+        "to"
+      ],
+      "type": "object"
+    },
+    "Health": {
+      "description": "`GET /v1/health` response.",
+      "properties": {
+        "bootstrapped": {
+          "type": "boolean"
+        },
+        "disk": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DiskHealth"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Free space on the daemon's working filesystem, and the reserve it is judged\nagainst.\n\nReported so disk pressure is something an orchestrator *watches* rather than\nsomething it discovers from a failed write. anthropics/claude-code#59856\nfilled two 10 GB disks to 100% with never-collected session directories and\nthe first symptom was `useradd: No space left on device` — by which point\nevery writer in the sandbox was already broken. A number on a health endpoint\nis what makes that curve visible while there is still time to act.\n\n`None` when free space could not be measured, which is deliberately distinct\nfrom zero: unmeasurable is not full, and a monitor that conflated them would\npage on a missing `statvfs`."
+        },
+        "identity_degraded": {
+          "description": "Whether any startup identity repair step failed. True means the VM is serving\nwith a value from the shared image still in place — a duplicate machine-id or\nboot_id — which is a security-relevant condition an operator may want to\ndrain the VM over, but is never a reason for the daemon to refuse to serve.",
+          "type": "boolean"
+        },
+        "identity_repaired": {
+          "description": "False when identity repair was switched off by config. Distinguished from a\nrepair that ran and found nothing so a monitor can tell \"opted out\" from\n\"nothing to do\".",
+          "type": "boolean"
+        },
+        "version": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "version",
+        "bootstrapped",
+        "disk",
+        "identity_degraded",
+        "identity_repaired"
+      ],
+      "type": "object"
+    },
+    "KillResponse": {
+      "description": "`POST /v1/exec/{id}/kill` response.\n\nA named type rather than the `serde_json::json!` literal this used to be: an\nad-hoc `Value` has no schema to derive, so the one route whose body a client\nmost needs to branch on — `killed` distinguishes \"signalled\" from \"the group\nwas already gone\", and both are 200 — would have been the one route the\npublished document could not describe.",
+      "properties": {
+        "exec_id": {
+          "type": "string"
+        },
+        "killed": {
+          "description": "Whether a signal was actually delivered. `false` with a 200 means the\nprocess group had already exited, which is the outcome a kill wanted.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "exec_id",
+        "killed"
+      ],
+      "type": "object"
+    },
+    "OutputEvent": {
+      "description": "One `output` SSE event.",
+      "properties": {
+        "offset": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "output": {
+          "type": "string"
+        },
+        "stream": {
+          "$ref": "#/$defs/StreamKind"
+        }
+      },
+      "required": [
+        "offset",
+        "stream",
+        "output"
+      ],
+      "type": "object"
+    },
+    "Phase": {
+      "description": "Where an exec sits in its lifecycle. Mirrors `ExecPhase` in the model crate.\n\n`JsonSchema` rides along with `Serialize` on every type from here down that\ncrosses the wire. schemars reads the same `#[serde(...)]` attributes serde\ndoes, so the published schema describes what the daemon actually emits — the\n`rename_all` below is the reason this matters rather than a formality.",
+      "oneOf": [
+        {
+          "const": "running",
+          "description": "Child spawned, still running (or its pipes still held by a grandchild).",
+          "type": "string"
+        },
+        {
+          "const": "exited",
+          "description": "Child exited and output is buffered and readable.",
+          "type": "string"
+        },
+        {
+          "const": "acked",
+          "description": "Caller acked; output has been released and the entry awaits collection.",
+          "type": "string"
+        }
+      ]
+    },
+    "PollResponse": {
+      "description": "Captured output and exit status of a finished exec.",
+      "properties": {
+        "exec_id": {
+          "type": "string"
+        },
+        "exit_code": {
+          "description": "Exit code, or `None` when the child died to a signal.",
+          "format": "int32",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "phase": {
+          "$ref": "#/$defs/Phase"
+        },
+        "signal": {
+          "description": "Signal number that killed the child, when one did.",
+          "format": "int32",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "stderr": {
+          "type": "string"
+        },
+        "stdout": {
+          "type": "string"
+        },
+        "truncated": {
+          "description": "Set when either stream hit `max_output_bytes` and was cut. An explicit\nflag rather than a sentinel string in the output: a marker inside the\nbytes is indistinguishable from output that happens to contain it.",
+          "type": "boolean"
+        },
+        "writers_may_be_alive": {
+          "description": "Set when the post-exit linger deadline expired with the pipes still open,\nmeaning some grandchild is alive and may write more that nobody will see.\nReported rather than hidden, because a harness that sees empty output from\na command it knows produced some needs to be able to tell why.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "exec_id",
+        "phase"
+      ],
+      "type": "object"
+    },
+    "RunHookEnvelope": {
+      "description": "The envelope the platform posts to the run hook.\n\nThe `runHookPayload` string given to `RunMicrovm` is not delivered as the\nrequest body: the platform wraps it, so the body is\n`{\"runHookPayload\": \"<the caller's string>\"}` and the caller's own JSON is one\n`serde_json` parse deeper. Measured 2026-08-05 — a daemon that reads\n`agent_token` from the top level answers 400, and the platform then terminates\nthe VM with \"Run lifecycle hook returned HTTP status 400\" before any traffic is\nforwarded, so the mistake is invisible from the outside.",
+      "properties": {
+        "runHookPayload": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "StartRequest": {
+      "description": "A start request. `command` is either an argv array or, with `shell: true`, a\nsingle script string.",
+      "properties": {
+        "command": {
+          "description": "argv when `shell` is false, or the script when it is true.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "cwd": {
+          "default": null,
+          "description": "Omitted means inherit the daemon's working directory. See the module docs.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "env": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {},
+          "type": "object"
+        },
+        "exec_id": {
+          "description": "Caller-minted idempotency key. Harbor retries, and a retry must not\nproduce a second child.",
+          "type": "string"
+        },
+        "group": {
+          "default": null,
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "shell": {
+          "default": false,
+          "type": "boolean"
+        },
+        "stdin": {
+          "default": false,
+          "description": "Whether to give the child a writable stdin pipe. Defaults to false, which\nkeeps `Stdio::null()`.\n\nOpt-in rather than always-on, and not only for tidiness: a child holding an\nopen stdin pipe nobody will ever write to is a child that blocks forever\nthe first time it reads. `/bin/sh` reading a script from stdin, `git`\ndeciding it can prompt, any tool that probes for input — all of them behave\ndifferently against a pipe than against `/dev/null`. Every existing caller\ngets today's behavior by not setting this.",
+          "type": "boolean"
+        },
+        "timeout_sec": {
+          "default": null,
+          "description": "Wall-clock budget. Validated before the child spawns — the predecessor\nraised on a bad value inside the waiter thread, by which point the child\nwas already running and became an orphan.",
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "user": {
+          "default": null,
+          "description": "Numeric uid to demote to. Optional; omitted means run as the daemon's own\nuser.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "exec_id",
+        "command"
+      ],
+      "type": "object"
+    },
+    "StartResponse": {
+      "properties": {
+        "exec_id": {
+          "type": "string"
+        },
+        "phase": {
+          "$ref": "#/$defs/Phase"
+        }
+      },
+      "required": [
+        "exec_id",
+        "phase"
+      ],
+      "type": "object"
+    },
+    "StdinRequest": {
+      "description": "`POST /v1/exec/{id}/stdin` body.\n\nBoth fields optional and both meaningful together: a final chunk plus EOF in\none request is the common case for feeding a prompt, and forcing two round\ntrips would leave a window where the child has the bytes but not the EOF that\ntells it the input is complete.",
+      "properties": {
+        "data_b64": {
+          "default": null,
+          "description": "Base64 so arbitrary bytes survive JSON. A JSON string cannot carry\nnon-UTF-8, and stdin is bytes.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "signal": {
+          "default": null,
+          "description": "`\"eof\"` closes the pipe after any `data_b64` is written. Named rather than\na bare boolean so the field has somewhere to grow.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "StdinResponse": {
+      "description": "`POST /v1/exec/{id}/stdin` response.\n\n`pub` rather than private, like every other type in this module the schema\nroute publishes: the generator names them by type, so a response shape that\nstays private is a shape a consumer cannot be told about.",
+      "properties": {
+        "eof": {
+          "type": "boolean"
+        },
+        "exec_id": {
+          "type": "string"
+        },
+        "written": {
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "exec_id",
+        "written",
+        "eof"
+      ],
+      "type": "object"
+    },
+    "StreamKind": {
+      "description": "Which pipe a streamed chunk came from. Both share one offset space, so a\nclient holds one cursor rather than two that can disagree about ordering.",
+      "enum": [
+        "stdout",
+        "stderr"
+      ],
+      "type": "string"
+    },
+    "StreamQuery": {
+      "description": "`GET /v1/exec/{id}/stream` query.",
+      "properties": {
+        "offset": {
+          "default": null,
+          "description": "Byte offset to resume from. Absent means 0, i.e. everything still in the\nreplay window.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "auth": {
+    "bootstrap": {
+      "before_bootstrap": "503 on every bearer route, never 404",
+      "how": "the platform posts the token to the run hook at launch",
+      "note": "the token is compared on raw bytes in constant time, so a non-ASCII header is answered rather than dropped",
+      "wrong_token": "401"
+    },
+    "header": "authorization",
+    "scheme": "bearer"
+  },
+  "daemon_version": "0.1.0",
+  "definition_collisions": [],
+  "generated_from": "the daemon's own serde types, via schemars",
+  "hook_prefix": "/aws/lambda-microvms/runtime/v1",
+  "limits": {
+    "exec_ttl_secs": 900.0,
+    "kill_grace_secs": 10.0,
+    "max_body_bytes": 536870912,
+    "max_drain_bytes": 65536,
+    "max_output_bytes": 8388608,
+    "max_stdin_write_bytes": 1048576,
+    "max_tar_bytes": 8589934592,
+    "max_tar_members": 100000,
+    "output_linger_secs": 5.0,
+    "sse_keepalive_secs": 15.0,
+    "stdin_write_timeout_secs": 5.0,
+    "stream_replay_bytes": 1048576
+  },
+  "protocol_version": "1",
+  "routes": [
+    {
+      "auth": "none (platform hook)",
+      "method": "POST",
+      "path": "/aws/lambda-microvms/runtime/v1/ready",
+      "request": null,
+      "response": null,
+      "statuses": [
+        {
+          "code": 200,
+          "error": "",
+          "meaning": "acknowledged. The platform terminates the VM on any other status, so there is no failure a hook can usefully report."
+        }
+      ],
+      "summary": "image-build readiness probe; answers 200 even before bootstrap, because the question is whether the daemon started"
+    },
+    {
+      "auth": "none (platform hook)",
+      "method": "POST",
+      "path": "/aws/lambda-microvms/runtime/v1/validate",
+      "request": null,
+      "response": null,
+      "statuses": [
+        {
+          "code": 200,
+          "error": "",
+          "meaning": "acknowledged. The platform terminates the VM on any other status, so there is no failure a hook can usefully report."
+        }
+      ],
+      "summary": "image-build validation probe; same reasoning as ready"
+    },
+    {
+      "auth": "none (platform hook)",
+      "method": "POST",
+      "path": "/aws/lambda-microvms/runtime/v1/run",
+      "request": {
+        "media_type": "application/json",
+        "schema": {
+          "$ref": "#/$defs/RunHookEnvelope"
+        }
+      },
+      "response": null,
+      "statuses": [
+        {
+          "code": 200,
+          "error": "",
+          "meaning": "the token was installed, or an identical token was replayed. A replay is success because the platform may retry its own hook, and answering 409 would fail a launch that is fine."
+        },
+        {
+          "code": 400,
+          "error": "",
+          "meaning": "the body is not JSON, carries no runHookPayload, the payload is not a JSON object with agent_token, or the token is empty. The platform terminates the VM on this, before any traffic is forwarded."
+        },
+        {
+          "code": 409,
+          "error": "",
+          "meaning": "a different token is already installed. Refused, and nothing changes: bootstrap is one-shot so a losing racer never replaces the winner."
+        }
+      ],
+      "summary": "one-shot token bootstrap. The platform wraps the caller's string, so agent_token is one JSON parse deeper than the request body: {\"runHookPayload\": \"{\\\"agent_token\\\": \\\"...\\\"}\"}."
+    },
+    {
+      "auth": "none (platform hook)",
+      "method": "POST",
+      "path": "/aws/lambda-microvms/runtime/v1/suspend",
+      "request": null,
+      "response": null,
+      "statuses": [
+        {
+          "code": 200,
+          "error": "",
+          "meaning": "acknowledged. The platform terminates the VM on any other status, so there is no failure a hook can usefully report."
+        }
+      ],
+      "summary": "acknowledged and logged"
+    },
+    {
+      "auth": "none (platform hook)",
+      "method": "POST",
+      "path": "/aws/lambda-microvms/runtime/v1/resume",
+      "request": null,
+      "response": null,
+      "statuses": [
+        {
+          "code": 200,
+          "error": "",
+          "meaning": "acknowledged. The platform terminates the VM on any other status, so there is no failure a hook can usefully report."
+        }
+      ],
+      "summary": "acknowledged. Measured: the token, filesystem, exec records, and even backgrounded processes survive a suspend/resume cycle. What does not survive is the guest's view of time, which jumps — so any timeout or lease held by a running command expires at once on resume."
+    },
+    {
+      "auth": "none (platform hook)",
+      "method": "POST",
+      "path": "/aws/lambda-microvms/runtime/v1/terminate",
+      "request": null,
+      "response": null,
+      "statuses": [
+        {
+          "code": 200,
+          "error": "",
+          "meaning": "acknowledged. The platform terminates the VM on any other status, so there is no failure a hook can usefully report."
+        }
+      ],
+      "summary": "acknowledged; begins graceful shutdown with in-flight requests draining"
+    },
+    {
+      "auth": "bearer",
+      "method": "POST",
+      "path": "/v1/exec/start",
+      "request": {
+        "media_type": "application/json",
+        "schema": {
+          "$ref": "#/$defs/StartRequest"
+        }
+      },
+      "response": {
+        "media_type": "application/json",
+        "schema": {
+          "$ref": "#/$defs/StartResponse"
+        }
+      },
+      "statuses": [
+        {
+          "code": 200,
+          "error": "",
+          "meaning": "started, or a retry of an already-started exec_id. Idempotent: a retry does not spawn a second child and does not disturb the first one's output."
+        },
+        {
+          "code": 400,
+          "error": "malformed_request",
+          "meaning": "the body is not a valid start request, exec_id is empty, timeout_sec is not a positive finite number, or command is empty with shell false"
+        },
+        {
+          "code": 401,
+          "error": "",
+          "meaning": "the presented bearer token does not match the installed one"
+        },
+        {
+          "code": 503,
+          "error": "",
+          "meaning": "no token is installed yet, so the control API is closed. Never 404: a client mapping 404 onto \"not found\" would report a phantom absent artifact."
+        },
+        {
+          "code": 413,
+          "error": "",
+          "meaning": "the request body exceeds limits.max_body_bytes, enforced on the wire"
+        },
+        {
+          "code": 500,
+          "error": "spawn_failed",
+          "meaning": "the child could not be spawned, e.g. ENOENT on argv[0]. Deliberately not 404: a client reads 404 here as \"no such exec\"."
+        }
+      ],
+      "summary": "start a command under a caller-minted exec_id. Idempotent on that id: a retry returns success without spawning a second child."
+    },
+    {
+      "auth": "bearer",
+      "method": "GET",
+      "path": "/v1/exec/{id}",
+      "request": null,
+      "response": {
+        "media_type": "application/json",
+        "schema": {
+          "$ref": "#/$defs/PollResponse"
+        }
+      },
+      "statuses": [
+        {
+          "code": 200,
+          "error": "",
+          "meaning": "the current phase, plus the outcome once the exec has exited and before it is acked. Strictly read-only."
+        },
+        {
+          "code": 401,
+          "error": "",
+          "meaning": "the presented bearer token does not match the installed one"
+        },
+        {
+          "code": 503,
+          "error": "",
+          "meaning": "no token is installed yet, so the control API is closed. Never 404: a client mapping 404 onto \"not found\" would report a phantom absent artifact."
+        },
+        {
+          "code": 404,
+          "error": "unknown_exec",
+          "meaning": "no exec is registered under this id, or its entry was collected after an ack"
+        }
+      ],
+      "summary": "poll status and output. Read-only: polling never mutates the entry, and output survives until an explicit ack."
+    },
+    {
+      "auth": "bearer",
+      "method": "GET",
+      "path": "/v1/exec/{id}/stream",
+      "query": {
+        "media_type": "application/x-www-form-urlencoded",
+        "schema": {
+          "$ref": "#/$defs/StreamQuery"
+        }
+      },
+      "request": null,
+      "response": {
+        "media_type": "text/event-stream",
+        "note": "resume with ?offset=N to receive exactly the bytes after N. The next offset to resume from is a chunk's offset plus the length of its decoded bytes. A body that ends without an exit event means the connection failed, not the command — that distinction is the reason this is SSE and not a chunked byte stream."
+      },
+      "sse_events": [
+        {
+          "event": "output",
+          "meaning": "a run of bytes at a known offset. `output` is base64 because output is arbitrary bytes and a JSON string cannot carry non-UTF-8 — and because a lossy decode would split a multi-byte character at a chunk boundary. Resume from offset + len(decoded).",
+          "schema": {
+            "$ref": "#/$defs/OutputEvent"
+          }
+        },
+        {
+          "event": "gap",
+          "meaning": "bytes in [from, to) are gone: the request resumed before the replay window, or this subscriber fell behind the live channel. Reported rather than hidden, because a client that cannot tell missing output from no output will read a truncated log as a complete one.",
+          "schema": {
+            "$ref": "#/$defs/GapEvent"
+          }
+        },
+        {
+          "event": "exit",
+          "meaning": "the terminal event, emitted before the body ends. A body that closes without it means the connection failed, not the command. `offset` is the total bytes published, so a client can assert it saw all of them.",
+          "schema": {
+            "$ref": "#/$defs/ExitEvent"
+          }
+        }
+      ],
+      "statuses": [
+        {
+          "code": 200,
+          "error": "",
+          "meaning": "an SSE stream that replays from ?offset= and then follows live output. Attaching and detaching do not affect the exec."
+        },
+        {
+          "code": 400,
+          "error": "malformed_request",
+          "meaning": "offset is not a non-negative integer"
+        },
+        {
+          "code": 401,
+          "error": "",
+          "meaning": "the presented bearer token does not match the installed one"
+        },
+        {
+          "code": 503,
+          "error": "",
+          "meaning": "no token is installed yet, so the control API is closed. Never 404: a client mapping 404 onto \"not found\" would report a phantom absent artifact."
+        },
+        {
+          "code": 404,
+          "error": "unknown_exec",
+          "meaning": "no exec is registered under this id, or its entry was collected after an ack"
+        }
+      ],
+      "summary": "follow output as Server-Sent Events from a byte offset"
+    },
+    {
+      "auth": "bearer",
+      "method": "POST",
+      "path": "/v1/exec/{id}/stdin",
+      "request": {
+        "media_type": "application/json",
+        "schema": {
+          "$ref": "#/$defs/StdinRequest"
+        }
+      },
+      "response": {
+        "media_type": "application/json",
+        "schema": {
+          "$ref": "#/$defs/StdinResponse"
+        }
+      },
+      "statuses": [
+        {
+          "code": 200,
+          "error": "",
+          "meaning": "bytes written, and eof echoed back so a client can confirm the pipe was closed rather than inferring it"
+        },
+        {
+          "code": 400,
+          "error": "malformed_request",
+          "meaning": "the body is not a valid stdin request, data_b64 is not valid base64, or signal is something other than \"eof\""
+        },
+        {
+          "code": 401,
+          "error": "",
+          "meaning": "the presented bearer token does not match the installed one"
+        },
+        {
+          "code": 503,
+          "error": "",
+          "meaning": "no token is installed yet, so the control API is closed. Never 404: a client mapping 404 onto \"not found\" would report a phantom absent artifact."
+        },
+        {
+          "code": 404,
+          "error": "unknown_exec",
+          "meaning": "no exec is registered under this id, or its entry was collected after an ack"
+        },
+        {
+          "code": 408,
+          "error": "stdin_write_timeout",
+          "meaning": "the child did not read within limits.stdin_write_timeout_secs. Retryable, and some bytes may already have been written."
+        },
+        {
+          "code": 409,
+          "error": "stdin_not_requested",
+          "meaning": "the exec was started without stdin: true, so its stdin is /dev/null. The fix is at start time, which is why this is 409 and not 400."
+        },
+        {
+          "code": 410,
+          "error": "stdin_closed",
+          "meaning": "stdin was already closed by an earlier eof, or the child stopped reading. 410 rather than 409: retrying will never succeed."
+        },
+        {
+          "code": 413,
+          "error": "stdin_write_too_large",
+          "meaning": "the decoded write exceeds limits.max_stdin_write_bytes"
+        },
+        {
+          "code": 500,
+          "error": "stdin_write_failed",
+          "meaning": "the write to the pipe failed for a reason other than a broken pipe"
+        }
+      ],
+      "summary": "write to a child's stdin, or signal EOF. A separate request from the output stream on purpose: a dropped attach must not cost the ability to feed the process. EOF is explicit rather than inferred, because a child reading stdin cannot exit until the daemon drops its own handle."
+    },
+    {
+      "auth": "bearer",
+      "method": "POST",
+      "path": "/v1/exec/{id}/ack",
+      "request": null,
+      "response": {
+        "media_type": "application/json",
+        "schema": {
+          "$ref": "#/$defs/PollResponse"
+        }
+      },
+      "statuses": [
+        {
+          "code": 200,
+          "error": "",
+          "meaning": "output released and the TTL clock started. This is the only way output leaves the daemon's custody."
+        },
+        {
+          "code": 401,
+          "error": "",
+          "meaning": "the presented bearer token does not match the installed one"
+        },
+        {
+          "code": 503,
+          "error": "",
+          "meaning": "no token is installed yet, so the control API is closed. Never 404: a client mapping 404 onto \"not found\" would report a phantom absent artifact."
+        },
+        {
+          "code": 404,
+          "error": "unknown_exec",
+          "meaning": "no exec is registered under this id, or its entry was collected after an ack"
+        },
+        {
+          "code": 409,
+          "error": "still_running",
+          "meaning": "the exec has not exited and output is still being written. A silent success here would drop it."
+        },
+        {
+          "code": 409,
+          "error": "already_acked",
+          "meaning": "an earlier ack released the output. 200 with an empty body would read as \"the command produced no output\"."
+        }
+      ],
+      "summary": "release output and enter TTL collection. Only acked entries are ever collected, so output nobody read is never destroyed."
+    },
+    {
+      "auth": "bearer",
+      "method": "POST",
+      "path": "/v1/exec/{id}/kill",
+      "request": null,
+      "response": {
+        "media_type": "application/json",
+        "schema": {
+          "$ref": "#/$defs/KillResponse"
+        }
+      },
+      "statuses": [
+        {
+          "code": 200,
+          "error": "",
+          "meaning": "the process group was signalled, or killed is false because it had already exited — which is the outcome a kill was asking for"
+        },
+        {
+          "code": 401,
+          "error": "",
+          "meaning": "the presented bearer token does not match the installed one"
+        },
+        {
+          "code": 503,
+          "error": "",
+          "meaning": "no token is installed yet, so the control API is closed. Never 404: a client mapping 404 onto \"not found\" would report a phantom absent artifact."
+        },
+        {
+          "code": 404,
+          "error": "unknown_exec",
+          "meaning": "no exec is registered under this id, or its entry was collected after an ack"
+        }
+      ],
+      "summary": "SIGTERM then SIGKILL to the whole process group, not just the direct child — a shell that backgrounded a server leaves the interesting process outside the child pid"
+    },
+    {
+      "auth": "bearer",
+      "method": "GET",
+      "path": "/v1/fs/file",
+      "query": {
+        "media_type": "application/x-www-form-urlencoded",
+        "schema": {
+          "$ref": "#/$defs/FsQuery"
+        }
+      },
+      "request": null,
+      "response": {
+        "media_type": "application/octet-stream",
+        "note": "the file's bytes, streamed"
+      },
+      "statuses": [
+        {
+          "code": 200,
+          "error": "",
+          "meaning": "the file's bytes, streamed rather than buffered"
+        },
+        {
+          "code": 400,
+          "error": "",
+          "meaning": "the path query parameter is missing, or it names a directory — use /v1/fs/tar for that. Never 404 for either: a protocol error must not look like an absent file."
+        },
+        {
+          "code": 401,
+          "error": "",
+          "meaning": "the presented bearer token does not match the installed one"
+        },
+        {
+          "code": 503,
+          "error": "",
+          "meaning": "no token is installed yet, so the control API is closed. Never 404: a client mapping 404 onto \"not found\" would report a phantom absent artifact."
+        },
+        {
+          "code": 404,
+          "error": "",
+          "meaning": "the path is genuinely absent. The one place in the fs surface where a client's FileNotFoundError is the right mapping."
+        },
+        {
+          "code": 500,
+          "error": "",
+          "meaning": "the file could not be opened or stat'ed"
+        }
+      ],
+      "summary": "read one file"
+    },
+    {
+      "auth": "bearer",
+      "method": "PUT",
+      "path": "/v1/fs/file",
+      "query": {
+        "media_type": "application/x-www-form-urlencoded",
+        "schema": {
+          "$ref": "#/$defs/FsQuery"
+        }
+      },
+      "request": {
+        "media_type": "application/octet-stream",
+        "note": "the file's bytes, streamed to disk rather than buffered"
+      },
+      "response": null,
+      "statuses": [
+        {
+          "code": 204,
+          "error": "",
+          "meaning": "written, with the mode applied"
+        },
+        {
+          "code": 400,
+          "error": "",
+          "meaning": "the path query parameter is missing, or mode is not a valid octal file mode. Checked before a byte lands, so a rejected mode leaves nothing behind."
+        },
+        {
+          "code": 401,
+          "error": "",
+          "meaning": "the presented bearer token does not match the installed one"
+        },
+        {
+          "code": 503,
+          "error": "",
+          "meaning": "no token is installed yet, so the control API is closed. Never 404: a client mapping 404 onto \"not found\" would report a phantom absent artifact."
+        },
+        {
+          "code": 413,
+          "error": "",
+          "meaning": "the request body exceeds limits.max_body_bytes, enforced on the wire"
+        },
+        {
+          "code": 507,
+          "error": "",
+          "meaning": "the target filesystem is under the configured disk reserve, and the body names the available and reserved byte counts. 507 rather than 500 because a 500 is indistinguishable from a daemon defect and a client retries it, which is right for a defect and actively harmful for a full disk; and rather than 413 because the write is not too large for the protocol, only for the space left."
+        },
+        {
+          "code": 500,
+          "error": "",
+          "meaning": "the parent could not be created, or the write or chmod failed"
+        }
+      ],
+      "summary": "write one file. Deliberately not confined to a root: the same token authorizes exec, so a root prefix would add no security while breaking harnesses that write to home directories and /etc."
+    },
+    {
+      "auth": "bearer",
+      "method": "GET",
+      "path": "/v1/fs/tar",
+      "query": {
+        "media_type": "application/x-www-form-urlencoded",
+        "schema": {
+          "$ref": "#/$defs/FsQuery"
+        }
+      },
+      "request": null,
+      "response": {
+        "media_type": "application/x-tar",
+        "note": "uncompressed, streamed from a spool file"
+      },
+      "statuses": [
+        {
+          "code": 200,
+          "error": "",
+          "meaning": "an uncompressed tar of the tree, streamed from a spool file. Symlinks are packed as symlinks, matching what extraction accepts."
+        },
+        {
+          "code": 400,
+          "error": "",
+          "meaning": "the path query parameter is missing, or it is not a directory — use /v1/fs/file for that"
+        },
+        {
+          "code": 401,
+          "error": "",
+          "meaning": "the presented bearer token does not match the installed one"
+        },
+        {
+          "code": 503,
+          "error": "",
+          "meaning": "no token is installed yet, so the control API is closed. Never 404: a client mapping 404 onto \"not found\" would report a phantom absent artifact."
+        },
+        {
+          "code": 404,
+          "error": "",
+          "meaning": "the directory is genuinely absent"
+        },
+        {
+          "code": 413,
+          "error": "",
+          "meaning": "the tree exceeds limits.max_tar_members or limits.max_tar_bytes, measured by a walk before anything is allocated"
+        },
+        {
+          "code": 500,
+          "error": "",
+          "meaning": "the tree could not be walked or packed"
+        }
+      ],
+      "summary": "download a tree as tar. Symlinks are packed as symlinks, which is the producing half of what extraction accepts."
+    },
+    {
+      "auth": "bearer",
+      "method": "PUT",
+      "path": "/v1/fs/tar",
+      "query": {
+        "media_type": "application/x-www-form-urlencoded",
+        "schema": {
+          "$ref": "#/$defs/FsQuery"
+        }
+      },
+      "request": {
+        "media_type": "application/x-tar",
+        "note": "uncompressed; spooled to an unlinked temp file, never buffered"
+      },
+      "response": null,
+      "statuses": [
+        {
+          "code": 204,
+          "error": "",
+          "meaning": "extracted under ?path="
+        },
+        {
+          "code": 400,
+          "error": "",
+          "meaning": "the path query parameter is missing or not absolute, the body was truncated, or a member violated the extraction contract — an escaping path, an absolute or out-of-tree link target, or a device or fifo member. The refused member's name is in the body."
+        },
+        {
+          "code": 401,
+          "error": "",
+          "meaning": "the presented bearer token does not match the installed one"
+        },
+        {
+          "code": 503,
+          "error": "",
+          "meaning": "no token is installed yet, so the control API is closed. Never 404: a client mapping 404 onto \"not found\" would report a phantom absent artifact."
+        },
+        {
+          "code": 413,
+          "error": "",
+          "meaning": "the archive exceeds limits.max_body_bytes on the wire, or limits.max_tar_members or limits.max_tar_bytes once decoded"
+        },
+        {
+          "code": 507,
+          "error": "",
+          "meaning": "the target filesystem is under the configured disk reserve, and the body names the available and reserved byte counts. 507 rather than 500 because a 500 is indistinguishable from a daemon defect and a client retries it, which is right for a defect and actively harmful for a full disk; and rather than 413 because the write is not too large for the protocol, only for the space left."
+        },
+        {
+          "code": 500,
+          "error": "",
+          "meaning": "extraction failed for a filesystem reason"
+        }
+      ],
+      "summary": "upload and extract a tar under ?path=, confined to that root — the one confined write path, because member paths come from the archive rather than from the caller. Mirrors the CPython tarfile `data` filter: in-tree symlinks preserved, absolute link targets refused, relative targets resolved lexically so a symlink written earlier in the same archive cannot redirect a later member."
+    },
+    {
+      "auth": "none",
+      "method": "GET",
+      "path": "/v1/health",
+      "request": null,
+      "response": {
+        "media_type": "application/json",
+        "schema": {
+          "$ref": "#/$defs/Health"
+        }
+      },
+      "statuses": [
+        {
+          "code": 200,
+          "error": "",
+          "meaning": "always, whether or not the daemon is bootstrapped. bootstrapped is how a client learns whether the control API is open yet."
+        }
+      ],
+      "summary": "liveness, daemon version, and whether bootstrap has completed"
+    },
+    {
+      "auth": "none",
+      "method": "GET",
+      "path": "/v1/schema",
+      "request": null,
+      "response": {
+        "media_type": "application/octet-stream",
+        "note": "this document"
+      },
+      "statuses": [
+        {
+          "code": 200,
+          "error": "",
+          "meaning": "this document. Unauthenticated by design: a client needs the contract before it has a token, and none of it is secret."
+        }
+      ],
+      "summary": "this document: every route, shape, status code, and operative limit"
+    }
+  ],
+  "title": "microvms-agentd wire protocol",
+  "unmatched_path": {
+    "code": 404,
+    "meaning": "no such route. Bearer routes are behind route_layer, so an unmatched path falls through to this rather than being answered 401 — a typo must not send a client chasing credentials."
+  },
+  "version_header": "microvms-agentd-version"
+}

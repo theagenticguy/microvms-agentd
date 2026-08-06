@@ -58,6 +58,7 @@ use axum::response::{IntoResponse, Response};
 use base64::Engine as _;
 use bytes::Bytes;
 use futures_util::Stream;
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::{ChildStdin, Command};
@@ -66,7 +67,12 @@ use tokio::sync::{Mutex, broadcast};
 use crate::state::AppState;
 
 /// Where an exec sits in its lifecycle. Mirrors `ExecPhase` in the model crate.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+///
+/// `JsonSchema` rides along with `Serialize` on every type from here down that
+/// crosses the wire. schemars reads the same `#[serde(...)]` attributes serde
+/// does, so the published schema describes what the daemon actually emits — the
+/// `rename_all` below is the reason this matters rather than a formality.
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Phase {
     /// Child spawned, still running (or its pipes still held by a grandchild).
@@ -78,7 +84,7 @@ pub enum Phase {
 }
 
 /// Captured output and exit status of a finished exec.
-#[derive(Clone, Debug, Default, Serialize)]
+#[derive(Clone, Debug, Default, JsonSchema, Serialize)]
 pub struct Outcome {
     /// Exit code, or `None` when the child died to a signal.
     pub exit_code: Option<i32>,
@@ -115,7 +121,7 @@ struct Terminal {
 
 /// Which pipe a streamed chunk came from. Both share one offset space, so a
 /// client holds one cursor rather than two that can disagree about ordering.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StreamKind {
     Stdout,
@@ -325,7 +331,7 @@ impl Shared {
 
 /// A start request. `command` is either an argv array or, with `shell: true`, a
 /// single script string.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct StartRequest {
     /// Caller-minted idempotency key. Harbor retries, and a retry must not
     /// produce a second child.
@@ -369,7 +375,7 @@ pub struct StartRequest {
 /// one request is the common case for feeding a prompt, and forcing two round
 /// trips would leave a window where the child has the bytes but not the EOF that
 /// tells it the input is complete.
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, JsonSchema)]
 pub struct StdinRequest {
     /// Base64 so arbitrary bytes survive JSON. A JSON string cannot carry
     /// non-UTF-8, and stdin is bytes.
@@ -381,15 +387,20 @@ pub struct StdinRequest {
     pub signal: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
-struct StdinResponse {
+/// `POST /v1/exec/{id}/stdin` response.
+///
+/// `pub` rather than private, like every other type in this module the schema
+/// route publishes: the generator names them by type, so a response shape that
+/// stays private is a shape a consumer cannot be told about.
+#[derive(Debug, JsonSchema, Serialize)]
+pub struct StdinResponse {
     exec_id: String,
     written: usize,
     eof: bool,
 }
 
 /// `GET /v1/exec/{id}/stream` query.
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, JsonSchema)]
 pub struct StreamQuery {
     /// Byte offset to resume from. Absent means 0, i.e. everything still in the
     /// replay window.
@@ -398,16 +409,16 @@ pub struct StreamQuery {
 }
 
 /// One `output` SSE event.
-#[derive(Debug, Serialize)]
-struct OutputEvent {
+#[derive(Debug, JsonSchema, Serialize)]
+pub struct OutputEvent {
     offset: u64,
     stream: StreamKind,
     output: String,
 }
 
 /// One `gap` SSE event: the byte range a lagging or late subscriber lost.
-#[derive(Debug, Serialize)]
-struct GapEvent {
+#[derive(Debug, JsonSchema, Serialize)]
+pub struct GapEvent {
     from: u64,
     to: u64,
 }
@@ -415,8 +426,8 @@ struct GapEvent {
 /// The terminal `exit` SSE event. Emitted before the stream ends, so a client
 /// that sees the body close without one knows the connection failed rather than
 /// the command finishing.
-#[derive(Debug, Serialize)]
-struct ExitEvent {
+#[derive(Debug, JsonSchema, Serialize)]
+pub struct ExitEvent {
     exit_code: Option<i32>,
     signal: Option<i32>,
     truncated: bool,
@@ -425,14 +436,29 @@ struct ExitEvent {
     offset: u64,
 }
 
-#[derive(Debug, Serialize)]
-struct StartResponse {
+#[derive(Debug, JsonSchema, Serialize)]
+pub struct StartResponse {
     exec_id: String,
     phase: Phase,
 }
 
-#[derive(Debug, Serialize)]
-struct PollResponse {
+/// `POST /v1/exec/{id}/kill` response.
+///
+/// A named type rather than the `serde_json::json!` literal this used to be: an
+/// ad-hoc `Value` has no schema to derive, so the one route whose body a client
+/// most needs to branch on — `killed` distinguishes "signalled" from "the group
+/// was already gone", and both are 200 — would have been the one route the
+/// published document could not describe.
+#[derive(Debug, JsonSchema, Serialize)]
+pub struct KillResponse {
+    exec_id: String,
+    /// Whether a signal was actually delivered. `false` with a 200 means the
+    /// process group had already exited, which is the outcome a kill wanted.
+    killed: bool,
+}
+
+#[derive(Debug, JsonSchema, Serialize)]
+pub struct PollResponse {
     exec_id: String,
     phase: Phase,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -440,8 +466,14 @@ struct PollResponse {
     result: Option<Outcome>,
 }
 
-#[derive(Debug, Serialize)]
-struct ErrorBody {
+/// The JSON error body every failing control route returns.
+///
+/// `error` is a stable machine-readable slug and `detail` is prose for a human
+/// reading a log. A client branches on `error` and the status code, never on
+/// `detail` — which is why the slug is a `&'static str` chosen at each call site
+/// rather than a formatted string.
+#[derive(Debug, JsonSchema, Serialize)]
+pub struct ErrorBody {
     error: &'static str,
     detail: String,
 }
@@ -1034,7 +1066,10 @@ pub async fn kill(State(state): State<AppState>, Path(id): Path<String>) -> Resp
         // reaped. Nothing to signal, and saying so is more useful than a 500.
         return (
             StatusCode::OK,
-            Json(serde_json::json!({ "exec_id": id, "killed": false })),
+            Json(KillResponse {
+                exec_id: id,
+                killed: false,
+            }),
         )
             .into_response();
     };
@@ -1045,7 +1080,10 @@ pub async fn kill(State(state): State<AppState>, Path(id): Path<String>) -> Resp
     tracing::info!(exec_id = %id, pgid, signaled, "kill requested");
     (
         StatusCode::OK,
-        Json(serde_json::json!({ "exec_id": id, "killed": signaled })),
+        Json(KillResponse {
+            exec_id: id,
+            killed: signaled,
+        }),
     )
         .into_response()
 }
@@ -2731,15 +2769,32 @@ mod tests {
         }
         assert!(ready, "the child never closed its stdin");
 
-        // The first write may land in the kernel buffer of a pipe with no reader;
-        // it is the write *after* the RST that reports EPIPE. Either one answering
-        // 410 is the property, so retry a bounded number of times.
+        // Fill past the pipe's capacity rather than writing a token payload a
+        // bounded number of times.
+        //
+        // Why this matters, measured: with a 7-byte payload the write can succeed
+        // indefinitely, because the bytes fit the kernel's 64 KiB pipe buffer and
+        // EPIPE is only raised once a write must block on a reader that is gone.
+        // The count needed to overflow that buffer is not a property of this
+        // daemon — under a parallel suite another test's `fork` transiently
+        // duplicates every open descriptor, including this pipe's read end, so the
+        // pipe genuinely still has a reader for that window and the write is
+        // genuinely fine. The old loop asserted on that race and failed roughly
+        // one run in eight, single-threaded never.
+        //
+        // A payload larger than the buffer removes the race: the write cannot be
+        // absorbed, so it must either block on a reader or report that none
+        // exists, whatever else the machine is doing.
+        let overflow = "x".repeat(256 * 1024);
         let mut status = None;
-        for _ in 0..20 {
+        for _ in 0..8 {
             let response = write_stdin(
                 State(state.clone()),
                 Path("stdin-closed-by-child".to_string()),
-                Ok(Json(stdin_body(Some("payload"), None))),
+                // Well under `max_stdin_write_bytes` (1 MiB) so a 413 cannot be
+                // mistaken for the 410 under test, and well over the 64 KiB pipe
+                // buffer so the write cannot be quietly absorbed.
+                Ok(Json(stdin_body(Some(&overflow), None))),
             )
             .await;
             status = Some(response.status());

@@ -23,7 +23,7 @@ the fork everyone is racing toward cannot be built above the hypervisor.**
 
 Three facts, in descending order of how much they should change what you build.
 
-**The trust boundary is unowned and consequential.** We measured (2026-08-05,
+**The trust boundary is unowned and consequential.** We measured (2026-08-04,
 us-east-1) that the platform's own lifecycle hook arrives from `127.0.0.1`,
 indistinguishable at the socket level from any process inside the VM. Source-address
 filtering is therefore not merely weak, it is wrong — it rejects the platform's own

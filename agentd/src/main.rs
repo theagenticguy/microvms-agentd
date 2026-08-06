@@ -7,7 +7,7 @@
 use std::net::{Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
-use agentd::{AppState, Config, exec, routes, serve};
+use agentd::{AppState, Config, disk, exec, identity, routes, serve};
 use tokio::net::TcpListener;
 
 fn main() -> std::io::Result<()> {
@@ -30,7 +30,27 @@ fn main() -> std::io::Result<()> {
 
 async fn run(config: Config) -> std::io::Result<()> {
     let port = config.port;
-    let state = AppState::new(config);
+
+    // Identity repair runs before the listener is bound, so no request can observe
+    // the image's shared machine-id even briefly. It is safe to do here and nowhere
+    // later precisely because the daemon is the container `CMD`: nothing in the VM
+    // has read these values yet. A workload started first would already hold its own
+    // copy, and no amount of rewriting would recall it.
+    //
+    // Every failure inside is logged and swallowed. Refusing to serve because a bind
+    // mount was denied would strand a VM with no way in — see `identity`.
+    let identity = if config.repair_identity {
+        identity::repair(&identity::Layout::default(), &identity::Host)
+    } else {
+        tracing::info!(
+            "identity repair disabled by configuration; this VM keeps the image's \
+             machine-id, hostname, and boot_id, which are shared with every other VM \
+             derived from the same snapshot"
+        );
+        identity::Report::skipped()
+    };
+
+    let state = AppState::with_probe(config, disk::available_bytes, identity);
 
     // Collection of acked exec entries runs on its own interval rather than
     // inside a request handler, so a slow collection cannot delay a response and

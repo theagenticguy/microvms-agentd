@@ -59,6 +59,22 @@ pub struct Config {
     /// write blocks forever; without this bound one wedged child pins a request
     /// (and a connection) for the life of the VM.
     pub stdin_write_timeout: Duration,
+    /// Bytes that must stay free on a write target's filesystem. A write that
+    /// would cross this is refused with 507 naming the actual free space, rather
+    /// than proceeding into an ENOSPC that surfaces as an indistinguishable 500.
+    ///
+    /// Zero disables the guard, for a deployment that would rather hit ENOSPC than
+    /// be refused.
+    pub disk_reserve_bytes: u64,
+    /// Whether to replace image-derived identity (`/etc/machine-id`, hostname,
+    /// `boot_id`, systemd's random seed) at startup.
+    ///
+    /// On by default because N VMs restored from one snapshot share every one of
+    /// those values, and a key generated in one can repeat a key generated in
+    /// another. Off is a supported choice, not a mistake: a fleet keyed by machine
+    /// id, or a VM deliberately re-created from a snapshot, wants the identity to
+    /// be stable.
+    pub repair_identity: bool,
 }
 
 impl Default for Config {
@@ -78,6 +94,15 @@ impl Default for Config {
             sse_keepalive: Duration::from_secs(15),
             max_stdin_write_bytes: 1024 * 1024,
             stdin_write_timeout: Duration::from_secs(5),
+            // 256 MiB. Chosen to be larger than the default `max_body_bytes` is
+            // *not* possible — the body limit is 512 MiB — so the in-flight
+            // re-check in `disk::copy_guarded` is what actually holds the line; the
+            // reserve is the headroom that absorbs its 8 MiB probe granularity and
+            // leaves room for the other writers in the VM to report their own
+            // errors. anthropics/claude-code#59856 filled a 10 GB disk to 100% and
+            // the first symptom was `useradd` failing, not the workload.
+            disk_reserve_bytes: 256 * 1024 * 1024,
+            repair_identity: true,
         }
     }
 }
@@ -116,7 +141,30 @@ impl Config {
         if let Some(bytes) = env_parse("AGENTD_MAX_STDIN_WRITE_BYTES") {
             cfg.max_stdin_write_bytes = bytes;
         }
+        if let Some(bytes) = env_parse("AGENTD_DISK_RESERVE_BYTES") {
+            cfg.disk_reserve_bytes = bytes;
+        }
+        if let Some(flag) = env_flag("AGENTD_REPAIR_IDENTITY") {
+            cfg.repair_identity = flag;
+        }
         cfg
+    }
+}
+
+/// Parses a boolean knob, accepting the spellings a Dockerfile or a Terraform
+/// template actually produces. `bool::from_str` takes only `true`/`false`, so
+/// `AGENTD_REPAIR_IDENTITY=0` would otherwise be ignored with a warning — and a
+/// deployment that believes it opted out but did not is worse than one that never
+/// tried.
+fn env_flag(key: &str) -> Option<bool> {
+    let raw = std::env::var(key).ok()?;
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => {
+            tracing::warn!(key, raw, "ignoring unparseable configuration flag");
+            None
+        }
     }
 }
 

@@ -10,7 +10,13 @@ description = "Exec and file-transfer daemon for AWS Lambda MicroVMs"
 axum = "0.8.9"
 # tower-http 0.7 is a breaking line; axum 0.8.9 pins ^0.6.8 internally, so we
 # stay on 0.6 to keep one version of the middleware types in the tree.
-tower-http = { version = "0.6", features = ["limit"] }
+# `catch-panic` turns a panicking handler into a 500 instead of a dropped
+# connection. It is load-bearing rather than cosmetic here: the daemon is the only
+# channel into the VM, so a panic that kills a connection and poisons a lock makes
+# the VM unreachable for good. See the `panic` setting in the workspace release
+# profile — `panic = "abort"` would make this layer unreachable, which is why the
+# profile overrides it back to `unwind`.
+tower-http = { version = "0.6", features = ["limit", "catch-panic"] }
 tokio = { version = "1.53", features = [
     "rt",
     "macros",
@@ -30,7 +36,12 @@ serde_json = "1"
 # let one archive parse differently across extractors.
 tar = "0.4.46"
 subtle = "2.6"
-nix = { version = "0.31", features = ["signal"] }
+# Features, each earning its place: `signal` for the exec kill path, `fs` for
+# `statvfs` (the disk-pressure guard), `mount` for the `MS_BIND` that shadows the
+# read-only procfs `boot_id`, and `hostname` for `sethostname`. Pinned to the 0.31
+# line, which is what is already locked; nix is pre-1.0 and every minor is a
+# breaking change, so a caret on 0.31 is the widest safe range.
+nix = { version = "0.31", features = ["signal", "fs", "mount", "hostname"] }
 tempfile = "3"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
@@ -41,6 +52,16 @@ tokio-util = { version = "0.7", features = ["io"] }
 # 0.23 line, the current one; the `Engine` trait replaced the old free functions in
 # 0.21, so `encode`/`decode` are called through `general_purpose::STANDARD`.
 base64 = "0.23"
+# The wire schema is *derived* from the same serde types the daemon serializes,
+# because a hand-written spec drifts from the code and a generated one cannot.
+# Pinned to 1.2.2, the current release: the 1.x line replaced `RootSchema` and
+# `SchemaObject` with one `Schema` newtype over `serde_json::Value` and renamed
+# `SchemaGenerator`, so 0.8 examples do not compile against it. `derive` and `std`
+# only — every optional feature is an integration with a crate we do not use, and
+# `preserve_order` in particular must stay off: it swaps `serde_json`'s sorted
+# `BTreeMap` for insertion order, and the committed artifact is compared byte for
+# byte, so key order has to be a function of the types rather than of derive order.
+schemars = { version = "1.2.2", default-features = false, features = ["derive", "std"] }
 
 [dev-dependencies]
 proptest = "1.11"

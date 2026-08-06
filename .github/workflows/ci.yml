@@ -20,10 +20,22 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all -- --check
       - run: cargo clippy --all-targets -- -D warnings
-      # One command covers all four tiers: the daemon's unit tests, the
+      # One command covers all five tiers: the daemon's unit tests, the
       # stateright model over every reachable state, the proptest tar-confinement
-      # properties, and the turmoil transport-fault simulation.
+      # properties, the turmoil transport-fault simulation, and the schema
+      # artifact's staleness and route-coverage checks.
       - run: cargo test --all
+      # Belt to the test suite's braces, and not redundant: this runs the real
+      # generator against the real path and fails with the regenerate command in
+      # the log, so a contributor whose PR turns the artifact stale is told how to
+      # fix it rather than reading an assertion diff of a 40 KB JSON file.
+      #
+      # A stale committed schema is the failure mode that makes a generated
+      # artifact worse than no artifact at all: consumers trust it precisely
+      # because it is generated, and nothing about a diff reveals that a document
+      # was left describing a protocol nobody serves.
+      - name: schema artifact is not stale
+        run: cargo run -p agentd --bin schema -- --check
 
   build:
     name: static aarch64 binary
@@ -45,14 +57,29 @@ jobs:
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: aarch64-linux-gnu-gcc
         run: cargo build --release -p agentd --target aarch64-unknown-linux-musl
+      # The build is a gate, not a release step. v0.1.0 ships source only, so
+      # nothing here publishes an artifact: a downloadable binary is a promise
+      # about provenance and signing that this project has not yet made. What the
+      # job proves is that the shipping target still cross-compiles and still
+      # links statically, which is what breaks silently when a dependency
+      # acquires a C shim.
       - name: report size and linkage
         run: |
           ls -l target/aarch64-unknown-linux-musl/release/agentd
           file target/aarch64-unknown-linux-musl/release/agentd
-      - uses: actions/upload-artifact@v4
-        with:
-          name: agentd-aarch64-musl
-          path: target/aarch64-unknown-linux-musl/release/agentd
+
+  python:
+    name: client library
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      # The client's tests run against a fake daemon over a real loopback socket,
+      # so they need no AWS credentials and no built binary. That is deliberate:
+      # a client test suite that required either would not run here at all.
+      - run: uv run --with pytest --with httpx --with boto3 pytest clients/python -q
+      - run: uvx ruff check clients/python conformance
+      - run: uvx ruff format --check clients/python
 
   spec:
     name: requirements verification
