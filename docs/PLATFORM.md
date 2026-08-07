@@ -115,23 +115,88 @@ This was found by a live run after the unit tests passed, because those tests
 inject a fake layout and a fake platform. It is the clearest case in this project
 of a guard that was verified in every tier except the one that mattered.
 
-## `minimumMemoryInMiB` is a floor, not a size — and it is generous
+## `minimumMemoryInMiB` selects a *baseline*, and the guest reports the *peak*
 
 Measured 2026-08-07, us-east-1, `al2023-1`. Requesting
 `resources=[{"minimumMemoryInMiB": 512}]` produced a guest reporting
-`MemTotal: 2037648 kB` — roughly 2 GB, four times the request. Requesting 2048
-produced `MemTotal: 8209056 kB`, roughly 8 GB. The field name says it: the API
-member is `minimumMemoryInMiB`, documented as "the minimum amount of memory in MiB
-to allocate", so the platform rounds up to whatever baseline class fits.
+`MemTotal: 2037648 kB` (~2 GB). Requesting 2048 produced `MemTotal: 8209056 kB`
+(~8 GB).
 
-Two consequences. A caller cannot use this field to *constrain* a VM, so any test
-of memory-pressure behavior must generate pressure relative to what the guest
-actually reports rather than to what was requested. And a caller sizing for cost
-should not assume they are billed for the request: check `MemTotal` in the guest,
-or the size class in the console, before reasoning about spend.
+Both match AWS's documented sizing table exactly (`microvms-images.html`), which
+pairs each baseline with a peak ceiling four times its size:
 
-Guest swap is absent (`SwapTotal: 0 kB`), so pressure goes straight to the OOM
-killer with no paging phase.
+| Baseline (billed while running) | Peak (burst ceiling) |
+| --- | --- |
+| 0.5 GB / 0.25 vCPU | 2 GB / 1 vCPU |
+| 1 GB / 0.5 vCPU | 4 GB / 2 vCPU |
+| 2 GB / 1 vCPU (default) | 8 GB / 4 vCPU |
+| 4 GB / 2 vCPU | 16 GB / 8 vCPU |
+| 8 GB / 4 vCPU | 32 GB / 16 vCPU |
+
+So `minimumMemoryInMiB` chooses a size class, and the number the guest reports in
+`/proc/meminfo` is that class's **peak**, not its baseline. That the guest reports
+the peak specifically is our inference from two matching measurements; AWS
+documents the table but not the `MemTotal` mapping.
+
+**Billing follows the baseline you requested, not the peak the guest reports.**
+AWS: "You pay the baseline rate while your MicroVM is running and only pay for what
+you actively use above the baseline, billed per second." An earlier version of this
+section said a caller "should not assume they are billed for the request", which was
+exactly backwards — the request is what you are billed for, and the extra memory is
+burst headroom charged only for the seconds it is actually consumed. Corrected
+2026-08-07 after reading the pricing page rather than inferring from the size.
+
+Consequences for a caller. You cannot use this field to *constrain* a VM, so a
+memory-pressure test must generate pressure against what the guest reports rather
+than what was requested. Guest swap is absent (`SwapTotal: 0 kB`), so pressure goes
+straight to the OOM killer with no paging phase. And picking a small baseline is a
+real cost lever rather than a cosmetic one, since baseline is the rate you pay for
+every running second.
+
+## What actually costs money
+
+Documented 2026-08-07 from the Lambda pricing page and the MicroVMs developer
+guide. Rates are us-east-1. MicroVMs has no standalone pricing page: the rates
+appear only inside worked examples on the Lambda pricing page, which is why they are
+easy to miss.
+
+| Line item | Rate |
+| --- | --- |
+| vCPU | $0.0000276944 per vCPU-second |
+| Memory | $0.0000036667 per GB-second |
+| Snapshot storage | $0.08 per GB-month, **1-week minimum retention** |
+| Snapshot read (launch or resume) | $0.00155 per GB |
+| Snapshot write (suspend) | $0.0038 per GB |
+| Data transfer | standard AWS rates, including MicroVM to your own VPC |
+
+vCPU and memory bill as two separate line items rather than one blended
+GB-second, and there is no per-request charge — instances bill per second. No
+MicroVMs free tier is published; the Lambda free tier is Functions-only. No
+minimum billing increment is published.
+
+Three things worth knowing before running a create-and-destroy test suite like this
+repo's:
+
+**Image storage has a one-week minimum.** A 2 GB image deleted sixty seconds after
+creation still bills about a week of storage, roughly four cents. Our conformance
+suite builds a fresh image per run, so "it costs pennies" is right per run but the
+floor is the image rather than the compute.
+
+**Idle time while RUNNING is billed at baseline.** This differs from AgentCore
+Runtime, which charges no CPU during I/O wait. On raw MicroVMs, wall-clock time in
+`RUNNING` costs baseline whether or not anything is executing, so suspension is the
+only way to stop paying.
+
+**Suspension is the cheap state, and churn is the cost.** A suspended 2 GB VM pays
+only snapshot storage, about $0.16 a month, against roughly $100 a month to leave
+the same VM running at baseline — a difference of two orders of magnitude, which is
+what makes a warm suspended pool viable. But each cycle pays a write plus a read,
+about $0.011 for a 2 GB VM, so the thing to avoid is suspending and resuming
+constantly rather than suspending for a long time.
+
+**Not published:** whether the server-side image build is billed as compute. The
+build starts a real MicroVM to run the Dockerfile, so it plausibly is, but AWS does
+not say and we have not measured it. Do not assume either way.
 
 ## Seeing an OOM: the process case works, the VM case is still unmeasured
 
