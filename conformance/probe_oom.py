@@ -273,8 +273,8 @@ def probe_one_vm(box: Sandbox, mv: Any, mib: int, *, parallel: bool) -> dict[str
             memory_mib=mib,
             hooks=default_hooks(AGENT_PORT, HOOK_TIMEOUT_SEC),
             tags={"agentd:purpose": "oom-probe"},
-            os_capabilities=["ALL"],
-            client_token=f"create-{image_name}-{run_id}",
+            repair_guest_identity=True,
+            token_scope=f"{image_name}-{run_id}",
         )
         print("  image CREATED")
 
@@ -285,7 +285,7 @@ def probe_one_vm(box: Sandbox, mv: Any, mib: int, *, parallel: bool) -> dict[str
             suspended_sec=900,
             auto_resume=False,
             max_duration_sec=1800,
-            client_token=f"run-{image_name}-{run_id}",
+            token_scope=f"{image_name}-{run_id}",
         )
         print(f"  microvm RUNNING ({box.microvm_id})")
 

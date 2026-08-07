@@ -678,14 +678,17 @@ def main() -> int:
             # Identity repair needs CAP_SYS_ADMIN for `sethostname` and for the bind
             # mount over `boot_id`. Without it those two steps fail with EPERM even
             # though the daemon runs as root, and the run reports
-            # identity_degraded. Measured 2026-08-06, us-east-1.
-            os_capabilities=["ALL"],
+            # identity_degraded. Measured 2026-08-06, us-east-1. The flag states the
+            # intent; the client maps it to the one value the API accepts, because
+            # "ALL" is the only one and a list would invite ["CAP_SYS_ADMIN"].
+            repair_guest_identity=True,
             build_timeout_sec=IMAGE_BUILD_TIMEOUT_SEC,
-            # Scoped to this run, never a pure function of the artifact's content. A
-            # content-derived token is a permanent idempotency key: delete the image
-            # and rebuild the same bytes, and the service replays the original
-            # create as a no-op, wedging an image that then cannot be deleted at all.
-            client_token=f"create-{image_name}-{run_id}",
+            # A label folded in next to the client's own per-attempt nonce, not the
+            # token itself. The client accepts no token, because a content- or
+            # name-derived one is a permanent idempotency key: delete the image and
+            # rebuild the same bytes and the service replays the original create as a
+            # no-op, wedging an image that then cannot be deleted at all.
+            token_scope=f"{image_name}-{run_id}",
         )
         print(f"  image {image.identifier} CREATED")
 
@@ -699,7 +702,7 @@ def main() -> int:
             suspended_sec=600,
             auto_resume=False,
             max_duration_sec=3600,
-            client_token=f"run-{image_name}-{run_id}",
+            token_scope=f"{image_name}-{run_id}",
         )
         print(f"  microvm {box.microvm_id} RUNNING endpoint={session.endpoint}")
 

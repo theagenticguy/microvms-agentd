@@ -38,8 +38,18 @@ import boto3
 REGION = os.environ.get("AWS_REGION", "us-east-1")
 # Everything this project creates carries one of these markers. Anything else in
 # the account is somebody else's and must not be touched.
-NAME_PREFIXES = ("agentd-conformance", "agentd-probe")
-LOG_GROUP_PREFIX = "/aws/lambda-microvms/agentd-"
+# Every prefix anything in this repo can create. Keeping this list complete is the
+# whole correctness condition: a missing prefix makes the checker report "clean"
+# while a resource bills, which is worse than having no checker at all — it
+# converts an unknown into a false assurance. The `microvm-cli` entry was added
+# after exactly that happened: a CLI run leaked a log group and this script said
+# the account was clean, because it only knew the two names the conformance
+# scripts used.
+NAME_PREFIXES = ("agentd-conformance", "agentd-probe", "microvm-cli", "microvm-")
+LOG_GROUP_PREFIXES = (
+    "/aws/lambda-microvms/agentd-",
+    "/aws/lambda-microvms/microvm-",
+)
 
 
 def ours(name: str | None) -> bool:
@@ -100,8 +110,12 @@ def main() -> int:
                 standing.append(f"iam role {role['RoleName']}")
 
     # The one Terraform cannot see, and therefore the one most likely to survive.
-    groups = logs.describe_log_groups(logGroupNamePrefix=LOG_GROUP_PREFIX)
-    for group in groups.get("logGroups", []):
+    log_groups: list[dict[str, Any]] = []
+    for prefix in LOG_GROUP_PREFIXES:
+        log_groups.extend(
+            logs.describe_log_groups(logGroupNamePrefix=prefix).get("logGroups", [])
+        )
+    for group in log_groups:
         leaks.append(f"log group {group['logGroupName']}")
 
     for note in pending:
@@ -122,7 +136,7 @@ def main() -> int:
         return 1
 
     print("\ndeleting")
-    for group in groups.get("logGroups", []):
+    for group in log_groups:
         _try(logs.delete_log_group, logGroupName=group["logGroupName"])
     for image in mv.list_microvm_images().get("items", []):
         if ours(image.get("name")) and image.get("state") != "DELETING":

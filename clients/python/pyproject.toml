@@ -18,6 +18,12 @@ dependencies = [
     # that fails at first call on a missing extra is worse than one that installs
     # 15 MB nobody asked for.
     "boto3>=1.40",
+    # The `microvm` CLI's parser. Chosen over Typer/Click because it derives the
+    # option name, type, closed choice set, default, and help text from the type
+    # hints and the docstring with no decorators — which is what makes `microvm
+    # manifest` a *derived* artifact rather than a hand-kept copy that drifts the
+    # first time someone adds a flag. Pinned `<5` because 5.x is alpha.
+    "cyclopts>=4.20,<5",
 ]
 classifiers = [
     "Programming Language :: Python :: 3.11",
@@ -28,6 +34,12 @@ classifiers = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0", "ruff>=0.6"]
+
+[project.scripts]
+# A fixed name on PATH, so `command -v microvm` answers from anywhere and an agent
+# never has to guess a path. `main` returns an exit code from the documented table
+# rather than letting an exception pick one.
+microvm = "microvms_agentd.cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/microvms_agentd"]
