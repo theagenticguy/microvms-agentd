@@ -115,6 +115,66 @@ This was found by a live run after the unit tests passed, because those tests
 inject a fake layout and a fake platform. It is the clearest case in this project
 of a guard that was verified in every tier except the one that mattered.
 
+## `minimumMemoryInMiB` is a floor, not a size — and it is generous
+
+Measured 2026-08-07, us-east-1, `al2023-1`. Requesting
+`resources=[{"minimumMemoryInMiB": 512}]` produced a guest reporting
+`MemTotal: 2037648 kB` — roughly 2 GB, four times the request. Requesting 2048
+produced `MemTotal: 8209056 kB`, roughly 8 GB. The field name says it: the API
+member is `minimumMemoryInMiB`, documented as "the minimum amount of memory in MiB
+to allocate", so the platform rounds up to whatever baseline class fits.
+
+Two consequences. A caller cannot use this field to *constrain* a VM, so any test
+of memory-pressure behavior must generate pressure relative to what the guest
+actually reports rather than to what was requested. And a caller sizing for cost
+should not assume they are billed for the request: check `MemTotal` in the guest,
+or the size class in the console, before reasoning about spend.
+
+Guest swap is absent (`SwapTotal: 0 kB`), so pressure goes straight to the OOM
+killer with no paging phase.
+
+## Seeing an OOM: the process case works, the VM case is still unmeasured
+
+Measured 2026-08-07, us-east-1, via `conformance/probe_oom.py`. The customer
+question is "is there a `dmesg`?" and it splits in two.
+
+**A process killed inside a living VM should be visible twice over, and the
+plumbing for it is confirmed present.** What was actually measured: `dmesg` runs in
+the guest and is readable with no extra privileges (it returned successfully, empty,
+because no OOM occurred), and `/sys/fs/cgroup/memory.events` exists and exposes
+`oom`, `oom_kill`, and `oom_group_kill` counters — all reading 0 on an unpressured
+VM. Those counters are the right thing for a supervisor to poll rather than
+discovering a kill after the fact.
+
+The daemon reports a killing signal on the exec result, so a caller would see
+SIGKILL rather than an exit code; that path is covered by unit tests but has not
+been exercised by a real OOM. Treat "you will see signal 9 and a dmesg line" as
+sound reasoning from confirmed plumbing rather than as an observation.
+
+**Whether a guest-wide OOM populates `stateReason` remains unmeasured, because we
+could not make one happen.** Two attempts failed for reasons worth recording rather
+than hiding:
+
+1. The first probe allocated with `python3`, which the `amazonlinux:2023-minimal`
+   base image does not have. It reported `command not found` with exit code 127 and
+   every downstream check passed — the probe measured nothing while looking like a
+   clean result. This is the failure mode this project keeps hitting: a green run
+   that never exercised the thing.
+2. The second allocated with `dd` into `/dev/shm`, which is tmpfs and therefore
+   capped near half of RAM. `dd` stopped at 64 MiB against a 1 GiB request and
+   exited 0, so again no memory pressure. tmpfs limits are a filesystem ceiling,
+   not a memory one.
+
+So `stateReason` was `null` and the state `RUNNING` throughout, which says only
+that we never applied real pressure. A future probe needs an allocator that touches
+anonymous memory the kernel must back and cannot silently cap — a small static
+binary shipped in the image is the obvious answer, since the guest has no
+interpreter and no compiler.
+
+What the runs *did* establish: the daemon survived 64 MiB of output under
+concurrent allocation with `truncated: true` on the result, so the output cap holds
+under pressure, and `/v1/health` stayed reachable and bootstrapped throughout.
+
 ## Suspend/resume is a freeze and restore, not a stop and start
 
 Measured 2026-08-05, us-east-1, `al2023-1` base, 1024 MiB baseline, via
