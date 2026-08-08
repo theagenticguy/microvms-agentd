@@ -4,8 +4,109 @@ version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "the MicroVMs control-plane library, populated by T-W2-2"
+description = "The MicroVMs control-plane and in-VM client: every trap closure, the cost engine, the sizing model"
 
-# Deliberately dependency-free. The crate exists so the workspace member list is
-# written once; T-W2-2 adds what it needs.
+# The complete dependency set, written once.
+#
+# Four lanes fill this crate in parallel (foundation, cost, control plane, session)
+# and every one of them would otherwise add a line here. A manifest three branches
+# edit is three conflicts on a file where a conflict is resolved by guessing which
+# version pin was intended, so the pins land up front and the later lanes add only
+# source files. That means some entries below are unused until their lane lands,
+# which is deliberate and visible: `cargo build` says nothing about an unused
+# dependency, so the cost of pinning early is zero and the cost of pinning late is
+# paid on merge.
+#
+# Every version is what the registry offered on 2026-08-08, checked with
+# `cargo info` rather than transcribed from a plan.
 [dependencies]
+# The error taxonomy's Display impls. 2.x rather than 1.x: `#[error]` on an enum
+# with `#[from]` is the same surface, and the 2.0 line is what receives fixes.
+thiserror = "2.0.19"
+# `constants::as_json` is the drift gate's second source (TRAP-12), so serde is a
+# runtime dependency of this crate rather than a test convenience: the CLI dumps
+# that value and `scripts/check-model-drift` compares it against the pinned
+# service model.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# ── the cost engine (T-W2-3) ────────────────────────────────────────────────
+# Money is decimal or it is wrong (COST-6): the ARM rates are figures like
+# 0.0000276944 and summing a few thousand of them in binary floating point drifts
+# in the direction of a bill nobody can reproduce. `serde-with-str` is what keeps
+# a Decimal in the JSON envelope as `"0.0000276944"` rather than as an f64 that
+# has already lost the exactness the type exists to hold.
+rust_decimal = { version = "1.42", features = ["serde-with-str"] }
+rust_decimal_macros = "1.40"
+
+# ── the control plane (T-W2-4) ──────────────────────────────────────────────
+# Hand-signed rather than a generated SDK: `lambda-microvms` has no aws-sdk-rust
+# crate, so the choice is between vendoring smithy codegen and signing 24
+# rest-json operations by hand. `default-features = false` on aws-config drops
+# `default-https-client` — the HTTP client here is reqwest, and pulling smithy's
+# hyper stack in alongside it would put two TLS stacks in one binary that ships to
+# a MicroVM. `rt-tokio` and `credentials-process`/`sso` stay because the whole
+# reason to depend on aws-config at all is the credential chain a developer
+# actually has: SSO, a credential process, IMDS.
+aws-config = { version = "1.10", default-features = false, features = [
+    "rt-tokio",
+    "credentials-process",
+    "sso",
+] }
+aws-credential-types = "1.3"
+# Default features are `sign-http` + `http1`, which is the http-1.x path:
+# `apply_to_request_http1x` mutates an `http::Request` that reqwest 0.13 consumes
+# through `TryFrom`. Anything else means converting between two http versions on
+# every call.
+aws-sigv4 = "1.5"
+# `rustls` rather than `default-tls`: the daemon ships to an aarch64 musl target
+# and a native-tls build there needs an OpenSSL the image does not carry. `json`
+# off deliberately — the control plane's rest-json bodies go through serde_json
+# directly so the error path can read a raw body, which is the only way to see an
+# AccessDeniedException whose message field is null (TRAP-6).
+reqwest = { version = "0.13", default-features = false, features = [
+    "rustls",
+    "http2",
+    "charset",
+    "stream",
+] }
+http = "1.5"
+# Retry with jitter for throttles and 5xx. aws-smithy-runtime has the same thing
+# behind its `client` feature, but taking it would mean taking the smithy client
+# that `default-features = false` above just declined.
+backon = { version = "1.6", features = ["tokio-sleep"] }
+# The image build takes a zip of the daemon binary plus a Dockerfile
+# (sandbox.py:523 `build_artifact`). Pinned to the 8.x line: 9.0 exists only as
+# `9.0.0-pre2`, and a pre-release in a shipping manifest is a version that can
+# change under you. Only `deflate` — the artifact is one binary and one text file,
+# so aes/bzip2/lzma/ppmd/xz/zstd are compressors this crate will never select and
+# C libraries it would otherwise have to build for the musl target.
+zip = { version = "8.6", default-features = false, features = ["deflate"] }
+
+# ── the in-VM session (T-W2-5) ──────────────────────────────────────────────
+# Same pin as the daemon carries. `time` for the poll and deadline paths, `sync`
+# for the proxy-token refresh, `io-util` for the SSE reader; no `rt-multi-thread`,
+# because a library does not choose the caller's runtime.
+tokio = { version = "1.53", features = ["time", "sync", "io-util", "macros"] }
+futures-util = "0.3"
+# Exec output and stdin are arbitrary bytes and a JSON string cannot hold
+# arbitrary bytes, so both sides of the wire carry base64. 0.23 to match agentd:
+# one version in the tree means the client and the daemon cannot disagree about
+# padding or alphabet.
+base64 = "0.23"
+
+[dev-dependencies]
+# The size-class and region guards are table-shaped, which is exactly where a
+# hand-picked example set passes over the gap it was written to find.
+proptest = "1.11"
+# Deterministic network simulation for the reconnect-at-cursor tests, mirroring
+# the daemon's dev-dependencies so both sides of the protocol are exercised under
+# the same simulated clock.
+turmoil = "0.7.2"
+hyper = { version = "1.11", features = ["client", "server", "http1"] }
+hyper-util = { version = "0.1", features = [
+    "client",
+    "client-legacy",
+    "server",
+    "tokio",
+] }
