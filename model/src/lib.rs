@@ -32,6 +32,8 @@
 //! The second half is what prose could not deliver: it prices the invariant
 //! instead of asserting that the invariant is fine.
 
+pub mod client;
+
 use stateright::{Model, Property};
 
 /// Who is sending a request. The daemon cannot tell these apart from the socket;
