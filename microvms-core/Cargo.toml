@@ -48,13 +48,15 @@ rust_decimal_macros = "1.40"
 # ── the control plane (T-W2-4) ──────────────────────────────────────────────
 # Hand-signed rather than a generated SDK: `lambda-microvms` has no aws-sdk-rust
 # crate, so the choice is between vendoring smithy codegen and signing 24
-# rest-json operations by hand. `default-features = false` on aws-config drops
-# `default-https-client` — the HTTP client here is reqwest, and pulling smithy's
-# hyper stack in alongside it would put two TLS stacks in one binary that ships to
-# a MicroVM. `rt-tokio` and `credentials-process`/`sso` stay because the whole
-# reason to depend on aws-config at all is the credential chain a developer
-# actually has: SSO, a credential process, IMDS.
+# rest-json operations by hand. `default-https-client` stays ON: the credential
+# chain does its own HTTP (IMDS, SSO, STS) through smithy's client and panics at
+# load() without one — every ControlPlane::new in the wild hit that before this
+# feature returned. Two HTTP stacks (smithy for credentials, reqwest for the
+# service calls) is the price; both sit on rustls, so it is one TLS
+# implementation, and this crate runs on the developer host or harness — agentd
+# is what ships into the MicroVM image, not this.
 aws-config = { version = "1.10", default-features = false, features = [
+    "default-https-client",
     "rt-tokio",
     "credentials-process",
     "sso",

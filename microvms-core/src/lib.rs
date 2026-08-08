@@ -71,6 +71,10 @@ pub mod sandbox;
 pub mod session;
 pub mod sizing;
 
+// Re-exported so consumers name wire types through this crate rather than
+// depending on `protocol` directly — the CLI's thinness guard counts on that.
+pub use protocol;
+
 pub use error::{Error, ErrorKind, WireKind};
 pub use hooks::{BuildHookTimeout, RunHookTimeout};
 pub use region::Region;

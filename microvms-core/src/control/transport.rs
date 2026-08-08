@@ -694,6 +694,17 @@ pub mod paths {
 mod tests {
     use super::*;
 
+    /// The regression that blocked the whole live tier: with aws-config's
+    /// `default-https-client` off, `load()` panics with "a http_client is
+    /// required" before any credential question is even asked. Constructing
+    /// through the real chain must yield a `Result` — either outcome is fine
+    /// here (this host may or may not have credentials); a panic is the bug.
+    /// IMDS is the only endpoint this can touch: link-local, free, and fast.
+    #[tokio::test]
+    async fn constructing_the_real_transport_returns_a_result_rather_than_panicking() {
+        let _ = SignedTransport::new(Region::UsEast1).await;
+    }
+
     /// The endpoint, from the model's `endpointPrefix`. `lambda` and not
     /// `lambda-microvms` — which is the fact that makes TRAP-6 possible, since this
     /// resolves for every AWS region.
