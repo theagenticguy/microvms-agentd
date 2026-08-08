@@ -38,6 +38,13 @@ pre-push:
       # run. So if the daemon changed since the last live run, say so — and let
       # the human decide, because only they know whether the change could touch
       # the platform boundary.
+      #
+      # The path list grew `microvms-core` and `microvms-cli` when the Rust client
+      # landed, and those two matter more here than the Python ones do rather than
+      # less: `microvms-core` owns every control-plane call and every trap guard,
+      # and its whole test suite runs through an injected seam — so a change to
+      # the real AWS path is exactly the change no local tier can see. Leaving
+      # them out would have made this note quietest about the newest code.
       run: |
         marker=.git/agentd-last-live-run
         if [ ! -f "$marker" ]; then
@@ -46,7 +53,7 @@ pre-push:
           echo "      platform boundary — hooks, bootstrap, image build, identity."
           exit 0
         fi
-        changed=$(git diff --name-only "$(cat "$marker")" HEAD -- agentd/src conformance clients/python 2>/dev/null | head -5)
+        changed=$(git diff --name-only "$(cat "$marker")" HEAD -- agentd/src microvms-core/src microvms-cli/src conformance clients/python 2>/dev/null | head -5)
         if [ -n "$changed" ]; then
           echo "note: the daemon or its clients changed since the last live run:"
           echo "$changed" | sed 's/^/        /'

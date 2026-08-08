@@ -70,10 +70,36 @@ description = "Fail if the committed schema no longer matches what is served"
 run = "cargo run -q -p agentd --bin schema -- --check"
 
 [tasks.spec]
-description = "Requirements consistency via symspec + Z3"
+description = "agentd.symspec.json consistency via symspec 0.1.0 + Z3"
+# Covers `spec/agentd.symspec.json` ONLY — six draft requirements about the daemon's
+# bootstrap and control-token rules. It is not the whole spec surface: `spec/core.symspec.json`
+# is 51 requirements in the v5 `docVersion: 3` format, and the 0.1.0 `symspec` on PATH
+# cannot read it at all — no state model, no effects/constraints, no reachability tier.
+# That one is `spec:core`.
+#
 # Not in `check`'s dependency list: symspec is a global npm install plus a
 # downloaded embedding model, so a fresh clone should not fail on its absence.
 run = "symspec check spec/agentd.symspec.json --strict"
+
+[tasks."spec:core"]
+description = "microvms-core's 51 requirements: contradictions, coverage, and reachability"
+# The v5 CLI by absolute path, not the `symspec` on PATH. That one is 0.1.0 and predates
+# everything this document depends on: `core.symspec.json` carries a state model (5
+# variables), 7 effects, and 3 constraints, and the tier that proves the constraints hold
+# over *unbounded* runs is the reachability tier 0.1.0 does not have. Pointed at the wrong
+# binary this does not fail loudly — it parses less and reports on less.
+#
+# `--reachability-timeout-ms 5000` rather than leaving it to inherit `--timeout-ms`, and the
+# flag's own help says why: Z3's cancellation is cooperative, so an unbounded reachability
+# query is an *uncancellable* one. This bound IS the cancellability mechanism, and 5s is
+# comfortably above the 794ms the three constraints actually take.
+#
+# Out of `check`'s depends for the same reason `spec` is out: this needs a node path in
+# someone's home directory. A gate that fails on a fresh clone is a gate people learn to
+# skip, and `check` is the one command that must never be skipped. Verified 2026-08-08:
+# 0 error findings, 202 warn / 56 info, 3 constraints proved under hypotheses, 0 violated,
+# 0 unknown.
+run = "node ~/workplace/symspec/packages/symspec/dist/cli.mjs check spec/core.symspec.json --reachability-timeout-ms 5000"
 
 [tasks."model:check"]
 description = "Fail if a hardcoded API constraint no longer matches botocore's service model"
@@ -86,11 +112,37 @@ description = "Fail if a hardcoded API constraint no longer matches botocore's s
 # In `check` rather than `live` because the model is a file inside botocore — no
 # network, no credentials, no money — so it costs the same as a lint and belongs
 # where the gate is unconditional.
+#
+# Compares THREE ways now, which is TRAP-12's "verify each hardcoded service constraint
+# against the pinned botocore service model in the build gate": the Python client's
+# constants against the model, `microvms-core`'s against the same model, and the two
+# clients against each other. The cross-comparison is not decoration — `MICROVM_REGIONS`
+# and the sizing table are measurement-backed, so the model can say nothing about them and
+# client-vs-client is the only check they can ever have.
+#
+# No `depends = ["build-cli"]`, because the script reaches the Rust constants through
+# `cargo run -q -p microvms-cli` itself. A prebuilt path would be faster and can be *stale*,
+# and a stale constants dump is precisely this gate's failure mode — it would compare a
+# value nobody ships and report agreement. Measured 2026-08-08: 0.4s warm, against 0.006s
+# for the built binary, which is nothing beside the rest of `check`. `--rust-binary` exists
+# for anyone who wants that trade knowingly.
 run = "./scripts/check-model-drift"
 
 [tasks.build]
 description = "Release build for the shipping target"
 run = "cargo build --release -p agentd --target $AGENTD_TARGET"
+
+[tasks."build:cli"]
+description = "Release build of the `microvm` CLI, for the host"
+# NOT `$AGENTD_TARGET`. The daemon cross-compiles to aarch64-musl because it runs *inside*
+# the guest; the CLI runs on the operator's machine, so building it for the guest's
+# architecture would produce a binary that cannot execute here. Two different answers to
+# "which target", because they are two different questions.
+#
+# Out of `check`'s depends: `cargo clippy --all-targets` in `lint` and `cargo test --all` in
+# `test` already compile this crate, so a third build would add ~30s to the gate to produce
+# an artifact only the live tier consumes.
+run = "cargo build --release -p microvms-cli"
 
 [tasks.check]
 description = "The full local gate — the definition of done"
@@ -106,6 +158,29 @@ run = "terraform -chdir=conformance/infra init -input=false && terraform -chdir=
 description = "56 checks against a real MicroVM through the platform endpoint"
 depends = ["build", "live:infra"]
 run = "./conformance/run.py --binary target/$AGENTD_TARGET/release/agentd"
+
+[tasks."live:conformance-rs"]
+description = "The same suite through the Rust client: 22 of the 56 checks the CLI can express"
+depends = ["build", "build:cli", "live:infra"]
+# Both binaries: `--binary` is the aarch64 daemon that gets baked into the image, and
+# `--microvm-binary` is the host-architecture CLI under test. Naming both is what makes the
+# two-target split above visible at the call site rather than only in a comment.
+#
+# 22 rather than 56, and the number is in the description on purpose. The CLI's `exec` is
+# one-shot with a generated exec id and there is no `microvm cp`, `ack`, `exec --stream`, or
+# `stdin` — so file transfer, tar round trips, the four hostile archives, SSE, stdin
+# lifecycle, and the health flags are not expressible through this client. The suite prints
+# each of the 34 as SKIP with the missing subcommand named, and `conformance/run.py` remains
+# the oracle for them. A description claiming 56 would be the more comfortable lie.
+#
+# Its own task rather than a flag on `live:conformance`, because the two suites answer
+# different questions and both should run: the Python one covers the protocol in depth, this
+# one covers the lifecycle plus CLI-3/CLI-4/CLI-6, which live nowhere else.
+run = """
+./conformance/run_rs.py \
+  --binary target/$AGENTD_TARGET/release/agentd \
+  --microvm-binary target/release/microvm
+"""
 
 [tasks."live:probe"]
 description = "Measure what a real suspend/resume cycle preserves"
@@ -144,7 +219,20 @@ description = "Every live suite, then an independent leak check. BILLABLE."
 # creates nothing. It is the cheapest thing in the tier and the only one that can
 # tell you a figure this repo publishes has gone wrong, so leaving it out of the
 # aggregate would mean it only ever ran when someone remembered to name it.
-depends = ["live:rates", "live:conformance", "live:probe", "live:verify-clean"]
+#
+# `live:conformance-rs` is in here rather than left to be remembered, which is the same
+# argument `live:rates` earned above. Every AWS-facing defect this project has hit was
+# invisible until a real run, and the Rust client's live paths have *never* had one — its 628
+# tests all go through an injected seam, so `ControlPlane::new` and everything past it are
+# unexercised against the real service. A suite that only runs when someone names it is a
+# suite that runs the week it is written.
+depends = [
+  "live:rates",
+  "live:conformance",
+  "live:conformance-rs",
+  "live:probe",
+  "live:verify-clean",
+]
 # Records the commit that was last proven against real AWS. The pre-push hook
 # reads it to tell you whether the daemon has changed since — advisory only,
 # because only a human knows whether a given change could touch the platform
