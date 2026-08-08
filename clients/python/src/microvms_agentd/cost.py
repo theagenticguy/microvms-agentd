@@ -24,10 +24,14 @@ flatters us.
 
 The table carries its own staleness: `RATES` is pinned to a retrieval date and a
 table older than `STALE_AFTER` warns, because a silently stale price is the same
-failure class as a silently stale schema.
+failure class as a silently stale schema. The warning is a fallback rather than the
+defence — it can only say that nobody has looked. `pricing.check_drift` looks, by
+comparing this table against the AWS Pricing API.
 
-Every rate here comes from `docs/PLATFORM.md`, "What actually costs money". None
-of it is re-derived, and billing reads `SizeClass.baseline_*` and never the peak.
+Every rate here is recorded in `docs/PLATFORM.md`, "What actually costs money".
+One of them, `storage_gb_month`, is derived: the API quotes snapshot storage per
+GB-hour and this table holds per GB-month, so it is the hourly figure times
+`SECONDS_PER_MONTH`. Billing reads `SizeClass.baseline_*` and never the peak.
 """
 
 from __future__ import annotations
@@ -261,16 +265,31 @@ class RateTable:
         return message
 
 
-#: Read 2026-08-07 from the Lambda pricing page, us-east-1, and recorded in
-#: `docs/PLATFORM.md` under "What actually costs money". Every value here appears
-#: there; none is derived. Change one and change that document in the same commit.
+#: Read 2026-08-07, us-east-1, and recorded in `docs/PLATFORM.md` under "What
+#: actually costs money". Four rates appear on the Lambda pricing page as written;
+#: `storage_gb_month` is *derived*, because the AWS Pricing API quotes snapshot
+#: storage per GB-hour and this table holds per GB-month. Change any of them and
+#: change that document in the same commit.
+#:
+#: `pricing.check_drift` measures these against the Pricing API, which carries the
+#: MicroVM line items directly — run `mise run live:rates`. That check, not
+#: `STALE_AFTER`, is what actually tells you whether a rate moved; the staleness
+#: warning only ever said that nobody had looked.
+#:
+#: Only the ARM figures are correct here and it is not a preference: MicroVMs are
+#: ARM64-only, the x86 compute rates in the same catalog are 17.9% higher, and this
+#: table used to hold the right ones by luck rather than by construction. See
+#: `pricing.MICROVM_LINES`, which selects the ARM lines and refuses to substitute.
 RATES = RateTable(
     region="us-east-1",
     source_url="https://aws.amazon.com/lambda/pricing/",
     retrieved=date(2026, 8, 7),
     vcpu_second=Decimal("0.0000276944"),
     gb_second=Decimal("0.0000036667"),
-    storage_gb_month=Decimal("0.08"),
+    # $0.0001111111 per GB-hour x 730 hours. Was 0.08 — a plausible-looking round
+    # number that understated every stored GB by 1.37%, which is the whole argument
+    # for deriving it from the API figure rather than reading a page.
+    storage_gb_month=Decimal("0.0811111030"),
     snapshot_read_gb=Decimal("0.00155"),
     snapshot_write_gb=Decimal("0.0038"),
     minimum_retention=timedelta(weeks=1),

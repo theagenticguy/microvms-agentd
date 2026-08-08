@@ -51,10 +51,15 @@ def test_every_rate_matches_the_documented_table() -> None:
     # Transcribed from `docs/PLATFORM.md`, "What actually costs money", us-east-1.
     # Asserted literally rather than computed, because the whole value of pinning a
     # rate table is that it can be diffed against the page it came from.
+    #
+    # `storage_gb_month` is the one derived value: the Pricing API quotes snapshot
+    # storage per GB-hour, and $0.0001111111 x 730 is $0.0811111030. It read 0.08
+    # here until 2026-08-07, which was 1.37% low. `test_pricing.py` locks it against
+    # the hourly figure the API returns; this locks the literal.
     assert RATES.region == "us-east-1"
     assert RATES.vcpu_second == Decimal("0.0000276944")
     assert RATES.gb_second == Decimal("0.0000036667")
-    assert RATES.storage_gb_month == Decimal("0.08")
+    assert RATES.storage_gb_month == Decimal("0.0811111030")
     assert RATES.snapshot_read_gb == Decimal("0.00155")
     assert RATES.snapshot_write_gb == Decimal("0.0038")
     assert RATES.minimum_retention == timedelta(weeks=1)

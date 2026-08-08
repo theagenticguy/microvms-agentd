@@ -16,6 +16,7 @@ from typing import Any
 
 import pytest
 
+import microvms_agentd.sandbox as mvsandbox
 from microvms_agentd import Sandbox
 
 
@@ -62,7 +63,14 @@ class FakeMv:
         return {"items": [{"imageVersion": "1"}]}
 
     def list_microvm_image_builds(self, **_: Any) -> dict[str, Any]:
-        return {"items": [{"state": "PENDING"}]}
+        # `buildState`, as the service model's `MicrovmImageBuildSummary` spells it —
+        # that shape has no `state` member at all. This fake said `state` for as long
+        # as the client read `state`, so the two agreed with each other and neither
+        # agreed with AWS: the stall probe was dead against the real service while its
+        # test passed. That is precisely the failure the spec's "a test may not assert
+        # against a fake that shares the client's own assumptions" rule names, and the
+        # model is the independent authority that broke the tie.
+        return {"items": [{"buildState": "PENDING"}]}
 
     def delete_microvm_image(self, **kw: Any) -> None:
         self._record("delete_microvm_image", kw)
@@ -796,3 +804,244 @@ def test_suspend_reports_a_dying_vm_rather_than_raising_through_a_teardown(binar
     box.build_image(name="t-1", binary=binary, bucket="b", build_role_arn="arn:build")
     box.run(execution_role_arn="arn:exec")
     assert box.suspend() == "TERMINATED"
+
+
+# -- constraints the service model states ------------------------------------
+#
+# Every guard below closes a request the client used to be able to build and AWS
+# would have rejected. They are local because botocore does not check them: reading
+# botocore's `validate.py`, `VALIDATED_METADATA_ATTRS` is `{'required', 'min',
+# 'document', 'union'}`, so `max`, `pattern`, and `enum` violations go to the wire
+# and come back as a `ValidationException`. `scripts/check-model-drift` asserts the
+# numbers here still match the shipped model; these tests assert the client acts on
+# them.
+
+
+def test_an_oversized_run_hook_payload_is_refused_before_the_launch() -> None:
+    # The finding that started this: docs claimed a 16 KB ceiling against a real
+    # ceiling of 4096, wrong by 4x in the direction that tells a caller four times as
+    # much secret material fits as actually does. A caller who passes a JWT or a
+    # signed credential blob as the agent token is who this catches, and the ceiling
+    # is on the *serialized* payload, so the token has to be sized against the
+    # JSON wrapper rather than against 4096 directly.
+    box, mv, _, _ = make()
+    over = "t" * mvsandbox.MAX_RUN_HOOK_PAYLOAD_BYTES
+    with pytest.raises(ValueError, match="over the ceiling of 4096"):
+        box.run(image_identifier="img-1", execution_role_arn="arn:exec", agent_token=over)
+    assert "run_microvm" not in [name for name, _ in mv.calls], "must not reach the wire"
+
+
+def test_a_payload_at_the_ceiling_is_accepted_because_the_bound_is_inclusive() -> None:
+    # Bracketed from both sides against real AWS on 2026-08-07: 4096 passes the length
+    # check, 4097 is rejected. An off-by-one here would refuse a payload the service
+    # accepts, and a caller who had measured their own fit would not believe the error.
+    box, mv, _, _ = make()
+    wrapper = len(json.dumps({"agent_token": ""}))
+    token = "t" * (mvsandbox.MAX_RUN_HOOK_PAYLOAD_BYTES - wrapper)
+    box.run(image_identifier="img-1", execution_role_arn="arn:exec", agent_token=token)
+    payload = mv.kwargs("run_microvm")["runHookPayload"]
+    assert len(payload.encode()) == mvsandbox.MAX_RUN_HOOK_PAYLOAD_BYTES
+
+
+def test_the_payload_ceiling_is_measured_in_bytes_not_characters() -> None:
+    # `len()` and the serialized length disagree the moment a caller's token carries a
+    # multi-byte character, and the service counts bytes. Checking `len()` would pass a
+    # payload the service rejects — the exact shape of the bug this guard replaced.
+    assert mvsandbox.require_payload_fits("a" * 4096) is not None
+    with pytest.raises(ValueError, match="4097 bytes"):
+        # 4095 characters, one of which serializes to two bytes.
+        mvsandbox.require_payload_fits("a" * 4095 + "é" * 1)
+
+
+@pytest.mark.parametrize(
+    "name, signature",
+    [
+        ("", "at least 1 character"),
+        ("n" * 65, "65 characters, over"),
+        ("has.a.dot", "no dots and no slashes"),
+        ("has/a/slash", "no dots and no slashes"),
+        ("has a space", "does not match"),
+    ],
+)
+def test_an_image_name_the_service_would_reject_is_refused_before_the_upload(
+    binary, name: str, signature: str
+) -> None:
+    # The order matters here, which is why the length case has its own message: the
+    # pattern message names dots and slashes, and reading that about a 70-character
+    # name containing neither sends the reader looking for a character that is not
+    # there. Refused before `put_object` because the create call — the one AWS would
+    # reject — happens after the artifact is already uploaded.
+    box, mv, s3, _ = make()
+    with pytest.raises(ValueError, match=signature):
+        box.build_image(name=name, binary=binary, bucket="b", build_role_arn="arn:build")
+    assert s3.puts == [], "the artifact must not be uploaded for a name AWS will reject"
+    assert mv.calls == []
+
+
+def test_the_run_time_and_build_time_hook_ceilings_are_60x_apart(binary) -> None:
+    # The trap this project exists to close, in miniature. A caller who picks one
+    # timeout large enough for a build hook (say 300s) is inside the 3600s image-hook
+    # ceiling and 5x over the 60s run-hook one — so the request passes on the family
+    # they were thinking about and fails on the one they were not, after the upload,
+    # reported as a constraint on a field they did not know had two ceilings.
+    box, _, s3, _ = make()
+    with pytest.raises(ValueError, match=r"microvmHooks\.runTimeoutInSeconds=300.*1\.\.60"):
+        box.build_image(
+            name="t-1",
+            binary=binary,
+            bucket="b",
+            build_role_arn="arn:build",
+            hooks=mvsandbox.default_hooks(9000, timeout=60, image_timeout=300)
+            | {"microvmHooks": {"run": "ENABLED", "runTimeoutInSeconds": 300}},
+        )
+    assert s3.puts == []
+
+    # And the other direction: 300s is fine on a build hook, so a client that applied
+    # one ceiling to both families would refuse a legal request.
+    hooks = mvsandbox.default_hooks(9000, timeout=30, image_timeout=300)
+    assert hooks["microvmImageHooks"]["readyTimeoutInSeconds"] == 300
+    assert hooks["microvmHooks"]["runTimeoutInSeconds"] == 30
+
+
+def test_a_build_hook_timeout_over_its_own_ceiling_is_still_refused() -> None:
+    # 3600 is the build family's ceiling, so this proves the guard is checking the
+    # right bound per family rather than letting the larger one stand in for both.
+    with pytest.raises(ValueError, match=r"readyTimeoutInSeconds=3601.*1\.\.3600"):
+        mvsandbox.default_hooks(9000, timeout=30, image_timeout=3601)
+
+
+def test_a_duration_over_eight_hours_is_refused_locally(binary) -> None:
+    # 28800 seconds is the hard ceiling on any one VM's life. A longer session needs a
+    # second VM, and the error says so — the service's own answer names a constraint
+    # and leaves the caller to work out that no number will do.
+    box, mv, _, _ = make()
+    with pytest.raises(ValueError, match=r"outside the accepted range 1\.\.28800"):
+        box.run(image_identifier="img-1", execution_role_arn="arn:exec", max_duration_sec=28_801)
+    assert mv.calls == []
+
+
+def test_a_non_arm_architecture_is_refused_because_the_enum_has_one_value(binary) -> None:
+    # `Architecture` is exactly `['ARM_64']`, read out of the service model rather than
+    # believed. The reason to refuse locally is the symptom: an x86 binary in the image
+    # surfaces as a run-hook *timeout*, which says nothing about architecture.
+    box, _, s3, _ = make()
+    with pytest.raises(ValueError, match="ARM64-only"):
+        box.build_image(
+            name="t-1",
+            binary=binary,
+            bucket="b",
+            build_role_arn="arn:build",
+            architecture="X86_64",
+        )
+    assert s3.puts == []
+
+
+def test_a_region_that_does_not_carry_microvms_is_refused_at_construction() -> None:
+    # Measured 2026-08-07: an unsupported region answers AccessDeniedException with a
+    # *null* message, indistinguishable from a real IAM denial — so a typo'd region
+    # sends someone to audit a policy that is fine. Construction time rather than first
+    # call, because the first call is where that evidence is destroyed. Nothing upstream
+    # objects: botocore lists zero regions for this service, yet the client builds for
+    # any region.
+    with pytest.raises(ValueError, match="null message"):
+        Sandbox(region="eu-central-1", microvm_client=FakeMv())
+    # The override exists because AWS adds regions faster than the list is re-read, and
+    # a client that refuses a region AWS just launched in is its own kind of wrong.
+    assert (
+        Sandbox(region="eu-central-1", microvm_client=FakeMv(), allow_unlisted_region=True).region
+        == "eu-central-1"
+    )
+
+
+def test_eu_central_1_is_not_in_the_region_list() -> None:
+    # It was, in `cli.MICROVM_REGIONS`, until 2026-08-07 — and it is one of the three
+    # regions measured returning the null-message denial. Named explicitly rather than
+    # left to the set comparison because a wrong *member* is the dangerous direction: a
+    # missing region makes the client refuse something valid, an extra one hands the
+    # caller the undiagnosable failure this whole guard exists to prevent.
+    assert "eu-central-1" not in mvsandbox.MICROVM_REGIONS
+    from microvms_agentd import cli
+
+    assert cli.MICROVM_REGIONS is mvsandbox.MICROVM_REGIONS, "one list, not two copies"
+
+
+def test_a_minted_client_token_fits_the_128_ceiling_for_the_worst_legal_input() -> None:
+    # Found 2026-08-07 by the drift checker's *coverage* report, not by a failing
+    # check: it named `RunMicrovmRequestClientTokenString` as a constraint nothing was
+    # bound to. `run` defaults its token scope to the image identifier — a full ARN —
+    # so an ap-northeast-1 ARN carrying a legal 64-character image name minted a
+    # 142-character token against a 128 ceiling. botocore does not validate `max`, so
+    # it would have reached the wire and failed the launch on a field the caller never
+    # set. A test on a short name passes either way, which is why this one uses the
+    # longest legal input rather than a typical one.
+    worst = f"arn:aws:lambda:ap-northeast-1:123456789012:microvm-image:{'n' * 64}"
+    for minted in (mvsandbox._create_token(worst), mvsandbox._run_token(worst)):
+        assert len(minted) <= mvsandbox.MAX_CLIENT_TOKEN_LEN, minted
+
+    # Truncating the label must not touch the nonce: a `clientToken` is a permanent
+    # idempotency key, so two attempts sharing a truncated scope colliding would be
+    # the wedge again — worse than the length error it was fixing.
+    assert len({mvsandbox._run_token(worst) for _ in range(200)}) == 200
+
+
+def test_the_stall_probe_reads_build_state_as_the_model_spells_it(binary) -> None:
+    # The guard that was dead against live AWS while its test passed. The model's
+    # `MicrovmImageBuildSummary` has no `state` member at all — only `buildState` — so
+    # `b.get("state")` returned None for every real response and the all-PENDING test
+    # could never be true. It was invisible because the fake also said `state`: the
+    # fake shared the client's own misreading, which is exactly what the spec's "a test
+    # may not assert against a fake that shares the client's own assumptions" rule
+    # forbids. The service model was the independent authority that broke the tie.
+    #
+    # Asserted against a fake that answers *only* `buildState`, so a client that reads
+    # `state` finds nothing and this test fails.
+    class ModelShapedMv(FakeMv):
+        def list_microvm_image_builds(self, **_: Any) -> dict[str, Any]:
+            return {"items": [{"buildId": "b-1", "buildState": "PENDING"}]}
+
+    box = Sandbox(
+        region="us-east-1",
+        microvm_client=ModelShapedMv(states=["PENDING"]),
+        s3_client=FakeS3(),
+        poll_interval_sec=0,
+    )
+    box._mv.image_states = iter(["CREATING"] * 100)
+    original = mvsandbox.STALL_GRACE_SEC
+    mvsandbox.STALL_GRACE_SEC = -1
+    try:
+        with pytest.raises(RuntimeError, match="clientToken replay signature"):
+            box.build_image(
+                name="t-1",
+                binary=binary,
+                bucket="b",
+                build_role_arn="arn:build",
+                build_timeout_sec=1,
+            )
+    finally:
+        mvsandbox.STALL_GRACE_SEC = original
+
+
+def test_every_pinned_constraint_is_covered_by_the_drift_checker() -> None:
+    # The checker is only worth trusting if it reads the same constants the client
+    # acts on. It imports `sandbox` directly rather than re-transcribing them, and this
+    # asserts the names it depends on still exist — a renamed constant would otherwise
+    # make the checker fail to import and the failure would read as a broken script
+    # rather than as drift.
+    for attr in (
+        "MODEL_API_VERSION",
+        "MAX_RUN_HOOK_PAYLOAD_BYTES",
+        "MAX_IMAGE_NAME_LEN",
+        "IMAGE_NAME_PATTERN",
+        "MAX_DURATION_SEC",
+        "MAX_MICROVM_HOOK_TIMEOUT_SEC",
+        "MAX_IMAGE_HOOK_TIMEOUT_SEC",
+        "MAX_HOOK_PORT",
+        "MAX_CLIENT_TOKEN_LEN",
+        "MAX_NETWORK_CONNECTORS",
+        "MAX_RESOURCES",
+        "ARCHITECTURES",
+        "CAPABILITIES",
+        "MODEL_IMAGE_READY_STATES",
+        "MICROVM_REGIONS",
+    ):
+        assert hasattr(mvsandbox, attr), f"check-model-drift reads sandbox.{attr}"

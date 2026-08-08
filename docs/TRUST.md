@@ -285,12 +285,23 @@ can enforce against a root process; omitting `INTERNET_EGRESS` is how you get a 
 no outbound network, and that call belongs to whoever calls `RunMicrovm`.
 
 **Secret delivery beyond the run hook.** The `runHookPayload` string is the only
-per-VM differentiator the platform offers, and `STRATEGY.md` records a 16 KB ceiling
-on it (we have not measured that ceiling ourselves). One bearer token fits. A cloud
-credential set, a fleet of per-task secrets, or anything needing rotation mid-session
-does not, and this contract has nothing to say about how you get them in. That is
-precisely the gap AgentCore's credential broker fills and that a raw-MicroVM customer
-has to fill themselves.
+per-VM differentiator the platform offers, and its ceiling is 4096 bytes, measured
+2026-08-07 in us-east-1 against API version `2025-09-09` and recorded in `PLATFORM.md`.
+This section previously cited a 16 KB ceiling from `STRATEGY.md` and flagged it as
+unmeasured; the real figure is a quarter of that, so the budget is tighter than this
+contract used to claim. Corrected 2026-08-07.
+
+One bearer token fits with room to spare, and so does the 128-bit identity seed the
+repair steps above need. What does not fit is anything at credential scale: a single
+set of AWS session credentials runs well past a kilobyte once the session token is
+included, so a handful of them exhausts the budget, and a per-task secret fleet or
+anything needing rotation mid-session is out of reach at any size, since the payload is
+delivered exactly once at launch and there is no second delivery. The smaller ceiling
+makes the conclusion firmer rather than changing it: `runHookPayload` is a bootstrap
+channel for one small secret, not a secret store, and it should be sized for the token
+that unlocks a broker rather than for the material the broker holds. This contract has
+nothing to say about how you get that material in. That is precisely the gap AgentCore's
+credential broker fills and that a raw-MicroVM customer has to fill themselves.
 
 **Anything requiring privileges the guest does not have.** The bind mount above is
 the visible case. There is no seccomp confinement, no user-namespace isolation of the

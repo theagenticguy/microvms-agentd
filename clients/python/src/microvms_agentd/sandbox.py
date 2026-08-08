@@ -30,10 +30,21 @@ from .transport import DEFAULT_AGENT_PORT
 
 SERVICE = "lambda-microvms"
 
-#: States the image API uses for "built and usable". More than one because the
-#: service has answered differently across API versions and a hard equality check
-#: on a single spelling is how a working build looks like a stalled one.
-IMAGE_READY_STATES = frozenset({"CREATED", "ACTIVE", "AVAILABLE"})
+#: The `MicrovmImageState` values that mean "built and usable", as the model spells
+#: them. `UPDATED` is here even though this client never calls `UpdateMicrovmImage`:
+#: an image someone else updated is usable, and treating it as still-building is a
+#: 45-minute wait on a state that will never change.
+MODEL_IMAGE_READY_STATES = frozenset({"CREATED", "UPDATED"})
+
+#: Spellings that are *not* in the `2025-09-09` `MicrovmImageState` enum. Kept
+#: because the service has answered differently across API versions and a hard
+#: equality check on one spelling is how a working build looks like a stalled one,
+#: but held separately so `scripts/check-model-drift` can check the model-derived
+#: set exactly instead of being told that two of the three values it cannot find are
+#: fine. If a future model adds either, move it up.
+_TOLERATED_IMAGE_READY_STATES = frozenset({"ACTIVE", "AVAILABLE"})
+
+IMAGE_READY_STATES = MODEL_IMAGE_READY_STATES | _TOLERATED_IMAGE_READY_STATES
 
 #: Terminal states. Reaching any of them *before* RUNNING means the VM died during
 #: startup, which for a hook-serving daemon almost always means a lifecycle hook
@@ -64,6 +75,270 @@ DEFAULT_POLL_INTERVAL_SEC = 5.0
 _TOKEN_NONCE_BYTES = 8
 
 
+# ── what the service model states ───────────────────────────────────────────
+#
+# Every number and pattern below is transcribed from the botocore service model
+# for `lambda-microvms`, and `scripts/check-model-drift` fails when any of them
+# stops matching the shipped model. The model is a machine-readable statement of
+# the service's own request validation; restating it by hand is how this project
+# published a 16 KB `runHookPayload` ceiling against a real ceiling of 4096.
+#
+# These are checked locally because **botocore does not check them.** Measured
+# 2026-08-07 by reading botocore's `validate.py`: `VALIDATED_METADATA_ATTRS` is
+# `{'required', 'min', 'document', 'union'}`, so a `min` violation raises
+# `ParamValidationError` before the wire, and `max`, `pattern`, and `enum`
+# violations are serialized, sent, and answered with a `ValidationException`.
+# Confirmed empirically for `max` (runHookPayload 4097, maximumDurationInSeconds
+# 28801, ImageName 65 chars, NetworkConnectorList 11 items, clientToken 129
+# chars), for `pattern` (ImageName "a b!"), and for `enum` (architecture
+# X86_64, additionalOsCapabilities CAP_SYS_ADMIN) — every one reached the wire.
+#
+# So the guards below are load-bearing rather than belt-and-braces, and the
+# obvious future simplification — "botocore validates the model already, delete
+# these" — silently reopens all of them.
+#
+# `IdlePolicy.maxIdleDurationSeconds` is the counter-example and deliberately has
+# no guard here: its constraint is `min: 60`, which botocore *does* enforce
+# locally with a clear message. A second check would be redundant.
+
+#: The model version every constraint here was read from.
+MODEL_API_VERSION = "2025-09-09"
+
+#: `RunMicrovmRequestRunHookPayloadString.max`. Inclusive: 4096 bytes passes the
+#: length check and 4097 is rejected, bracketed 2026-08-07 by calling `RunMicrovm`
+#: with a deliberately bogus `imageIdentifier` so nothing could be created or
+#: billed. `docs/STRATEGY.md` and `docs/TRUST.md` claimed 16 KB, which is wrong by
+#: 4x in the dangerous direction — it tells a caller four times as much secret
+#: material fits as actually does.
+MAX_RUN_HOOK_PAYLOAD_BYTES = 4096
+
+#: `ImageName`: min 1, max 64, pattern `[a-zA-Z0-9-_]+`. No dots and no slashes,
+#: which rules out the two separators a caller reaching for a namespaced name
+#: writes first.
+MAX_IMAGE_NAME_LEN = 64
+IMAGE_NAME_PATTERN = r"[a-zA-Z0-9-_]+"
+_IMAGE_NAME_RE = re.compile(rf"\A(?:{IMAGE_NAME_PATTERN})\Z")
+
+#: `RunMicrovmRequestMaximumDurationInSecondsInteger`: min 1, max 28800 — eight
+#: hours, and the hard ceiling on any single VM's life.
+MAX_DURATION_SEC = 28800
+
+#: `MicrovmHooks*TimeoutInSecondsInteger` (run, resume, suspend, terminate):
+#: max 60. `MicrovmImageHooks*TimeoutInSecondsInteger` (ready, validate): max
+#: 3600. The 60x gap follows from what each family is for — a build hook waits on
+#: a Dockerfile, a run hook waits on a daemon that is already booted — and it is
+#: the whole reason `default_hooks` takes two timeouts rather than one. A single
+#: shared value large enough for a build (say 300) is rejected on the run family
+#: only, after the artifact is uploaded.
+MAX_MICROVM_HOOK_TIMEOUT_SEC = 60
+MAX_IMAGE_HOOK_TIMEOUT_SEC = 3600
+
+#: `HooksPortInteger`: min 1, max 65535.
+MAX_HOOK_PORT = 65535
+
+#: `Capability` enum is exactly this one value, which is why `build_image` takes a
+#: `repair_guest_identity: bool` naming the intent rather than a capability list.
+#: There is no way to ask for `CAP_SYS_ADMIN` alone.
+CAPABILITIES = ("ALL",)
+
+#: `Architecture` enum is exactly this one value: a MicroVM cannot be x86. Machine
+#: checkable rather than folklore — the drift checker reads it out of the model.
+ARCHITECTURES = ("ARM_64",)
+DEFAULT_ARCHITECTURE = "ARM_64"
+
+#: `NetworkConnectorList.max` and `ResourcesList.max`. Only one resources entry is
+#: accepted, so "give the VM two memory floors" is not a thing that can be asked.
+MAX_NETWORK_CONNECTORS = 10
+MAX_RESOURCES = 1
+
+#: Regions that answered `ListMicrovms` when this was written. Keeping this list
+#: correct is the whole correctness condition, in both directions. A *missing*
+#: region makes this client refuse a launch AWS would have accepted, which is the
+#: safer direction and still wrong — `allow_unlisted_region=True` is the escape
+#: hatch, and it costs the caller the diagnostic below. An *extra* region is worse:
+#: measured 2026-08-07, a region that does not carry MicroVMs answers
+#: `AccessDeniedException` with a null message field, which is indistinguishable
+#: from a real IAM denial, so a typo'd region sends someone to audit a policy that
+#: is fine.
+#:
+#: No botocore call answers the question, and the two that look like they might
+#: disagree with each other: `endpoint_resolver.get_available_endpoints` returns an
+#: empty list while `session.get_available_regions` returns all 34 Lambda regions,
+#: because the model's `endpointPrefix` is `lambda`. Neither is this list, so
+#: neither can stand in for it. `boto3.client(...)` also constructs happily for any
+#: region and resolves to `https://lambda.<region>.amazonaws.com`.
+#:
+#: `eu-central-1` was in this list until 2026-08-07 and does *not* carry MicroVMs:
+#: it was one of the three regions measured returning the null-message denial.
+#:
+#: This is the single definition. `pricing.py` imports it rather than restating it,
+#: because the copy in `cli.py` had already drifted to include `eu-central-1` while
+#: this one was correct, and two lists that must agree are one list that will not.
+MICROVM_REGIONS = frozenset({"us-east-1", "us-east-2", "us-west-2", "eu-west-1", "ap-northeast-1"})
+
+#: `Create/Run/UpdateMicrovmImageRequestClientTokenString.max`, all three 128.
+MAX_CLIENT_TOKEN_LEN = 128
+
+#: How much of the scope label survives into a token. Not a cosmetic cap. The tokens
+#: are `<verb>-<scope>-<16 hex>`, and `run`'s scope defaults to the *image
+#: identifier* — a full ARN. Found 2026-08-07 by the drift checker's coverage report
+#: naming `RunMicrovmRequestClientTokenString` as unbound: an ap-northeast-1 ARN
+#: carrying a legal 64-character image name mints a 142-character token, over the
+#: 128 ceiling, and botocore does not check `max` so it would have gone to the wire
+#: and failed the launch on a field the caller never set.
+#:
+#: The truncation is on the *label*, never the nonce, so a shortened scope cannot
+#: make two attempts collide — which is the one property of these tokens that
+#: matters, since a `clientToken` is a permanent idempotency key.
+_MAX_TOKEN_SCOPE_LEN = 64
+
+
+def _token(verb: str, scope: str) -> str:
+    nonce = secrets.token_hex(_TOKEN_NONCE_BYTES)
+    # Keep the tail rather than the head: an ARN's distinguishing part is the
+    # resource name at the end, and every ARN in a region shares its prefix.
+    label = scope[-_MAX_TOKEN_SCOPE_LEN:]
+    token = f"{verb}-{label}-{nonce}"
+    assert len(token) <= MAX_CLIENT_TOKEN_LEN, token
+    return token
+
+
+def require_valid_image_name(name: str) -> str:
+    """Rejects an image name the service would reject, before the artifact upload.
+
+    Order matters: the emptiness and length cases get their own messages because the
+    pattern message ("no dots, no slashes") is actively misleading for a 70-character
+    name that contains neither.
+    """
+    if not name:
+        raise ValueError(
+            "image name is empty, but ImageName requires at least 1 character "
+            f"(service model {MODEL_API_VERSION})."
+        )
+    if len(name) > MAX_IMAGE_NAME_LEN:
+        raise ValueError(
+            f"image name is {len(name)} characters, over the ImageName ceiling of "
+            f"{MAX_IMAGE_NAME_LEN} (service model {MODEL_API_VERSION}). Rejected here "
+            "rather than by AWS, because the create call happens *after* the artifact "
+            "upload — so the service's answer costs you the upload first."
+        )
+    if not _IMAGE_NAME_RE.fullmatch(name):
+        raise ValueError(
+            f"image name {name!r} does not match the ImageName pattern "
+            f"{IMAGE_NAME_PATTERN!r} (service model {MODEL_API_VERSION}). Letters, "
+            "digits, hyphen, and underscore only — no dots and no slashes, which are "
+            "the two separators a namespaced name reaches for first."
+        )
+    return name
+
+
+def require_payload_fits(payload: str) -> str:
+    """Rejects a `runHookPayload` over the service ceiling, before `RunMicrovm`.
+
+    Bytes rather than characters: the ceiling is on the serialized string, so a
+    payload measured in `len()` passes while the same value with one multi-byte
+    character in it does not. `json.dumps` escapes non-ASCII by default, which makes
+    the two agree for the client's own token payload and disagree for a caller's.
+
+    This is where a caller learns that a credential bundle does not fit. The
+    alternative is a `ValidationException` from the control plane after the launch
+    request is already in flight, naming a constraint rather than a remedy.
+    """
+    size = len(payload.encode("utf-8"))
+    if size <= MAX_RUN_HOOK_PAYLOAD_BYTES:
+        return payload
+    raise ValueError(
+        f"runHookPayload is {size} bytes, over the ceiling of "
+        f"{MAX_RUN_HOOK_PAYLOAD_BYTES} (service model {MODEL_API_VERSION}, measured "
+        f"inclusive 2026-08-07). This is the only per-VM secret channel the platform "
+        f"offers: one bearer token fits, a cloud credential set does not. Note "
+        f"docs/STRATEGY.md and docs/TRUST.md claimed 16 KB, which is wrong by 4x."
+    )
+
+
+def require_duration_in_range(seconds: int) -> int:
+    """Rejects a `maximumDurationInSeconds` outside the service range."""
+    if 1 <= seconds <= MAX_DURATION_SEC:
+        return seconds
+    raise ValueError(
+        f"maximumDurationInSeconds={seconds} is outside the accepted range 1.."
+        f"{MAX_DURATION_SEC} (service model {MODEL_API_VERSION}) — "
+        f"{MAX_DURATION_SEC}s is eight hours, the hard ceiling on any one VM's life. "
+        "A longer session needs a second VM, not a larger number."
+    )
+
+
+def require_hook_timeouts_in_range(hooks: dict[str, Any]) -> dict[str, Any]:
+    """Rejects a hook block whose timeouts the service would reject.
+
+    Two families with ceilings 60x apart, and confusing them is exactly the trap
+    this validation exists to close: `run`/`resume`/`suspend`/`terminate` cap at
+    60 seconds, `ready`/`validate` at 3600. A caller who picks one number large
+    enough for a build hook passes image validation and fails on the run family —
+    after the artifact upload, and reported as a constraint on a field they did not
+    know had two different ceilings.
+    """
+    families = (
+        ("microvmHooks", MAX_MICROVM_HOOK_TIMEOUT_SEC, ("run", "resume", "suspend", "terminate")),
+        ("microvmImageHooks", MAX_IMAGE_HOOK_TIMEOUT_SEC, ("ready", "validate")),
+    )
+    for block_name, ceiling, hook_names in families:
+        block = hooks.get(block_name) or {}
+        for hook in hook_names:
+            key = f"{hook}TimeoutInSeconds"
+            if key not in block:
+                continue
+            value = block[key]
+            if 1 <= value <= ceiling:
+                continue
+            other = (
+                MAX_IMAGE_HOOK_TIMEOUT_SEC
+                if ceiling == MAX_MICROVM_HOOK_TIMEOUT_SEC
+                else MAX_MICROVM_HOOK_TIMEOUT_SEC
+            )
+            raise ValueError(
+                f"{block_name}.{key}={value} is outside the accepted range 1..{ceiling} "
+                f"(service model {MODEL_API_VERSION}). The two hook families have "
+                f"ceilings 60x apart — {block_name} caps at {ceiling}s while the other "
+                f"family caps at {other}s — because a build hook waits on a Dockerfile "
+                f"and a run hook waits on a daemon that is already booted."
+            )
+    port = hooks.get("port")
+    if port is not None and not 1 <= port <= MAX_HOOK_PORT:
+        raise ValueError(
+            f"hooks.port={port} is outside 1..{MAX_HOOK_PORT} (service model {MODEL_API_VERSION})."
+        )
+    return hooks
+
+
+def require_supported_region(region: str, *, allow_unlisted: bool = False) -> str:
+    """Rejects a region that does not carry MicroVMs, at construction time.
+
+    Construction time rather than first call, because the first call is where the
+    diagnostic is destroyed: measured 2026-08-07, an unsupported region answers
+    `AccessDeniedException` with a *null* message, which reads as a genuine IAM
+    denial and sends the reader to audit a policy that is fine. Nothing between the
+    caller and that answer objects — botocore's endpoint resolver lists zero regions
+    for `lambda-microvms`, and `boto3.client` happily builds one for any region.
+
+    `allow_unlisted` exists because AWS adds regions faster than this list is
+    re-read, and a client that refuses a region AWS has just launched in is its own
+    kind of wrong. The override costs exactly the diagnostic above.
+    """
+    if allow_unlisted or region in MICROVM_REGIONS:
+        return region
+    known = ", ".join(sorted(MICROVM_REGIONS))
+    raise ValueError(
+        f"region {region!r} is not one this client has seen carry MicroVMs ({known}). "
+        "Refused here because the first API call is where the evidence disappears: an "
+        "unsupported region answers AccessDeniedException with a null message, which "
+        "is indistinguishable from a real IAM denial (docs/PLATFORM.md, 'Calling an "
+        "unpriced region returns AccessDeniedException with a null message'). If AWS "
+        "has since launched MicroVMs here, pass allow_unlisted_region=True and add the "
+        "region to MICROVM_REGIONS."
+    )
+
+
 def _create_token(scope: str) -> str:
     """An image-create idempotency token, unique per attempt by construction.
 
@@ -80,7 +355,7 @@ def _create_token(scope: str) -> str:
     shape defaulted correctly and accepted `client_token=<content digest>`, which is
     precisely the value that wedges an image.
     """
-    return f"create-{scope}-{secrets.token_hex(_TOKEN_NONCE_BYTES)}"
+    return _token("create", scope)
 
 
 def _run_token(scope: str) -> str:
@@ -91,7 +366,7 @@ def _run_token(scope: str) -> str:
     who asked for a second VM gets the first one's id back and two callers then drive
     the same guest.
     """
-    return f"run-{scope}-{secrets.token_hex(_TOKEN_NONCE_BYTES)}"
+    return _token("run", scope)
 
 
 class NetworkConnector(Enum):
@@ -261,7 +536,9 @@ def build_artifact(binary: str | Path, dockerfile: str | None = None) -> bytes:
 
 
 def default_hooks(
-    port: int = DEFAULT_AGENT_PORT, timeout: int = DEFAULT_HOOK_TIMEOUT_SEC
+    port: int = DEFAULT_AGENT_PORT,
+    timeout: int = DEFAULT_HOOK_TIMEOUT_SEC,
+    image_timeout: int | None = None,
 ) -> dict[str, Any]:
     """Every hook the daemon serves, enabled.
 
@@ -270,14 +547,20 @@ def default_hooks(
     therefore before any token has been delivered. Gating them on bootstrap state
     fails the build rather than the run, which is a confusing place to discover the
     mistake.
+
+    `image_timeout` is a second parameter rather than a reuse of `timeout` because
+    the two families' ceilings are 60x apart — 60s for the run-time hooks, 3600s for
+    the build hooks. Defaulting it to `timeout` keeps the safe case one argument, and
+    a caller who needs a long build hook can raise that family alone instead of
+    raising both and being rejected on the run family only.
     """
-    return {
+    hooks = {
         "port": port,
         "microvmImageHooks": {
             "ready": "ENABLED",
-            "readyTimeoutInSeconds": timeout,
+            "readyTimeoutInSeconds": timeout if image_timeout is None else image_timeout,
             "validate": "ENABLED",
-            "validateTimeoutInSeconds": timeout,
+            "validateTimeoutInSeconds": timeout if image_timeout is None else image_timeout,
         },
         "microvmHooks": {
             "run": "ENABLED",
@@ -290,6 +573,7 @@ def default_hooks(
             "terminateTimeoutInSeconds": timeout,
         },
     }
+    return require_hook_timeouts_in_range(hooks)
 
 
 #: Measured 2026-08-05. Not `/aws/lambda/microvms/*` — an IAM policy granting that
@@ -341,7 +625,11 @@ class Sandbox:
         s3_client: Any = None,
         poll_interval_sec: float = DEFAULT_POLL_INTERVAL_SEC,
         clock: Callable[[], float] = time.monotonic,
+        allow_unlisted_region: bool = False,
     ) -> None:
+        # Before the client is built, because building one succeeds for any region and
+        # the first call is where the evidence is lost to a null-message denial.
+        require_supported_region(region, allow_unlisted=allow_unlisted_region)
         self.region = region
         self.port = port
         self.poll_interval_sec = poll_interval_sec
@@ -399,8 +687,22 @@ class Sandbox:
         CloudTrail. It is not the token — see `_create_token` for why the client will
         not accept one.
         """
+        # Every local rejection happens before `put_object`, which is the whole point:
+        # the create call the service would reject comes *after* the artifact upload,
+        # so letting AWS answer costs the upload and the wait before the answer.
+        require_valid_image_name(name)
+        if architecture not in ARCHITECTURES:
+            raise ValueError(
+                f"architecture={architecture!r} is not in the Architecture enum "
+                f"{list(ARCHITECTURES)} (service model {MODEL_API_VERSION}). MicroVMs are "
+                "ARM64-only, so a host-built x86 binary is the most common first-attempt "
+                "failure — and it surfaces as a run-hook timeout, which says nothing "
+                "about architecture."
+            )
         base = resolve_base_image(base_image)
         size = size_class_for(memory_mib)
+        if hooks is not None:
+            require_hook_timeouts_in_range(hooks)
         if inherit_workdir:
             self._require_workdir(base, dockerfile)
         if dockerfile is not None:
@@ -565,7 +867,15 @@ class Sandbox:
             builds = self._mv.list_microvm_image_builds(
                 imageIdentifier=image_id, imageVersion=version
             )
-            states = [b.get("state") for b in builds.get("items", [])]
+            # `buildState`, not `state`. The model's `MicrovmImageBuildSummary` has no
+            # `state` member at all, so the previous `b.get("state")` read `None` from
+            # every real response and the all-PENDING test below could never be true.
+            # This guard — the only thing that separates a wedged image from a slow
+            # build, and the one that would have caught the ~15-hour wedge — was dead
+            # against live AWS while passing its unit test, because the fake returned
+            # `{"state": "PENDING"}`: the fake shared the client's own misreading.
+            # Found 2026-08-07 by diffing against the service model.
+            states = [b.get("buildState") for b in builds.get("items", [])]
         except Exception:  # noqa: BLE001 - a best-effort probe must never break the wait
             return
         if states and all(s == "PENDING" for s in states):
@@ -610,8 +920,13 @@ class Sandbox:
         identifier = image_identifier or (self.image.identifier if self.image else None)
         if not identifier:
             raise ValueError("no image: pass image_identifier or call build_image first")
+        require_duration_in_range(max_duration_sec)
 
         token = agent_token or secrets.token_urlsafe(32)
+        # Checked even though the client builds the payload itself, because
+        # `agent_token` is a caller-supplied value: a caller who passes a JWT or a
+        # signed blob rather than a bearer token is who this catches.
+        payload = require_payload_fits(json.dumps({"agent_token": token}))
         kwargs: dict[str, Any] = {
             "imageIdentifier": identifier,
             "executionRoleArn": execution_role_arn,
@@ -625,7 +940,7 @@ class Sandbox:
                 "autoResumeEnabled": auto_resume,
             },
             "maximumDurationInSeconds": max_duration_sec,
-            "runHookPayload": json.dumps({"agent_token": token}),
+            "runHookPayload": payload,
             "clientToken": _run_token(token_scope or identifier),
         }
         if egress:

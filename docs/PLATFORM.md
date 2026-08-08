@@ -51,6 +51,79 @@ and application logs for more details.` before forwarding any traffic — so the
 failure is invisible from outside the VM, and the VM is gone before you can look
 inside it. Read `GetMicrovm`'s `stateReason` first when a launch dies young.
 
+## The `runHookPayload` ceiling is 4096 bytes, and the service model states it
+
+Measured 2026-08-07, us-east-1, API version `2025-09-09`. `STRATEGY.md` asserted a
+16 KB `runHookPayload` and `TRUST.md` repeated it while flagging it as unmeasured. The
+real ceiling is 4096 bytes, a quarter of the claimed figure, and the error ran in the
+dangerous direction: it told a reader they could fit four times the secret material they
+actually can. Corrected 2026-08-07 in both files.
+
+The boundary was bracketed from both sides by calling `RunMicrovm` with a deliberately
+bogus `imageIdentifier`, so nothing could be created and nothing was billed:
+
+| Payload length | Result |
+| --- | --- |
+| 4096 bytes | passes the length check, fails only on the bogus ARN (`Malformed ARN - doesn't start with 'arn:'`) |
+| 4097 bytes | `1 validation error detected: Value at 'runHookPayload' failed to satisfy constraint: Member must have length less than or equal to 4096` |
+
+So 4096 is inclusive. The bogus-ARN technique generalizes: to probe a request-validation
+boundary without creating a billable resource, make one other field invalid in a way that
+fails later than the constraint under test, then read which error comes back.
+
+botocore does not enforce this client-side. The oversized request goes to the wire and
+the server rejects it, so a caller building a payload gets no local signal that it is too
+large. A length check before the call is worth having.
+
+The figure was there to be read the whole time. The botocore service model for
+`lambda-microvms` version `2025-09-09` declares
+`RunMicrovmRequestRunHookPayloadString` with `max: 4096`. That model is a
+machine-readable statement of the service's constraints, and this project had been
+restating those constraints in prose by hand and getting one of them wrong by 4x. Other
+constraints it states, useful and none of them measured by us:
+
+| Constraint | Value |
+| --- | --- |
+| `Architecture` enum | exactly `['ARM_64']`, so a MicroVM cannot be x86 |
+| `Capability` enum | exactly `['ALL']` |
+| `run`, `resume`, `suspend`, `terminate` hook timeouts | max 60 seconds |
+| `ready` and `validate` image-build hook timeouts | max 3600 seconds, 60x the run-time hooks |
+| `maximumDurationInSeconds` | max 28800 (8 hours) |
+| `ImageName` | max 64 chars, pattern `[a-zA-Z0-9-_]+` |
+
+The 60x gap between the two hook families follows from what they are for: a build hook
+waits on a Dockerfile, a run hook waits on a daemon that is already booted. A daemon that
+takes more than 60 seconds to answer `/run` fails the launch with no way to ask for more
+time.
+
+A drift checker is being added at `scripts/check-model-drift` and wired into
+`mise run check`, so a documented constraint that no longer matches the shipped model
+fails mechanically instead of waiting for someone to notice the prose.
+
+## Calling an unpriced region returns `AccessDeniedException` with a null message
+
+Measured 2026-08-07 by calling `ListMicrovms` in eight regions. The five regions that
+price MicroVMs all answered successfully: us-east-1, us-east-2, us-west-2, eu-west-1,
+ap-northeast-1. eu-central-1, ap-southeast-2, and sa-east-1 each returned
+`AccessDeniedException` with the message field `None`.
+
+That is indistinguishable from a genuine IAM denial, so someone who typos a region
+audits a policy that is fine. The tell is the null message: a real denial names the
+principal and the action.
+
+Nothing earlier in the call path catches it either. `boto3.client("lambda-microvms",
+region_name=...)` constructs successfully for any region and resolves to
+`https://lambda.<region>.amazonaws.com`, because the service model's `endpointPrefix` is
+`lambda`. So the first API call is the only thing that reports the problem, and it
+reports the wrong cause.
+
+One resolver detail, stated precisely because the two calls disagree.
+`endpoint_resolver.get_available_endpoints("lambda-microvms")` returns an empty list,
+while `session.get_available_regions("lambda-microvms")` returns 34 regions, the full
+Lambda set, since resolution keys off the shared `lambda` prefix. Neither answer is the
+five-region truth, so do not use either as a support check. Keep the supported list
+explicitly and validate the caller's region against it before the first call.
+
 ## Network connectors are ARNs
 
 Measured 2026-08-05. `ingressNetworkConnectors` takes
@@ -155,22 +228,73 @@ every running second.
 
 ## What actually costs money
 
-Documented 2026-08-07 from the Lambda pricing page and the MicroVMs developer
-guide. Rates are us-east-1. MicroVMs has no standalone pricing page: the rates
-appear only inside worked examples on the Lambda pricing page, which is why they are
-easy to miss.
+Measured 2026-08-07 from the AWS Pricing API, us-east-1, with live
+`pricing.get_products(ServiceCode="AWSLambda")` calls filtered to usage types
+containing `MicroVM`.
 
-| Line item | Rate |
-| --- | --- |
-| vCPU | $0.0000276944 per vCPU-second |
-| Memory | $0.0000036667 per GB-second |
-| Snapshot storage | $0.08 per GB-month, **1-week minimum retention** |
-| Snapshot read (launch or resume) | $0.00155 per GB |
-| Snapshot write (suspend) | $0.0038 per GB |
-| Data transfer | standard AWS rates, including MicroVM to your own VPC |
+**Get the rates from the Pricing API, not from the pricing page.** An earlier version
+of this section said MicroVMs "has no standalone pricing page: the rates appear only
+inside worked examples on the Lambda pricing page". The first half is still true and the
+second is wrong: the Pricing API carries MicroVM rates directly, as seven named usage
+types under `AWSLambda`, so they are queryable rather than only readable out of prose.
+Corrected 2026-08-07 after querying the API rather than continuing to restate the page.
+A caller who needs current rates should query, since a hand-copied table drifts and this
+one did.
+
+The seven line items, us-east-1, exactly as returned:
+
+| Usage type | Rate | Unit |
+| --- | --- | --- |
+| `Lambda-MicroVM-vCPU-Second-ARM` | 0.0000276944 | per vCPU-second |
+| `Lambda-MicroVM-vCPU-Second` | 0.0000326557 | per vCPU-second |
+| `Lambda-MicroVM-Memory-GB-Second-ARM` | 0.0000036667 | per GB-second |
+| `Lambda-MicroVM-Memory-GB-Second` | 0.0000043235 | per GB-second |
+| `Lambda-MicroVM-Snapshot-Read-GB` | 0.0015467699 | per GB |
+| `Lambda-MicroVM-Snapshot-Write-GB` | 0.0037977138 | per GB |
+| `Lambda-MicroVM-Snapshot-Storage-GB-Hour` | 0.0001111111 | per GB-hour |
+
+Data transfer is not among them and bills at standard AWS rates, including MicroVM to
+your own VPC.
+
+**Snapshot storage was understated.** This section listed $0.08 per GB-month. The API
+prices storage per GB-hour, and $0.0001111111 per GB-hour is $0.0811111030 at AWS's own
+730-hour month, so the old figure was 1.37% low. Corrected 2026-08-07. The one-week
+minimum retention still applies. The rest of the old table survived the check: read was
+0.00155 against 0.0015467699 (0.21% high), write 0.0038 against 0.0037977138 (0.06%
+high), and both compute rates matched to the digit.
+
+**There are two compute rates 17.9% apart, and only the ARM one can ever apply.** The
+service model's `Architecture` enum has exactly one member, `ARM_64`, so a MicroVM
+cannot be x86 and the non-ARM line items are unreachable for this service. The old table
+used the ARM figures and was correct by luck rather than by construction. This is worth
+recording because the Pricing API returns both and the Lambda pricing page gives a reader
+no obvious signal about which applies, so someone pricing a fleet by hand can land on the
+non-ARM column and overstate compute by 17.9%.
+
+**Only five regions price MicroVMs, and us-east-1 rates do not travel.** us-east-1,
+us-east-2, us-west-2, eu-west-1, and ap-northeast-1 return the seven line items;
+eu-central-1, ap-southeast-2, and sa-east-1 return none. us-east-2 and us-west-2 are
+identical to us-east-1 on every line item. The other two are not:
+
+| Region | ARM compute | Snapshot read | Snapshot write | Snapshot storage |
+| --- | --- | --- | --- | --- |
+| us-east-2, us-west-2 | same | same | same | same |
+| eu-west-1 | +5.3% | +6.0% | +7.0% | +19.0% |
+| ap-northeast-1 | +16.4% | +19.9% | +22.6% | +20.0% |
+
+So a Tokyo caller who estimates from us-east-1 rates understates their bill by up to
+22%, and the largest gaps are on the snapshot dimensions rather than on compute, which
+matters most for a design that leans on a suspended pool.
+
+One measurement trap worth recording, because it produces a confident wrong answer.
+us-east-1 usage types are unprefixed while every other region carries a location prefix,
+`USW2-Lambda-MicroVM-Snapshot-Read-GB` and so on. Comparing raw `usagetype` strings
+across regions therefore matches nothing outside us-east-1. The first pass at this table
+came out as NaNs, which reads as "no regional variation" rather than as a join bug. Strip
+the prefix before comparing.
 
 vCPU and memory bill as two separate line items rather than one blended
-GB-second, and there is no per-request charge — instances bill per second. No
+GB-second, and there is no per-request charge: instances bill per second. No
 MicroVMs free tier is published; the Lambda free tier is Functions-only. No
 minimum billing increment is published.
 
@@ -196,7 +320,12 @@ constantly rather than suspending for a long time.
 
 **Not published:** whether the server-side image build is billed as compute. The
 build starts a real MicroVM to run the Dockerfile, so it plausibly is, but AWS does
-not say and we have not measured it. Do not assume either way.
+not say and we have not measured it. Do not assume either way. The Pricing API does not
+settle it either, and that is now a checked finding rather than an assumption: none of
+the seven MicroVM usage types names a build, so if build time is billed it arrives on one
+of the existing compute or snapshot dimensions rather than on a line item of its own. A
+reader auditing a bill for a distinct build charge will not find one, which is not the
+same as the build being free.
 
 ## Seeing an OOM: the process case works, the VM case is still unmeasured
 

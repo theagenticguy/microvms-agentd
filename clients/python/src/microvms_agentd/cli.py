@@ -46,20 +46,23 @@ from .cost import (
     run_report,
 )
 from .errors import AgentdError, AuthTokenMintError, HttpError, Unauthorized
+
+# Safe at module level despite the lazy `from .sandbox import Sandbox` inside the
+# handlers below: `sandbox` imports boto3 lazily too, so naming a constant from it
+# costs nothing and does not drag the SDK in.
+from .sandbox import MICROVM_REGIONS as _MICROVM_REGIONS
 from .sizing import size_class_for
 
 #: The envelope's own version, bumped when a field's meaning changes rather than
 #: when a command is added. An agent that pinned to "1" must keep parsing.
 API_VERSION = "1"
 
-#: Regions where `lambda-microvms` was available when this was written. A local
-#: check rather than a call, because the failure it prevents is a `RunMicrovm`
-#: against an endpoint that resolves and then answers with something that reads
-#: like a permissions problem. Advisory: `doctor` reports an unlisted region as a
-#: warning, not a failure, since AWS adds regions faster than we re-read the page.
-MICROVM_REGIONS = frozenset(
-    {"us-east-1", "us-east-2", "us-west-2", "eu-west-1", "eu-central-1", "ap-northeast-1"}
-)
+#: Re-exported from `sandbox` rather than restated. The two lists had already
+#: diverged: this one carried `eu-central-1`, which measurement on 2026-08-07 shows
+#: does *not* carry MicroVMs — it was one of the three regions that answered
+#: `AccessDeniedException` with a null message. A second copy of a list whose
+#: correctness condition is completeness is a second copy that goes stale alone.
+MICROVM_REGIONS = _MICROVM_REGIONS
 
 #: MicroVMs are ARM64-only, so a daemon binary built for the host is the single
 #: most common first-attempt failure — and it surfaces as a run-hook timeout,

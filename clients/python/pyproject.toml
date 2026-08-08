@@ -65,6 +65,10 @@ known-first-party = ["microvms_agentd", "fake_daemon"]
 [tool.ruff.lint.per-file-ignores]
 # The stdlib's own do_GET/do_POST naming, which a handler subclass cannot rename.
 "tests/fake_daemon.py" = ["N802"]
+# botocore's own PascalCase kwargs (ServiceCode, Filters, NextToken). The fake
+# Pricing client has to accept the names the real one does or it would pass calls
+# the real client rejects, which is the one thing a fake must not do.
+"tests/test_pricing.py" = ["N803"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

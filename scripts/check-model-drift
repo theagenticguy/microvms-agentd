@@ -1,0 +1,421 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["boto3>=1.40", "httpx>=0.27", "cyclopts>=4.20,<5"]
+# ///
+#
+# boto3 is here for the botocore it bundles, which is what carries the model. httpx
+# and cyclopts are here only because importing `microvms_agentd.sandbox` runs the
+# package `__init__`, which pulls the wire layer and the CLI. Paid deliberately: the
+# alternative is parsing the constants out of `sandbox.py` as text, which makes this
+# script a *second* reader of the same values and lets the two disagree — precisely
+# the failure it exists to catch.
+"""Check the constraints this client hardcodes against the shipped service model.
+
+botocore ships a machine-readable model for `lambda-microvms` that states many of
+the constraints this project had been restating in prose by hand. Nobody had
+compared the two, and the prose was wrong: `docs/STRATEGY.md` and `docs/TRUST.md`
+published a 16 KB `runHookPayload` ceiling against a model that says 4096 — wrong
+by 4x in the dangerous direction, since it tells a caller four times as much secret
+material fits as actually does. It had survived multiple review passes because a
+number in prose has nothing to disagree with.
+
+This gives it something to disagree with. Every constraint the client hardcodes is
+read back out of the model and compared. A mismatch is drift and fails the build,
+in either direction: the model tightening means we now accept something AWS
+rejects, and the model loosening means we refuse something valid.
+
+*A checker that reports clean while a constraint has drifted is worse than no
+checker*, because it converts an unknown into false assurance. That exact failure
+has already happened here — `scripts/verify-clean` reported an account clean while
+a log group billed, because its prefix list knew two of the four name prefixes (see
+the comment above `NAME_PREFIXES`). The response is the same one: this script
+enumerates every check by name, and is loud about the constraints the model states
+that it does *not* bind to anything in our code. A green tick over three silent
+checks is the failure mode, so the count and the uncovered list always print.
+
+Needs no network and no credentials — the model is a file inside botocore — so this
+belongs in `mise run check` alongside `schema:check`, whose argument it shares: a
+generated artifact consumers trust *because* it is generated is the most dangerous
+thing to leave stale.
+
+Exit 0 when every checked constraint agrees, 1 on drift or a missing model.
+"""
+
+from __future__ import annotations
+
+import argparse
+import gzip
+import json
+import sys
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+SERVICE = "lambda-microvms"
+API_VERSION = "2025-09-09"
+
+
+def load_model() -> tuple[dict[str, Any], Path]:
+    """The service model, resolved through botocore rather than by hardcoded path.
+
+    Through the loader because the path embeds the Python version and the botocore
+    version's data layout, so a venv rebuild or an SDK upgrade moves it. A hardcoded
+    path that stops resolving is the same defect as a stale constant: it makes the
+    check silently unrunnable rather than loudly wrong.
+
+    Raises rather than returning a sentinel, and the caller does not catch it. An
+    absent model must fail this script — "the model was not there so nothing
+    disagreed" is exactly the false assurance the docstring above is about.
+    """
+    import botocore
+
+    root = Path(botocore.__file__).parent / "data" / SERVICE
+    if not root.is_dir():
+        raise SystemExit(
+            f"no service model for {SERVICE} under {root}. botocore "
+            f"{botocore.__version__} either predates the service or dropped it. This "
+            "check cannot run without the model, and skipping it would report clean "
+            "on constraints nothing verified — install a botocore that ships it."
+        )
+
+    versions = sorted(p.name for p in root.iterdir() if p.is_dir())
+    if API_VERSION not in versions:
+        raise SystemExit(
+            f"botocore ships {SERVICE} API versions {versions}, not {API_VERSION}. "
+            "Every constraint in this repo was read from that version, so a different "
+            "one is not a drift result — it is a different question. Re-read the "
+            "constraints against the new version and bump API_VERSION here."
+        )
+
+    for name in ("service-2.json.gz", "service-2.json"):
+        path = root / API_VERSION / name
+        if not path.exists():
+            continue
+        opener = gzip.open if path.suffix == ".gz" else open
+        with opener(path, "rt") as handle:  # type: ignore[operator]
+            return json.load(handle), path
+    raise SystemExit(f"no service-2.json[.gz] under {root / API_VERSION}")
+
+
+@dataclass
+class Result:
+    """One named comparison, so a pass is as visible as a failure.
+
+    Named because the enumeration *is* the report: a reader has to be able to see
+    which constraints were compared without reading this file, or a checker that
+    covers three things looks the same as one that covers thirty.
+    """
+
+    name: str
+    ours: Any
+    model: Any
+    ok: bool
+    note: str = ""
+
+
+@dataclass
+class Checker:
+    model: dict[str, Any]
+    results: list[Result] = field(default_factory=list)
+    #: Every shape this run read a constraint out of. Drives the coverage report:
+    #: anything constrained in the model and absent from here is stated by AWS and
+    #: bound to nothing in our code, which is the honest thing to print.
+    touched: set[str] = field(default_factory=set)
+
+    def shape(self, name: str) -> dict[str, Any]:
+        try:
+            return self.model["shapes"][name]
+        except KeyError:
+            raise SystemExit(
+                f"the model has no shape {name!r}. A renamed shape is drift this script "
+                "cannot interpret, so it fails rather than skipping the constraint."
+            ) from None
+
+    def record(self, name: str, ours: Any, model: Any, *, note: str = "") -> None:
+        self.results.append(Result(name, ours, model, ours == model, note))
+
+    def enum(self, label: str, shape: str, ours: tuple[str, ...] | frozenset[str]) -> None:
+        self.touched.add(shape)
+        self.record(label, tuple(sorted(ours)), tuple(sorted(self.shape(shape)["enum"])))
+
+    def bound(self, label: str, shape: str, key: str, ours: Any) -> None:
+        self.touched.add(shape)
+        self.record(label, ours, self.shape(shape).get(key))
+
+    def pattern(self, label: str, shape: str, ours: str) -> None:
+        self.touched.add(shape)
+        self.record(label, ours, self.shape(shape).get("pattern"))
+
+
+def check(mod: Any, sandbox: Any, model: dict[str, Any]) -> Checker:
+    """Every constraint the client hardcodes, compared against its model shape.
+
+    Grouped by the trap each one closes rather than by shape name, because the
+    grouping is what tells a reader why the constraint is worth pinning.
+    """
+    c = Checker(model)
+
+    # The 4x documentation bug this script was written for.
+    c.bound(
+        "runHookPayload max bytes",
+        "RunMicrovmRequestRunHookPayloadString",
+        "max",
+        sandbox.MAX_RUN_HOOK_PAYLOAD_BYTES,
+    )
+
+    # ARM64-only is machine-checkable, not folklore.
+    c.enum("Architecture enum", "Architecture", sandbox.ARCHITECTURES)
+    # Why `build_image` takes `repair_guest_identity: bool` and not a capability list:
+    # there is exactly one accepted value, so a list can only express a mistake.
+    c.enum("Capability enum", "Capability", sandbox.CAPABILITIES)
+
+    # The state machines the client's polling loops branch on. A state added to the
+    # model that no loop knows is a VM this client waits out rather than reports.
+    c.enum("MicrovmState enum", "MicrovmState", MICROVM_STATES)
+    c.enum("MicrovmImageState enum", "MicrovmImageState", IMAGE_STATES)
+    c.enum("MicrovmImageVersionState enum", "MicrovmImageVersionState", IMAGE_VERSION_STATES)
+    c.enum("BuildState enum", "BuildState", BUILD_STATES)
+    c.enum("Chipset enum", "Chipset", CHIPSETS)
+
+    # Terminal-state sets are subsets rather than equalities, so they get their own
+    # comparison: the check is that every member is a real state, which is what
+    # catches a typo'd or removed spelling.
+    model_states = set(c.shape("MicrovmState")["enum"])
+    for label, ours in (
+        ("TERMINAL_STATES ⊆ MicrovmState", sandbox.TERMINAL_STATES),
+        ("DEAD_STATES ⊆ MicrovmState", sandbox.DEAD_STATES),
+    ):
+        unknown = sorted(set(ours) - model_states)
+        c.record(label, unknown, [], note="states our code branches on that the model omits")
+
+    # `IMAGE_READY_STATES` deliberately carries two spellings the enum does not have
+    # (`ACTIVE`, `AVAILABLE`), kept for older API versions. So the model-derived half
+    # is what gets compared — asserting the whole set against the enum would fail
+    # forever, and asserting nothing would let a real removal through.
+    unknown_ready = sorted(sandbox.MODEL_IMAGE_READY_STATES - set(c.shape("MicrovmImageState")["enum"]))
+    c.record(
+        "MODEL_IMAGE_READY_STATES ⊆ MicrovmImageState",
+        unknown_ready,
+        [],
+        note="tolerated-legacy spellings are held separately, in _TOLERATED_IMAGE_READY_STATES",
+    )
+
+    # Image name: rejected locally because the create call happens after the upload.
+    c.bound("ImageName max length", "ImageName", "max", sandbox.MAX_IMAGE_NAME_LEN)
+    c.pattern("ImageName pattern", "ImageName", sandbox.IMAGE_NAME_PATTERN)
+
+    # The eight-hour ceiling on a VM's life.
+    c.bound(
+        "maximumDurationInSeconds max",
+        "RunMicrovmRequestMaximumDurationInSecondsInteger",
+        "max",
+        sandbox.MAX_DURATION_SEC,
+    )
+
+    # The 60x gap that makes confusing the two hook families a trap. Each of the six
+    # shapes is checked separately rather than one per family: they are six shapes in
+    # the model and AWS can move one without moving its siblings, which is exactly
+    # the drift a per-family check would hide.
+    for hook in ("Run", "Resume", "Suspend", "Terminate"):
+        c.bound(
+            f"microvmHooks.{hook.lower()}TimeoutInSeconds max",
+            f"MicrovmHooks{hook}TimeoutInSecondsInteger",
+            "max",
+            sandbox.MAX_MICROVM_HOOK_TIMEOUT_SEC,
+        )
+    for hook in ("Ready", "Validate"):
+        c.bound(
+            f"microvmImageHooks.{hook.lower()}TimeoutInSeconds max",
+            f"MicrovmImageHooks{hook}TimeoutInSecondsInteger",
+            "max",
+            sandbox.MAX_IMAGE_HOOK_TIMEOUT_SEC,
+        )
+    c.bound("hooks.port max", "HooksPortInteger", "max", sandbox.MAX_HOOK_PORT)
+
+    # List ceilings. `ResourcesList` max 1 is why "two memory floors" is unaskable.
+    c.bound("NetworkConnectorList max", "NetworkConnectorList", "max", sandbox.MAX_NETWORK_CONNECTORS)
+    c.bound("ResourcesList max", "ResourcesList", "max", sandbox.MAX_RESOURCES)
+    c.bound("EnvironmentVariableMap max", "EnvironmentVariableMap", "max", MAX_ENVIRONMENT_VARIABLES)
+    c.pattern("RoleArn pattern", "RoleArn", ROLE_ARN_PATTERN)
+
+    # `min: 60` with no max, and the one constraint here botocore *does* enforce
+    # locally — so the client adds no check for it and this comparison exists only to
+    # notice if that stops being true.
+    c.bound(
+        "idlePolicy.maxIdleDurationSeconds min",
+        "IdlePolicyMaxIdleDurationSecondsInteger",
+        "min",
+        MIN_IDLE_DURATION_SEC,
+    )
+
+    # The most expensive incident this repo has had came from not knowing these are
+    # permanent keys. Asserted as a set, so a *fourth* idempotency-token member added
+    # by AWS fails here — a create-shaped call whose token this client does not
+    # randomize is the wedge again.
+    found = {
+        f"{shape}.{member}"
+        for shape, body in model["shapes"].items()
+        for member, spec in body.get("members", {}).items()
+        if spec.get("idempotencyToken")
+    }
+    c.record("idempotencyToken members", sorted(IDEMPOTENCY_TOKEN_MEMBERS), sorted(found))
+
+    # All three token shapes, separately. This one earned its place: the coverage
+    # report below named `RunMicrovmRequestClientTokenString` as unbound, and checking
+    # it found that `run`'s token — which defaults its scope to a full image ARN —
+    # exceeded 128 characters for a legal 64-character image name in the
+    # longest-named region. It would have failed the launch on a field the caller
+    # never set. The uncovered list is not decoration.
+    for verb in ("CreateMicrovmImage", "RunMicrovm", "UpdateMicrovmImage"):
+        c.bound(
+            f"{verb}Request.clientToken max",
+            f"{verb}RequestClientTokenString",
+            "max",
+            sandbox.MAX_CLIENT_TOKEN_LEN,
+        )
+
+    # The tokens this client actually mints, against that ceiling. A bound the client
+    # satisfies today is not the same claim as a bound it satisfies for the worst
+    # legal input, and the worst legal input is what broke it.
+    worst_scope = f"arn:aws:lambda:ap-northeast-1:123456789012:microvm-image:{'n' * 64}"
+    for label, minted in (
+        ("minted create token ≤ clientToken max", sandbox._create_token(worst_scope)),
+        ("minted run token ≤ clientToken max", sandbox._run_token(worst_scope)),
+    ):
+        c.record(label, len(minted) <= sandbox.MAX_CLIENT_TOKEN_LEN, True, note=f"{len(minted)} chars")
+
+    # The client's `MICROVM_REGIONS` cannot be checked against the model at all, and
+    # saying so is the point. The model states no region list, and the two botocore
+    # calls that look like they might substitute for one disagree: get_available_endpoints
+    # returns an empty list while get_available_regions returns all 34 Lambda regions,
+    # since `endpointPrefix` is `lambda`. Neither is the five-region truth, so that
+    # constraint is measurement-backed only and this script must not imply otherwise.
+    c.record(
+        "MICROVM_REGIONS",
+        len(sandbox.MICROVM_REGIONS),
+        len(sandbox.MICROVM_REGIONS),
+        note="NOT model-backed: the model states no regions. Measured 2026-08-07 only.",
+    )
+
+    return c
+
+
+#: Constraints below are held here rather than imported because nothing in the
+#: client hardcodes them yet. They are still worth pinning: each one is a ceiling a
+#: future caller could cross, and a pinned value that turns out to differ from the
+#: model is how we learn the model moved. Keeping them here rather than dropping
+#: them is the difference between a checker that covers what we use and one that
+#: covers what the service states.
+MICROVM_STATES = ("PENDING", "RUNNING", "SUSPENDING", "SUSPENDED", "TERMINATING", "TERMINATED")
+IMAGE_STATES = (
+    "CREATING",
+    "CREATED",
+    "CREATE_FAILED",
+    "UPDATING",
+    "UPDATED",
+    "UPDATE_FAILED",
+    "DELETING",
+    "DELETE_FAILED",
+    "DELETED",
+)
+IMAGE_VERSION_STATES = (
+    "PENDING",
+    "IN_PROGRESS",
+    "SUCCESSFUL",
+    "FAILED",
+    "DELETING",
+    "DELETED",
+    "DELETE_FAILED",
+)
+BUILD_STATES = ("PENDING", "IN_PROGRESS", "SUCCESSFUL", "FAILED")
+CHIPSETS = ("GRAVITON",)
+MAX_ENVIRONMENT_VARIABLES = 50
+MIN_IDLE_DURATION_SEC = 60
+ROLE_ARN_PATTERN = r"arn:aws[a-z\-]*:iam::[0-9]{12}:role/?[a-zA-Z_0-9+=,.@\-_/]+"
+IDEMPOTENCY_TOKEN_MEMBERS = (
+    "CreateMicrovmImageRequest.clientToken",
+    "RunMicrovmRequest.clientToken",
+    "UpdateMicrovmImageRequest.clientToken",
+)
+
+
+def uncovered(model: dict[str, Any], touched: set[str]) -> list[str]:
+    """Shapes the model constrains that no check above binds to our code.
+
+    The honest half of the report. A checker that prints only its passes cannot be
+    distinguished from one that checks three things, and the reader's next question —
+    "what did you not look at?" — has to be answerable without reading the source.
+    """
+    constrained = {
+        name
+        for name, body in model["shapes"].items()
+        if {"enum", "min", "max", "pattern"} & set(body)
+    }
+    return sorted(constrained - touched)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="list every constraint the model states that no check binds",
+    )
+    args = parser.parse_args()
+
+    model, path = load_model()
+
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "clients" / "python" / "src"))
+    # Imported as a module rather than through the package, so this runs without
+    # boto3's other consumers being importable and without triggering `cli`.
+    import microvms_agentd.sandbox as sandbox
+
+    if sandbox.MODEL_API_VERSION != API_VERSION:
+        print(
+            f"DRIFT sandbox.MODEL_API_VERSION is {sandbox.MODEL_API_VERSION!r} but this "
+            f"script compares against {API_VERSION!r}"
+        )
+        return 1
+
+    checker = check(sandbox, sandbox, model)
+    drifted = [r for r in checker.results if not r.ok]
+    missing = uncovered(model, checker.touched)
+
+    print(f"service model: {SERVICE} {API_VERSION}")
+    print(f"  from: {path}")
+    print(f"\n{len(checker.results)} constraint(s) compared:")
+    for result in checker.results:
+        mark = "ok  " if result.ok else "DRIFT"
+        line = f"  {mark} {result.name}"
+        if not result.ok:
+            line += f"\n        ours:  {result.ours!r}\n        model: {result.model!r}"
+        elif result.note:
+            line += f"  ({result.note})"
+        print(line)
+
+    print(f"\n{len(missing)} constrained shape(s) the model states and no check binds:")
+    if args.verbose:
+        for name in missing:
+            body = model["shapes"][name]
+            stated = {k: v for k, v in body.items() if k in ("enum", "min", "max", "pattern")}
+            print(f"  -- {name} {stated}")
+    else:
+        print(f"  {', '.join(missing[:8])}{', ...' if len(missing) > 8 else ''}")
+        print("  (--verbose for all, with the value each one states)")
+    print(
+        "  These are constraints AWS states that nothing in this client is pinned to.\n"
+        "  Not a failure — most are response-only or unused shapes — but they are the\n"
+        "  answer to 'what did this not check', and that answer has to be printable."
+    )
+
+    if drifted:
+        print(f"\n{len(drifted)} constraint(s) drifted. Either the model moved or our value")
+        print("was wrong. Read the model, fix the constant, and re-measure if it is a ceiling.")
+        return 1
+    print(f"\nno drift: {len(checker.results)} constraint(s) agree with the shipped model")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

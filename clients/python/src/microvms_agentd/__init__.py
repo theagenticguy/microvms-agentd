@@ -66,7 +66,28 @@ from .models import (
     StreamEvent,
     StreamKind,
 )
+
+# `pricing.MICROVM_REGIONS` is deliberately not re-exported here: `sandbox` exports
+# a list of the same name for the same five regions, and two package-level names
+# that must agree is how they come to disagree. Callers who want the pricing one
+# import `microvms_agentd.pricing` and get it qualified.
+from .pricing import (
+    PricingError,
+    RateCatalogChanged,
+    RateDrift,
+    RegionNotPriced,
+    check_drift,
+    fetch_rate_table,
+)
 from .sandbox import (
+    ARCHITECTURES,
+    CAPABILITIES,
+    MAX_DURATION_SEC,
+    MAX_IMAGE_HOOK_TIMEOUT_SEC,
+    MAX_IMAGE_NAME_LEN,
+    MAX_MICROVM_HOOK_TIMEOUT_SEC,
+    MAX_RUN_HOOK_PAYLOAD_BYTES,
+    MODEL_API_VERSION,
     BaseImage,
     Image,
     NetworkConnector,
@@ -74,6 +95,11 @@ from .sandbox import (
     build_artifact,
     default_dockerfile,
     default_hooks,
+    require_duration_in_range,
+    require_hook_timeouts_in_range,
+    require_payload_fits,
+    require_supported_region,
+    require_valid_image_name,
 )
 from .session import Session
 from .sizing import (
@@ -96,8 +122,17 @@ __version__ = "0.1.0"
 from .cli import main as cli_main
 
 __all__ = [
+    "ARCHITECTURES",
+    "CAPABILITIES",
     "DEFAULT_AGENT_PORT",
     "DEFAULT_BASELINE_MIB",
+    "MAX_DURATION_SEC",
+    "MAX_IMAGE_HOOK_TIMEOUT_SEC",
+    "MAX_IMAGE_NAME_LEN",
+    "MAX_MICROVM_HOOK_TIMEOUT_SEC",
+    "MAX_RUN_HOOK_PAYLOAD_BYTES",
+    "MICROVM_REGIONS",
+    "MODEL_API_VERSION",
     "RATES",
     "SIZE_CLASSES",
     "AgentdError",
@@ -125,10 +160,14 @@ __all__ = [
     "OutputChunk",
     "OutputGap",
     "Phase",
+    "PricingError",
     "ProtocolError",
     "Provenance",
     "ProxyAuth",
+    "RateCatalogChanged",
+    "RateDrift",
     "RateTable",
+    "RegionNotPriced",
     "RequestTimeout",
     "ResidencyComparison",
     "Sandbox",
@@ -148,12 +187,19 @@ __all__ = [
     "Unpriced",
     "__version__",
     "build_artifact",
+    "check_drift",
     "cli_main",
     "compare_residency",
     "default_dockerfile",
     "default_hooks",
     "default_size_class",
     "estimate_run",
+    "fetch_rate_table",
+    "require_duration_in_range",
+    "require_hook_timeouts_in_range",
+    "require_payload_fits",
+    "require_supported_region",
+    "require_valid_image_name",
     "run_report",
     "size_class_for",
 ]

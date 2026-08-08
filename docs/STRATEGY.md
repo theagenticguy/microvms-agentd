@@ -81,10 +81,14 @@ partly free because each `RunMicrovm` is a Firecracker restore, so VMGenID bumps
 Linux ≥5.18 reseeds the kernel CSPRNG (documented), but the caller still owns
 userspace PRNG pools, `/etc/machine-id`, hostname, `/proc/sys/kernel/random/boot_id`
 (read-only, needs a bind mount), `/var/lib/systemd/random-seed`, and any cached
-credential or lease. The 16 KB `runHookPayload` is the only per-VM differentiator
-the platform offers, so repair belongs in the run hook. Getting this wrong produces
-VM-generated keys that repeat across sandboxes, which is a security bug rather than
-a performance regression.
+credential or lease. The 4096-byte `runHookPayload` is the only per-VM differentiator
+the platform offers, so repair belongs in the run hook. An earlier version of this
+memo called that ceiling 16 KB; it is 4096 bytes, measured 2026-08-07 in us-east-1 and
+recorded in `PLATFORM.md`. The correction strengthens the argument rather than weakening
+it: 4096 bytes is ample for the one 128-bit seed this list needs, and far too small to
+be a general secret channel, so the run hook is where per-VM identity belongs and is
+not where a credential set can live. Getting this wrong produces VM-generated keys that
+repeat across sandboxes, which is a security bug rather than a performance regression.
 
 **2. Content-addressed environment layers, fingerprinted by lockfile.** Attack the
 31–48%. Dependencies belong in the image, shared by construction; only working-tree

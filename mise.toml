@@ -75,13 +75,26 @@ description = "Requirements consistency via symspec + Z3"
 # downloaded embedding model, so a fresh clone should not fail on its absence.
 run = "symspec check spec/agentd.symspec.json --strict"
 
+[tasks."model:check"]
+description = "Fail if a hardcoded API constraint no longer matches botocore's service model"
+# Same argument as `schema:check`, pointed the other way. That one asserts the
+# generated artifact still describes what we serve; this one asserts the constants we
+# wrote by hand still describe what AWS accepts. Both exist because a value nobody
+# can disagree with drifts silently: this project published a 16 KB `runHookPayload`
+# ceiling through several review passes against a model that says 4096.
+#
+# In `check` rather than `live` because the model is a file inside botocore — no
+# network, no credentials, no money — so it costs the same as a lint and belongs
+# where the gate is unconditional.
+run = "./scripts/check-model-drift"
+
 [tasks.build]
 description = "Release build for the shipping target"
 run = "cargo build --release -p agentd --target $AGENTD_TARGET"
 
 [tasks.check]
 description = "The full local gate — the definition of done"
-depends = ["lint", "test", "test:python", "schema:check", "build"]
+depends = ["lint", "test", "test:python", "schema:check", "model:check", "build"]
 
 # ── live AWS suites (billable, manual) ──────────────────────────────────────
 
@@ -99,6 +112,25 @@ description = "Measure what a real suspend/resume cycle preserves"
 depends = ["build", "live:infra"]
 run = "./conformance/probe_suspend_resume.py --binary target/$AGENTD_TARGET/release/agentd"
 
+[tasks."live:rates"]
+description = "Fail if the pinned rate table no longer matches the AWS Pricing API"
+# The same argument as `schema:check`: a stale pinned artifact is worse than none,
+# because a consumer trusts a price *because* it is pinned and no diff reveals that
+# it describes a bill nobody pays. `cost.STALE_AFTER` could only say nobody had
+# looked; this looks.
+#
+# In `live` rather than `check` despite costing nothing — the Pricing API is free
+# and creates no resources — because it needs network and credentials, and `check`
+# is defined by needing neither. A gate that fails on a plane without AWS creds is
+# a gate people learn to skip, and `check` is the one command that must never be
+# skipped.
+# Not `python -m microvms_agentd.pricing`: the package `__init__` imports `pricing`,
+# so `-m` re-executes an already-imported module and warns about it on every run. A
+# gate whose normal output includes a RuntimeWarning is a gate whose real warnings
+# get skimmed past.
+run = "uv run --with boto3 python -c 'from microvms_agentd.pricing import main; raise SystemExit(main())'"
+dir = "clients/python"
+
 [tasks."live:verify-clean"]
 description = "Ask the account what leaked, rather than trusting teardown"
 # Independent of the code that did the cleanup, which is the whole point:
@@ -108,7 +140,11 @@ run = "./scripts/verify-clean"
 
 [tasks.live]
 description = "Every live suite, then an independent leak check. BILLABLE."
-depends = ["live:conformance", "live:probe", "live:verify-clean"]
+# `live:rates` is in here even though it is the one member that spends nothing and
+# creates nothing. It is the cheapest thing in the tier and the only one that can
+# tell you a figure this repo publishes has gone wrong, so leaving it out of the
+# aggregate would mean it only ever ran when someone remembered to name it.
+depends = ["live:rates", "live:conformance", "live:probe", "live:verify-clean"]
 # Records the commit that was last proven against real AWS. The pre-push hook
 # reads it to tell you whether the daemon has changed since — advisory only,
 # because only a human knows whether a given change could touch the platform
