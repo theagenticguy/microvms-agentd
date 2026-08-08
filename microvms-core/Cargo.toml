@@ -20,6 +20,12 @@ description = "The MicroVMs control-plane and in-VM client: every trap closure, 
 # Every version is what the registry offered on 2026-08-08, checked with
 # `cargo info` rather than transcribed from a plan.
 [dependencies]
+# The wire contract, shared with the daemon rather than mirrored (ARCH-2). This is
+# the one entry the dependency-freeze above missed, and it is not optional: the
+# alternative is a client that redefines `Phase`, `Outcome`, and the SSE event
+# payloads locally, which is precisely the drift the protocol crate was extracted to
+# make impossible. A field renamed in `protocol/` must break this crate's build.
+protocol = { path = "../protocol" }
 # The error taxonomy's Display impls. 2.x rather than 1.x: `#[error]` on an enum
 # with `#[from]` is the same surface, and the 2.0 line is what receives fixes.
 thiserror = "2.0.19"

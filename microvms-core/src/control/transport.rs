@@ -1,0 +1,1006 @@
+//! The signed rest-json transport, and the seam a test replaces it at.
+//!
+//! # Why this is hand-rolled
+//!
+//! `lambda-microvms` has no `aws-sdk-rust` crate. The alternatives were vendoring
+//! smithy-rs codegen — Gradle, JDK 17, Kotlin, and a project that declares its external
+//! interfaces unstable — or signing 24 rest-json operations by hand with the first-party
+//! low-level crates, which is the flow the AWS SDK maintainers point at for exactly this
+//! case. rest-json is also the easiest protocol to hand-roll: plain JSON bodies,
+//! URI-bound operations, standard headers, no XML and no query-protocol encoding.
+//!
+//! # The seam, and what the fake is allowed to know
+//!
+//! [`Transport`] is a trait with one method. The real implementation signs and sends;
+//! the test implementation is a **contract recorder** that asserts on the emitted
+//! request in the shape the service model declares.
+//!
+//! The rule the recorder follows is the lesson from the `buildState` bug: a fake that
+//! shares the client's assumptions hides exactly the class of defect the fake exists to
+//! catch. So the recorder never asserts on a value the client computed, and every
+//! response it hands back is **literal JSON in the model's spelling** — see
+//! [`crate::control::ops`] for why that is not a round trip through this crate's own
+//! serializer.
+//!
+//! # Local validation is not optional
+//!
+//! botocore's `VALIDATED_METADATA_ATTRS` is `{required, min, document, union}`, so
+//! `max`, `pattern`, and `enum` violations are serialized, sent, and answered with a
+//! `ValidationException` — confirmed empirically for `max` (runHookPayload 4097,
+//! maximumDurationInSeconds 28801, ImageName 65 chars, clientToken 129 chars), for
+//! `pattern`, and for `enum`. The same holds here with more force: **nothing** in this
+//! transport reads the service model at runtime, so every constraint is checked in the
+//! caller before a request is built or it is not checked at all.
+
+use std::time::SystemTime;
+
+use crate::error::{Error, ErrorKind};
+use crate::region::Region;
+
+/// The pinned API version, which is also the first path segment of every operation.
+///
+/// Read from [`crate::constants::MODEL_API_VERSION`] rather than written again, so the
+/// drift gate's version check and the URLs cannot disagree: a client signing
+/// `/2025-09-09/...` while claiming to implement a different model is a client whose
+/// constraint checks were verified against the wrong thing.
+const API_PATH_VERSION: &str = crate::constants::MODEL_API_VERSION;
+
+/// The SigV4 signing name, from the model's `signingName`.
+///
+/// `lambda`, not `lambda-microvms`. The `endpointPrefix` is also `lambda`, which is why
+/// an endpoint resolves for every AWS region and a client constructs happily for a region
+/// that does not carry MicroVMs (TRAP-6, `crate::region`).
+const SIGNING_NAME: &str = "lambda";
+
+/// One control-plane call: method, path, optional JSON body.
+///
+/// A struct rather than a long parameter list because the recorder asserts on it as a
+/// whole, and because `method` and `path` next to each other is how a reader checks a
+/// path against the model's `http` trait.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Call {
+    /// The operation name, for diagnostics and for the recorder's ledger.
+    ///
+    /// Carried rather than derived from the path: the recorder's TRAP-11 assertion is
+    /// "no call named `CreateMicrovmShellAuthToken`", and matching that on a path is a
+    /// substring test that a renamed route would slip past.
+    pub operation: &'static str,
+    /// `GET`, `POST`, or `DELETE` — the three the model's `http` traits use.
+    pub method: Method,
+    /// The path **after** the host, with the API version and every URI parameter already
+    /// percent-encoded. Includes the query string when the operation has one.
+    pub path: String,
+    /// The rest-json body, or `None` for an operation the model gives no body members.
+    pub body: Option<Vec<u8>>,
+}
+
+/// The three HTTP methods the model's operations use.
+///
+/// An enum so a call site cannot pass `"post"` and have the canonical request silently
+/// disagree with the wire method.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Method {
+    Get,
+    Post,
+    Delete,
+}
+
+impl Method {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Method::Get => "GET",
+            Method::Post => "POST",
+            Method::Delete => "DELETE",
+        }
+    }
+}
+
+impl Call {
+    /// A `GET` with no body.
+    pub fn get(operation: &'static str, path: impl Into<String>) -> Self {
+        Self {
+            operation,
+            method: Method::Get,
+            path: path.into(),
+            body: None,
+        }
+    }
+
+    /// A `POST` carrying a serialized rest-json body.
+    pub fn post_json<T: serde::Serialize>(
+        operation: &'static str,
+        path: impl Into<String>,
+        body: &T,
+    ) -> Result<Self, Error> {
+        let body = serde_json::to_vec(body).map_err(|error| {
+            Error::new(
+                ErrorKind::Unexpected,
+                format!("could not serialize the {operation} request body: {error}"),
+            )
+        })?;
+        Ok(Self {
+            operation,
+            method: Method::Post,
+            path: path.into(),
+            body: Some(body),
+        })
+    }
+
+    /// A `POST` with no body members. `SuspendMicrovm` and `ResumeMicrovm` are both this
+    /// shape: their only member is the URI-located identifier.
+    ///
+    /// The body is `Some(b"{}")` rather than `None`, because an empty POST and a POST of
+    /// `{}` are different canonical requests and rest-json services answer the former
+    /// inconsistently.
+    pub fn post_empty(operation: &'static str, path: impl Into<String>) -> Self {
+        Self {
+            operation,
+            method: Method::Post,
+            path: path.into(),
+            body: Some(b"{}".to_vec()),
+        }
+    }
+
+    /// A `DELETE` with no body.
+    pub fn delete(operation: &'static str, path: impl Into<String>) -> Self {
+        Self {
+            operation,
+            method: Method::Delete,
+            path: path.into(),
+            body: None,
+        }
+    }
+
+    /// The body as bytes, empty when there is none — which is what gets signed.
+    fn body_bytes(&self) -> &[u8] {
+        self.body.as_deref().unwrap_or(&[])
+    }
+}
+
+/// What the control plane answered: a status and a raw body.
+///
+/// Raw bytes rather than a deserialized value because the error path has to read a body
+/// the success types cannot hold, and because TRAP-6's null `message` field is only
+/// visible to something that did not already require a `String` there.
+#[derive(Clone, Debug)]
+pub struct Reply {
+    pub status: u16,
+    pub body: Vec<u8>,
+}
+
+impl Reply {
+    /// Deserializes the body as `T`, or reports the failure with the body attached.
+    ///
+    /// The body goes in the message because a rest-json parse failure with the text
+    /// withheld is unactionable: the reader cannot tell a renamed member from a truncated
+    /// response. Truncated to 512 bytes, since a list response can be large and the first
+    /// 512 characters always contain the member that failed.
+    pub fn json<T: serde::de::DeserializeOwned>(&self, operation: &str) -> Result<T, Error> {
+        serde_json::from_slice(&self.body).map_err(|error| {
+            let text = String::from_utf8_lossy(&self.body);
+            let shown: String = text.chars().take(512).collect();
+            Error::new(
+                ErrorKind::Platform,
+                format!(
+                    "could not read the {operation} response ({error}). The service model for \
+                     {API_PATH_VERSION} is what this client's shapes are transcribed from, so a \
+                     member that has moved is a drift-gate failure rather than a transport bug. \
+                     Body: {shown}"
+                ),
+            )
+            .with_source(error)
+        })
+    }
+
+    /// Whether the status is a success. rest-json operations here answer 200 or 201.
+    fn is_success(&self) -> bool {
+        (200..300).contains(&self.status)
+    }
+}
+
+/// The one seam every operation goes through.
+///
+/// One method, so a fake is a few lines and there is no partially-overridden transport
+/// whose behaviour is half real. `&self` rather than `&mut self` so the recorder can be
+/// shared behind an `Arc` while a lifecycle runs.
+pub trait Transport: Send + Sync {
+    /// Performs `call`, returning whatever the far side answered.
+    ///
+    /// A transport-level failure (no status at all) is an `Err`; a 4xx or 5xx is an
+    /// `Ok(Reply)` carrying the status, because classifying a status is
+    /// [`classify_failure`]'s job and a transport that classified would be a second
+    /// place the taxonomy lives.
+    fn send(
+        &self,
+        call: Call,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Reply, Error>> + Send + '_>>;
+}
+
+/// Sends `call` through `transport`, retrying the retryable statuses, and turns a failure
+/// status into a classified [`Error`].
+///
+/// # Which failures retry
+///
+/// 429 (`ThrottlingException`), 500 (`InternalServerException`), and any other 5xx, plus
+/// a transport error that produced no status. AWS standard-mode semantics, matched by
+/// hand because the smithy retry pieces are coupled to an orchestrator this client does
+/// not have.
+///
+/// # Why retrying the mutating operations is safe
+///
+/// Every mutating operation this client sends carries a `clientToken`, so a retry is
+/// idempotent by the service's own contract — which is the same property that makes the
+/// token dangerous to derive (TRAP-1). `SuspendMicrovm`/`ResumeMicrovm`/`TerminateMicrovm`
+/// take no token and are retried anyway: they are state transitions whose second
+/// application is a no-op or a `ConflictException`, and a conflict is not retried.
+pub async fn send_with_retry(transport: &dyn Transport, call: Call) -> Result<Reply, Error> {
+    use backon::{ExponentialBuilder, Retryable};
+
+    let operation = call.operation;
+    let attempt = || {
+        let call = call.clone();
+        async move {
+            let reply = transport.send(call).await?;
+            if reply.is_success() {
+                return Ok(reply);
+            }
+            Err(classify_failure(operation, &reply))
+        }
+    };
+
+    attempt
+        .retry(
+            ExponentialBuilder::default()
+                .with_jitter()
+                .with_min_delay(std::time::Duration::from_millis(200))
+                .with_max_delay(std::time::Duration::from_secs(20))
+                .with_max_times(5),
+        )
+        .when(Error::retryable)
+        .await
+}
+
+/// Turns a failure status and body into an [`Error`] of the right kind.
+///
+/// # The statuses are the control plane's, not the daemon's
+///
+/// [`crate::error::WireKind`] is the *daemon's* status discipline and deliberately has no
+/// generic 4xx fallback, because the daemon's 400-versus-404 distinction is load-bearing.
+/// None of that applies here: these seven statuses come from the modeled exception shapes
+/// (`ValidationException` 400, `ServiceQuotaExceededException` 402,
+/// `AccessDeniedException` 403, `ResourceNotFoundException` 404, `ConflictException` 409,
+/// `ThrottlingException` 429, `InternalServerException` 500). So a control-plane failure
+/// carries an [`ErrorKind`] and **no** `WireKind` — which is what `error.rs` already
+/// documents: "`None` for every local reject and every control-plane failure — those never
+/// reached the in-VM daemon".
+///
+/// # 403 and the null message
+///
+/// A 403 whose `message` is null is the unsupported-region signature (TRAP-6). The
+/// message says so, because the alternative — forwarding a null as "AccessDenied: " — is
+/// precisely what sends someone to audit an IAM policy that is fine.
+pub fn classify_failure(operation: &str, reply: &Reply) -> Error {
+    let parsed: crate::control::ops::ServiceErrorWire =
+        serde_json::from_slice(&reply.body).unwrap_or_default();
+    let detail = parsed.message.as_deref().unwrap_or("").trim().to_string();
+
+    let (kind, explanation) = match reply.status {
+        400 => (
+            ErrorKind::Platform,
+            "ValidationException — the service refused a value. Every max, pattern, and enum \
+             constraint is checked locally before the call for exactly this reason (botocore's \
+             VALIDATED_METADATA_ATTRS covers only required and min), so reaching this status means \
+             a constraint this client does not yet check."
+                .to_string(),
+        ),
+        402 => (
+            ErrorKind::Platform,
+            "ServiceQuotaExceededException — an account limit, not a request defect.".to_string(),
+        ),
+        403 if detail.is_empty() => (
+            ErrorKind::Credentials,
+            "AccessDeniedException with an empty or null message field. Measured 2026-08-07: this \
+             is the signature of a region that does not carry MicroVMs, and it is \
+             indistinguishable from a genuine IAM denial except that a real denial names the \
+             principal and the action (docs/PLATFORM.md, 'Calling an unpriced region returns \
+             AccessDeniedException with a null message'). Check the region before the policy."
+                .to_string(),
+        ),
+        403 => (
+            ErrorKind::Credentials,
+            "AccessDeniedException, with a message — so this is a genuine denial rather than the \
+             null-message region trap."
+                .to_string(),
+        ),
+        404 => (
+            ErrorKind::Platform,
+            "ResourceNotFoundException — the image or MicroVM does not exist.".to_string(),
+        ),
+        409 => (
+            ErrorKind::Platform,
+            "ConflictException — the resource is in a state that forbids this call. An image in \
+             CREATING refuses deletion, which is why teardown retries."
+                .to_string(),
+        ),
+        429 => (
+            ErrorKind::Retryable,
+            "ThrottlingException — retry the identical request.".to_string(),
+        ),
+        status if status >= 500 => (
+            ErrorKind::Retryable,
+            "InternalServerException — a service fault, retry the identical request.".to_string(),
+        ),
+        _ => (
+            ErrorKind::Platform,
+            "an unmodeled status: the service model declares 400, 402, 403, 404, 409, 429, and \
+             500 for these operations."
+                .to_string(),
+        ),
+    };
+
+    let said = if detail.is_empty() {
+        "the service sent no message".to_string()
+    } else {
+        format!("the service said {detail:?}")
+    };
+    Error::new(
+        kind,
+        format!(
+            "{operation} failed with HTTP {}: {said}. {explanation}",
+            reply.status
+        ),
+    )
+}
+
+/// The real transport: resolve credentials, sign SigV4, send with reqwest.
+pub struct SignedTransport {
+    region: Region,
+    endpoint: String,
+    credentials: aws_credential_types::provider::SharedCredentialsProvider,
+    http: reqwest::Client,
+}
+
+impl std::fmt::Debug for SignedTransport {
+    /// Hand-written because a derived one would print the credentials provider, and the
+    /// provider's own `Debug` is not something this crate controls.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SignedTransport")
+            .field("region", &self.region)
+            .field("endpoint", &self.endpoint)
+            .finish_non_exhaustive()
+    }
+}
+
+impl SignedTransport {
+    /// Resolves the default credential chain for `region` and builds the HTTP client.
+    ///
+    /// # Why the chain rather than explicit keys
+    ///
+    /// Because the credentials a developer actually has are in SSO, a credential process,
+    /// or an instance profile, and re-implementing that resolution is how a client ends up
+    /// working only on the machine it was written on. `aws-config`'s default chain is the
+    /// whole reason to depend on it at all — the manifest turns off its HTTP client, since
+    /// reqwest is the one here, but keeps `sso` and `credentials-process`.
+    ///
+    /// The provider is held rather than the resolved credentials: instance-profile creds
+    /// are temporary, so each request re-resolves and picks up a rotation. That is why
+    /// this is a provider field and not a `Credentials` field.
+    pub async fn new(region: Region) -> Result<Self, Error> {
+        let config = aws_config::defaults(aws_config::BehaviorVersion::latest())
+            .region(aws_config::Region::new(region.as_str().to_string()))
+            .load()
+            .await;
+        let credentials = config.credentials_provider().ok_or_else(|| {
+            Error::new(
+                ErrorKind::Credentials,
+                "no credentials provider resolved. The default chain looks at environment \
+                 variables, the shared config files, SSO, a credential process, then the EC2 \
+                 instance metadata service; none of them answered. `aws sts get-caller-identity` \
+                 is the cheapest way to see the same failure.",
+            )
+        })?;
+
+        let http = reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(10))
+            // Generous rather than tight: a control-plane call is not a hot path, and a
+            // timeout shorter than the service's own tail latency turns a slow answer into
+            // a retry storm against an operation that may not be idempotent.
+            .timeout(std::time::Duration::from_secs(60))
+            .build()
+            .map_err(|error| {
+                Error::new(
+                    ErrorKind::Precondition,
+                    format!("could not build the HTTP client: {error}"),
+                )
+                .with_source(error)
+            })?;
+
+        Ok(Self {
+            endpoint: endpoint_for(&region),
+            region,
+            credentials,
+            http,
+        })
+    }
+
+    /// The URL this transport would send `call` to. Public for the test that checks a path
+    /// against the model without needing credentials.
+    fn url(&self, call: &Call) -> String {
+        format!("{}{}", self.endpoint, call.path)
+    }
+}
+
+/// `https://lambda.<region>.amazonaws.com`, from the model's `endpointPrefix`.
+///
+/// The prefix is `lambda` rather than `lambda-microvms`, which is why this resolves for
+/// every AWS region including the ones that answer the null-message denial.
+pub fn endpoint_for(region: &Region) -> String {
+    format!("https://{SIGNING_NAME}.{}.amazonaws.com", region.as_str())
+}
+
+impl Transport for SignedTransport {
+    fn send(
+        &self,
+        call: Call,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Reply, Error>> + Send + '_>>
+    {
+        Box::pin(async move {
+            use aws_credential_types::provider::ProvideCredentials as _;
+
+            // Re-resolved per request so an instance-profile rotation is picked up. The
+            // provider caches internally, so this is not a metadata call per request.
+            let credentials = self
+                .credentials
+                .provide_credentials()
+                .await
+                .map_err(|error| {
+                    Error::new(
+                        ErrorKind::Credentials,
+                        format!(
+                            "could not resolve credentials for {}: {error}. Waiting will not fix \
+                             this — the identity is wrong or absent.",
+                            call.operation
+                        ),
+                    )
+                    .with_source(error)
+                })?;
+
+            let url = self.url(&call);
+            let body = call.body_bytes().to_vec();
+
+            // Built before signing, because the signature covers the headers that are on
+            // it: content-type is signed, and adding one afterwards invalidates it.
+            let mut request = http::Request::builder()
+                .method(call.method.as_str())
+                .uri(&url)
+                .header("content-type", "application/json")
+                .body(body.clone())
+                .map_err(|error| {
+                    Error::new(
+                        ErrorKind::Unexpected,
+                        format!("could not build the {} request: {error}", call.operation),
+                    )
+                    .with_source(error)
+                })?;
+
+            sign_in_place(&mut request, &credentials, &self.region)?;
+
+            let (parts, body) = request.into_parts();
+            let request = http::Request::from_parts(parts, reqwest::Body::from(body));
+            let request = reqwest::Request::try_from(request).map_err(|error| {
+                Error::new(
+                    ErrorKind::Unexpected,
+                    format!("could not convert the signed request: {error}"),
+                )
+                .with_source(error)
+            })?;
+
+            // A failure here produced no status, so it says nothing about service state:
+            // Retryable, matching the daemon transport's own rule.
+            let response = self.http.execute(request).await.map_err(|error| {
+                Error::new(
+                    ErrorKind::Retryable,
+                    format!(
+                        "the {} request to {url} did not complete: {error}",
+                        call.operation
+                    ),
+                )
+                .with_source(error)
+            })?;
+
+            let status = response.status().as_u16();
+            let body = response
+                .bytes()
+                .await
+                .map_err(|error| {
+                    Error::new(
+                        ErrorKind::Retryable,
+                        format!(
+                            "could not read the {} response body: {error}",
+                            call.operation
+                        ),
+                    )
+                    .with_source(error)
+                })?
+                .to_vec();
+
+            Ok(Reply { status, body })
+        })
+    }
+}
+
+/// Signs `request` in place with SigV4 for `region`.
+///
+/// Split out so the signing step is one readable unit and so the test below can sign a
+/// request with static credentials and inspect the headers, which is the only way to check
+/// the signing name and region without a live call.
+fn sign_in_place(
+    request: &mut http::Request<Vec<u8>>,
+    credentials: &aws_credential_types::Credentials,
+    region: &Region,
+) -> Result<(), Error> {
+    use aws_sigv4::http_request::{SignableBody, SignableRequest, SigningSettings, sign};
+    use aws_sigv4::sign::v4;
+
+    let identity = credentials.clone().into();
+    let params: aws_sigv4::http_request::SigningParams = v4::SigningParams::builder()
+        .identity(&identity)
+        .region(region.as_str())
+        .name(SIGNING_NAME)
+        .time(SystemTime::now())
+        .settings(SigningSettings::default())
+        .build()
+        .map_err(|error| {
+            Error::new(
+                ErrorKind::Unexpected,
+                format!("could not build SigV4 signing parameters: {error}"),
+            )
+            .with_source(error)
+        })?
+        .into();
+
+    // The headers view has to borrow from `request`, so the signable view is built and
+    // consumed before the mutable borrow that applies the signature.
+    let instructions = {
+        let signable = SignableRequest::new(
+            request.method().as_str(),
+            request.uri().to_string(),
+            request.headers().iter().filter_map(|(name, value)| {
+                // A header whose value is not ASCII cannot be part of a canonical
+                // request. This client sets only content-type, so the filter is a
+                // guard against a future header rather than a live case — and dropping
+                // one is correct: an unsigned header is still sent, it is just not
+                // covered.
+                value.to_str().ok().map(|value| (name.as_str(), value))
+            }),
+            // `Bytes`, never `UnsignedPayload`: non-S3 services reject an unsigned
+            // payload, and an empty body still needs its empty-payload SHA256 signed.
+            SignableBody::Bytes(request.body()),
+        )
+        .map_err(|error| {
+            Error::new(
+                ErrorKind::Unexpected,
+                format!("could not build the signable request: {error}"),
+            )
+            .with_source(error)
+        })?;
+
+        sign(signable, &params)
+            .map_err(|error| {
+                Error::new(
+                    ErrorKind::Credentials,
+                    format!("SigV4 signing failed: {error}"),
+                )
+                .with_source(error)
+            })?
+            .into_parts()
+            .0
+    };
+
+    // `http1x` rather than `http0x`: aws-sigv4's default features are sign-http + http1,
+    // which is the version reqwest 0.13 consumes through TryFrom. Mixing the two http
+    // versions would mean converting on every call.
+    instructions.apply_to_request_http1x(request);
+    Ok(())
+}
+
+/// The operation paths, one function per `http.requestUri` in the model.
+///
+/// Here rather than inlined at each call site so a path is written once and can be read
+/// against the model in one place. Every URI parameter is percent-encoded, because an
+/// image identifier may be an ARN — which contains `:` and `/` — and an unencoded ARN in a
+/// path segment is a different resource.
+pub mod paths {
+    use super::API_PATH_VERSION;
+
+    /// Percent-encodes a URI path segment.
+    ///
+    /// Hand-rolled against RFC 3986's unreserved set rather than pulling a dependency for
+    /// it. **`/` is encoded**, which is the whole point: an image ARN's slashes would
+    /// otherwise split into extra path segments and address something else. `:` is
+    /// encoded too — legal unencoded in a path per the RFC, but AWS's own SDKs encode it
+    /// in labels and the signature must match whatever is sent.
+    pub fn encode_segment(segment: &str) -> String {
+        let mut encoded = String::with_capacity(segment.len());
+        for byte in segment.bytes() {
+            match byte {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                    encoded.push(byte as char);
+                }
+                other => {
+                    use std::fmt::Write as _;
+                    let _ = write!(encoded, "%{other:02X}");
+                }
+            }
+        }
+        encoded
+    }
+
+    /// `POST /2025-09-09/microvm-images`
+    pub fn microvm_images() -> String {
+        format!("/{API_PATH_VERSION}/microvm-images")
+    }
+
+    /// `GET|DELETE /2025-09-09/microvm-images/{imageIdentifier}`
+    pub fn microvm_image(image: &str) -> String {
+        format!(
+            "/{API_PATH_VERSION}/microvm-images/{}",
+            encode_segment(image)
+        )
+    }
+
+    /// `GET /2025-09-09/microvm-images/{imageIdentifier}/versions`
+    pub fn image_versions(image: &str) -> String {
+        format!("{}/versions", microvm_image(image))
+    }
+
+    /// `DELETE /2025-09-09/microvm-images/{imageIdentifier}/versions/{imageVersion}`
+    pub fn image_version(image: &str, version: &str) -> String {
+        format!("{}/{}", image_versions(image), encode_segment(version))
+    }
+
+    /// `GET /2025-09-09/microvm-images/{imageIdentifier}/versions/{imageVersion}/builds`
+    pub fn image_builds(image: &str, version: &str) -> String {
+        format!("{}/builds", image_version(image, version))
+    }
+
+    /// `POST /2025-09-09/microvms`
+    pub fn microvms() -> String {
+        format!("/{API_PATH_VERSION}/microvms")
+    }
+
+    /// `GET|DELETE /2025-09-09/microvms/{microvmIdentifier}`
+    pub fn microvm(id: &str) -> String {
+        format!("/{API_PATH_VERSION}/microvms/{}", encode_segment(id))
+    }
+
+    /// `POST /2025-09-09/microvms/{microvmIdentifier}/suspend`
+    pub fn suspend(id: &str) -> String {
+        format!("{}/suspend", microvm(id))
+    }
+
+    /// `POST /2025-09-09/microvms/{microvmIdentifier}/resume`
+    pub fn resume(id: &str) -> String {
+        format!("{}/resume", microvm(id))
+    }
+
+    /// `POST /2025-09-09/microvms/{microvmIdentifier}/auth-token`
+    pub fn auth_token(id: &str) -> String {
+        format!("{}/auth-token", microvm(id))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The endpoint, from the model's `endpointPrefix`. `lambda` and not
+    /// `lambda-microvms` — which is the fact that makes TRAP-6 possible, since this
+    /// resolves for every AWS region.
+    #[test]
+    fn the_endpoint_uses_the_models_lambda_prefix_for_every_region() {
+        assert_eq!(
+            endpoint_for(&Region::UsEast1),
+            "https://lambda.us-east-1.amazonaws.com"
+        );
+        assert_eq!(
+            endpoint_for(&Region::ApNortheast1),
+            "https://lambda.ap-northeast-1.amazonaws.com"
+        );
+        // Including one that does not carry MicroVMs, which is the point.
+        assert_eq!(
+            endpoint_for(&Region::unlisted("eu-central-1")),
+            "https://lambda.eu-central-1.amazonaws.com"
+        );
+    }
+
+    /// Every path against the model's `http.requestUri`, as literals. Transcribed from
+    /// `service-2.json` rather than built from a template, because a template shared with
+    /// the code under test would agree with a wrong template.
+    #[test]
+    fn every_path_matches_the_models_request_uri() {
+        assert_eq!(paths::microvm_images(), "/2025-09-09/microvm-images");
+        assert_eq!(
+            paths::microvm_image("img"),
+            "/2025-09-09/microvm-images/img"
+        );
+        assert_eq!(
+            paths::image_versions("img"),
+            "/2025-09-09/microvm-images/img/versions"
+        );
+        assert_eq!(
+            paths::image_version("img", "1"),
+            "/2025-09-09/microvm-images/img/versions/1"
+        );
+        assert_eq!(
+            paths::image_builds("img", "1"),
+            "/2025-09-09/microvm-images/img/versions/1/builds"
+        );
+        assert_eq!(paths::microvms(), "/2025-09-09/microvms");
+        assert_eq!(paths::microvm("mvm-1"), "/2025-09-09/microvms/mvm-1");
+        assert_eq!(
+            paths::suspend("mvm-1"),
+            "/2025-09-09/microvms/mvm-1/suspend"
+        );
+        assert_eq!(paths::resume("mvm-1"), "/2025-09-09/microvms/mvm-1/resume");
+        assert_eq!(
+            paths::auth_token("mvm-1"),
+            "/2025-09-09/microvms/mvm-1/auth-token"
+        );
+    }
+
+    /// An ARN in a URI parameter is percent-encoded, slashes included. `MicrovmImageIdentifier`
+    /// is documented as "ARN or ID", so this is the ordinary case rather than an edge one —
+    /// and an unencoded ARN's slashes would split into extra path segments addressing
+    /// something else entirely.
+    #[test]
+    fn an_arn_identifier_is_percent_encoded_including_its_slashes() {
+        let arn = "arn:aws:lambda:us-east-1:123456789012:microvm-image/img";
+        let path = paths::microvm_image(arn);
+        assert_eq!(
+            path,
+            "/2025-09-09/microvm-images/arn%3Aaws%3Alambda%3Aus-east-1%3A123456789012%3Amicrovm-image%2Fimg"
+        );
+        assert!(
+            !path["/2025-09-09/microvm-images/".len()..].contains('/'),
+            "an encoded identifier contributes no path separators: {path}"
+        );
+    }
+
+    /// The API version in the path is the constant the drift gate checks, not a second
+    /// literal. Two copies of `2025-09-09` are two things to update, and the one that gets
+    /// missed is the one nothing compiles against.
+    #[test]
+    fn the_path_version_is_the_pinned_model_version() {
+        assert_eq!(API_PATH_VERSION, crate::constants::MODEL_API_VERSION);
+        assert!(paths::microvms().starts_with("/2025-09-09/"));
+    }
+
+    /// The signing name is `lambda`, from the model's `signingName`. A signature computed
+    /// for `lambda-microvms` is rejected in a way that reads like bad credentials.
+    #[test]
+    fn the_signing_name_is_lambda_not_lambda_microvms() {
+        assert_eq!(SIGNING_NAME, "lambda");
+    }
+
+    /// Signing puts an `authorization` header on the request naming the region and the
+    /// signing name, and an `x-amz-security-token` when the credentials are temporary.
+    ///
+    /// Static credentials rather than a resolved chain, so this runs with no AWS
+    /// configuration and no network — the signature is a pure function of the inputs.
+    #[test]
+    fn signing_names_the_region_and_the_service_in_the_credential_scope() {
+        let credentials = aws_credential_types::Credentials::new(
+            "AKIDEXAMPLE",
+            "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY",
+            Some("session-token".to_string()),
+            None,
+            "test",
+        );
+        let mut request = http::Request::builder()
+            .method("POST")
+            .uri("https://lambda.eu-west-1.amazonaws.com/2025-09-09/microvms")
+            .header("content-type", "application/json")
+            .body(b"{}".to_vec())
+            .expect("builds");
+
+        sign_in_place(&mut request, &credentials, &Region::EuWest1).expect("signs");
+
+        let headers = request.headers();
+        let authorization = headers
+            .get("authorization")
+            .expect("a signature was applied")
+            .to_str()
+            .expect("ascii");
+        assert!(
+            authorization.starts_with("AWS4-HMAC-SHA256 "),
+            "{authorization}"
+        );
+        assert!(
+            authorization.contains("/eu-west-1/lambda/aws4_request"),
+            "the credential scope must name the request region and the signing name: \
+             {authorization}"
+        );
+        assert!(
+            headers.contains_key("x-amz-date"),
+            "a signed date is required"
+        );
+        assert!(
+            headers.contains_key("x-amz-security-token"),
+            "temporary credentials carry a session token in the canonical request"
+        );
+    }
+
+    /// A `GET` with no body still gets signed, with the empty-payload SHA256 —
+    /// `SignableBody::Bytes(&[])` rather than `UnsignedPayload`, which non-S3 services
+    /// reject.
+    #[test]
+    fn a_bodyless_get_is_signed_rather_than_sent_unsigned() {
+        let credentials =
+            aws_credential_types::Credentials::new("AKIDEXAMPLE", "secret", None, None, "test");
+        let mut request = http::Request::builder()
+            .method("GET")
+            .uri("https://lambda.us-east-1.amazonaws.com/2025-09-09/microvms/mvm-1")
+            .body(Vec::new())
+            .expect("builds");
+
+        sign_in_place(&mut request, &credentials, &Region::UsEast1).expect("signs");
+        assert!(request.headers().contains_key("authorization"));
+        assert!(
+            !request.headers().contains_key("x-amz-security-token"),
+            "static credentials carry no session token"
+        );
+    }
+
+    /// TRAP-6's diagnostic, on the exact response shape the trap produces: 403 with a
+    /// null message. The message has to name the region cause *and* say the field was
+    /// null, because "AccessDeniedException" alone is what sends a reader to the IAM
+    /// console.
+    #[test]
+    fn a_null_message_access_denied_names_the_region_trap() {
+        let reply = Reply {
+            status: 403,
+            body: br#"{"message": null}"#.to_vec(),
+        };
+        let error = classify_failure("ListMicrovms", &reply);
+        assert_eq!(error.kind(), ErrorKind::Credentials);
+        let message = error.to_string();
+        assert!(message.contains("null"), "{message}");
+        assert!(message.contains("region"), "{message}");
+        assert!(message.contains("does not carry MicroVMs"), "{message}");
+        assert!(
+            message.contains("Check the region before the policy"),
+            "the remedy has to be the region, not the policy: {message}"
+        );
+    }
+
+    /// A 403 *with* a message is a genuine denial and says so, so the two are not
+    /// conflated. A classifier that named the region trap on every 403 would be as
+    /// misleading in the other direction.
+    #[test]
+    fn a_403_with_a_message_is_reported_as_a_genuine_denial() {
+        let reply = Reply {
+            status: 403,
+            body: br#"{"message": "User: arn:aws:iam::1:user/u is not authorized"}"#.to_vec(),
+        };
+        let error = classify_failure("RunMicrovm", &reply);
+        assert_eq!(error.kind(), ErrorKind::Credentials);
+        let message = error.to_string();
+        assert!(message.contains("not authorized"), "{message}");
+        assert!(
+            message.contains("genuine denial"),
+            "must distinguish itself from the null-message case: {message}"
+        );
+        assert!(
+            !message.contains("does not carry MicroVMs"),
+            "must not blame the region when the service named a principal: {message}"
+        );
+    }
+
+    /// Only the throttle and the 5xx family are retryable. A retried 409 would spin
+    /// against an image in CREATING, and a retried 400 would send the same rejected value
+    /// five more times.
+    #[test]
+    fn only_throttles_and_server_faults_are_retryable() {
+        let cases = [
+            (400, false),
+            (402, false),
+            (403, false),
+            (404, false),
+            (409, false),
+            (429, true),
+            (500, true),
+            (502, true),
+            (503, true),
+        ];
+        for (status, retryable) in cases {
+            let reply = Reply {
+                status,
+                body: br#"{"message": "detail"}"#.to_vec(),
+            };
+            let error = classify_failure("GetMicrovm", &reply);
+            assert_eq!(error.retryable(), retryable, "HTTP {status}");
+        }
+    }
+
+    /// A control-plane failure carries **no** `WireKind`: nothing reached the in-VM
+    /// daemon, so there is no daemon-chosen status to report and the CLI's `data.kind`
+    /// must be absent rather than invented.
+    #[test]
+    fn a_control_plane_failure_carries_no_daemon_wire_kind() {
+        for status in [400, 403, 404, 409, 429, 500] {
+            let reply = Reply {
+                status,
+                body: Vec::new(),
+            };
+            assert_eq!(
+                classify_failure("GetMicrovm", &reply).wire_kind(),
+                None,
+                "HTTP {status} never reached the daemon"
+            );
+        }
+    }
+
+    /// An unparseable error body still classifies by status rather than failing. A service
+    /// answering an HTML error page or a truncated body must not turn a 429 into an
+    /// unexpected error, which would stop the retry.
+    #[test]
+    fn an_unparseable_error_body_still_classifies_by_status() {
+        let reply = Reply {
+            status: 429,
+            body: b"<html>Too Many Requests</html>".to_vec(),
+        };
+        let error = classify_failure("RunMicrovm", &reply);
+        assert!(error.retryable(), "a throttle is a throttle");
+        assert!(error.to_string().contains("no message"), "{error}");
+    }
+
+    /// A body-parse failure names the operation and shows the body, because a rest-json
+    /// parse error with the text withheld cannot distinguish a renamed member from a
+    /// truncated response.
+    #[test]
+    fn a_response_that_does_not_parse_reports_the_body() {
+        let reply = Reply {
+            status: 200,
+            body: br#"{"microvmId": 42}"#.to_vec(),
+        };
+        let error = reply
+            .json::<crate::control::ops::MicrovmResponseWire>("GetMicrovm")
+            .expect_err("microvmId is a string shape");
+        let message = error.to_string();
+        assert!(message.contains("GetMicrovm"), "{message}");
+        assert!(message.contains("microvmId"), "{message}");
+        assert_eq!(error.kind(), ErrorKind::Platform);
+    }
+
+    /// A `POST` with no body members sends `{}` rather than nothing: an empty POST and a
+    /// POST of `{}` are different canonical requests, and rest-json services answer the
+    /// former inconsistently.
+    #[test]
+    fn a_bodyless_post_sends_an_empty_json_object() {
+        let call = Call::post_empty("SuspendMicrovm", paths::suspend("mvm-1"));
+        assert_eq!(call.body.as_deref(), Some(&b"{}"[..]));
+        assert_eq!(call.method, Method::Post);
+    }
+
+    /// A `GET` and a `DELETE` carry no body at all, and the signed empty payload is what
+    /// `body_bytes` yields.
+    #[test]
+    fn a_get_and_a_delete_carry_no_body() {
+        let get = Call::get("GetMicrovm", paths::microvm("mvm-1"));
+        assert_eq!(get.body, None);
+        assert_eq!(get.body_bytes(), b"");
+
+        let delete = Call::delete("TerminateMicrovm", paths::microvm("mvm-1"));
+        assert_eq!(delete.body, None);
+        assert_eq!(delete.method, Method::Delete);
+    }
+
+    /// The three methods, spelled as the canonical request needs them: uppercase.
+    #[test]
+    fn the_methods_are_the_three_the_model_uses_spelled_uppercase() {
+        assert_eq!(Method::Get.as_str(), "GET");
+        assert_eq!(Method::Post.as_str(), "POST");
+        assert_eq!(Method::Delete.as_str(), "DELETE");
+    }
+}

@@ -1,0 +1,496 @@
+//! The build artifact: a zip of the daemon binary and a Dockerfile.
+//!
+//! What `CreateMicrovmImage`'s `codeArtifact.uri` points at (`sandbox.py:523`
+//! `build_artifact`). Two entries, and both of them carry a measured constraint.
+//!
+//! # The execute bit has to be in the zip entry
+//!
+//! A build that copies a non-executable binary produces an image whose `CMD` fails, and
+//! the failure surfaces as a **run-hook timeout** — which says nothing about permissions,
+//! and sends the reader to look at the daemon's startup path instead of at the archive.
+//! So the `agentd` entry sets mode `0o755` explicitly rather than inheriting whatever the
+//! host file had.
+//!
+//! # The agent token is never in here (TRAP-5's other half)
+//!
+//! The artifact becomes a **shared image snapshot**: every MicroVM launched from the image
+//! sees the same bytes. A per-VM secret in there is a per-VM secret shared with every VM.
+//! So the token travels through `runHookPayload` at launch instead, and this function has
+//! no parameter that could carry one — see [`crate::control::microvm`]. The test at the
+//! bottom of this file scans the produced zip's raw bytes for a token value to prove the
+//! path stays closed, which is a byte scan rather than an API review because the leak
+//! would be a *value* appearing somewhere, not a parameter being declared.
+
+use std::io::Write as _;
+
+use crate::error::{Error, ErrorKind};
+
+/// The Dockerfile entry's name, which the build looks for by convention.
+const DOCKERFILE_ENTRY: &str = "Dockerfile";
+
+/// The daemon entry's name, matching the `CMD ["/agentd"]` the Dockerfile sets.
+const AGENTD_ENTRY: &str = "agentd";
+
+/// The mode the daemon entry carries.
+///
+/// See the module docs: a non-executable binary here becomes a run-hook timeout later.
+const AGENTD_MODE: u32 = 0o755;
+
+/// Zips `binary` with `dockerfile` into the bytes `codeArtifact.uri` will point at.
+///
+/// `binary` is the daemon's bytes rather than a path, so the caller owns the read and this
+/// function has no filesystem behaviour to stub in a test.
+pub fn build_artifact(binary: &[u8], dockerfile: &str) -> Result<Vec<u8>, Error> {
+    use zip::write::{SimpleFileOptions, ZipWriter};
+
+    let mut writer = ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    let deflated =
+        SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+
+    let mut write_entry = |name: &str, bytes: &[u8], options: SimpleFileOptions| {
+        writer
+            .start_file(name, options)
+            .and_then(|()| writer.write_all(bytes).map_err(Into::into))
+            .map_err(|error| {
+                Error::new(
+                    ErrorKind::Unexpected,
+                    format!("could not add {name} to the build artifact: {error}"),
+                )
+            })
+    };
+
+    write_entry(DOCKERFILE_ENTRY, dockerfile.as_bytes(), deflated)?;
+    write_entry(AGENTD_ENTRY, binary, deflated.unix_permissions(AGENTD_MODE))?;
+
+    let bytes = writer
+        .finish()
+        .map_err(|error| {
+            Error::new(
+                ErrorKind::Unexpected,
+                format!("could not finish the build artifact: {error}"),
+            )
+        })?
+        .into_inner();
+    Ok(bytes)
+}
+
+/// A base image: the platform ARN, the Dockerfile `FROM` that pairs with it, and whether
+/// it declares a `WORKDIR`.
+///
+/// All three together because the first two **must** agree and used to be able to
+/// disagree: the Python client's `DEFAULT_BASE_IMAGE` named the managed base for
+/// `baseImageArn` while `default_dockerfile` hardcoded an unrelated registry literal in
+/// its `FROM`, so changing either left the other pointing somewhere else
+/// (`sandbox.py:410-444`). Pairing them means a caller selects one thing and both fields
+/// follow.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BaseImage {
+    /// Goes into `baseImageArn` — the platform's managed base, not a registry ref.
+    pub name: String,
+    /// Goes into the Dockerfile `FROM` — the registry ref measured alongside `name`.
+    pub docker_ref: String,
+    /// What `docker inspect` reports for `WorkingDir`. Empty means it declares none.
+    ///
+    /// A field rather than a lookup because a caller with a purpose-built image is the
+    /// only one who can say what their image declares, and this client cannot read it
+    /// without pulling the manifest.
+    pub working_dir: String,
+}
+
+impl BaseImage {
+    /// The managed base every `docs/PLATFORM.md` measurement from 2026-08-06 onward used,
+    /// paired with the registry ref those same builds used as `FROM`.
+    ///
+    /// `working_dir` is empty, and that is measured rather than assumed:
+    /// `al2023-minimal`, `python:3.12-slim`, and `node:20-slim` all leave `WorkingDir`
+    /// empty (2026-08-05), which is what makes [`require_workdir`] necessary.
+    pub fn al2023() -> Self {
+        Self {
+            name: "al2023-1".to_string(),
+            docker_ref: "public.ecr.aws/amazonlinux/amazonlinux:2023-minimal".to_string(),
+            working_dir: String::new(),
+        }
+    }
+
+    /// The `baseImageArn` for this base in `region`.
+    pub fn arn(&self, region: &crate::region::Region) -> String {
+        format!(
+            "arn:aws:lambda:{}:aws:microvm-image:{}",
+            region.as_str(),
+            self.name
+        )
+    }
+}
+
+impl Default for BaseImage {
+    fn default() -> Self {
+        Self::al2023()
+    }
+}
+
+/// A Dockerfile that makes the daemon the container `CMD`.
+///
+/// `ENTRYPOINT []` plus `CMD ["/agentd"]` is the deployment invariant the trust boundary
+/// rests on: it is what guarantees no task workload runs before the platform's run hook
+/// lands. It is also what makes an omitted `cwd` inherit the image `WORKDIR`, since the
+/// daemon's own cwd is the image's.
+///
+/// The `FROM` is derived from `base` rather than written here, so it cannot disagree with
+/// the `baseImageArn` the create call sends.
+///
+/// The invariant is *unenforced*: a base image that starts its own background process
+/// before bootstrap breaks it, and enforcing that belongs to whoever builds the image
+/// (`docs/PROTOCOL.md`, "Trust boundary").
+pub fn default_dockerfile(port: u16, workdir: Option<&str>, base: &BaseImage) -> String {
+    let mut lines = vec![
+        format!("FROM {}", base.docker_ref),
+        "COPY agentd /agentd".to_string(),
+        "RUN chmod 0755 /agentd".to_string(),
+    ];
+    if let Some(workdir) = workdir.filter(|dir| !dir.is_empty()) {
+        lines.push(format!("RUN mkdir -p {workdir}"));
+        lines.push(format!("WORKDIR {workdir}"));
+    }
+    lines.extend([
+        format!("ENV AGENTD_PORT={port}"),
+        "ENV AGENTD_LOG=info".to_string(),
+        format!("EXPOSE {port}"),
+        "ENTRYPOINT []".to_string(),
+        r#"CMD ["/agentd"]"#.to_string(),
+        String::new(),
+    ]);
+    lines.join("\n")
+}
+
+/// The image ref in a Dockerfile's first `FROM`, or `None` when it has none.
+///
+/// Deliberately loose on whitespace and case, and it ignores `--platform=` and `AS name`
+/// decoration, because the check exists to catch a base that disagrees rather than to
+/// validate Dockerfile syntax.
+///
+/// Hand-rolled rather than a regex: the pattern is "first token after FROM on a line whose
+/// first word is FROM", and a regex crate is a dependency this lane cannot add anyway.
+pub fn dockerfile_from_ref(dockerfile: &str) -> Option<&str> {
+    for line in dockerfile.lines() {
+        let mut words = line.split_whitespace();
+        let Some(first) = words.next() else { continue };
+        if !first.eq_ignore_ascii_case("FROM") {
+            continue;
+        }
+        // Skip flag decoration such as `--platform=linux/arm64`.
+        return words.find(|word| !word.starts_with("--"));
+    }
+    None
+}
+
+/// Rejects working-directory inheritance when nothing declares one.
+///
+/// Measured 2026-08-05: `al2023-minimal`, `python:3.12-slim`, and `node:20-slim` all leave
+/// `WorkingDir` empty, so "inherit the image WORKDIR" inherits `/` and every relative path
+/// in the caller's commands resolves somewhere they did not mean.
+///
+/// Rejected rather than warned because the symptom appears in the **guest, one build cycle
+/// later**, as commands running in the wrong directory rather than as anything about
+/// `WORKDIR`.
+pub fn require_workdir(base: &BaseImage, dockerfile: Option<&str>) -> Result<(), Error> {
+    if !base.working_dir.is_empty() {
+        return Ok(());
+    }
+    let declares_workdir = dockerfile.is_some_and(|text| {
+        text.lines().any(|line| {
+            let mut words = line.split_whitespace();
+            words
+                .next()
+                .is_some_and(|first| first.eq_ignore_ascii_case("WORKDIR"))
+                && words.next().is_some()
+        })
+    });
+    if declares_workdir {
+        return Ok(());
+    }
+    Err(Error::invalid_arg(format!(
+        "inherit_workdir was requested but base image {:?} declares no WorkingDir and the \
+         Dockerfile sets none. Most public ARM64 base images leave it empty \
+         (docs/PLATFORM.md, 'Most public ARM64 base images have no WORKDIR'), so there is \
+         nothing to inherit and every relative path would resolve against `/`. Pass a workdir \
+         to default_dockerfile, or set WORKDIR in your own Dockerfile.",
+        base.name
+    )))
+}
+
+/// Rejects a Dockerfile whose `FROM` is not the selected base image.
+///
+/// The build runs the Dockerfile *on top of* the base named in `baseImageArn`, so the two
+/// disagreeing produces an image built from something other than the platform base whose
+/// behaviour every `docs/PLATFORM.md` measurement describes — and nothing in the result
+/// says so.
+pub fn require_matching_from(base: &BaseImage, dockerfile: &str) -> Result<(), Error> {
+    let Some(found) = dockerfile_from_ref(dockerfile) else {
+        // No FROM at all is not this check's business: the build will say so, and a
+        // Dockerfile validator is not what this is.
+        return Ok(());
+    };
+    if found == base.docker_ref {
+        return Ok(());
+    }
+    Err(Error::invalid_arg(format!(
+        "the Dockerfile's FROM is {found:?} but base image {:?} pairs with {:?}. These must \
+         agree: baseImageArn and the FROM select the same base, and a mismatch builds against \
+         a base none of the measured platform behaviour applies to. Use default_dockerfile \
+         with this base, or pass a BaseImage whose docker_ref matches.",
+        base.name, base.docker_ref
+    )))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The archive holds exactly the two entries the build expects, named as the build
+    /// looks for them.
+    #[test]
+    fn the_artifact_holds_a_dockerfile_and_the_daemon() {
+        let bytes = build_artifact(b"\x7fELF fake daemon", "FROM scratch\n").expect("zips");
+        let mut archive =
+            zip::ZipArchive::new(std::io::Cursor::new(bytes)).expect("a readable zip");
+
+        let mut names: Vec<String> = (0..archive.len())
+            .map(|index| archive.by_index(index).expect("entry").name().to_string())
+            .collect();
+        names.sort();
+        assert_eq!(names, ["Dockerfile", "agentd"]);
+    }
+
+    /// The daemon entry carries mode 0755, and the Dockerfile entry does not have to.
+    ///
+    /// Read back out of the archive rather than asserted on the constant, because the
+    /// constant being right and the zip entry carrying it are two different facts — and it
+    /// is the second one that turns into a run-hook timeout.
+    ///
+    /// The permission bits are masked out of the returned mode: `zip` reports the whole
+    /// Unix mode, so the entry reads as `0o100755` — `S_IFREG | 0o755`. Comparing the
+    /// unmasked value against `0o755` fails while the archive is perfectly correct, which
+    /// is a test that would have sent someone to debug the writer.
+    #[test]
+    fn the_daemon_entry_carries_the_execute_bit() {
+        let bytes = build_artifact(b"binary", "FROM scratch\n").expect("zips");
+        let mut archive =
+            zip::ZipArchive::new(std::io::Cursor::new(bytes)).expect("a readable zip");
+        let mode = archive
+            .by_name("agentd")
+            .expect("the daemon entry")
+            .unix_mode()
+            .expect("a mode was recorded");
+        assert_eq!(
+            mode & 0o777,
+            AGENTD_MODE,
+            "a non-executable binary surfaces as a run-hook timeout, not a permission error \
+             (mode was {mode:o})"
+        );
+        assert!(
+            mode & 0o111 != 0,
+            "the execute bit is the whole point: {mode:o}"
+        );
+    }
+
+    /// The bytes round-trip. A zip that holds a truncated or re-encoded binary produces an
+    /// image whose CMD fails for a reason no message names.
+    #[test]
+    fn the_daemon_bytes_survive_the_round_trip() {
+        use std::io::Read as _;
+
+        // Deliberately includes a NUL and a high byte, which is what a real ELF has and
+        // what a text-mode write would mangle.
+        let binary: Vec<u8> = (0u8..=255).cycle().take(4096).collect();
+        let bytes = build_artifact(&binary, "FROM scratch\n").expect("zips");
+        let mut archive =
+            zip::ZipArchive::new(std::io::Cursor::new(bytes)).expect("a readable zip");
+        let mut read = Vec::new();
+        archive
+            .by_name("agentd")
+            .expect("entry")
+            .read_to_end(&mut read)
+            .expect("reads");
+        assert_eq!(read, binary);
+    }
+
+    /// **AC-2-3, the byte-scan guard.** The agent token must not appear anywhere in the
+    /// artifact's raw bytes.
+    ///
+    /// A byte scan rather than an API review, because the leak this guards against is a
+    /// *value* turning up somewhere — in the Dockerfile as an `ENV`, in a baked config
+    /// file, in a stray argument — not a parameter being declared. Scanning the compressed
+    /// bytes and the decompressed entries both, since deflate would hide a literal from a
+    /// naive scan of the archive.
+    ///
+    /// **Falsification** — add the token to the Dockerfile (`ENV AGENT_TOKEN=…`, the
+    /// plausible mistake) and the decompressed scan fails.
+    #[test]
+    fn the_artifact_never_carries_the_agent_token() {
+        use std::io::Read as _;
+
+        let token = "s3cr3t-agent-token-do-not-bake-me";
+        let dockerfile = default_dockerfile(9000, Some("/opt/work"), &BaseImage::al2023());
+        assert!(
+            !dockerfile.contains(token),
+            "the default Dockerfile must not mention a token"
+        );
+
+        let bytes = build_artifact(b"binary", &dockerfile).expect("zips");
+        assert!(
+            !bytes
+                .windows(token.len())
+                .any(|window| window == token.as_bytes()),
+            "the token appears in the artifact's raw bytes"
+        );
+
+        let mut archive =
+            zip::ZipArchive::new(std::io::Cursor::new(bytes)).expect("a readable zip");
+        for index in 0..archive.len() {
+            let mut entry = archive.by_index(index).expect("entry");
+            let name = entry.name().to_string();
+            let mut content = Vec::new();
+            entry.read_to_end(&mut content).expect("reads");
+            assert!(
+                !content
+                    .windows(token.len())
+                    .any(|window| window == token.as_bytes()),
+                "the token appears inside {name} — the image snapshot is shared by every VM \
+                 launched from it, so a token here is a token shared with every VM"
+            );
+        }
+    }
+
+    /// The Dockerfile's `FROM` comes from the base image, so the two cannot disagree.
+    #[test]
+    fn the_default_dockerfile_derives_its_from_from_the_base_image() {
+        let base = BaseImage::al2023();
+        let dockerfile = default_dockerfile(9000, None, &base);
+        assert_eq!(
+            dockerfile_from_ref(&dockerfile),
+            Some(base.docker_ref.as_str())
+        );
+        assert!(dockerfile.contains(r#"CMD ["/agentd"]"#));
+        assert!(
+            dockerfile.contains("ENTRYPOINT []"),
+            "the trust boundary rests on this line"
+        );
+        assert!(dockerfile.contains("ENV AGENTD_PORT=9000"));
+    }
+
+    /// A workdir is written as both a `mkdir` and a `WORKDIR`, and is absent when none was
+    /// asked for. An empty string counts as none, since that is what an unset value looks
+    /// like coming from a CLI flag.
+    #[test]
+    fn a_workdir_is_created_and_set_or_absent_entirely() {
+        let base = BaseImage::al2023();
+        let with = default_dockerfile(9000, Some("/opt/baked-workdir"), &base);
+        assert!(with.contains("RUN mkdir -p /opt/baked-workdir"));
+        assert!(with.contains("WORKDIR /opt/baked-workdir"));
+
+        for none in [None, Some("")] {
+            let without = default_dockerfile(9000, none, &base);
+            assert!(!without.contains("WORKDIR"), "{without}");
+        }
+    }
+
+    /// `FROM` parsing tolerates the decoration a real Dockerfile carries: lowercase,
+    /// leading whitespace, a `--platform` flag, and an `AS` alias.
+    #[test]
+    fn the_from_parser_ignores_decoration_rather_than_validating_syntax() {
+        assert_eq!(dockerfile_from_ref("FROM alpine\n"), Some("alpine"));
+        assert_eq!(dockerfile_from_ref("  from alpine:3\n"), Some("alpine:3"));
+        assert_eq!(
+            dockerfile_from_ref("FROM --platform=linux/arm64 alpine AS build\n"),
+            Some("alpine")
+        );
+        assert_eq!(dockerfile_from_ref("RUN echo from nowhere\n"), None);
+        assert_eq!(dockerfile_from_ref(""), None);
+    }
+
+    /// A `FROM` that disagrees with the base image is refused, and the message names both
+    /// refs — the one found and the one expected — because "these must agree" without both
+    /// values leaves the caller to guess which to change.
+    #[test]
+    fn a_dockerfile_from_that_disagrees_with_the_base_is_refused() {
+        let base = BaseImage::al2023();
+        let error = require_matching_from(&base, "FROM ubuntu:24.04\nCOPY agentd /agentd\n")
+            .expect_err("ubuntu is not the managed base");
+        assert_eq!(error.kind(), ErrorKind::InvalidArg);
+        let message = error.to_string();
+        assert!(message.contains("ubuntu:24.04"), "{message}");
+        assert!(message.contains(&base.docker_ref), "{message}");
+        assert!(
+            message.contains("none of the measured platform behaviour applies"),
+            "{message}"
+        );
+
+        require_matching_from(&base, &default_dockerfile(9000, None, &base))
+            .expect("the derived Dockerfile agrees with its own base");
+    }
+
+    /// A Dockerfile with no `FROM` is not this check's business: the build will say so, and
+    /// refusing here would be a Dockerfile validator rather than an agreement check.
+    #[test]
+    fn a_dockerfile_with_no_from_is_left_to_the_build() {
+        require_matching_from(&BaseImage::al2023(), "COPY agentd /agentd\n")
+            .expect("no FROM is not a disagreement");
+    }
+
+    /// Workdir inheritance is refused when neither the base nor the Dockerfile declares
+    /// one, and the message says where the symptom would have appeared — in the guest, a
+    /// build cycle later.
+    #[test]
+    fn inheriting_a_workdir_nothing_declares_is_refused() {
+        let base = BaseImage::al2023();
+        assert!(base.working_dir.is_empty(), "the measured case");
+
+        let error = require_workdir(&base, None).expect_err("nothing declares a workdir");
+        assert_eq!(error.kind(), ErrorKind::InvalidArg);
+        let message = error.to_string();
+        assert!(message.contains("no WorkingDir"), "{message}");
+        assert!(message.contains("nothing to inherit"), "{message}");
+        assert!(message.contains("docs/PLATFORM.md"), "{message}");
+    }
+
+    /// It is accepted when *either* side declares one — the Dockerfile's `WORKDIR` or the
+    /// base image's own `working_dir`. Both directions, because a check that only read the
+    /// Dockerfile would refuse a caller on a purpose-built image that declares one.
+    #[test]
+    fn either_the_dockerfile_or_the_base_may_supply_the_workdir() {
+        let base = BaseImage::al2023();
+        require_workdir(&base, Some("FROM x\nWORKDIR /srv\n"))
+            .expect("the Dockerfile declares one");
+
+        let purpose_built = BaseImage {
+            working_dir: "/app".to_string(),
+            ..BaseImage::al2023()
+        };
+        require_workdir(&purpose_built, None).expect("the base image declares one");
+    }
+
+    /// A bare `WORKDIR` with no argument does not count as declaring one. It is the shape a
+    /// truncated edit leaves behind, and treating it as a declaration would pass the guard
+    /// on a Dockerfile that sets nothing.
+    #[test]
+    fn a_workdir_with_no_argument_does_not_count_as_a_declaration() {
+        let error = require_workdir(&BaseImage::al2023(), Some("FROM x\nWORKDIR\n"))
+            .expect_err("WORKDIR with no path declares nothing");
+        assert_eq!(error.kind(), ErrorKind::InvalidArg);
+    }
+
+    /// The base image ARN, for the region it is requested in. `microvm-image:` with a
+    /// colon, which is the managed-base spelling and not the `microvm-image/` of a
+    /// customer image ARN.
+    #[test]
+    fn the_base_image_arn_names_the_request_region() {
+        assert_eq!(
+            BaseImage::al2023().arn(&crate::region::Region::UsEast1),
+            "arn:aws:lambda:us-east-1:aws:microvm-image:al2023-1"
+        );
+        assert_eq!(
+            BaseImage::al2023().arn(&crate::region::Region::ApNortheast1),
+            "arn:aws:lambda:ap-northeast-1:aws:microvm-image:al2023-1"
+        );
+    }
+}
