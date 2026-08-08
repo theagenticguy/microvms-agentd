@@ -13,3 +13,11 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 *.egg-info/
+# The napi-rs build outputs. `napi build --platform` writes the compiled addon plus a
+# generated loader and type declarations beside `package.json`; all three are derived from
+# `microvms-js/src/` and are rebuilt by `npm run build`, so committing them would commit one
+# platform's binary into a repo other platforms clone.
+microvms-js/*.node
+microvms-js/index.js
+microvms-js/index.d.ts
+microvms-js/node_modules/

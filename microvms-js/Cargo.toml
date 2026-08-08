@@ -4,8 +4,43 @@ version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "the napi-rs bindings, populated by T-W3-8"
+description = "the napi-rs bindings over microvms-core"
+# Nothing publish-shaped. `package.json` carries `"private": true` for the npm
+# side; this is the crates.io side of the same statement.
+publish = false
 
-# Deliberately dependency-free. The crate exists so the workspace member list is
-# written once; T-W3-8 adds what it needs.
+# `cdylib` only, and that is the difference from `microvms-py`: a Node addon is
+# loaded by the runtime and nothing in this workspace links it, so an `rlib`
+# would be a second artifact with no consumer. The smoke test drives the built
+# `.node` through `node --test`, not through `cargo test`.
+[lib]
+crate-type = ["cdylib"]
+
 [dependencies]
+# The only thing being wrapped. No edge to `microvms-cli` (BIND-1).
+microvms-core = { path = "../microvms-core" }
+# The wire types the core's public signatures already answer with. See the same
+# entry in `microvms-py/Cargo.toml` for why naming the crate beats re-declaring
+# the shapes (ARCH-2).
+protocol = { path = "../protocol" }
+# `async` pulls in `tokio_rt`: an exported `#[napi] pub async fn` then runs on
+# napi's managed runtime and returns a JavaScript Promise, with `Err` rejecting
+# it. That is why this side needs no `block_on` bridge at all — Node is
+# async-native, so the core's async surface maps straight through.
+napi = { version = "3", default-features = false, features = [
+    "napi4",
+    "async",
+] }
+napi-derive = "3"
+# The core's own poll and deadline paths need a runtime with `time`; napi
+# provides the runtime, and this names the features the futures require. No
+# `rt-multi-thread` — napi owns the runtime, and a library does not choose it.
+tokio = { version = "1.53", features = ["time", "sync"] }
+# `ExecHandle::stream_with` answers a `Stream`, which the async iterator drains.
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+
+[build-dependencies]
+# Omitting `napi_build::setup()` produces undefined-symbol link failures, which
+# is the one build-time requirement napi-rs still has — it uses no node-gyp and
+# no Node headers, and resolves Node-API symbols at runtime through libloading.
+napi-build = "2"

@@ -4,8 +4,77 @@ version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "the microvm CLI, populated by T-W3-7"
+description = "the `microvm` binary: a working sandbox in one command, and nothing microvms-core does not do"
 
-# Deliberately dependency-free. The crate exists so the workspace member list is
-# written once; T-W3-7 adds what it needs.
+# ── no lib target, deliberately (ARCH-5) ────────────────────────────────────
+#
+# There is exactly one `[[bin]]` below and no `src/lib.rs`, so this crate exports
+# nothing a binding could depend on. That absence *is* ARCH-5's witness ("nothing a
+# binding needs lives in the CLI") and it is asserted mechanically:
+# `tests/dependency_direction.rs` reads `cargo metadata` and fails if a `lib` target
+# ever appears here. Compare the alternative — a lib target with a doc comment asking
+# people not to use it — which is a request rather than a property.
+[[bin]]
+name = "microvm"
+path = "src/main.rs"
+
+# ── the dependency set is the requirement under test (CLI-2, AC-5-4) ────────
+#
+# Six direct dependencies and no seventh. There is no `reqwest`, no `aws-*`, no
+# `hyper`, no `aws-sigv4`, and there cannot be one: `tests/thinness.rs` reads this
+# manifest through `cargo metadata` and asserts the direct dependency set is *exactly*
+# the names below. An allowlist rather than a denylist, because a denylist is defeated
+# by the one crate nobody thought to write down — which is the failure shape the
+# Python's three-legged static guard (`tests/test_cli.py:209`, `:261`, `:281`) was
+# built out of after each leg was defeated on purpose.
+#
+# The CLI reaches AWS through `microvms-core` and through nothing else. That is
+# CLI-2, and the honest way to state it is a manifest a test can read.
 [dependencies]
+# The whole product surface. Every AWS call, every trap closure, the cost engine,
+# and the error taxonomy the exit table is a rendering of.
+microvms-core = { path = "../microvms-core" }
+# The daemon↔client wire contract, and it is here because it has to be:
+# `microvms_core::session::Session::run` takes a `protocol::exec::StartRequest` in its
+# signature (`microvms-core/src/session/mod.rs:310`) and `microvms-core` does not
+# re-export the `protocol` crate — so there is no way to call that method without
+# naming this crate. Recorded as a C3 gap in the packet rather than worked around,
+# because the fix is a one-line `pub use protocol;` in core and that file is another
+# task's.
+#
+# It is also the *right* dependency to have if you have to have one: it is ARCH-2's
+# shared contract, carries no transport, and its whole purpose is that a field renamed
+# on the daemon side breaks this build. It is on the thinness guard's expected set with
+# this reason attached.
+protocol = { path = "../protocol" }
+# 4.6.6 was the registry's max_stable_version on 2026-08-08 (research-cli.yaml).
+# `derive` because the command tree is the manifest's only source: a builder tree
+# would be a second place the surface is written down.
+clap = { version = "4.6.6", features = ["derive"] }
+# The interactive surface (CLI-1). Default features keep the crossterm backend, which
+# is what `ratatui::init`/`restore` use and what installs the panic hook that
+# un-wedges a terminal (research-cli.yaml sources [8][9]).
+ratatui = "0.30.2"
+# The envelope. Hand-rolling the JSON was considered and rejected: the envelope has a
+# string field carrying a service error message, and hand-escaping that is how a
+# quote in an AWS error breaks an agent's parse.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# `rt-multi-thread` because this crate *is* the process and therefore is the thing
+# entitled to choose a runtime — `microvms-core` deliberately does not (its tokio
+# entry carries no runtime feature). `signal` is CLI-6's interrupt: `ctrl_c()` is a
+# future the launch path selects against, which is what makes the guard testable
+# without sending a real signal to a test process.
+tokio = { version = "1.53", features = [
+    "rt-multi-thread",
+    "macros",
+    "signal",
+    "time",
+] }
+
+[dev-dependencies]
+# The structural guards read the real dependency graph rather than parsing TOML:
+# `cargo metadata` resolves path dependencies and workspace inheritance, so an edge
+# added transitively or through a renamed key is still an edge this sees. Parsing
+# `Cargo.toml` by hand would check the file, not the build.
+cargo_metadata = "0.23.1"

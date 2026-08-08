@@ -1,0 +1,21 @@
+{
+  "name": "microvms",
+  "version": "0.1.0",
+  "description": "Node bindings over microvms-core: the MicroVMs client with every trap closure",
+  "private": true,
+  "main": "index.js",
+  "types": "index.d.ts",
+  "napi": {
+    "binaryName": "microvms"
+  },
+  "scripts": {
+    "build": "napi build --manifest-path ../Cargo.toml --package microvms-js --platform --output-dir .",
+    "test": "node --test __test__/*.mjs"
+  },
+  "devDependencies": {
+    "@napi-rs/cli": "^3.8.2"
+  },
+  "engines": {
+    "node": "^20.17.0 || ^22.13.0 || >=23.5.0"
+  }
+}

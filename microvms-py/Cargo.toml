@@ -4,8 +4,42 @@ version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "the PyO3 bindings, populated by T-W3-8"
+description = "the PyO3 bindings over microvms-core"
+# Nothing publish-shaped: no keywords, no categories, no readme, and
+# `publish = false` said out loud so a `cargo publish --workspace` cannot reach
+# here by accident.
+publish = false
 
-# Deliberately dependency-free. The crate exists so the workspace member list is
-# written once; T-W3-8 adds what it needs.
+# `cdylib` is the extension module Python imports; `rlib` is what lets `tests/`
+# and doctests link the crate. cdylib alone produces E0432/E0463 for anything
+# that tries to `use` it (research-bindings.yaml,
+# pitfalls.cdylib-only-breaks-integration-tests).
+[lib]
+name = "microvms"
+crate-type = ["cdylib", "rlib"]
+
 [dependencies]
+# The only thing being wrapped. There is deliberately no edge to `microvms-cli`
+# (BIND-1): a binding that depended on the CLI would be a binding whose surface
+# is whatever the CLI happened to expose, and the CLI is a consumer of this same
+# core rather than a layer above it.
+microvms-core = { path = "../microvms-core" }
+# The wire types the session surface already answers with (`Health`, `Phase`,
+# `Outcome`, `ExitEvent`). Not a new dependency in substance: `microvms-core`'s
+# public signatures return these, so a binding that mapped them without naming
+# the crate would have to re-declare their fields — which is exactly the drift
+# `protocol` was extracted to make impossible (ARCH-2).
+protocol = { path = "../protocol" }
+# No `extension-module` feature. It is deprecated, and enabling it disables
+# libpython linking for *every* target in the workspace, which breaks
+# `cargo test` and `cargo build -p microvms-py` with undefined `_PyExc_*`
+# symbols. maturin >= 1.9.4 sets PYO3_BUILD_EXTENSION_MODULE itself for a wheel
+# build (research-bindings.yaml, extension_module_feature_note).
+pyo3 = { version = "0.29", features = ["abi3-py39"] }
+# One multi-thread runtime for the whole process, blocked on with the GIL
+# released. `sync` is the bounded channel the stream iterator hands events
+# across; `time` is what the core's poll loops sleep on.
+tokio = { version = "1.53", features = ["rt-multi-thread", "sync", "time"] }
+# `Stream` is not in std and `ExecHandle::stream_with` answers with one, so the
+# trait has to be nameable to poll it. Same version as the core carries.
+futures-util = { version = "0.3", default-features = false, features = ["std"] }

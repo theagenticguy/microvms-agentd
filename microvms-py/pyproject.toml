@@ -1,0 +1,35 @@
+[build-system]
+requires = ["maturin>=1.9.4,<2.0"]
+build-backend = "maturin"
+
+# `maturin>=1.9.4` rather than `>=1.0` is load-bearing: from that release maturin
+# sets PYO3_BUILD_EXTENSION_MODULE for a distribution build, which is what lets
+# `Cargo.toml` omit pyo3's deprecated `extension-module` feature. With an older
+# maturin the feature would be required, and enabling it breaks `cargo test` for
+# every other member of this workspace.
+
+[project]
+name = "microvms"
+version = "0.1.0"
+description = "Python bindings over microvms-core: the MicroVMs client with every trap closure"
+requires-python = ">=3.9"
+# No `authors`, no `license`, no `readme`, no `classifiers`, no `urls`. This is a
+# locally-built wheel for `maturin develop`, not a package anyone publishes, and
+# the metadata a publish needs is metadata a reader could mistake for intent to
+# publish.
+
+[tool.maturin]
+# Defaults to the Cargo.toml next to this file; stated because `maturin build -m`
+# from the workspace root resolves it relative to the manifest, and being explicit
+# is how the two invocations stay the same build.
+manifest-path = "Cargo.toml"
+# `abi3-py39` in Cargo.toml is what makes one wheel load on 3.9 and newer; nothing
+# here needs to restate it.
+
+# No `[dependency-groups]`, and that is a measured omission rather than a
+# preference: `maturin develop --uv` runs `uv pip install --group` relative to the
+# *invocation* directory, so with a group declared here the command fails from the
+# workspace root with "No pyproject.toml found at <workspace>/pyproject.toml". The
+# test dependency is one package, installed alongside maturin itself, and a group
+# that breaks the documented build command is not worth the tidiness.
+
