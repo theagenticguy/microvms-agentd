@@ -43,31 +43,11 @@ use serde_json::{Map, Value, json};
 
 use crate::config::Config;
 
-/// Protocol version, distinct from the daemon version.
-///
-/// It tracks the `/v1/` path namespace rather than the crate version: a patch to
-/// the daemon does not change the wire format, and a client that pinned a daemon
-/// version would refuse an upgrade it is compatible with.
-///
-/// What a client should do on a mismatch, stated here because it is the question a
-/// version number exists to answer:
-///
-/// * **Same `protocol_version`, different `daemon_version`** — proceed. The path
-///   namespace and every shape in `$defs` are unchanged; only the implementation
-///   moved. This is the normal case and must not be treated as an error.
-/// * **Different `protocol_version`** — do not proceed against `/v1/`. A new
-///   protocol version means a shape or a status code changed meaning, and a client
-///   built for `1` cannot tell a changed meaning from a bug. Fetch `/v1/schema`,
-///   which stays unauthenticated precisely so this is diagnosable, and fail with
-///   the two versions named.
-/// * **The `microvms-agentd-version` response header disagrees with the schema
-///   document's `daemon_version`** — you are talking to two daemons through one
-///   endpoint, or to a proxy that rewrote a response. Treat it as a transport
-///   fault, not a version negotiation.
-///
-/// There is deliberately no negotiation *request*: the daemon serves exactly one
-/// protocol version, and a client that has read this document already knows which.
-pub const PROTOCOL_VERSION: &str = "1";
+/// The protocol version, re-exported from its original path. It lives in the
+/// `protocol` crate because a client has to compare against the same constant this
+/// document publishes, and two copies of a version number is the drift the number
+/// exists to detect.
+pub use protocol::PROTOCOL_VERSION;
 
 /// Whether a route requires the bearer token.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

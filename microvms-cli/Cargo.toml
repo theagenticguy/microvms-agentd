@@ -1,0 +1,11 @@
+[package]
+name = "microvms-cli"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "the microvm CLI, populated by T-W3-7"
+
+# Deliberately dependency-free. The crate exists so the workspace member list is
+# written once; T-W3-7 adds what it needs.
+[dependencies]

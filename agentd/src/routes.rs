@@ -6,26 +6,20 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router, middleware};
-use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
 use tower_http::catch_panic::CatchPanicLayer;
 use tower_http::limit::RequestBodyLimitLayer;
 
 use crate::state::{AppState, Bootstrap};
 use crate::{auth, exec, fs, schema};
 
+/// The hook and health wire types and the header constant, re-exported from their
+/// original paths so every call site and doc reference here stays valid.
+pub use protocol::VERSION_HEADER;
+pub use protocol::health::{DiskHealth, Health};
+pub use protocol::hook::{HOOK_PREFIX, RunHook, RunHookEnvelope};
+
 /// Version reported by `/v1/health` and the `microvms-agentd-version` header.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
-
-/// The response header carrying [`VERSION`], on every response including errors.
-///
-/// Lowercase because HTTP/2 requires it and hyper normalizes anyway; naming it
-/// once here keeps the layer, the schema document, and any test asserting on it
-/// from drifting into three spellings of the same header.
-pub const VERSION_HEADER: &str = "microvms-agentd-version";
-
-/// Prefix the platform uses for every lifecycle hook. Fixed by the service.
-pub const HOOK_PREFIX: &str = "/aws/lambda-microvms/runtime/v1";
 
 fn hook_path(hook: &str) -> String {
     format!("{HOOK_PREFIX}/{hook}")
@@ -168,74 +162,6 @@ async fn stamp_version(request: axum::extract::Request, next: middleware::Next) 
     response
 }
 
-/// The envelope the platform posts to the run hook.
-///
-/// The `runHookPayload` string given to `RunMicrovm` is not delivered as the
-/// request body: the platform wraps it, so the body is
-/// `{"runHookPayload": "<the caller's string>"}` and the caller's own JSON is one
-/// `serde_json` parse deeper. Measured 2026-08-05 — a daemon that reads
-/// `agent_token` from the top level answers 400, and the platform then terminates
-/// the VM with "Run lifecycle hook returned HTTP status 400" before any traffic is
-/// forwarded, so the mistake is invisible from the outside.
-#[derive(Debug, Deserialize, JsonSchema)]
-pub struct RunHookEnvelope {
-    #[serde(rename = "runHookPayload")]
-    pub run_hook_payload: Option<String>,
-}
-
-/// The caller's own payload, carrying the per-VM secret.
-///
-/// Passing the token at launch is what keeps it out of the shared image snapshot.
-/// It is safe because the platform forwards no external traffic until this hook
-/// returns 200.
-#[derive(Debug, Deserialize, JsonSchema)]
-pub struct RunHook {
-    pub agent_token: String,
-}
-
-/// `GET /v1/health` response.
-#[derive(Debug, JsonSchema, Serialize)]
-pub struct Health {
-    version: &'static str,
-    bootstrapped: bool,
-    /// Free space on the daemon's working filesystem, and the reserve it is judged
-    /// against.
-    ///
-    /// Reported so disk pressure is something an orchestrator *watches* rather than
-    /// something it discovers from a failed write. anthropics/claude-code#59856
-    /// filled two 10 GB disks to 100% with never-collected session directories and
-    /// the first symptom was `useradd: No space left on device` — by which point
-    /// every writer in the sandbox was already broken. A number on a health endpoint
-    /// is what makes that curve visible while there is still time to act.
-    ///
-    /// `None` when free space could not be measured, which is deliberately distinct
-    /// from zero: unmeasurable is not full, and a monitor that conflated them would
-    /// page on a missing `statvfs`.
-    disk: Option<DiskHealth>,
-    /// Whether any startup identity repair step failed. True means the VM is serving
-    /// with a value from the shared image still in place — a duplicate machine-id or
-    /// boot_id — which is a security-relevant condition an operator may want to
-    /// drain the VM over, but is never a reason for the daemon to refuse to serve.
-    identity_degraded: bool,
-    /// False when identity repair was switched off by config. Distinguished from a
-    /// repair that ran and found nothing so a monitor can tell "opted out" from
-    /// "nothing to do".
-    identity_repaired: bool,
-}
-
-/// The disk half of [`Health`].
-#[derive(Debug, JsonSchema, Serialize)]
-pub struct DiskHealth {
-    /// Bytes available to an unprivileged writer, from `statvfs` `f_bavail`.
-    available_bytes: u64,
-    /// Bytes that must stay free before a write is refused. Zero means the guard is
-    /// disabled.
-    reserve_bytes: u64,
-    /// Whether a write would be refused right now. Precomputed rather than left to
-    /// the client, so every consumer applies the same comparison the write path does.
-    under_pressure: bool,
-}
-
 /// One-shot token bootstrap.
 ///
 /// Deliberately unauthenticated: the platform has no credential to present, and
@@ -351,7 +277,9 @@ async fn terminate_hook() -> StatusCode {
 async fn health(State(state): State<AppState>) -> Json<Health> {
     let identity = state.identity_report();
     Json(Health {
-        version: VERSION,
+        // `Cow` on the wire type so a client deserializes into an owned string; the
+        // daemon's own version is a `&'static str` and stays borrowed.
+        version: std::borrow::Cow::Borrowed(VERSION),
         bootstrapped: state.is_bootstrapped(),
         // Measured against the daemon's own working directory, which is the image
         // WORKDIR and the filesystem a caller's writes land on by default. A write

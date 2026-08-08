@@ -51,13 +51,15 @@ use axum::extract::{Request, State};
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use futures_util::TryStreamExt;
-use schemars::JsonSchema;
-use serde::Deserialize;
 use tar::EntryType;
 use tokio_util::io::{ReaderStream, StreamReader};
 
 use crate::disk::{self, CopyError};
 use crate::state::AppState;
+
+/// The one typed shape in this module, re-exported from its original path. The
+/// bodies here are opaque byte streams, so the query is the whole wire contract.
+pub use protocol::fs::FsQuery;
 
 /// The refusal a write gets when the target filesystem is under the configured
 /// reserve.
@@ -86,21 +88,6 @@ fn insufficient_storage(path: &Path, reading: disk::Reading) -> Response {
         ),
     )
         .into_response()
-}
-
-/// Query string for every route in this module.
-///
-/// `path` is required. A request missing it is 400, never 404: clients map 404
-/// onto `FileNotFoundError`, so answering 404 for a protocol typo made a missing
-/// query key look like an absent artifact — that is how one defect hid for a full
-/// review round.
-#[derive(Debug, Deserialize, JsonSchema)]
-pub struct FsQuery {
-    pub path: String,
-    /// Octal mode for a written file, carried as a string so `0644` and `644`
-    /// both parse and neither is read as decimal 644.
-    #[serde(default)]
-    pub mode: Option<String>,
 }
 
 /// Why an archive or member was refused.

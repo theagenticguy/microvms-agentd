@@ -44,10 +44,12 @@
 //!   feeding a running process. An exec is a server-side object and attaching is
 //!   a view onto it.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+use std::borrow::Cow;
 
 use axum::Json;
 use axum::extract::rejection::{JsonRejection, QueryRejection};
@@ -58,50 +60,33 @@ use axum::response::{IntoResponse, Response};
 use base64::Engine as _;
 use bytes::Bytes;
 use futures_util::Stream;
-use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::{ChildStdin, Command};
 use tokio::sync::{Mutex, broadcast};
 
 use crate::state::AppState;
+// The error slugs and SSE event names. Named rather than spelled at each call site:
+// a client matches on these exact strings, so a typo on either side is a response a
+// consumer cannot branch on.
+use protocol::exec::{
+    ERROR_ALREADY_ACKED, ERROR_MALFORMED_REQUEST, ERROR_SPAWN_FAILED, ERROR_STDIN_CLOSED,
+    ERROR_STDIN_NOT_REQUESTED, ERROR_STDIN_WRITE_FAILED, ERROR_STDIN_WRITE_TIMEOUT,
+    ERROR_STDIN_WRITE_TOO_LARGE, ERROR_STILL_RUNNING, ERROR_UNKNOWN_EXEC, EVENT_EXIT, EVENT_GAP,
+    EVENT_OUTPUT,
+};
 
-/// Where an exec sits in its lifecycle. Mirrors `ExecPhase` in the model crate.
+/// The wire types, re-exported from their original paths.
 ///
-/// `JsonSchema` rides along with `Serialize` on every type from here down that
-/// crosses the wire. schemars reads the same `#[serde(...)]` attributes serde
-/// does, so the published schema describes what the daemon actually emits — the
-/// `rename_all` below is the reason this matters rather than a formality.
-#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Phase {
-    /// Child spawned, still running (or its pipes still held by a grandchild).
-    Running,
-    /// Child exited and output is buffered and readable.
-    Exited,
-    /// Caller acked; output has been released and the entry awaits collection.
-    Acked,
-}
-
-/// Captured output and exit status of a finished exec.
-#[derive(Clone, Debug, Default, JsonSchema, Serialize)]
-pub struct Outcome {
-    /// Exit code, or `None` when the child died to a signal.
-    pub exit_code: Option<i32>,
-    /// Signal number that killed the child, when one did.
-    pub signal: Option<i32>,
-    pub stdout: String,
-    pub stderr: String,
-    /// Set when either stream hit `max_output_bytes` and was cut. An explicit
-    /// flag rather than a sentinel string in the output: a marker inside the
-    /// bytes is indistinguishable from output that happens to contain it.
-    pub truncated: bool,
-    /// Set when the post-exit linger deadline expired with the pipes still open,
-    /// meaning some grandchild is alive and may write more that nobody will see.
-    /// Reported rather than hidden, because a harness that sees empty output from
-    /// a command it knows produced some needs to be able to tell why.
-    pub writers_may_be_alive: bool,
-}
+/// They live in the `protocol` crate now, because a client needs the identical
+/// shapes and the only thing that had kept two copies in step was review. Re-exported
+/// rather than referenced through `protocol::` at each use so that `exec::Phase` keeps
+/// naming the same type it always has — for the handlers below, for the doc references
+/// in the `agentd-model` crate, and for anything downstream that imported it.
+pub use protocol::exec::{
+    ErrorBody, ExitEvent, GapEvent, KillResponse, Outcome, OutputEvent, Phase, PollResponse,
+    StartRequest, StartResponse, StdinRequest, StdinResponse, StreamKind, StreamQuery,
+};
 
 /// The exit status of a finished exec, kept separately from [`Outcome`].
 ///
@@ -117,15 +102,6 @@ struct Terminal {
     signal: Option<i32>,
     truncated: bool,
     writers_may_be_alive: bool,
-}
-
-/// Which pipe a streamed chunk came from. Both share one offset space, so a
-/// client holds one cursor rather than two that can disagree about ordering.
-#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum StreamKind {
-    Stdout,
-    Stderr,
 }
 
 /// One message on an exec's live fan-out channel.
@@ -329,166 +305,21 @@ impl Shared {
     }
 }
 
-/// A start request. `command` is either an argv array or, with `shell: true`, a
-/// single script string.
-#[derive(Debug, Deserialize, JsonSchema)]
-pub struct StartRequest {
-    /// Caller-minted idempotency key. Harbor retries, and a retry must not
-    /// produce a second child.
-    pub exec_id: String,
-    /// argv when `shell` is false, or the script when it is true.
-    pub command: Vec<String>,
-    #[serde(default)]
-    pub shell: bool,
-    /// Omitted means inherit the daemon's working directory. See the module docs.
-    #[serde(default)]
-    pub cwd: Option<String>,
-    #[serde(default)]
-    pub env: HashMap<String, String>,
-    /// Numeric uid to demote to. Optional; omitted means run as the daemon's own
-    /// user.
-    #[serde(default)]
-    pub user: Option<u32>,
-    #[serde(default)]
-    pub group: Option<u32>,
-    /// Wall-clock budget. Validated before the child spawns — the predecessor
-    /// raised on a bad value inside the waiter thread, by which point the child
-    /// was already running and became an orphan.
-    #[serde(default)]
-    pub timeout_sec: Option<f64>,
-    /// Whether to give the child a writable stdin pipe. Defaults to false, which
-    /// keeps `Stdio::null()`.
-    ///
-    /// Opt-in rather than always-on, and not only for tidiness: a child holding an
-    /// open stdin pipe nobody will ever write to is a child that blocks forever
-    /// the first time it reads. `/bin/sh` reading a script from stdin, `git`
-    /// deciding it can prompt, any tool that probes for input — all of them behave
-    /// differently against a pipe than against `/dev/null`. Every existing caller
-    /// gets today's behavior by not setting this.
-    #[serde(default)]
-    pub stdin: bool,
-}
-
-/// `POST /v1/exec/{id}/stdin` body.
-///
-/// Both fields optional and both meaningful together: a final chunk plus EOF in
-/// one request is the common case for feeding a prompt, and forcing two round
-/// trips would leave a window where the child has the bytes but not the EOF that
-/// tells it the input is complete.
-#[derive(Debug, Default, Deserialize, JsonSchema)]
-pub struct StdinRequest {
-    /// Base64 so arbitrary bytes survive JSON. A JSON string cannot carry
-    /// non-UTF-8, and stdin is bytes.
-    #[serde(default)]
-    pub data_b64: Option<String>,
-    /// `"eof"` closes the pipe after any `data_b64` is written. Named rather than
-    /// a bare boolean so the field has somewhere to grow.
-    #[serde(default)]
-    pub signal: Option<String>,
-}
-
-/// `POST /v1/exec/{id}/stdin` response.
-///
-/// `pub` rather than private, like every other type in this module the schema
-/// route publishes: the generator names them by type, so a response shape that
-/// stays private is a shape a consumer cannot be told about.
-#[derive(Debug, JsonSchema, Serialize)]
-pub struct StdinResponse {
-    exec_id: String,
-    written: usize,
-    eof: bool,
-}
-
-/// `GET /v1/exec/{id}/stream` query.
-#[derive(Debug, Default, Deserialize, JsonSchema)]
-pub struct StreamQuery {
-    /// Byte offset to resume from. Absent means 0, i.e. everything still in the
-    /// replay window.
-    #[serde(default)]
-    pub offset: Option<u64>,
-}
-
-/// One `output` SSE event.
-#[derive(Debug, JsonSchema, Serialize)]
-pub struct OutputEvent {
-    offset: u64,
-    stream: StreamKind,
-    output: String,
-}
-
-/// One `gap` SSE event: the byte range a lagging or late subscriber lost.
-#[derive(Debug, JsonSchema, Serialize)]
-pub struct GapEvent {
-    from: u64,
-    to: u64,
-}
-
-/// The terminal `exit` SSE event. Emitted before the stream ends, so a client
-/// that sees the body close without one knows the connection failed rather than
-/// the command finishing.
-#[derive(Debug, JsonSchema, Serialize)]
-pub struct ExitEvent {
-    exit_code: Option<i32>,
-    signal: Option<i32>,
-    truncated: bool,
-    writers_may_be_alive: bool,
-    /// Total bytes published, so a client can assert it saw all of them.
-    offset: u64,
-}
-
-#[derive(Debug, JsonSchema, Serialize)]
-pub struct StartResponse {
-    exec_id: String,
-    phase: Phase,
-}
-
-/// `POST /v1/exec/{id}/kill` response.
-///
-/// A named type rather than the `serde_json::json!` literal this used to be: an
-/// ad-hoc `Value` has no schema to derive, so the one route whose body a client
-/// most needs to branch on — `killed` distinguishes "signalled" from "the group
-/// was already gone", and both are 200 — would have been the one route the
-/// published document could not describe.
-#[derive(Debug, JsonSchema, Serialize)]
-pub struct KillResponse {
-    exec_id: String,
-    /// Whether a signal was actually delivered. `false` with a 200 means the
-    /// process group had already exited, which is the outcome a kill wanted.
-    killed: bool,
-}
-
-#[derive(Debug, JsonSchema, Serialize)]
-pub struct PollResponse {
-    exec_id: String,
-    phase: Phase,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[serde(flatten)]
-    result: Option<Outcome>,
-}
-
-/// The JSON error body every failing control route returns.
-///
-/// `error` is a stable machine-readable slug and `detail` is prose for a human
-/// reading a log. A client branches on `error` and the status code, never on
-/// `detail` — which is why the slug is a `&'static str` chosen at each call site
-/// rather than a formatted string.
-#[derive(Debug, JsonSchema, Serialize)]
-pub struct ErrorBody {
-    error: &'static str,
-    detail: String,
-}
-
 /// Builds an error response.
 ///
 /// The status is always chosen by the caller of this function, never inferred
 /// from an error type: a bad body key must be 400 and an absent id must be 404,
 /// and collapsing the two is the defect that made a protocol typo look like a
 /// missing artifact.
+///
+/// Stays here rather than moving to `protocol` with the body it builds: the pairing
+/// of a slug with an axum `StatusCode` is daemon machinery, and a client reads the
+/// two rather than constructing them.
 fn fail(status: StatusCode, error: &'static str, detail: impl Into<String>) -> Response {
     (
         status,
         Json(ErrorBody {
-            error,
+            error: Cow::Borrowed(error),
             detail: detail.into(),
         }),
     )
@@ -503,7 +334,7 @@ pub async fn start(
     let Ok(Json(req)) = body else {
         return fail(
             StatusCode::BAD_REQUEST,
-            "malformed_request",
+            ERROR_MALFORMED_REQUEST,
             "body is not a valid start request",
         );
     };
@@ -511,7 +342,7 @@ pub async fn start(
     if req.exec_id.is_empty() {
         return fail(
             StatusCode::BAD_REQUEST,
-            "malformed_request",
+            ERROR_MALFORMED_REQUEST,
             "exec_id must not be empty",
         );
     }
@@ -520,12 +351,12 @@ pub async fn start(
     // running child with nobody to reap it.
     let timeout = match validate_timeout(req.timeout_sec) {
         Ok(timeout) => timeout,
-        Err(detail) => return fail(StatusCode::BAD_REQUEST, "malformed_request", detail),
+        Err(detail) => return fail(StatusCode::BAD_REQUEST, ERROR_MALFORMED_REQUEST, detail),
     };
 
     let command = match build_command(&req) {
         Ok(command) => command,
-        Err(detail) => return fail(StatusCode::BAD_REQUEST, "malformed_request", detail),
+        Err(detail) => return fail(StatusCode::BAD_REQUEST, ERROR_MALFORMED_REQUEST, detail),
     };
 
     // Idempotency: decided under the registry lock, before the spawn, so two
@@ -560,7 +391,7 @@ pub async fn start(
             tracing::warn!(exec_id = %req.exec_id, %err, "spawn failed");
             fail(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                "spawn_failed",
+                ERROR_SPAWN_FAILED,
                 err.to_string(),
             )
         }
@@ -575,7 +406,7 @@ pub async fn start(
 pub async fn poll(State(state): State<AppState>, Path(id): Path<String>) -> Response {
     let shared = match state.with_execs(|execs| execs.get(&id).map(|entry| entry.shared.clone())) {
         Some(shared) => shared,
-        None => return fail(StatusCode::NOT_FOUND, "unknown_exec", id),
+        None => return fail(StatusCode::NOT_FOUND, ERROR_UNKNOWN_EXEC, id),
     };
 
     let acked = state.with_execs(|execs| {
@@ -628,14 +459,14 @@ pub async fn stream(
     let Ok(Query(query)) = query else {
         return fail(
             StatusCode::BAD_REQUEST,
-            "malformed_request",
+            ERROR_MALFORMED_REQUEST,
             "offset must be a non-negative integer",
         );
     };
 
     let shared = match state.with_execs(|execs| execs.get(&id).map(|entry| entry.shared.clone())) {
         Some(shared) => shared,
-        None => return fail(StatusCode::NOT_FOUND, "unknown_exec", id),
+        None => return fail(StatusCode::NOT_FOUND, ERROR_UNKNOWN_EXEC, id),
     };
 
     let from = query.offset.unwrap_or(0);
@@ -709,7 +540,7 @@ impl Attach {
         });
         let offset = self.shared.log.lock().await.total;
         typed(
-            "exit",
+            EVENT_EXIT,
             &ExitEvent {
                 exit_code: terminal.exit_code,
                 signal: terminal.signal,
@@ -809,7 +640,7 @@ fn build_stream(
 
 fn output_event(stream: StreamKind, offset: u64, bytes: &[u8]) -> Event {
     typed(
-        "output",
+        EVENT_OUTPUT,
         &OutputEvent {
             offset,
             stream,
@@ -822,7 +653,7 @@ fn output_event(stream: StreamKind, offset: u64, bytes: &[u8]) -> Event {
 }
 
 fn gap_event(from: u64, to: u64) -> Event {
-    typed("gap", &GapEvent { from, to })
+    typed(EVENT_GAP, &GapEvent { from, to })
 }
 
 /// Builds one named SSE event.
@@ -855,14 +686,14 @@ pub async fn write_stdin(
     let Ok(Json(req)) = body else {
         return fail(
             StatusCode::BAD_REQUEST,
-            "malformed_request",
+            ERROR_MALFORMED_REQUEST,
             "body is not a valid stdin request",
         );
     };
 
     let shared = match state.with_execs(|execs| execs.get(&id).map(|entry| entry.shared.clone())) {
         Some(shared) => shared,
-        None => return fail(StatusCode::NOT_FOUND, "unknown_exec", id),
+        None => return fail(StatusCode::NOT_FOUND, ERROR_UNKNOWN_EXEC, id),
     };
 
     if !shared.stdin_requested {
@@ -870,7 +701,7 @@ pub async fn write_stdin(
         // accept it, and the fix is at start time rather than in this body.
         return fail(
             StatusCode::CONFLICT,
-            "stdin_not_requested",
+            ERROR_STDIN_NOT_REQUESTED,
             "this exec was started without stdin: true, so its stdin is /dev/null",
         );
     }
@@ -881,7 +712,7 @@ pub async fn write_stdin(
         Some(other) => {
             return fail(
                 StatusCode::BAD_REQUEST,
-                "malformed_request",
+                ERROR_MALFORMED_REQUEST,
                 format!("unknown stdin signal {other:?}; only \"eof\" is defined"),
             );
         }
@@ -894,7 +725,7 @@ pub async fn write_stdin(
             Err(err) => {
                 return fail(
                     StatusCode::BAD_REQUEST,
-                    "malformed_request",
+                    ERROR_MALFORMED_REQUEST,
                     format!("data_b64 is not valid base64: {err}"),
                 );
             }
@@ -905,7 +736,7 @@ pub async fn write_stdin(
     if data.len() > cap {
         return fail(
             StatusCode::PAYLOAD_TOO_LARGE,
-            "stdin_write_too_large",
+            ERROR_STDIN_WRITE_TOO_LARGE,
             format!(
                 "{} bytes exceeds the {cap}-byte stdin write limit",
                 data.len()
@@ -920,7 +751,7 @@ pub async fn write_stdin(
         // and a client retrying will never succeed.
         return fail(
             StatusCode::GONE,
-            "stdin_closed",
+            ERROR_STDIN_CLOSED,
             "stdin has already been closed or the child has exited",
         );
     };
@@ -945,14 +776,14 @@ pub async fn write_stdin(
                 *slot = None;
                 return fail(
                     StatusCode::GONE,
-                    "stdin_closed",
+                    ERROR_STDIN_CLOSED,
                     "the child is no longer reading stdin",
                 );
             }
             Ok(Err(err)) => {
                 return fail(
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    "stdin_write_failed",
+                    ERROR_STDIN_WRITE_FAILED,
                     err.to_string(),
                 );
             }
@@ -963,7 +794,7 @@ pub async fn write_stdin(
                 // reconcile, which is why the detail says so.
                 return fail(
                     StatusCode::REQUEST_TIMEOUT,
-                    "stdin_write_timeout",
+                    ERROR_STDIN_WRITE_TIMEOUT,
                     "the child did not read stdin within the write timeout; \
                      some bytes may have been written",
                 );
@@ -999,14 +830,14 @@ pub async fn write_stdin(
 pub async fn ack(State(state): State<AppState>, Path(id): Path<String>) -> Response {
     let shared = match state.with_execs(|execs| execs.get(&id).map(|entry| entry.shared.clone())) {
         Some(shared) => shared,
-        None => return fail(StatusCode::NOT_FOUND, "unknown_exec", id),
+        None => return fail(StatusCode::NOT_FOUND, ERROR_UNKNOWN_EXEC, id),
     };
 
     let mut slot = shared.result.lock().await;
     if slot.is_none() {
         return fail(
             StatusCode::CONFLICT,
-            "still_running",
+            ERROR_STILL_RUNNING,
             "exec has not exited; output is still being written",
         );
     }
@@ -1029,7 +860,7 @@ pub async fn ack(State(state): State<AppState>, Path(id): Path<String>) -> Respo
     if !marked {
         return fail(
             StatusCode::CONFLICT,
-            "already_acked",
+            ERROR_ALREADY_ACKED,
             "output was released by an earlier ack",
         );
     }
@@ -1058,7 +889,7 @@ pub async fn kill(State(state): State<AppState>, Path(id): Path<String>) -> Resp
             .map(|entry| (entry.pgid, entry.shared.clone()))
     }) {
         Some((pgid, shared)) => (pgid, shared),
-        None => return fail(StatusCode::NOT_FOUND, "unknown_exec", id),
+        None => return fail(StatusCode::NOT_FOUND, ERROR_UNKNOWN_EXEC, id),
     };
 
     let Some(pgid) = pgid else {
@@ -1537,6 +1368,8 @@ fn unix_signal(_status: &std::process::ExitStatus) -> Option<i32> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::*;
     use crate::config::Config;
 

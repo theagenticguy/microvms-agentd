@@ -1,0 +1,11 @@
+[package]
+name = "microvms-core"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "the MicroVMs control-plane library, populated by T-W2-2"
+
+# Deliberately dependency-free. The crate exists so the workspace member list is
+# written once; T-W2-2 adds what it needs.
+[dependencies]

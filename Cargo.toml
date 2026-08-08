@@ -1,10 +1,23 @@
 [workspace]
-members = ["agentd","model"]
+members = [
+    "agentd",
+    "microvms-cli",
+    "microvms-core",
+    "microvms-js",
+    "microvms-py",
+    "model",
+    "protocol",
+]
 resolver = "3"
 
 # The daemon crate lands here as `agentd/` once the model settles. Keeping the
 # workspace in place from the first commit means adding it is a one-line change
 # rather than a restructure.
+#
+# The list is complete rather than grown: `microvms-core`, `microvms-cli`,
+# `microvms-py`, and `microvms-js` are stubs whose owning tasks fill them in, and
+# declaring them all at once means no later change has to touch this file. A member
+# added late is a member every other in-flight branch conflicts on.
 
 [workspace.package]
 edition = "2024"

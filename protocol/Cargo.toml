@@ -1,0 +1,22 @@
+[package]
+name = "protocol"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Wire types shared by the microvms-agentd daemon and its clients"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+# Same pin and the same two features as the daemon carries, and for the same
+# reason: `preserve_order` must stay off or the committed `docs/schema.json` stops
+# being a function of the types. One version of schemars in the tree is what makes
+# the generated artifact reproducible across the two crates that feed it.
+schemars = { version = "1.2.2", default-features = false, features = ["derive", "std"] }
+
+# Not a runtime dependency, and not a new one either: schemars already pulls
+# `serde_json` in, so this only names what is in the tree. The round-trip tests need
+# a concrete format — a type that derives both halves of serde and is never driven
+# through one is a type whose halves can still disagree.
+[dev-dependencies]
+serde_json = "1"
