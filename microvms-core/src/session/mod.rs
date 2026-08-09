@@ -102,7 +102,18 @@ impl Transport {
 
     /// Sends one request and returns the response whatever its status.
     async fn request(&self, mut request: HttpRequest) -> Result<HttpResponse, Error> {
-        request.headers = self.headers(request_token(&request)).await?;
+        // Prepend, never replace: the caller's headers carry the content type
+        // (exec start is application/json, file upload is octet-stream), and
+        // replacing the vec silently stripped them — the daemon answered 400
+        // "body is not a valid start request" on the first live run while every
+        // fake-backed test stayed green, because the fakes parse bodies without
+        // reading content-type. The replacement was also what stripped the
+        // token-intent marker, so keeping the caller's headers means dropping
+        // that one explicitly — it is not a real header and must not leave.
+        let mut headers = self.headers(request_token(&request)).await?;
+        request.headers.retain(|(name, _)| name != TOKEN_INTENT);
+        headers.append(&mut request.headers);
+        request.headers = headers;
         if request.timeout.is_none() {
             request.timeout = Some(self.timeout);
         }
@@ -663,6 +674,30 @@ mod tests {
 
     fn header(request: &HttpRequest, name: &str) -> Option<String> {
         request.header(name).map(str::to_string)
+    }
+
+    /// The live-run regression: `Transport::request` REPLACED the header vec with
+    /// the auth headers, stripping the content type the caller set — the daemon
+    /// answered 400 "body is not a valid start request" against real axum while
+    /// every fake stayed green (fakes parse bodies without reading content-type).
+    ///
+    /// **Guard proof.** Change the prepend back to `request.headers = auth_headers`
+    /// and this test is red on the content-type assertion.
+    #[tokio::test]
+    async fn a_callers_content_type_survives_the_auth_header_injection() {
+        let recorder = Recorder::with([Reply::ok(
+            serde_json::json!({"exec_id":"e1","phase":"running"}),
+        )]);
+        let (session, _, _) = session_with(Arc::clone(&recorder));
+
+        session.run(start_request("e1")).await.expect("start");
+
+        let seen = recorder.requests();
+        assert_eq!(
+            header(&seen[0], "content-type").as_deref(),
+            Some("application/json"),
+            "the exec start lost its content type to the auth header injection"
+        );
     }
 
     /// TRAP-7's send side, asserted on a recorded request rather than on a return
