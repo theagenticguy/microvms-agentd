@@ -77,7 +77,7 @@ Versions are [semantic](https://semver.org/spec/v2.0.0.html); the wire contract 
   false` on every `setup-uv` step, because there is no lockfile in this repo to key a cache
   on — every Python entry point is a `uvx` invocation or a PEP 723 script — and a cache that
   can never be invalidated would pin the boto3 whose bundled service model the drift gate
-  exists to read fresh. `configure-aws-credentials@v4` is the one step still on Node 20;
+  exists to read fresh. `configure-aws-credentials@v4` was the one step still on Node 20 (v6 has since landed on node24 and the workflow moved to it);
   upstream has no Node 24 major yet.
 
 - **Three accepted debts now carry their reasons in the code**, rather than in a session

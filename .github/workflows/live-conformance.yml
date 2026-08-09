@@ -48,9 +48,8 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
       # Every `uses:` here is on a Node 24 major, for the reason `ci.yml`'s header
-      # paragraph gives. `configure-aws-credentials@v4` is the exception and there
-      # is no fix for it: v5 is still Node 20 upstream, so the deprecation warning
-      # on that one step is the upstream's to clear.
+      # paragraph gives — including `configure-aws-credentials@v6`, whose rolling
+      # v6 tag landed on node24 (checked against the tag's action.yml, 2026-08-09).
       - uses: astral-sh/setup-uv@v7
         with:
           # See `ci.yml`'s `security` job: `conformance/run_rs.py` and
@@ -67,7 +66,7 @@ jobs:
       # needs to create MicroVM images, run MicroVMs, and manage the conformance
       # stack's bucket and roles.
       - name: assume AWS role
-        uses: aws-actions/configure-aws-credentials@v4
+        uses: aws-actions/configure-aws-credentials@v6
         with:
           role-to-assume: ${{ secrets.LIVE_CONFORMANCE_ROLE_ARN }}
           aws-region: ${{ inputs.region }}
