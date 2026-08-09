@@ -11,11 +11,17 @@
 //! `microvms-core/src/cost.rs:624` makes by returning `Option` from `Amount::estimate`
 //! instead of defaulting to zero.
 //!
-//! Every dollar figure crosses into JSON as a **string**, never a number. `Decimal` to `f64`
+//! Every **dollar** figure crosses into JSON as a string, never a number. `Decimal` to `f64`
 //! to `serde_json::Number` is a lossy step for a figure whose exactness is the whole point of
-//! the type, and `cli.py:718` writes `str(...)` for the same reason. The one numeric second
-//! figure in the envelope is `breakEvenSeconds`, which core exposes through a function whose
-//! name says it is lossy.
+//! the type, and `cli.py:718` writes `str(...)` for the same reason.
+//!
+//! Every **seconds** figure crosses as a JSON number: `breakEvenSeconds`, a line item's
+//! `duration.seconds` (`cli.py:743`), and a comparison's `holdSeconds` (`cli.py:2189`). Each
+//! goes through an accessor core named `_f64`, so the lossy step is a visible call rather than
+//! an implicit coercion. The split is not a compromise between two half-rules — it is which
+//! consumer is being protected. A caller summing a dollar column must be stopped from doing
+//! float arithmetic on money; a caller comparing a duration against a timeout must not have
+//! to discover that one of the two clients quotes seconds in quotes.
 
 use microvms_core::cost::{Amount, CostReport, LineItem, ResidencyComparison};
 use serde_json::{Map, Value, json};
@@ -81,10 +87,14 @@ pub fn line_to_json(item: &LineItem) -> Value {
         "unit": item.unit,
         "amount": amount,
         "duration": item.duration.map(|duration| json!({
-            // Seconds as a string too: a duration derived from a rate table's month is a
-            // 28-significant-digit decimal, and the JSON number that survives it is not the
-            // one the arithmetic used.
-            "seconds": duration.seconds().to_string(),
+            // A JSON **number**, because `cli.py:743` emits `item.duration.seconds`, which is
+            // a float. Seconds are not dollars: the exactness argument that keeps every money
+            // figure a string does apply to a retention span derived from a rate table's
+            // month, but parity wins here, and it wins for the reason `breakEvenSeconds` was
+            // already a number — a consumer doing arithmetic on a duration must not have to
+            // branch on which client produced the envelope. The accessor is named `_f64` so
+            // the lossy step is visible, which is core's own convention for exactly this.
+            "seconds": duration.seconds_f64(),
             "provenance": duration.provenance().as_str(),
         })),
         "note": item.note,
@@ -94,7 +104,9 @@ pub fn line_to_json(item: &LineItem) -> Value {
 /// A residency comparison as JSON.
 pub fn comparison_to_json(comparison: &ResidencyComparison) -> Result<Value, microvms_core::Error> {
     Ok(json!({
-        "holdSeconds": comparison.hold().seconds().to_string(),
+        // A number, matching `cli.py:2189`'s `residency.hold.seconds`, through the same
+        // `_f64` accessor as the line items' seconds and for the same reason.
+        "holdSeconds": comparison.hold().seconds_f64(),
         "cycles": comparison.cycles(),
         "running": report_to_json(comparison.running()),
         "suspended": report_to_json(comparison.suspended()),
@@ -107,12 +119,21 @@ pub fn comparison_to_json(comparison: &ResidencyComparison) -> Result<Value, mic
     }))
 }
 
-/// The dense rendering of a cost report: one tab-separated line per item.
+/// The dense rendering of a cost report: `phase\tunit\tamount`, one line per item.
+///
+/// Three fields and no total row, which is `cli.py:2203-2207` exactly. Both divergences the
+/// shape used to carry were the plausible kind. The extra `quantity` field put the amount in
+/// field four, so `cut -f3` — the column the module used to name — read the *unit* out of one
+/// client and the amount out of the other. And the appended `total` row is a line whose first
+/// field is not a phase, so `awk` over the phase column of a dense report sees a phase called
+/// `total`; the total is in the JSON envelope and in the plain rendering, which is where a
+/// consumer that wants it should read it, rather than in the stream a script is summing.
 ///
 /// An unpriced line reads the literal `unpriced` in the amount column rather than a blank or
-/// a zero, so `cut -f3` on this output cannot be summed into a wrong total either.
+/// a zero, so `cut -f3 | paste -sd+ | bc` on this output fails loudly instead of producing a
+/// total that flatters us.
 pub fn report_dense(report: &CostReport) -> String {
-    let mut lines: Vec<String> = report
+    report
         .items()
         .iter()
         .map(|item| {
@@ -120,26 +141,10 @@ pub fn report_dense(report: &CostReport) -> String {
                 Amount::Estimated(usd) => usd.amount().to_string(),
                 Amount::Unpriced { .. } => "unpriced".to_string(),
             };
-            format!(
-                "{}\t{}\t{}\t{}",
-                item.phase.as_str(),
-                item.quantity_string(),
-                item.unit,
-                amount
-            )
+            format!("{}\t{}\t{}", item.phase.as_str(), item.unit, amount)
         })
-        .collect();
-    let total = report.total();
-    lines.push(format!(
-        "total\t{}\t{}",
-        total.floor().amount(),
-        if total.is_lower_bound() {
-            "lower-bound"
-        } else {
-            "exact"
-        }
-    ));
-    lines.join("\n")
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 // ── run ─────────────────────────────────────────────────────────────────────
@@ -423,13 +428,38 @@ mod tests {
         assert_eq!(json["complete"], false);
     }
 
-    /// Every dollar figure is a string, and every priced line has one.
+    /// Every dollar figure is a string, and every priced line has one. Every *seconds*
+    /// figure is a number.
     ///
-    /// A JSON number here is a `Decimal` that went through an f64, which is the exactness the
-    /// type exists to hold. Asserted over every item so a single unconverted field fails.
+    /// A JSON number for a dollar figure is a `Decimal` that went through an f64, which is the
+    /// exactness the type exists to hold. Asserted over every item so a single unconverted
+    /// field fails.
+    ///
+    /// The seconds half is the same assertion pointed the other way, and it is pinned here
+    /// rather than left implicit because the two rules look contradictory side by side and the
+    /// natural "tidy-up" is to make them agree. `cli.py:743` emits `duration.seconds` as a
+    /// float, so a string here is a field a consumer has to branch on by client — which is
+    /// exactly the substitutability `breakEvenSeconds` was already a number to preserve. The
+    /// oracle, verbatim:
+    ///
+    /// ```text
+    /// cd clients/python && uv run --with boto3 python -c "
+    /// import io, contextlib, json
+    /// from microvms_agentd.cli import dispatch
+    /// buf = io.StringIO()
+    /// with contextlib.redirect_stdout(buf): dispatch(['cost','--json','--running-sec=3600'])
+    /// i = json.load(io.StringIO(buf.getvalue()))['data']['report']['items'][0]
+    /// print(repr(i['duration']['seconds']))"
+    /// # 3600.0
+    /// ```
+    ///
+    /// **Falsification** — put `.to_string()` back on either seconds field and the matching
+    /// arm here is red while every dollar assertion stays green, which is what says the two
+    /// halves are independent. Verified.
     #[test]
-    fn no_dollar_figure_reaches_json_as_a_number() {
+    fn every_dollar_is_a_string_and_every_seconds_figure_is_a_number() {
         let json = report_to_json(&a_report());
+        let mut durations = 0;
         for item in json["items"].as_array().expect("items") {
             if let Some(usd) = item["amount"].get("usd") {
                 assert!(usd.is_string(), "{item}");
@@ -440,10 +470,50 @@ mod tests {
             }
             assert!(item["quantity"].is_string(), "{item}");
             if !item["duration"].is_null() {
-                assert!(item["duration"]["seconds"].is_string(), "{item}");
+                durations += 1;
+                assert!(
+                    item["duration"]["seconds"].is_number(),
+                    "a number, matching cli.py:743: {item}"
+                );
             }
         }
+        assert!(
+            durations > 0,
+            "vacuous unless a duration was present: {json}"
+        );
         assert!(json["total"]["priced"].is_string());
+
+        // The exact values, so this is parity rather than merely a type check. Checked against
+        // the oracle on this same report shape — `600` for the timed build and `604800.0` for
+        // the retention floor — read through `as_f64` because the oracle's build figure is a
+        // JSON int where its retention figure is a float, and both are numbers.
+        let seconds: Vec<f64> = json["items"]
+            .as_array()
+            .expect("items")
+            .iter()
+            .filter(|item| !item["duration"].is_null())
+            .map(|item| item["duration"]["seconds"].as_f64().expect("a number"))
+            .collect();
+        assert!(seconds.contains(&600.0), "{seconds:?}");
+        assert!(seconds.contains(&604_800.0), "{seconds:?}");
+
+        // And `holdSeconds` on the comparison, which is the second field `cli.py` (`:2189`)
+        // emits as a number and the one a scheduler compares against a timeout.
+        let comparison = comparison_to_json(
+            &microvms_core::cost::compare_residency(
+                SizeClass::Mib2048,
+                std::time::Duration::from_secs(3600),
+                1,
+                &pinned_rates(),
+                fresh_day(),
+            )
+            .expect("a comparison"),
+        )
+        .expect("renders");
+        assert_eq!(comparison["holdSeconds"].as_f64(), Some(3600.0));
+        assert!(comparison["breakEvenSeconds"].is_number());
+        // The money beside it stays a string, which is the whole point of the split.
+        assert!(comparison["perCycleUsd"].is_string());
     }
 
     /// A measured run labels the phases a clock timed measured, and the one nobody timed
@@ -580,25 +650,73 @@ mod tests {
         );
     }
 
-    /// The dense cost rendering never puts a number where an unpriced line is.
+    /// The dense cost rendering is the oracle's three fields, with no total row.
     ///
-    /// `cut -f4 | paste -sd+ | bc` on this output is a thing someone will do, and it must not
-    /// produce a total that flatters us.
+    /// `cli.py:2203-2207` emits `phase\tunit\tamount` and stops. Both divergences this pins are
+    /// silent under a type check and loud under a pipe: a fourth `quantity` field moved the
+    /// amount to field four, so the same `cut -f3` read the *unit* from one client and the
+    /// amount from the other, and the appended `total` row put a line in the stream whose first
+    /// field is not a phase — `awk '$1=="running"'` is fine, `wc -l` and any per-phase
+    /// aggregation are not.
+    ///
+    /// The field names are checked positionally against the oracle's literal output:
+    ///
+    /// ```text
+    /// cd clients/python && uv run --with boto3 python -c "
+    /// import io, contextlib
+    /// from microvms_agentd.cli import dispatch
+    /// buf = io.StringIO()
+    /// with contextlib.redirect_stdout(buf):
+    ///     dispatch(['cost','--dense','--running-sec=3600','--build-sec=300','--image-gb=2'])
+    /// print(repr(buf.getvalue()))"
+    /// # 'image-build\tseconds\tunpriced\nimage-storage\tGB-months\t0.0373...\n...'
+    /// ```
+    ///
+    /// **Falsification** — add the quantity field back, or push the total row back on, and this
+    /// is red on the field count or the line count respectively. Verified for both.
     #[test]
-    fn the_dense_cost_rendering_writes_the_word_unpriced() {
+    fn the_dense_cost_rendering_is_three_fields_and_no_total() {
         let dense = report_dense(&a_report());
-        let build_line = dense
+        let rows: Vec<Vec<&str>> = dense
             .lines()
-            .find(|line| line.starts_with("image-build"))
-            .expect("the build line");
-        assert!(build_line.ends_with("unpriced"), "{build_line}");
+            .map(|line| line.split('\t').collect())
+            .collect();
+        assert!(!rows.is_empty(), "{dense}");
+        for row in &rows {
+            assert_eq!(
+                row.len(),
+                3,
+                "phase, unit, amount and nothing else: {row:?}"
+            );
+        }
+        // No total row: the last line is a phase like every other, so the line count is the
+        // item count.
+        assert_eq!(rows.len(), a_report().items().len(), "{dense}");
         assert!(
-            dense
-                .lines()
-                .last()
-                .expect("a total")
-                .contains("lower-bound"),
-            "{dense}"
+            !dense.contains("lower-bound") && !dense.contains("\nexact"),
+            "the total belongs to the JSON envelope and the plain render, not this stream: \
+             {dense}"
+        );
+
+        // Field two is the unit and field three is the amount, in the oracle's positions.
+        let build = rows
+            .iter()
+            .find(|row| row[0] == "image-build")
+            .expect("the build line");
+        assert_eq!(build[1], "seconds");
+        // And the unpriced line writes the word rather than a number, so
+        // `cut -f3 | paste -sd+ | bc` fails loudly instead of totalling to something that
+        // flatters us.
+        assert_eq!(build[2], "unpriced");
+
+        let storage = rows
+            .iter()
+            .find(|row| row[0] == "image-storage")
+            .expect("the storage line");
+        assert_eq!(storage[1], "GB-months");
+        assert!(
+            storage[2].parse::<f64>().is_ok(),
+            "a priced line's field three is the figure: {storage:?}"
         );
     }
 

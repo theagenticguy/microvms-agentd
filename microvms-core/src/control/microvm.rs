@@ -63,8 +63,22 @@ pub const MAX_TOKEN_MINUTES: u32 = 60;
 /// The type is the guard: there is no way to build one over 4096 bytes, so no call site has
 /// to remember to check. See the module docs for the measurement and for why the service
 /// model's own documentation string disagrees with its shape.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct RunHookPayload(String);
+
+/// Prints the size and nothing else.
+///
+/// The payload is the platform's only per-VM secret channel — its whole purpose is to carry
+/// the agent token — so a derived `Debug` would print that token into every log line that
+/// formats one, and into every line that formats the [`RunMicrovmRequest`] holding it.
+/// [`RunMicrovmRequest`] keeps its derive: with this impl in place, the derived one prints
+/// `RunHookPayload(<N bytes>)` for that field, so the safety is inherited rather than
+/// restated. The length is kept because it is the number every TRAP-5 diagnosis needs.
+impl std::fmt::Debug for RunHookPayload {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "RunHookPayload(<{} bytes>)", self.0.len())
+    }
+}
 
 impl RunHookPayload {
     /// The payload carrying an agent token, as the daemon expects to find it.
@@ -192,10 +206,25 @@ impl From<ops::MicrovmResponseWire> for Microvm {
 /// [`ProxyToken::headers`] always emits **both** headers, which is the other half of the
 /// same trap: `X-aws-proxy-auth` without `X-aws-proxy-port` is rejected the same
 /// indistinguishable way.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct ProxyToken {
     value: String,
     port: u16,
+}
+
+/// Names the headers and the port, never the token value.
+///
+/// A minted proxy token is a credential, and a derived `Debug` would print it into every
+/// log line that formats a [`ProxyToken`], a [`RunMicrovmRequest`] holding one, or an error
+/// chain containing either. The sibling type in [`crate::session::proxy`] made this choice
+/// first; this is the same rule on the control-plane side of the conversion.
+impl std::fmt::Debug for ProxyToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProxyToken")
+            .field("headers", &[PROXY_AUTH_HEADER, PROXY_PORT_HEADER])
+            .field("port", &self.port)
+            .finish()
+    }
 }
 
 impl ProxyToken {
@@ -956,6 +985,60 @@ mod tests {
         let body = fake.first_body("CreateMicrovmAuthToken");
         assert_eq!(body["expirationInMinutes"], 60);
         assert_eq!(body["allowedPorts"][0]["port"], 9000);
+    }
+
+    /// A launch request's `Debug` does not print the agent token.
+    ///
+    /// Asserted on the whole [`RunMicrovmRequest`] rather than on the payload alone,
+    /// because that is the type a caller actually logs — and it keeps its derived `Debug`,
+    /// so what is pinned here is that the derive inherits [`RunHookPayload`]'s hand-written
+    /// one. **Falsification** — restore `#[derive(Debug)]` on [`RunHookPayload`] and the
+    /// `SECRETTOKEN` assertion fails through the derived request `Debug`.
+    #[test]
+    fn a_launch_requests_debug_does_not_print_the_agent_token() {
+        let payload = RunHookPayload::for_agent_token("SECRETTOKEN").expect("fits");
+
+        let rendered = format!("{payload:?}");
+        assert!(
+            !rendered.contains("SECRETTOKEN"),
+            "the agent token reached a Debug string: {rendered}"
+        );
+        assert!(
+            rendered.contains(&format!("{} bytes", payload.len())),
+            "the size is what a TRAP-5 diagnosis needs: {rendered}"
+        );
+
+        let request = RunMicrovmRequest::new("arn:image", payload);
+        let rendered = format!("{request:?}");
+        assert!(rendered.contains("arn:image"), "{rendered}");
+        assert!(
+            !rendered.contains("SECRETTOKEN"),
+            "the agent token reached a Debug string through the request: {rendered}"
+        );
+    }
+
+    /// A minted token's `Debug` names its headers and never its value, so a logged
+    /// launch does not log a credential.
+    ///
+    /// The mirror of `session::proxy`'s `a_proxy_token_debug_does_not_print_the_credential`,
+    /// on the control-plane side of the conversion. **Falsification** — restore
+    /// `#[derive(Debug)]` on [`ProxyToken`] and this fails on the `secret` assertion.
+    #[test]
+    fn a_proxy_token_debug_does_not_print_the_credential() {
+        let mut map = std::collections::BTreeMap::new();
+        map.insert(
+            PROXY_AUTH_HEADER.to_string(),
+            "eyJhbGciOi-secret".to_string(),
+        );
+        let token = ProxyToken::from_map(&map, 9000).expect("the map has the auth key");
+
+        let rendered = format!("{token:?}");
+        assert!(rendered.contains(PROXY_AUTH_HEADER), "{rendered}");
+        assert!(rendered.contains("9000"), "{rendered}");
+        assert!(
+            !rendered.contains("secret"),
+            "the token value reached a Debug string: {rendered}"
+        );
     }
 
     /// A response whose map lacks the auth key is **retryable**, because minting happens

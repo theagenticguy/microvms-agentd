@@ -34,13 +34,11 @@ path = "src/main.rs"
 # The whole product surface. Every AWS call, every trap closure, the cost engine,
 # and the error taxonomy the exit table is a rendering of.
 microvms-core = { path = "../microvms-core" }
-# The daemon↔client wire contract, and it is here because it has to be:
-# `microvms_core::session::Session::run` takes a `protocol::exec::StartRequest` in its
-# signature (`microvms-core/src/session/mod.rs:310`) and `microvms-core` does not
-# re-export the `protocol` crate — so there is no way to call that method without
-# naming this crate. Recorded as a C3 gap in the packet rather than worked around,
-# because the fix is a one-line `pub use protocol;` in core and that file is another
-# task's.
+# The daemon↔client wire contract. Core now re-exports it (`pub use protocol;`,
+# microvms-core/src/lib.rs) so this direct edge is no longer forced — it stays
+# because Cargo features and versions resolve identically either way and the
+# thinness test allowlists it explicitly as ARCH-2's own crate. Dropping it in
+# favor of `microvms_core::protocol::` paths is a fine future cleanup.
 #
 # It is also the *right* dependency to have if you have to have one: it is ARCH-2's
 # shared contract, carries no transport, and its whole purpose is that a field renamed

@@ -352,6 +352,25 @@ fn a_piped_ls_with_an_empty_ledger_says_nothing_outstanding() {
 }
 
 /// The dense cost path is TSV a shell can cut, and never a dollar figure where a line is unpriced.
+///
+/// Three fields per line and no total row, through the real binary — the same contract
+/// `render::report_dense`'s unit test pins, asserted here across the process boundary because
+/// this is the shape a shell pipeline actually receives. The oracle for these exact arguments:
+///
+/// ```text
+/// cd clients/python && uv run --with boto3 python -c "
+/// import io, contextlib
+/// from microvms_agentd.cli import dispatch
+/// buf = io.StringIO()
+/// with contextlib.redirect_stdout(buf):
+///     dispatch(['cost','--running-sec','3600','--build-sec','600','--image-gb','2','--dense'])
+/// print(repr(buf.getvalue()))"
+/// # 'image-build\tseconds\tunpriced\n...\nresume\tGB\t0.003100\n'   # seven lines, no total
+/// ```
+///
+/// This test used to require a trailing `lower-bound` row, which is why the divergence
+/// survived: the guard asserted the wrong shape confidently. The total is still reachable —
+/// `--json`'s `total.render` and the plain (non-dense) rendering both carry it.
 #[test]
 fn the_dense_cost_path_is_cuttable_and_marks_unpriced_lines() {
     let outcome = run(
@@ -375,18 +394,25 @@ fn the_dense_cost_path_is_cuttable_and_marks_unpriced_lines() {
         .unwrap_or_else(|| panic!("no build line in {}", outcome.stdout));
     let fields: Vec<&str> = build_line.split('\t').collect();
     assert_eq!(
-        fields.last(),
-        Some(&"unpriced"),
-        "a summable zero must never appear here: {build_line}"
+        fields,
+        ["image-build", "seconds", "unpriced"],
+        "phase, unit, amount — and a summable zero must never appear in the third: {build_line}"
     );
+    // Every line is an item, so field one is always a phase and the line count is the item
+    // count. A `total` row here would be a phase called `total` to anything aggregating.
+    let lines: Vec<&str> = outcome.stdout.lines().collect();
+    assert_eq!(lines.len(), 7, "{}", outcome.stdout);
+    for line in &lines {
+        assert_eq!(
+            line.split('\t').count(),
+            3,
+            "{line:?} in {}",
+            outcome.stdout
+        );
+    }
     assert!(
-        outcome
-            .stdout
-            .lines()
-            .last()
-            .expect("a total")
-            .contains("lower-bound"),
-        "{}",
+        !outcome.stdout.contains("lower-bound") && !outcome.stdout.contains("total\t"),
+        "the total belongs to --json and the plain rendering: {}",
         outcome.stdout
     );
 }

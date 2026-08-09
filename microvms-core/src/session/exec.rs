@@ -517,7 +517,12 @@ impl Attach {
             let Some(chunk) = self.chunks.next_chunk().await? else {
                 return Ok(None);
             };
-            self.frames.extend(self.parser.feed(&chunk));
+            // A parse failure here is the undelimited-data ceiling, which is
+            // `ErrorKind::Protocol` and therefore not retryable — so `advance` ends the
+            // stream with it rather than reconnecting into the same non-SSE body. That is
+            // the point: a proxy answering an error page would otherwise be retried
+            // `max_reconnects` times, filling the buffer again each time.
+            self.frames.extend(self.parser.feed(&chunk)?);
         }
     }
 }

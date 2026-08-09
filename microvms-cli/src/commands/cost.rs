@@ -33,9 +33,39 @@ pub fn cost<O: std::io::Write, E: std::io::Write>(
     // its inputs — which is core's own choice and what lets a test assert staleness without
     // travelling in time.
     let today = CalendarDate::today_utc();
-    // A launch happened if there is running time or an image, matching `cli.py:2168`. A launch
-    // reads a snapshot, so claiming one that did not happen adds a transfer line.
-    let launched = args.running_sec > 0.0 || args.image_gb.is_some();
+
+    // A negative duration is refused here, before any arithmetic, because that is what the
+    // oracle does: `cost.py:118-122` raises from `Duration.__post_init__` and the CLI reports
+    // ERR_INVALID_ARG / exit 2. Checked up front rather than left to the constructor, because
+    // the constructor is only reached for a phase the report keeps — and a phase filtered out
+    // for being non-positive would take its own refusal with it, which is how `--build-sec -5`
+    // came to exit 0 with a report of a run that did not happen.
+    for (flag, seconds) in [
+        ("--running-sec", args.running_sec),
+        ("--suspended-sec", args.suspended_sec),
+        ("--build-sec", args.build_sec),
+    ] {
+        if seconds < 0.0 {
+            // The message is the oracle's verbatim, `{seconds:?}` rather than `{seconds}`
+            // because Rust's `Display` prints `-5` for `-5.0` where Python prints `-5.0`.
+            // Which flag it was goes in a *suggestion*, which is the CLI-shaped half —
+            // the library says what went wrong and the CLI says which flag addresses it —
+            // rather than into the message an agent may be matching on.
+            return Err(
+                crate::exit::classify(&microvms_core::Error::invalid_arg(format!(
+                    "a duration cannot be negative: {seconds:?}s"
+                )))
+                .suggest(format!("{flag} was {seconds:?}")),
+            );
+        }
+    }
+
+    // A launch happened if there is running time or an image, matching `cli.py:2168`'s
+    // `bool(running_sec or image_gb)`. Both halves are falsy at zero there, so `--image-gb 0`
+    // does *not* launch — an `is_some()` here would have made a zero-sized image claim a
+    // snapshot read the plan never pays for. A launch reads a snapshot, so claiming one that
+    // did not happen adds a transfer line.
+    let launched = args.running_sec > 0.0 || args.image_gb.is_some_and(|gb| gb != 0.0);
 
     let report = if args.estimate {
         estimate_run(
@@ -51,13 +81,17 @@ pub fn cost<O: std::io::Write, E: std::io::Write>(
             },
             &rates,
             today,
-            "plan",
+            // `cli.py:646`'s default. Not "plan": the label is the report's own name for
+            // itself and the two clients' reports have to be substitutable.
+            "estimate",
         )?
     } else {
         // Zero means "this phase did not happen", not "a phase that cost nothing": a
-        // zero-length line on a report claims a measurement nobody took.
+        // zero-length line on a report claims a measurement nobody took. Exactly zero,
+        // matching the oracle's `if running_sec else None` — negative is already refused
+        // above, so this is not the place a sign error is caught.
         let measured = |seconds: f64| -> Result<Option<DurationP>, microvms_core::Error> {
-            if seconds <= 0.0 {
+            if seconds == 0.0 {
                 return Ok(None);
             }
             Ok(Some(DurationP::measured_secs_f64(seconds)?))
@@ -167,20 +201,26 @@ mod tests {
     }
 
     fn run_cost(args: CostArgs) -> (Rendered, String) {
+        let (result, stderr) = try_cost(args);
+        (result.expect("the arithmetic holds"), stderr)
+    }
+
+    /// The same drive, keeping the failure. The refusal path is a contract too.
+    fn try_cost(args: CostArgs) -> (Result<Rendered, CliError>, String) {
         let mut out = Output::new(Format::Json, false, Vec::new(), Vec::new());
         let env = |_: &str| None;
         let seam = NoAws;
-        let rendered = {
+        let result = {
             let mut ctx = Ctx {
                 seam: &seam,
                 out: &mut out,
                 infra: Infra::default(),
                 env: &env,
             };
-            cost(&mut ctx, &args).expect("the arithmetic holds")
+            cost(&mut ctx, &args)
         };
         let stderr = String::from_utf8(out_stderr(out)).expect("utf8");
-        (rendered, stderr)
+        (result, stderr)
     }
 
     /// Drains an output's stderr buffer. A helper because `Output`'s fields are private.
@@ -222,7 +262,10 @@ mod tests {
 
         assert_eq!(estimate.data["report"]["fullyMeasured"], false);
         assert_eq!(measured.data["report"]["fullyMeasured"], true);
-        assert_eq!(estimate.data["report"]["label"], "plan");
+        // `estimate`, which is `cli.py:646`'s default label, not "plan". The label is the
+        // report's own name for itself and it is the field a consumer reads to tell a plan
+        // from a receipt, so the two clients cannot disagree on the word.
+        assert_eq!(estimate.data["report"]["label"], "estimate");
         assert_eq!(measured.data["report"]["label"], "run");
         // The dollar figures agree — it is the same arithmetic — which is what makes the label
         // the only difference and therefore the thing that has to be right.
@@ -363,5 +406,117 @@ mod tests {
         // 2 GB for 3600 s is 7200 GB-seconds; the peak would be 28800.
         assert_eq!(memory["quantity"], "7200");
         assert_eq!(memory["unit"], "GB-seconds");
+    }
+
+    /// A negative duration is refused with ERR_INVALID_ARG rather than dropped.
+    ///
+    /// The old `seconds <= 0.0` filter treated `-5` the same as `0`: the phase vanished and
+    /// the CLI printed a clean report of a run that could not have happened, exit 0. That is
+    /// the worst available answer — an inverted clock is a bug in the caller's timing and a
+    /// report is the last place it should be laundered into silence. The oracle refuses:
+    ///
+    /// ```text
+    /// cd clients/python && uv run --with boto3 python -c "
+    /// from microvms_agentd.cli import dispatch
+    /// print(dispatch(['cost','--json','--running-sec=-5']))"
+    /// # {"status": "error", "error": "a duration cannot be negative: -5.0s",
+    /// #  "code": "ERR_INVALID_ARG", "exitCode": 2, ...}
+    /// # 2
+    /// ```
+    ///
+    /// All three flags and both paths, because `--estimate` and the measured path reached
+    /// the check through different constructors and the oracle refuses on all six.
+    ///
+    /// **Falsification** — restore `if seconds <= 0.0 { return Ok(None) }` and drop the
+    /// up-front loop: every case here goes red on `expect_err`, while the report the CLI
+    /// then prints still balances. Verified.
+    #[test]
+    fn a_negative_duration_is_refused_rather_than_silently_dropped() {
+        for estimate in [false, true] {
+            for flag in ["running", "suspended", "build"] {
+                let mut bad = args(crate::cli::MemoryMib::Mib2048);
+                bad.estimate = estimate;
+                match flag {
+                    "running" => bad.running_sec = -5.0,
+                    "suspended" => bad.suspended_sec = -5.0,
+                    _ => bad.build_sec = -5.0,
+                }
+                let (result, _) = try_cost(bad);
+                let error = result.expect_err(&format!("--{flag}-sec -5 (estimate={estimate})"));
+                assert_eq!(error.exit, crate::exit::Exit::InvalidArg);
+                assert_eq!(error.code(), "ERR_INVALID_ARG");
+                assert_eq!(i32::from(error.exit as u8), 2);
+                // The oracle's message verbatim, `-5.0s` and not `-5s`.
+                assert_eq!(error.message, "a duration cannot be negative: -5.0s");
+                // And which flag it was, so the remedy is actionable.
+                assert!(
+                    error
+                        .suggestions
+                        .iter()
+                        .any(|line| line.contains(&format!("--{flag}-sec"))),
+                    "{:?}",
+                    error.suggestions
+                );
+            }
+        }
+
+        // Exactly zero is *not* an error: it means "this phase did not happen" and the
+        // phase is omitted, which is the oracle's `if running_sec else None`. Without this
+        // half the fix above could have refused zero too and every default invocation would
+        // exit 2.
+        let mut zeroes = args(crate::cli::MemoryMib::Mib2048);
+        zeroes.cycles = 0;
+        let (rendered, _) = run_cost(zeroes);
+        assert!(
+            rendered.data["report"]["items"]
+                .as_array()
+                .expect("an array")
+                .is_empty(),
+            "zero omits the phase rather than refusing it: {}",
+            rendered.data["report"]["items"]
+        );
+    }
+
+    /// A zero-sized image does not launch, because `0` is falsy in the oracle.
+    ///
+    /// `cli.py:2168` is `launched=bool(running_sec or image_gb)`, so `--image-gb 0` leaves
+    /// `launched` false. An `is_some()` test here read `Some(0.0)` as truthy and added a
+    /// `launch` line — a snapshot read charged against an image with no bytes in it.
+    /// Measured against the oracle, which prints
+    /// `[('image-build', '0'), ('image-storage', '0.00')]` for
+    /// `cost --json --image-gb=0 --cycles=0` and adds `launch` only at `--image-gb=2`.
+    ///
+    /// **Falsification** — put `args.image_gb.is_some()` back and the first assertion is red
+    /// on a `launch` phase the oracle does not emit. Verified.
+    #[test]
+    fn a_zero_sized_image_does_not_launch() {
+        let phases = |args: CostArgs| -> Vec<String> {
+            let (rendered, _) = run_cost(args);
+            rendered.data["report"]["items"]
+                .as_array()
+                .expect("an array")
+                .iter()
+                .map(|item| item["phase"].as_str().unwrap_or_default().to_string())
+                .collect()
+        };
+
+        let mut zero_image = args(crate::cli::MemoryMib::Mib2048);
+        zero_image.image_gb = Some(0.0);
+        zero_image.cycles = 0;
+        assert_eq!(
+            phases(zero_image),
+            ["image-build", "image-storage"],
+            "a zero-sized image builds and stores nothing, and never launches"
+        );
+
+        // A real image does launch, so the check above is about the zero rather than about
+        // the flag being ignored.
+        let mut real_image = args(crate::cli::MemoryMib::Mib2048);
+        real_image.image_gb = Some(2.0);
+        real_image.cycles = 0;
+        assert_eq!(
+            phases(real_image),
+            ["image-build", "image-storage", "launch"]
+        );
     }
 }

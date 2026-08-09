@@ -21,7 +21,7 @@
 
 use base64::Engine as _;
 
-use crate::error::{Error, WireKind};
+use crate::error::{Error, ErrorKind, WireKind};
 
 /// One complete SSE frame: its event name and its raw `data:` text.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -30,10 +30,53 @@ pub struct Frame {
     pub data: String,
 }
 
+/// The longest frame terminator, in bytes. See [`find_frame_end`].
+const MAX_TERMINATOR_LEN: usize = 4;
+
+/// The ceiling on bytes held for a frame that has not terminated.
+///
+/// # Why a ceiling at all
+///
+/// Without one, a peer that sends bytes and never a blank line makes this buffer grow
+/// until the process dies. That is not hypothetical for this client: the thing on the
+/// other end of the stream is a *proxy* in front of the daemon, and a proxy that answers
+/// a stream request with a non-SSE body — an HTML error page, a redirect chain, a chunked
+/// response it keeps writing to — produces exactly that shape. There is no frame boundary
+/// coming, so no other guard in the parser ever fires.
+///
+/// # Why 4 MiB
+///
+/// Sized from the daemon's actual frame sizes, with a large multiple of headroom.
+///
+/// One `output` event carries one read from a child's pipe, and the daemon reads into a
+/// 16 KiB scratch buffer (`Capped::new` in `agentd/src/exec.rs`). Base64 inflates that by
+/// 4/3, so the biggest `data:` line the daemon emits is about 22 KiB plus a short JSON
+/// envelope — call it 24 KiB. A reattach that replays the 1 MiB stream ring does not
+/// change the number: the ring is replayed as its individual chunks, each its own frame,
+/// each still one 16 KiB read. `gap` and `exit` frames are tens of bytes.
+///
+/// 4 MiB is roughly 170 frames' worth of that, which leaves room for a proxy that
+/// coalesces reads, for a future daemon with a larger scratch buffer, and for the
+/// `stream_buffer_bytes` ring being raised to a few MiB — while staying small enough to be
+/// irrelevant against the 512 MiB baseline VM this client talks to. A caller that hits it
+/// is not reading a big frame; it is reading something that is not SSE.
+///
+/// The bound is on the *residue*: [`SseParser::feed`] drains every complete frame first, so
+/// a single read that legitimately carries many megabytes of finished frames is not
+/// refused. What is refused is a residue that keeps growing across feeds.
+pub const MAX_PENDING_BYTES: usize = 4 * 1024 * 1024;
+
 /// Feed bytes, get whole frames out. Holds a partial frame across feeds.
 #[derive(Debug, Default)]
 pub struct SseParser {
     buffer: Vec<u8>,
+    /// How much of `buffer` the terminator scan has already ruled out.
+    ///
+    /// The scan resumes here rather than at byte zero. Rescanning from zero on every feed
+    /// is quadratic in the size of a partial frame, and the buffer is largest exactly when
+    /// the stream is busiest: 800 unterminated 8 KiB reads took 31 seconds to scan and now
+    /// take milliseconds.
+    scanned: usize,
 }
 
 impl SseParser {
@@ -42,17 +85,50 @@ impl SseParser {
     }
 
     /// Every frame `chunk` completed. Never returns a partial one.
-    pub fn feed(&mut self, chunk: &[u8]) -> Vec<Frame> {
+    ///
+    /// Fails with [`ErrorKind::Protocol`] once the undelimited residue passes
+    /// [`MAX_PENDING_BYTES`] — see that constant for why, and for why the check is on what
+    /// is left after draining rather than on what arrived.
+    pub fn feed(&mut self, chunk: &[u8]) -> Result<Vec<Frame>, Error> {
         self.buffer.extend_from_slice(chunk);
         let mut frames = Vec::new();
-        while let Some((body, consumed)) = find_frame_end(&self.buffer) {
+        loop {
+            // Back up by one byte less than the longest terminator, because a terminator
+            // straddling a chunk boundary has its first bytes inside the already-scanned
+            // region. Backing up to zero instead is what made this quadratic.
+            let from = self.scanned.saturating_sub(MAX_TERMINATOR_LEN - 1);
+            let Some((body, consumed)) = find_frame_end(&self.buffer, from) else {
+                self.scanned = self.buffer.len();
+                break;
+            };
             let raw = self.buffer[..body].to_vec();
             self.buffer.drain(..consumed);
+            // Nothing past the terminator has been looked at yet — the search stopped at
+            // the first match — so the next pass starts over on what is left.
+            self.scanned = 0;
             if let Some(frame) = parse_frame(&raw) {
                 frames.push(frame);
             }
         }
-        frames
+
+        if self.buffer.len() > MAX_PENDING_BYTES {
+            let held = self.buffer.len();
+            // Dropped rather than kept: the stream is over, and holding megabytes that no
+            // longer have a reader is the second half of the same bug.
+            self.buffer = Vec::new();
+            self.scanned = 0;
+            return Err(Error::new(
+                ErrorKind::Protocol,
+                format!(
+                    "the event stream sent {held} bytes with no frame terminator, over the \
+                     {MAX_PENDING_BYTES}-byte ceiling on undelimited data. The daemon's largest \
+                     frame is one 16 KiB pipe read base64-encoded, about 24 KiB, so a residue \
+                     this size means the response body is not server-sent events — most often \
+                     a proxy answering with an error page instead of the stream."
+                ),
+            ));
+        }
+        Ok(frames)
     }
 
     /// Bytes held for an incomplete frame. Diagnostic; a healthy stream sits at 0.
@@ -61,21 +137,24 @@ impl SseParser {
     }
 }
 
-/// Locates the first frame terminator, returning the body length and bytes consumed.
+/// Locates the first frame terminator at or after `from`, returning the body length and
+/// bytes consumed.
 ///
 /// A frame ends at a blank line, and the wire spelling of that varies: `\n\n`,
 /// `\r\n\r\n`, `\r\r`. All three are accepted because a proxy in the path may rewrite
 /// line endings, and picking one spelling would work right up until it did not.
-fn find_frame_end(buffer: &[u8]) -> Option<(usize, usize)> {
+fn find_frame_end(buffer: &[u8], from: usize) -> Option<(usize, usize)> {
+    let tail = buffer.get(from..)?;
     let mut earliest: Option<(usize, usize)> = None;
     for terminator in [
         b"\r\n\r\n".as_slice(),
         b"\n\n".as_slice(),
         b"\r\r".as_slice(),
     ] {
-        let Some(idx) = find(buffer, terminator) else {
+        let Some(idx) = find(tail, terminator) else {
             continue;
         };
+        let idx = from + idx;
         // A shorter terminator can be found at a lower index inside a longer one
         // (`\n\n` sits at index+1 of `\r\n\r\n`), so the earliest start wins and ties
         // break toward the longer match.
@@ -268,7 +347,7 @@ mod tests {
         let mut parser = SseParser::new();
         let mut frames = Vec::new();
         for byte in wire.as_bytes() {
-            frames.extend(parser.feed(&[*byte]));
+            frames.extend(parser.feed(&[*byte]).expect("under the pending ceiling"));
         }
         assert_eq!(frames.len(), 1, "the split frame did not reassemble");
         assert_eq!(parser.pending(), 0, "a complete stream left bytes behind");
@@ -294,7 +373,9 @@ mod tests {
              \"writers_may_be_alive\":false,\"offset\":2}\n\n"
         );
         let mut parser = SseParser::new();
-        let frames = parser.feed(wire.as_bytes());
+        let frames = parser
+            .feed(wire.as_bytes())
+            .expect("under the pending ceiling");
         assert_eq!(frames.len(), 3);
         assert!(matches!(
             decode(&frames[2]).expect("decodes"),
@@ -309,12 +390,152 @@ mod tests {
         let (head, tail) = wire.split_at(wire.len() - 4);
         let mut parser = SseParser::new();
         assert!(
-            parser.feed(head.as_bytes()).is_empty(),
+            parser
+                .feed(head.as_bytes())
+                .expect("under the pending ceiling")
+                .is_empty(),
             "an incomplete frame was emitted"
         );
         assert!(parser.pending() > 0);
-        let frames = parser.feed(tail.as_bytes());
+        let frames = parser
+            .feed(tail.as_bytes())
+            .expect("under the pending ceiling");
         assert_eq!(frames.len(), 1);
+    }
+
+    /// The scan cursor does not skip a terminator that straddles a chunk boundary.
+    ///
+    /// This is the way a resumed scan gets it wrong: the previous feed ended part-way
+    /// through the blank line, so the terminator's first bytes are inside the region
+    /// already ruled out. Every split of every spelling is exercised, which is what makes
+    /// the back-up-by-terminator-length-minus-one arithmetic pinned rather than sampled.
+    ///
+    /// **Falsification** — resume the scan at `self.scanned` with no back-up and the
+    /// `\r\n\r\n` and `\r\r` splits stop producing a frame at all.
+    #[test]
+    fn a_terminator_straddling_a_chunk_boundary_is_still_found() {
+        for terminator in ["\n\n", "\r\n\r\n", "\r\r"] {
+            let wire = format!("event: gap\ndata: {{\"from\":0,\"to\":4}}{terminator}");
+            for split in 1..wire.len() {
+                let mut parser = SseParser::new();
+                let mut frames = Vec::new();
+                frames.extend(
+                    parser
+                        .feed(&wire.as_bytes()[..split])
+                        .expect("under the pending ceiling"),
+                );
+                frames.extend(
+                    parser
+                        .feed(&wire.as_bytes()[split..])
+                        .expect("under the pending ceiling"),
+                );
+                assert_eq!(
+                    frames.len(),
+                    1,
+                    "{terminator:?} split at {split} did not reassemble"
+                );
+                assert_eq!(
+                    parser.pending(),
+                    0,
+                    "{terminator:?} split at {split} left bytes behind"
+                );
+                assert!(matches!(
+                    decode(&frames[0]).expect("decodes"),
+                    Some(ExecEvent::Gap { from: 0, to: 4 })
+                ));
+            }
+        }
+    }
+
+    /// An undelimited stream is refused at the ceiling rather than buffered forever.
+    ///
+    /// [`ErrorKind::Protocol`] and therefore **not retryable**, which is the half that
+    /// matters to `exec::Attach`: a reconnect into the same non-SSE body would refill the
+    /// buffer `max_reconnects` times over.
+    ///
+    /// **Falsification** — drop the ceiling check and the parser accepts every chunk, so
+    /// `expect_err` panics.
+    #[test]
+    fn an_unterminated_stream_is_refused_at_the_pending_ceiling() {
+        let mut parser = SseParser::new();
+        // 8 KiB with no blank line anywhere, which is what a proxy's HTML error page or a
+        // redirect chain looks like to this parser.
+        let chunk = vec![b'x'; 8 * 1024];
+        let mut fed = 0usize;
+        loop {
+            match parser.feed(&chunk) {
+                Ok(frames) => {
+                    assert!(frames.is_empty(), "undelimited data produced a frame");
+                    fed += chunk.len();
+                    assert!(
+                        parser.pending() <= MAX_PENDING_BYTES,
+                        "the buffer passed the ceiling without erroring: {}",
+                        parser.pending()
+                    );
+                    assert!(
+                        fed <= MAX_PENDING_BYTES + chunk.len(),
+                        "the ceiling never fired"
+                    );
+                }
+                Err(err) => {
+                    assert_eq!(err.kind(), ErrorKind::Protocol);
+                    assert!(
+                        !err.retryable(),
+                        "a reconnect would refill the buffer from the same body"
+                    );
+                    assert_eq!(
+                        err.wire_kind(),
+                        None,
+                        "no status produced this; it is a client-side ceiling"
+                    );
+                    let message = err.to_string();
+                    assert!(
+                        message.contains(&MAX_PENDING_BYTES.to_string()),
+                        "the message must name the ceiling: {message}"
+                    );
+                    assert!(
+                        message.contains("no frame terminator"),
+                        "the message must say what was wrong: {message}"
+                    );
+                    assert_eq!(
+                        parser.pending(),
+                        0,
+                        "the refused bytes are dropped, not held for a reader that is gone"
+                    );
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Scanning is linear in the buffer, not quadratic.
+    ///
+    /// The measured shape of the defect: 800 unterminated 8 KiB reads — 6.4 MiB, one read
+    /// under the ceiling per feed — took **31 seconds** to rescan from byte zero every
+    /// time. A generous budget rather than a tight one, because this runs on shared CI
+    /// hardware and the difference being caught is four orders of magnitude.
+    ///
+    /// **Falsification** — restore the scan from byte zero and this takes half a minute.
+    #[test]
+    fn scanning_an_unterminated_buffer_stays_linear() {
+        let chunk = vec![b'x'; 8 * 1024];
+        let started = std::time::Instant::now();
+        let mut parser = SseParser::new();
+        for _ in 0..800 {
+            // A feed that trips the ceiling resets the buffer, which would hide the
+            // quadratic scan — so the parser is rebuilt instead of being allowed to grow
+            // past it, and each iteration still scans a buffer the old code rescanned
+            // whole.
+            if parser.pending() + chunk.len() > MAX_PENDING_BYTES {
+                parser = SseParser::new();
+            }
+            parser.feed(&chunk).expect("under the pending ceiling");
+        }
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_millis(500),
+            "800 x 8 KiB unterminated feeds took {elapsed:?}; the quadratic rescan is back"
+        );
     }
 
     /// All three blank-line spellings terminate a frame, because a proxy may rewrite
@@ -324,7 +545,9 @@ mod tests {
         for terminator in ["\n\n", "\r\n\r\n", "\r\r"] {
             let wire = format!("event: gap\r\ndata: {{\"from\":0,\"to\":4}}{terminator}");
             let mut parser = SseParser::new();
-            let frames = parser.feed(wire.as_bytes());
+            let frames = parser
+                .feed(wire.as_bytes())
+                .expect("under the pending ceiling");
             assert_eq!(frames.len(), 1, "{terminator:?} did not terminate a frame");
             assert!(matches!(
                 decode(&frames[0]).expect("decodes"),
@@ -338,14 +561,30 @@ mod tests {
     #[test]
     fn a_keepalive_comment_is_not_a_frame() {
         let mut parser = SseParser::new();
-        assert!(parser.feed(b":\n\n").is_empty());
-        assert!(parser.feed(b": keep-alive-text\n\n").is_empty());
+        assert!(
+            parser
+                .feed(b":\n\n")
+                .expect("under the pending ceiling")
+                .is_empty()
+        );
+        assert!(
+            parser
+                .feed(b": keep-alive-text\n\n")
+                .expect("under the pending ceiling")
+                .is_empty()
+        );
         assert_eq!(parser.pending(), 0);
 
         // And it does not disturb a real frame that follows it on the same read.
         let wire = format!(":\n\n{}", output_frame(0, b"real"));
         let mut parser = SseParser::new();
-        assert_eq!(parser.feed(wire.as_bytes()).len(), 1);
+        assert_eq!(
+            parser
+                .feed(wire.as_bytes())
+                .expect("under the pending ceiling")
+                .len(),
+            1
+        );
     }
 
     /// One space after the colon is stripped, a second is payload.
@@ -355,7 +594,9 @@ mod tests {
     #[test]
     fn exactly_one_leading_space_is_stripped_from_a_field_value() {
         let mut parser = SseParser::new();
-        let frames = parser.feed(b"event:  gap\ndata:  {\"from\":1,\"to\":2}\n\n");
+        let frames = parser
+            .feed(b"event:  gap\ndata:  {\"from\":1,\"to\":2}\n\n")
+            .expect("under the pending ceiling");
         assert_eq!(frames.len(), 1);
         assert_eq!(frames[0].event, " gap", "more than one space was stripped");
         assert_eq!(frames[0].data, " {\"from\":1,\"to\":2}");
@@ -372,10 +613,12 @@ mod tests {
     #[test]
     fn an_unrecognized_or_unparseable_frame_is_dropped_rather_than_raised() {
         let mut parser = SseParser::new();
-        let frames = parser.feed(
-            b"event: something-new\ndata: {}\n\n\
+        let frames = parser
+            .feed(
+                b"event: something-new\ndata: {}\n\n\
               event: gap\ndata: not json at all\n\n",
-        );
+            )
+            .expect("under the pending ceiling");
         assert_eq!(frames.len(), 2);
         for frame in &frames {
             assert!(
@@ -394,7 +637,7 @@ mod tests {
         let mut parser = SseParser::new();
         let frames = parser.feed(
             b"event: output\ndata: {\"offset\":7,\"stream\":\"stdout\",\"output\":\"!!!!\"}\n\n",
-        );
+        ).expect("under the pending ceiling");
         let err = decode(&frames[0]).expect_err("bad base64 must be reported");
         assert!(err.to_string().contains('7'), "{err}");
     }
@@ -427,7 +670,9 @@ mod tests {
     #[test]
     fn a_multi_line_data_payload_joins_with_newlines() {
         let mut parser = SseParser::new();
-        let frames = parser.feed(b"event: gap\ndata: {\"from\":0,\ndata: \"to\":5}\n\n");
+        let frames = parser
+            .feed(b"event: gap\ndata: {\"from\":0,\ndata: \"to\":5}\n\n")
+            .expect("under the pending ceiling");
         assert_eq!(frames.len(), 1);
         assert_eq!(frames[0].data, "{\"from\":0,\n\"to\":5}");
         assert!(matches!(

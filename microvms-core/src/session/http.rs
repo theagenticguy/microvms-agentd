@@ -34,7 +34,7 @@ use crate::error::{Error, WireKind};
 ///
 /// Owned rather than borrowed because a backend may need to move it into a spawned
 /// task, and a recorder needs to keep it after the call returns.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct HttpRequest {
     pub method: &'static str,
     /// Path plus query string. Not a full URL: the base is the backend's, so a
@@ -63,6 +63,32 @@ impl HttpRequest {
             .iter()
             .find(|(key, _)| key.eq_ignore_ascii_case(name))
             .map(|(_, value)| value.as_str())
+    }
+}
+
+/// Names the headers, never their values, and sizes the body rather than printing it.
+///
+/// Every request on this seam carries `authorization: Bearer <agent token>`, and a
+/// streaming attach also carries the minted `X-aws-proxy-auth` — so a derived `Debug` puts
+/// two credentials in any log line, error chain, or test-failure message that formats a
+/// request. Redacting *all* header values rather than allowlisting the two known ones,
+/// because an allowlist is a list somebody has to remember to extend the next time the
+/// platform adds a header, and the platform's stated reason for a token *map* is that it
+/// may need more than one.
+///
+/// The body is sized rather than shown for the same reason: an upload body is file
+/// contents, a stdin body is base64 of whatever the caller is feeding a child, and neither
+/// belongs in a log.
+impl fmt::Debug for HttpRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let names: Vec<&str> = self.headers.iter().map(|(name, _)| name.as_str()).collect();
+        f.debug_struct("HttpRequest")
+            .field("method", &self.method)
+            .field("path", &self.path)
+            .field("headers", &names)
+            .field("body_len", &self.body.len())
+            .field("timeout", &self.timeout)
+            .finish()
     }
 }
 
@@ -458,5 +484,47 @@ mod tests {
             .push(("X-Aws-Proxy-Port".into(), "9000".into()));
         assert_eq!(request.header("x-aws-proxy-port"), Some("9000"));
         assert_eq!(request.header("authorization"), None);
+    }
+
+    /// A request's `Debug` names its headers and never their values, so neither the agent
+    /// token nor the minted proxy token reaches a log line or a test-failure message.
+    ///
+    /// **Falsification** — restore `#[derive(Debug)]` on [`HttpRequest`] and both value
+    /// assertions fail; drop the body from the redaction and the last one fails.
+    #[test]
+    fn a_request_debug_prints_header_names_and_never_their_values() {
+        let mut request = HttpRequest::new("POST", "/v1/exec/e1/stdin");
+        request.headers.push((
+            "authorization".into(),
+            "Bearer super-secret-agent-token".into(),
+        ));
+        request
+            .headers
+            .push(("X-aws-proxy-auth".into(), "eyJhbGciOi-secret-jwe".into()));
+        request.body = b"secret-body-bytes".to_vec();
+        request.timeout = Some(Duration::from_secs(7));
+
+        let rendered = format!("{request:?}");
+        assert!(rendered.contains("authorization"), "{rendered}");
+        assert!(rendered.contains("X-aws-proxy-auth"), "{rendered}");
+        assert!(rendered.contains("/v1/exec/e1/stdin"), "{rendered}");
+        assert!(rendered.contains("POST"), "{rendered}");
+        assert!(rendered.contains('7'), "the timeout survives: {rendered}");
+        assert!(
+            rendered.contains("body_len"),
+            "the body's size is diagnostic: {rendered}"
+        );
+        assert!(
+            !rendered.contains("super-secret-agent-token"),
+            "the agent token reached a Debug string: {rendered}"
+        );
+        assert!(
+            !rendered.contains("eyJhbGciOi-secret-jwe"),
+            "the minted proxy token reached a Debug string: {rendered}"
+        );
+        assert!(
+            !rendered.contains("secret-body-bytes"),
+            "the body reached a Debug string: {rendered}"
+        );
     }
 }

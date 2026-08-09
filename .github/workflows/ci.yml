@@ -37,6 +37,52 @@ jobs:
       - name: schema artifact is not stale
         run: cargo run -p agentd --bin schema -- --check
 
+  drift:
+    name: hardcoded constraints match the service model
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: astral-sh/setup-uv@v5
+      # TRAP-12 says "in the build gate", and pre-push alone is not a gate — a
+      # --no-verify push or a merge that trusts CI skips it. The script needs the
+      # botocore model, which lives inside the clients/python venv locally; here
+      # uv provides botocore directly. It compares three ways: Python constants
+      # against the model, the Rust constants (via `cargo run -q -p microvms-cli
+      # -- constants --emit-json`) against the same model, and the two clients
+      # against each other — the cross-check is the only possible guard for
+      # measurement-backed values like the region list, which no model states.
+      - run: ./scripts/check-model-drift
+
+  bindings:
+    name: python and node bindings
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: astral-sh/setup-uv@v5
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      # The binding suites are where BIND-2/BIND-5 live: nine planted bypasses
+      # (raw tokens, capability lists, bare-float dollars) each have a test that
+      # goes red if the door reopens. `cargo test --workspace` reports 0 tests
+      # for these crates — the guards run only under their own toolchains, so a
+      # gate that skips this job would never notice a reopened trap.
+      - name: python binding tests
+        run: |
+          uv venv .venv-bindings
+          . .venv-bindings/bin/activate
+          uvx maturin@1.14 develop -m microvms-py/Cargo.toml
+          uv pip install pytest
+          pytest microvms-py/tests -q
+      - name: node binding tests
+        run: |
+          npx -y -p @napi-rs/cli@3 napi build --manifest-path Cargo.toml --package microvms-js --platform --output-dir . --cwd microvms-js
+          node --test "microvms-js/__test__/*.mjs"
+
   build:
     name: static aarch64 binary
     runs-on: ubuntu-latest

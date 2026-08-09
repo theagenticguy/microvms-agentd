@@ -451,6 +451,21 @@ impl DurationP {
         seconds_of(self.duration())
     }
 
+    /// The span as an f64, for a JSON envelope.
+    ///
+    /// **Lossy, and named so**, exactly like
+    /// [`ResidencyComparison::break_even_seconds_f64`]. The exact answer is
+    /// [`DurationP::seconds`]; this exists because `cli.py:743` emits a line item's
+    /// `duration.seconds` as a JSON *number* and the two clients' envelopes have to be
+    /// substitutable. Seconds, not dollars — no money figure has an f64 accessor
+    /// (COST-2), and that asymmetry is the whole rule: a consumer doing arithmetic on
+    /// a duration should not have to branch on which client produced the envelope,
+    /// while a consumer doing arithmetic on a dollar figure should be reading the
+    /// string and told so.
+    pub fn seconds_f64(self) -> f64 {
+        self.duration().as_secs_f64()
+    }
+
     /// True only for a timed span. Read by [`CostReport::fully_measured`].
     pub fn is_measured(self) -> bool {
         matches!(self, DurationP::Measured(_))
@@ -654,6 +669,23 @@ impl fmt::Display for Amount {
     }
 }
 
+/// One line item a total could not price: which phase it belonged to, and why.
+///
+/// The phase travels beside the reason because the two answer different questions and
+/// a reader needs both. `cost.py:339-343` renders the *phase names* in the total's
+/// parenthetical — `plus 1 unpriced (image-build)` — because a reason is a paragraph
+/// and a total is one line, while [`Total::unpriced_reasons`] still hands over the
+/// paragraphs for the consumer that wants them. Carrying only the reason, which is
+/// what this type replaced, made the phase unavailable at render time and the Rust
+/// total printed the paragraph.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UnpricedLine {
+    /// The phase the line belonged to. What the total's parenthetical names.
+    pub phase: CostPhase,
+    /// Why no figure could be attached to it.
+    pub reason: String,
+}
+
 /// A report's total, which is a lower bound whenever anything is unpriced (COST-4).
 ///
 /// Two variants rather than a struct with a flag, and that is the upgrade over the
@@ -672,29 +704,36 @@ pub enum Total {
     AtLeast {
         /// The sum of the priced lines. Not the total — the total is unknowable.
         floor: EstimatedUsd,
-        /// Why each unpriced line could not be priced, in report order.
+        /// The lines that could not be priced, in report order.
         ///
         /// Non-empty by construction: [`Total::of`] answers [`Total::Exact`] when
-        /// there is nothing to name, so an `AtLeast` with an empty reason list — a
-        /// lower bound that will not say what it is missing — is not a value this
-        /// type holds.
-        unpriced: Vec<String>,
+        /// there is nothing to name, so an `AtLeast` with an empty list — a lower
+        /// bound that will not say what it is missing — is not a value this type
+        /// holds.
+        unpriced: Vec<UnpricedLine>,
     },
 }
 
 impl Total {
-    /// The total over a report's amounts.
+    /// The total over a report's amounts, each labelled with the phase it came from.
     ///
     /// The one place a total is computed, so COST-4 holds for every consumer rather
     /// than for the ones that remembered. An unpriced amount routes the whole answer
     /// to [`Total::AtLeast`]; it is never skipped and never summed as zero.
-    pub fn of<'a>(amounts: impl IntoIterator<Item = &'a Amount>) -> Total {
+    ///
+    /// Takes `(phase, amount)` rather than a bare amount so the phase cannot go
+    /// missing on the way in: the rendered total names phases, and a `Total` built
+    /// without them could only fall back to printing reasons.
+    pub fn of<'a>(amounts: impl IntoIterator<Item = (CostPhase, &'a Amount)>) -> Total {
         let mut floor = EstimatedUsd::ZERO;
-        let mut unpriced: Vec<String> = Vec::new();
-        for amount in amounts {
+        let mut unpriced: Vec<UnpricedLine> = Vec::new();
+        for (phase, amount) in amounts {
             match amount {
                 Amount::Estimated(usd) => floor = floor + *usd,
-                Amount::Unpriced { reason } => unpriced.push(reason.clone()),
+                Amount::Unpriced { reason } => unpriced.push(UnpricedLine {
+                    phase,
+                    reason: reason.clone(),
+                }),
             }
         }
         if unpriced.is_empty() {
@@ -721,17 +760,49 @@ impl Total {
         matches!(self, Total::AtLeast { .. })
     }
 
-    /// The reasons the unpriced lines could not be priced. Empty for
-    /// [`Total::Exact`].
-    pub fn unpriced_reasons(&self) -> &[String] {
+    /// The lines that could not be priced. Empty for [`Total::Exact`].
+    pub fn unpriced_lines(&self) -> &[UnpricedLine] {
         match self {
             Total::Exact(_) => &[],
             Total::AtLeast { unpriced, .. } => unpriced,
         }
     }
+
+    /// The reasons the unpriced lines could not be priced, in report order. Empty for
+    /// [`Total::Exact`].
+    ///
+    /// Kept beside [`Total::unpriced_lines`] because the reason is what a consumer
+    /// surfacing the *why* wants, while the rendered total names phases.
+    pub fn unpriced_reasons(&self) -> Vec<String> {
+        self.unpriced_lines()
+            .iter()
+            .map(|line| line.reason.clone())
+            .collect()
+    }
+
+    /// The distinct phase names of the unpriced lines, sorted — what the rendered
+    /// total names.
+    ///
+    /// Sorted and deduplicated to match `cost.py:342`'s
+    /// `", ".join(sorted({item.phase.value for item in self.unpriced}))`: two unpriced
+    /// lines in one phase name it once, and the order does not depend on report order.
+    pub fn unpriced_phase_names(&self) -> Vec<&'static str> {
+        let mut names: Vec<&'static str> = self
+            .unpriced_lines()
+            .iter()
+            .map(|line| line.phase.as_str())
+            .collect();
+        names.sort_unstable();
+        names.dedup();
+        names
+    }
 }
 
 /// "at least" is the whole point, so it leads.
+///
+/// The parenthetical names **phases**, not reasons, which is `cost.py:343` verbatim. A
+/// reason is a sentence explaining what AWS does not publish, and joining several of
+/// them turns a one-line total into a paragraph the two clients cannot both print.
 impl fmt::Display for Total {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -740,7 +811,7 @@ impl fmt::Display for Total {
                 f,
                 "at least {floor}, plus {} unpriced ({})",
                 unpriced.len(),
-                unpriced.join("; ")
+                self.unpriced_phase_names().join(", ")
             ),
         }
     }
@@ -1272,9 +1343,17 @@ impl CostPhase {
     }
 }
 
+/// `pad` rather than `write_str`, because a phase is a column.
+///
+/// `write_str` ignores the formatter's width entirely, so `{:<14}` on a phase silently
+/// produced a ragged table — every plain-text line's dollar figure started at a
+/// different offset, and the fix looks like it is already there in the format string.
+/// [`fmt::Formatter::pad`] is the one spelling that honours width, precision, and
+/// alignment; `write!(f, "{}", ...)` here would recurse straight back into this
+/// impl and drop the width again.
 impl fmt::Display for CostPhase {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
+        f.pad(self.as_str())
     }
 }
 
@@ -1376,7 +1455,7 @@ impl CostReport {
 
     /// The total, which is a lower bound whenever anything is unpriced (COST-4).
     pub fn total(&self) -> Total {
-        Total::of(self.items.iter().map(|item| &item.amount))
+        Total::of(self.items.iter().map(|item| (item.phase, &item.amount)))
     }
 
     /// False whenever any phase has no published rate. See [`Total`].
@@ -2390,18 +2469,144 @@ mod tests {
         assert_eq!(total.floor(), expected);
     }
 
+    /// The rendered lower bound is the oracle's string, character for character.
+    ///
+    /// The Python is the contract here and the two divergences it catches are the ones a
+    /// re-derivation would not: the parenthetical names **phases** where the Rust used to
+    /// join reasons — a hundred-and-ninety-character sentence about what AWS does not
+    /// publish, in the field a reader scans for "which phase" — and the separator is
+    /// `", "` rather than `"; "`.
+    ///
+    /// The expected string is copied from the oracle rather than assembled here:
+    ///
+    /// ```text
+    /// cd clients/python && uv run --with boto3 python -c "
+    /// from microvms_agentd.cost import run_report, Duration
+    /// r = run_report(size=2048, running=Duration.measured(3600),
+    ///                image_build=Duration.measured(300), image_gb=2.0, label='run')
+    /// print(repr(str(r.total)))"
+    /// # 'at least ~$0.166533 (estimated), plus 1 unpriced (image-build)'
+    /// ```
+    ///
+    /// **Falsification** — restore `unpriced.join("; ")` over the reasons in
+    /// [`Total`]'s `Display` and this is red on the whole parenthetical while every
+    /// figure, count, and `isLowerBound` still agrees. Verified.
+    #[test]
+    fn the_rendered_lower_bound_is_the_oracles_string_verbatim() {
+        let report = run_report(
+            SizeClass::Mib2048,
+            &RunUsage {
+                running: Some(DurationP::Measured(Duration::from_secs(3600))),
+                image_build: Some(DurationP::Measured(Duration::from_secs(300))),
+                image_gb: Some(2.0),
+                ..RunUsage::launched()
+            },
+            &rates(),
+            fresh_day(),
+            "run",
+        )
+        .expect("a build prices");
+        assert_eq!(
+            report.total().to_string(),
+            "at least ~$0.166533 (estimated), plus 1 unpriced (image-build)"
+        );
+
+        // Two unpriced lines in the same phase name it once, and two phases read sorted
+        // rather than in report order — `sorted({...})` in the oracle is a set.
+        let amounts = [
+            (CostPhase::Running, Amount::unpriced("second")),
+            (CostPhase::ImageBuild, Amount::unpriced("first")),
+            (CostPhase::ImageBuild, Amount::unpriced("also first")),
+        ];
+        let total = Total::of(amounts.iter().map(|(phase, amount)| (*phase, amount)));
+        assert_eq!(total.unpriced_phase_names(), ["image-build", "running"]);
+        assert_eq!(
+            total.to_string(),
+            "at least ~$0.000000 (estimated), plus 3 unpriced (image-build, running)",
+            "three lines, two names — the count is lines and the parenthetical is phases"
+        );
+        // The reasons are still reachable, in report order, for the consumer that wants
+        // the paragraph the total has no room for.
+        assert_eq!(total.unpriced_reasons(), ["second", "first", "also first"]);
+    }
+
+    /// Every rendered line's amount starts at the same column.
+    ///
+    /// The plain-text report is a table, and the phase column is what aligns it. `{:<14}`
+    /// in [`LineItem`]'s `Display` is not enough on its own: a `Display` impl written as
+    /// `f.write_str(...)` ignores the formatter's width outright, so the format string
+    /// reads as padded while the output is ragged — `image-build` and `launch` differ by
+    /// six characters and the dollar figures walk. The oracle's own render puts the
+    /// amount at column 44 on all seven lines of this same report, checked with
+    /// `line.index('~$')` on `cost.py`'s `CostReport.render()`.
+    ///
+    /// The assertion is that the columns *agree* rather than that they equal 44, because
+    /// the widths belong to `LineItem` and a deliberate change there should not have to
+    /// come here — but a phase that stops padding is not a deliberate change.
+    ///
+    /// **Falsification** — put `f.write_str(self.as_str())` back in [`CostPhase`]'s
+    /// `Display` and this is red with two distinct offsets. Verified.
+    #[test]
+    fn every_rendered_line_puts_its_amount_in_the_same_column() {
+        let report = run_report(
+            SizeClass::Mib2048,
+            &RunUsage {
+                running: Some(DurationP::Measured(Duration::from_secs(3600))),
+                image_build: Some(DurationP::Measured(Duration::from_secs(300))),
+                image_gb: Some(2.0),
+                suspend_resume_cycles: 1,
+                ..RunUsage::launched()
+            },
+            &rates(),
+            fresh_day(),
+            "run",
+        )
+        .expect("a report");
+        let text = report.render();
+        // The phases whose names differ most: `image-storage` is thirteen characters and
+        // `launch` is six, so an unpadded phase column shows up as a seven-column shift.
+        let offsets: Vec<(usize, &str)> = text
+            .lines()
+            .filter(|line| line.starts_with("  "))
+            .map(|line| {
+                let amount = line
+                    .find("~$")
+                    .or_else(|| line.find("unpriced"))
+                    .unwrap_or_else(|| panic!("every line has an amount: {line}"));
+                (amount, line)
+            })
+            .collect();
+        assert!(offsets.len() >= 7, "{text}");
+        let (first, first_line) = offsets[0];
+        for (offset, line) in &offsets {
+            assert_eq!(
+                *offset, first,
+                "the amount column has to agree across lines:\n{first_line}\n{line}"
+            );
+        }
+        // And the phase is genuinely padded rather than the widths happening to cancel.
+        assert_eq!(
+            format!("{:<14}|", CostPhase::Launch),
+            "launch        |",
+            "a phase in a width-bearing format slot has to pad"
+        );
+    }
+
     /// A lower bound that will not say what it is missing is not a value [`Total`]
     /// holds: an empty reason list routes to [`Total::Exact`].
     #[test]
     fn a_total_over_only_priced_lines_is_exact_and_names_nothing() {
         let amounts = [Amount::estimated(dec!(1)), Amount::estimated(dec!(2))];
-        let total = Total::of(&amounts);
+        let total = Total::of(amounts.iter().map(|amount| (CostPhase::Running, amount)));
         assert_eq!(total, Total::Exact(EstimatedUsd::new(dec!(3))));
         assert!(!total.is_lower_bound());
         assert!(total.unpriced_reasons().is_empty());
         assert_eq!(total.to_string(), "~$3.00 (estimated)");
         // The degenerate case: no lines at all is exactly zero, not a lower bound.
-        assert_eq!(Total::of(&[]), Total::Exact(EstimatedUsd::ZERO));
+        assert_eq!(
+            Total::of(std::iter::empty()),
+            Total::Exact(EstimatedUsd::ZERO)
+        );
     }
 
     /// The complement of the build test: a run against an existing image pays no build,
@@ -3419,33 +3624,56 @@ mod tests {
         /// answer, which is what makes this catch a `Total::of` that dropped the
         /// unpriced line: such an implementation answers `Exact` where `documented`
         /// says `AtLeast`.
+        ///
+        /// The parenthetical is checked against a reference built the oracle's way —
+        /// `", ".join(sorted({phase}))` — so a `Display` that reaches for reasons, report
+        /// order, or the wrong separator disagrees on some generated input rather than
+        /// only on the one report a hand-written test happens to build.
         #[test]
         fn a_total_is_a_lower_bound_exactly_when_something_is_unpriced(
             figures in prop::collection::vec(
-                prop_oneof![
-                    (0u64..1_000_000).prop_map(|cents| Amount::estimated(
-                        Decimal::from(cents) / dec!(100)
-                    )),
-                    "[a-z ]{1,20}".prop_map(Amount::unpriced),
-                ],
+                (
+                    prop::sample::select(&[
+                        CostPhase::ImageBuild,
+                        CostPhase::Running,
+                        CostPhase::Suspended,
+                    ][..]),
+                    prop_oneof![
+                        (0u64..1_000_000).prop_map(|cents| Amount::estimated(
+                            Decimal::from(cents) / dec!(100)
+                        )),
+                        "[a-z ]{1,20}".prop_map(Amount::unpriced),
+                    ],
+                ),
                 0..12,
             ),
         ) {
             let expected_floor: Decimal = figures
                 .iter()
-                .filter_map(|amount| amount.estimate())
+                .filter_map(|(_, amount)| amount.estimate())
                 .map(EstimatedUsd::amount)
                 .sum();
             let expected_reasons: Vec<String> = figures
                 .iter()
-                .filter_map(|amount| amount.unpriced_reason())
+                .filter_map(|(_, amount)| amount.unpriced_reason())
                 .map(str::to_string)
                 .collect();
+            let expected_names: Vec<&str> = {
+                let mut names: Vec<&str> = figures
+                    .iter()
+                    .filter(|(_, amount)| amount.unpriced_reason().is_some())
+                    .map(|(phase, _)| phase.as_str())
+                    .collect();
+                names.sort_unstable();
+                names.dedup();
+                names
+            };
 
-            let total = Total::of(&figures);
+            let total = Total::of(figures.iter().map(|(phase, amount)| (*phase, amount)));
             prop_assert_eq!(total.is_lower_bound(), !expected_reasons.is_empty());
             prop_assert_eq!(total.floor().amount(), expected_floor);
             prop_assert_eq!(total.unpriced_reasons(), expected_reasons.as_slice());
+            prop_assert_eq!(total.unpriced_phase_names(), expected_names.as_slice());
             match &total {
                 Total::Exact(_) => prop_assert!(expected_reasons.is_empty()),
                 Total::AtLeast { unpriced, .. } => prop_assert!(!unpriced.is_empty()),
@@ -3455,6 +3683,17 @@ mod tests {
                 total.to_string().starts_with("at least "),
                 total.is_lower_bound()
             );
+            if total.is_lower_bound() {
+                prop_assert_eq!(
+                    total.to_string(),
+                    format!(
+                        "at least {}, plus {} unpriced ({})",
+                        total.floor(),
+                        expected_reasons.len(),
+                        expected_names.join(", ")
+                    )
+                );
+            }
         }
 
         /// COST-6, over the whole arithmetic: a report's figures are exactly what the
