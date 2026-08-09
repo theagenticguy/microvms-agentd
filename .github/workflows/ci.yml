@@ -92,7 +92,8 @@ jobs:
       # published the moment the repo is public.
       - name: betterleaks over full history
         run: |
-          curl -sSfL https://github.com/betterleaks/betterleaks/releases/latest/download/betterleaks_Linux_x86_64.tar.gz | tar xz betterleaks
+          tag=$(curl -sSfL https://api.github.com/repos/betterleaks/betterleaks/releases/latest | python3 -c 'import json,sys; print(json.load(sys.stdin)["tag_name"].lstrip("v"))')
+          curl -sSfL "https://github.com/betterleaks/betterleaks/releases/latest/download/betterleaks_${tag}_linux_x64.tar.gz" | tar xz betterleaks
           ./betterleaks git .
       - name: license headers
         run: ./scripts/check-license-headers
@@ -194,20 +195,12 @@ jobs:
           ls -l target/aarch64-unknown-linux-musl/release/agentd
           file target/aarch64-unknown-linux-musl/release/agentd
 
-  spec:
-    name: requirements verification
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '22'
-      - name: install symspec
-        run: npm install -g symspec
-      # symspec downloads a sha256-pinned local embedding model for its
-      # meaning-similarity tier, then runs fully offline.
-      - run: symspec download-model
-      # --strict exits 3 when nothing was proven wrong but the document could not
-      # be verified, which is the outcome we want to fail on: an unverifiable
-      # spec is not a passing spec.
-      - run: symspec check spec/agentd.symspec.json --strict
+# The requirements-verification job (symspec over spec/*.symspec.json) ran here
+# while symspec was on npm. The tool this repo actually needs is the v5 line
+# (1.0.0-alpha.0) — the only version that can read core.symspec.json's state
+# model and reachability tier — and it is not published anywhere yet; it runs
+# from a local checkout via `mise run spec:core`. A CI job that installed the
+# 0.1.0 registry package would verify the six-requirement daemon draft and skip
+# the 51 requirements that matter, which is worse than no job: green next to
+# the word "requirements" reads as "the requirements were verified". The job
+# returns when symspec 1.x is installable from a registry or vendorable.
