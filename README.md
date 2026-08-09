@@ -34,11 +34,24 @@ bind mount over `boot_id` will work. Each is recorded in
 `docs/PLATFORM.md` with its date, and the transport tier was corrected so it fails
 against the old behavior.
 
-Not yet done: a repeat run in a second region, the CI cross-compile job has never
-executed (there is no git remote), and 34 of the oracle's 56 checks — file transfer,
-tar round trips, SSE ordering, stdin lifecycle, the health flags — are no longer
-covered against real AWS, because the `microvm` CLI has no subcommand for them. The
-live suite reports each one as SKIP by name rather than letting the gap go quiet.
+Not yet done: a repeat run in a second region, and the CI cross-compile job has never
+executed (there is no git remote).
+
+The coverage gap that used to sit here is closed. For one release, 34 of the deleted
+oracle's 56 checks — file transfer, tar round trips, the four hostile archives, SSE
+ordering, the stdin lifecycle, double-ack, the 8 MiB cap trio, the identity-repair
+health flags — had no live coverage, because the `microvm` CLI had no subcommand for
+them; the live suite reported each as SKIP by name rather than letting the gap go
+quiet. `docs/CLI-COVERAGE-PLAN.md` grew the five doors that close them — `microvm
+health`, exec identity (`--exec-id`, `--poll`, `--detach`), `microvm ack`, `microvm cp`
+(with `--tar`), `exec --stream`, and `microvm stdin` — and `conformance/run_rs.py` now
+expresses all 75 named checks with none skipped, each under the name the oracle gave it.
+
+The first live round of those paths came back 69/7, and the pattern held: every failure
+was in the *driver* rather than in the new subcommands — a tar chain that shelled out to
+a `tar` binary al2023-minimal does not carry, and a start/poll/ack sequence that could
+not be expressed because `exec` acked its own output. The second gap is what `exec
+--detach` exists for. Both fixed; the tier has not been rerun since.
 
 ## Suspend and resume preserve everything
 

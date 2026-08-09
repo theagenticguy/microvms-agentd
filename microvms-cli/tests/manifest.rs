@@ -46,7 +46,11 @@ fn manifest() -> serde_json::Value {
 fn every_command_the_manifest_lists_is_one_the_binary_routes() {
     let manifest = manifest();
     let commands = manifest["commands"].as_array().expect("an array");
-    assert_eq!(commands.len(), 12, "eleven Python commands plus constants");
+    assert_eq!(
+        commands.len(),
+        16,
+        "the lifecycle six, the attached five, and the local five"
+    );
 
     for command in commands {
         let name = command["name"].as_str().expect("a name");

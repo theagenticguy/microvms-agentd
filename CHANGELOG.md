@@ -6,6 +6,68 @@ Versions are [semantic](https://semver.org/spec/v2.0.0.html); the wire contract 
 
 ## Unreleased
 
+### Added
+
+- **Five `microvm` subcommands, and the live coverage they unlock.** `microvm health`,
+  `microvm ack`, `microvm stdin`, `microvm cp` (with `--tar` and `--mode`), and five new
+  shapes on `exec` — `--exec-id` for an idempotent retry, `--poll` for a read-only status
+  read, `--detach` to start without waiting or acking, `--stream` for output as it arrives,
+  `--stdin` for feeding a child. All five go through `microvms-core`'s existing session
+  surface and through the one `attach_session` seam; no daemon, protocol, or core change was
+  needed, which is what `docs/CLI-COVERAGE-PLAN.md` predicted and is the reason it was one
+  task rather than four.
+
+  `--detach` was added after the first live round rather than designed in, and it is worth
+  its own note: every other `exec` shape ends in start-wait-**ack**, and that ack releases
+  the output irreversibly — a second one is a 409 and a later poll reports `acked` with
+  nothing. A caller who wants to own an exec's lifecycle (start now, poll later, ack when
+  ready, possibly from another process, since the record lives in the VM) needs a start that
+  stops after starting.
+
+  `cp --tar` is asymmetric and the asymmetry is the design: the `vm:` side is a **directory**
+  that the daemon packs or extracts through `/v1/fs/tar`, and the local side is a `.tar`
+  **file**, because neither this binary nor `microvms-core` carries a tar library — which
+  keeps the daemon's confined extractor the only extractor in the system. Nothing outside the
+  daemon packs or unpacks, including the guest, whose base image may have no `tar` at all.
+
+  `exec --stream` is the one documented exception to "exactly one envelope on stdout": it
+  emits NDJSON — one event object per line, the envelope last — under a **different**
+  discriminant, `microvm.exec.stream`. `microvm manifest` publishes the alternate shape as
+  `exec`'s `alternateResponse` and states the exception in its `conventions`, so a consumer
+  discovers it rather than encountering it. Stream chunks are the command's *output*, not
+  progress, which is why they cannot go on stderr; buffering them to keep stdout one
+  document would remove the only reason to stream.
+
+  One new direct dependency, `futures-util`, for the `Stream` trait
+  `ExecHandle::stream_with` returns. It is a trait definition rather than a capability — it
+  opens no socket and knows nothing about AWS — and `tests/thinness.rs` carries the
+  paragraph justifying it. A callback driver in `microvms-core` would remove the need; that
+  is recorded as the preferred fix.
+
+### Changed
+
+- **`conformance/run_rs.py` expresses every named check.** The `UNSUPPORTED` table and its
+  `unsupported()` primitive are gone: all 34 entries became real live check bodies under
+  the names `conformance/run.py` gave them, so this suite's report diffs line for line
+  against the last recorded oracle run in git history — `SKIP` there, `PASS` here. The four
+  hostile archives are hand-built with `tarfile` (GNU tar sanitizes several of them) and
+  handed to `microvm cp --tar`; the expected failure is the **daemon's** refusal surfacing
+  as `data.kind: ProtocolError`, because the CLI deliberately does not pre-validate an
+  archive and a byte-scan guard proves it.
+
+  75 checks rather than the plan's 72: two of the old 38 were weak readings off the launch
+  envelope and are now asserted directly against `microvm health`, and three checks are
+  new. `Results.skipped` and a `skip()` primitive remain with no live caller, exercised by
+  `--self-test`, because a suite that removed its own ability to report a gap is a suite
+  whose next gap is silent.
+
+  The first live round found seven failures across two clusters, both in this driver rather
+  than in the five subcommands: a tar chain that shelled out to a `tar` binary the base image
+  does not have (deleted — it tested the image's tooling) and pointed `--tar` at a file where
+  the route wants a directory, and a start/poll/ack sequence that could not be expressed
+  because `exec` acked its own output. The second is what `--detach` exists for. Fixed and
+  re-verified offline; the live tier is rerun by the orchestrator.
+
 ### Removed
 
 - **`clients/python`** — the Python client, its 83 tests, and the two conformance
@@ -24,9 +86,13 @@ Versions are [semantic](https://semver.org/spec/v2.0.0.html); the wire contract 
   pins the region list and sizing table against its own literals, since those two
   values were verified by the Python-vs-Rust cross-comparison and by nothing else.
 
-  What is genuinely lost: 34 of the oracle's 56 checks have no live coverage, because
-  the `microvm` CLI has no `cp`, `ack`, `exec --stream`, `stdin`, or `health`
-  subcommand. `conformance/run_rs.py` reports each one as SKIP by name.
+  What was genuinely lost, and has since been recovered: 34 of the oracle's 56 checks
+  had no live coverage, because the `microvm` CLI had no `cp`, `ack`, `exec --stream`,
+  `stdin`, or `health` subcommand, and `conformance/run_rs.py` reported each one as SKIP
+  by name. Those five subcommands landed in the same Unreleased cycle (see Added above)
+  and every SKIP became a real check — so the loss lasted one release and is recorded
+  here rather than edited out, because "the CLI grew the subcommand" is the outcome the
+  SKIP list existed to make actionable.
 
 ## [0.1.0] — 2026-08-06
 

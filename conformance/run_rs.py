@@ -6,76 +6,93 @@
 # SPDX-License-Identifier: Apache-2.0
 """Live conformance run driving the **Rust** client stack through the `microvm` CLI.
 
-This is now the only live suite. `conformance/run.py` was the oracle — 56 checks
-through the Python client — and it went away with that client once both suites ran
-green against real AWS on the same commit (Python 56/56, this one 38/38). Every
-check name here is still byte-identical to the name run.py gave it, and the
-`UNSUPPORTED` list below still names all 34 checks only that client could express.
-Both facts are kept deliberately: they are what lets a reader of this report diff it
-against the last recorded oracle run in git history, and what makes the coverage this
-client does not have a statement rather than a silence.
+This is the only live suite, and it now expresses **every named check** — 75 of them, with
+none recorded SKIP. `conformance/run.py` was the oracle — 56 checks through the Python
+client — and it went away with that client once both suites ran green against real AWS on
+the same commit (Python 56/56, this one 38/38 with 34 recorded SKIP). Those 34 were the
+protocol-detail
+half only that client could reach: file transfer, tar round trips, the four hostile
+archives, SSE ordering, the stdin lifecycle, double-ack, the 8 MiB cap trio, the
+identity-repair health flags. `docs/CLI-COVERAGE-PLAN.md` grew the five CLI doors that
+close them — `health`, exec identity (`--exec-id`/`--poll`), `ack`, `cp`, `--stream`,
+`stdin` — and this file is the flip: every `UNSUPPORTED` entry became a real check body,
+with the **name byte-identical** to the one run.py gave it. That is deliberate, and it is
+the whole reason the names were preserved through a release where they meant nothing:
+this report diffs line for line against the last recorded oracle run in git history, and
+each of those 34 lines reads `SKIP` there and `PASS` here.
 
-A hybrid driver, and each of the three lanes is deliberate
----------------------------------------------------------
+75 rather than 72, and every delta is worth naming rather than rounding away.
+`docs/CLI-COVERAGE-PLAN.md` counted 72 by adding the 38 this suite expressed to the 34 it
+did not; two of those 38 — `health reachable through the endpoint` and `platform ran the
+run hook before forwarding traffic` — were *weak* readings asserted off the launch envelope
+because no `microvm health` existed, and they are now asserted directly against the health
+envelope in `drive_health`. The launch keeps one new check of its own in their place
+(`the launch reported an endpoint to attach to`). `drive_exec_identity` adds two:
+`polling reads an exec without consuming it` — the read-only property, which the oracle
+never asserted because its `poll()` could not be confused with an ack — and
+`a detached start reports running rather than a verdict`.
 
-1. **The CLI, through `--json` envelopes.** The client under test. Lifecycle
-   (`run`, `exec`, `suspend`, `resume`, `terminate`), the local commands, the
-   envelope contract, and the exit-code table. Every invocation also verifies CLI-4
-   for free: `Cli.call` parses the whole of stdout as one JSON document, so a stray
-   `println!` anywhere in the Rust crate turns this suite red rather than being
-   noticed by nobody.
+The first live round subtracted one. `tree packed in the guest` ran `tar cf` inside the VM
+and was deleted rather than fixed: al2023-minimal ships no `tar` binary, and a step needing
+one tests the base image's tooling rather than this client. The daemon packs and extracts
+through its own `/v1/fs/tar` routes, which is what `cp --tar` drives now.
 
-2. **Raw `httpx`, for six checks that test the DAEMON.** The raw run-hook POST and
-   the raw status-code sends. These are the two reach-arounds `conformance/run.py`
-   documented before it was deleted: the only callers of `/run` are the platform
-   itself and an attacker inside the VM, and the other four assert on a status
-   integer the daemon chose. They are not about the client, so the client they go
-   through does not matter — and adding a raw-request escape to the CLI so they
-   could go through it would violate CLI-2 and CLI-5 to make a report look tidier.
+A hybrid driver, and both lanes are deliberate
+----------------------------------------------
 
-   Raw rather than through a client library, and that is the *stronger* shape for
-   what these six mean. They assert on the status integer directly — 409, 200, 401,
-   400 — where the deleted Python suite asserted on the exception its own taxonomy
-   mapped that integer to. One layer fewer between the daemon's decision and the
-   assertion about it, and no way for a client's status table to be the thing that
-   passes.
+1. **The CLI, through `--json` envelopes.** The client under test, and now the whole
+   protocol surface: lifecycle, exec identity, file and tar transfer, streaming, stdin,
+   health. Every invocation also verifies CLI-4 for free — `Cli.call` parses the whole of
+   stdout as one JSON document, so a stray `println!` anywhere in the Rust crate turns
+   this suite red rather than being noticed by nobody.
 
-3. **`unsupported()`, for the checks this CLI has no subcommand for.** Named, listed,
-   and counted, never quietly dropped. See the next section, because this lane is
-   larger than it looks and pretending otherwise would be the failure mode.
+   `exec --stream` is the one documented exception and has its own reader,
+   `Cli.call_stream`, which asserts the shape rather than tolerating it: every line but
+   the last parses as an event, the last parses as the envelope, and its `type` is
+   `microvm.exec.stream` rather than `microvm.exec`. A streaming invocation read with
+   `Cli.call` would fail on the parse, which is correct — the two shapes are different
+   contracts and the driver should not have one function that accepts either.
 
-What this suite does NOT cover, and why that is a property rather than a bug
---------------------------------------------------------------------------
+2. **Raw `httpx`, for six checks that test the DAEMON.** The raw run-hook POST and the
+   raw status-code sends. These are the two reach-arounds `conformance/run.py` documented
+   before it was deleted: the only callers of `/run` are the platform itself and an
+   attacker inside the VM, and the other four assert on a status integer the daemon chose.
+   They are not about the client, so the client they go through does not matter — and
+   adding a raw-request escape to the CLI so they could go through it would violate CLI-2
+   and CLI-5 to make a report look tidier.
 
-`microvms-core` carries the whole session surface — `upload_file`, `download_tar`,
-`stream`, `write_stdin`, `ack`, `poll`. The **CLI** exposes almost none of it: its
-`exec` is one-shot `run_sync` (start, wait, ack) with a generated exec id, and there
-is no `microvm cp`, no `microvm ack`, no `microvm exec --stream`, no `microvm stdin`.
+   Raw rather than through a client library, and that is the *stronger* shape for what
+   these six mean. They assert on the status integer directly — 409, 200, 401, 400 —
+   where the deleted Python suite asserted on the exception its own taxonomy mapped that
+   integer to. One layer fewer between the daemon's decision and the assertion about it,
+   and no way for a client's status table to be the thing that passes.
 
-So the protocol-detail half of the old oracle — file transfer, tar round trips,
-hostile archives, SSE ordering, stdin lifecycle, double-ack, the 8 MiB output cap,
-the identity-repair health flags — is **not expressible through this client**, and
-every one of those checks is recorded `SKIP` with the reason. That is the honest
-report, and the alternative was worse in a specific way: reaching for a second client
-so those checks could go green would produce a green run over a Rust stack that was
-never asked to do them, which is the same false assurance
-`scripts/check-model-drift` exists to refuse ("a checker that reports clean while a
-constraint has drifted is worse than no checker").
+The third lane is gone. `unsupported()` and the `UNSUPPORTED` table were the honest
+record of a real gap; with the gap closed, keeping them would be the opposite of honest.
+`Results.skipped` stays as a list and stays in the summary, printed as a count that
+should read zero — because a suite that removed its own ability to report a skip is a
+suite whose next gap is silent.
 
-What is left is exactly the half only this client can answer: the lifecycle, the
-suspend/resume evidence, the teardown ordering, and the CLI's own requirements —
-CLI-3's exit codes, CLI-4's one envelope, CLI-6's named leak on interrupt. Those
-never existed in the oracle at all. A `SKIP` here becomes a `PASS` the day the CLI
-grows the subcommand, and until then the SSE and tar surfaces are covered locally by
-`microvms-core`'s own tiers rather than against real AWS — which is a real gap, named
-here rather than papered over.
+What is asserted through the CLI rather than around it
+------------------------------------------------------
+
+Every hostile archive is now a real live check. The four archives are built here with
+`tarfile`, exactly as run.py built them (GNU tar sanitizes several of these, which is why
+they are hand-built), written to a temp file, and handed to `microvm cp --tar`. The
+expected outcome is the **daemon's** refusal surfacing as `data.kind: ProtocolError` with
+exit 5 — not this suite's opinion of the archive, and not the CLI's. The CLI deliberately
+does not pre-validate an archive (`microvms-cli/src/commands/attached.rs`, and the
+byte-scan guard in `src/guards.rs` that proves it), because a client-side check would make
+these four checks pass against the client's copy of the member rules while the extractor
+that actually runs in production went untested.
 
 Money
 -----
 
-This run creates real MicroVMs and is billable, ~15 min. It belongs to
-`mise run live` and is never hooked. `--self-test` is the offline half: it drives the
-envelope-to-exception mapping against a stub `microvm` script and touches no account.
+This run creates real MicroVMs and is billable, ~15 min. It belongs to `mise run live`
+and is never hooked. `--self-test` is the offline half: it drives the
+envelope-to-exception mapping and the NDJSON stream reader against a stub `microvm`
+script and touches no account.
 
 Usage:
     conformance/run_rs.py --self-test          # offline, free
@@ -286,6 +303,90 @@ class Cli:
         # is the right answer.
         return envelope
 
+    def call_stream(
+        self, *args: str, timeout: float = 900.0
+    ) -> tuple[list[dict[str, Any]], Envelope]:
+        """One `exec --stream` invocation, as (events, final envelope).
+
+        **The one invocation with a different stdout contract**, and this function asserts
+        that contract rather than tolerating it. `microvm manifest` publishes it as
+        `exec`'s `alternateResponse`: NDJSON, one event object per line, the envelope last,
+        with `type: microvm.exec.stream` rather than `microvm.exec`.
+
+        Three things are checked here, and each is a way the shape can be wrong while the
+        command still looks like it worked:
+
+        * every line parses as JSON on its own — a partial or multi-line record would
+          make a line-reading consumer lose an event;
+        * the **last** line is the envelope and the ones before it are not — an envelope
+          written first (or pretty-printed, which makes it several lines) would have a
+          consumer hit the terminator before any output;
+        * the discriminant is the streaming one, so a consumer branching on `type` learns
+          which parse applied from the field it reads first.
+
+        A separate function from `call` rather than a flag on it, deliberately: `call`'s
+        whole assertion is that stdout is *one* document, and a function that accepted
+        either shape would weaken that for the sixty invocations that are not streams.
+        """
+        argv = self.argv(*args)
+        self.log.append(shlex.join(argv))
+        proc = subprocess.run(
+            argv, capture_output=True, text=True, check=False, timeout=timeout
+        )
+        lines = [line for line in proc.stdout.splitlines() if line.strip()]
+        if not lines:
+            raise EnvelopeError(
+                f"{shlex.join(argv)} wrote nothing to stdout. A stream emits one event "
+                f"per line and the envelope last.\nstderr:\n{proc.stderr[:400]}"
+            )
+
+        documents: list[dict[str, Any]] = []
+        for index, line in enumerate(lines):
+            try:
+                parsed = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise EnvelopeError(
+                    f"{shlex.join(argv)} line {index} is not one JSON document ({exc}). "
+                    f"A streamed exec writes NDJSON — one object per line — so a record "
+                    f"spanning lines makes a line-reading consumer lose it. Line was:\n"
+                    f"{line[:400]}"
+                ) from None
+            if not isinstance(parsed, dict):
+                raise EnvelopeError(
+                    f"{shlex.join(argv)} line {index} is a {type(parsed).__name__}"
+                )
+            documents.append(parsed)
+
+        *events, final = documents
+        if "status" not in final:
+            raise EnvelopeError(
+                f"{shlex.join(argv)}'s last line is not the envelope: {str(final)[:200]}. "
+                "The envelope goes last precisely so a consumer reading line by line "
+                "receives every event before the terminator."
+            )
+        for index, event in enumerate(events):
+            if "status" in event:
+                raise EnvelopeError(
+                    f"{shlex.join(argv)} line {index} looks like an envelope rather than "
+                    f"an event. Exactly one envelope per invocation, and it is the last "
+                    f"line: {str(event)[:200]}"
+                )
+        envelope = Envelope.parse(final)
+        if envelope.status == "error":
+            if proc.returncode != envelope.exit_code:
+                raise EnvelopeError(
+                    f"{shlex.join(argv)} exited {proc.returncode} but its envelope says "
+                    f"exitCode {envelope.exit_code}. CLI-3 holds on the streaming path too."
+                )
+            raise KindError(envelope)
+        if envelope.type != "microvm.exec.stream":
+            raise EnvelopeError(
+                f"{shlex.join(argv)} streamed but announced {envelope.type!r}. The "
+                "streaming shape must carry its own discriminant, or a consumer "
+                "branching on `type` cannot tell which parse to use."
+            )
+        return events, envelope
+
     @staticmethod
     def parse_stdout(stdout: str, argv: list[str]) -> Envelope:
         """The whole of stdout as one document. This *is* CLI-4's assertion.
@@ -314,10 +415,16 @@ class Cli:
 class Results:
     """Every check's outcome, so the summary reports facts rather than a feeling.
 
-    The four primitives are the oracle's, with the same names and the same semantics, plus
-    `unsupported`. `skipped` is a *third* list rather than a pass with a note, because
-    a skip folded into `passed` is how a suite that covers half of what it claims looks
-    identical to one that covers all of it.
+    The four primitives are the oracle's, with the same names and the same semantics.
+    `skipped` is a *third* list rather than a pass with a note, because a skip folded into
+    `passed` is how a suite that covers half of what it claims looks identical to one that
+    covers all of it.
+
+    It is now always empty, and it stays here anyway. The `unsupported()` primitive that
+    filled it was the honest record of 34 checks this client could not express; those
+    surfaces landed and the entries became real check bodies. Deleting the list along with
+    them would remove the suite's ability to *say* a gap exists — so the count is still
+    printed, and it should read zero. The next gap gets a line rather than a silence.
     """
 
     passed: list[str] = field(default_factory=list)
@@ -382,133 +489,82 @@ class Results:
             return self.check(name, False, repr(exc))
         return self.check(name, True)
 
-    def unsupported(self, name: str, reason: str) -> None:
+    def skip(self, name: str, reason: str) -> None:
         """Records a check this client has no way to express.
 
         Printed as `SKIP` and counted apart from both passes and failures. It does not
-        fail the run — the CLI genuinely has no subcommand for it, and a suite that is
-        permanently red is a suite people stop reading — but it is never silent, which
-        is the whole difference between a coverage statement and a gap.
+        fail the run — a suite that is permanently red is a suite people stop reading —
+        but it is never silent, which is the whole difference between a coverage statement
+        and a gap.
+
+        **No caller, on purpose.** This was `unsupported()` and it had 34; the CLI grew the
+        surfaces and every one became a real check. It is kept as the shape the next gap
+        takes, because the alternative is that the next gap has nowhere to be recorded and
+        gets a comment instead. `--self-test` calls it once against a throwaway `Results`
+        so it cannot rot into something that no longer runs.
         """
         self.skipped.append((name, reason))
         print(f"  SKIP  {name} — {reason}")
 
 
-# ── the checks the CLI has no subcommand for ─────────────────────────────────
-
-#: `(check name, reason)` for every oracle check this client cannot express.
-#:
-#: Written out rather than derived by diffing the oracle at runtime, and the reason was
-#: the measure-coupling lesson: a runtime diff would have silently shrunk the moment the
-#: oracle renamed a check, reporting better coverage for a suite that had not changed. It
-#: is now the *only* record of those 34 names, which is the second reason it is a literal
-#: list: a derived one would have vanished with the file it derived from.
-#:
-#: Each reason names the missing subcommand rather than saying "unsupported", because
-#: the actionable half is which surface would have to grow.
-UNSUPPORTED: tuple[tuple[str, str], ...] = (
-    (
-        "ack accepted",
-        "no `microvm ack`: the CLI's exec is one-shot run_sync, which acks itself",
-    ),
-    (
-        "second ack refused with 409",
-        "no `microvm ack`, so a double-ack cannot be issued",
-    ),
-    (
-        "unknown exec id is 404",
-        "no `microvm exec --poll <id>`: exec ids are generated, not named",
-    ),
-    (
-        "retried start did not spawn a second child",
-        (
-            "no stable --exec-id: the CLI mints one per invocation (TRAP-1's shape), so "
-            "the idempotency-key retry cannot be replayed"
-        ),
-    ),
-    ("retried start accepted", "no stable --exec-id; see the check above"),
-    (
-        "noisy command still exits 0",
-        "expressible, but the 8 MiB cap assertion below is not",
-    ),
-    (
-        "output past the cap was truncated",
-        "`truncated` is in the exec envelope, but see below",
-    ),
-    ("daemon survived the truncation", "no `microvm health`"),
-    ("single file write accepted", "no `microvm cp`: file transfer is core-only"),
-    ("single file read returns the bytes", "no `microvm cp`"),
-    ("read of an absent file is 404", "no `microvm cp`"),
-    (
-        "tree created for the round trip",
-        (
-            "expressible through `microvm exec`, but the round trip it sets up is not — "
-            "so building the tree would assert nothing"
-        ),
-    ),
-    ("tar download succeeded", "no `microvm cp --tar`"),
-    ("tar upload accepted", "no `microvm cp --tar`"),
-    ("symlink survived the round trip as a symlink", "no `microvm cp --tar`"),
-    ("symlink still resolves to its target's content", "no `microvm cp --tar`"),
-    (
-        "identity repair completed every step",
-        "no `microvm health`: identity_degraded is a health flag",
-    ),
-    (
-        "identity repair actually ran",
-        "no `microvm health`: identity_repaired is a health flag",
-    ),
-    ("SSE reached us through the endpoint proxy", "no `microvm exec --stream`"),
-    ("streamed output is complete and ordered", "no `microvm exec --stream`"),
-    ("no gap was reported for a small stream", "no `microvm exec --stream`"),
-    (
-        "the terminal exit event carried the real exit code",
-        "no `microvm exec --stream`",
-    ),
-    (
-        "the exec survived being streamed and is still pollable",
-        "no `microvm exec --stream`",
-    ),
-    ("stdin write accepted", "no `microvm stdin`"),
-    ("stdin close accepted", "no `microvm stdin`"),
-    ("a child reading stdin exits once stdin closes", "no `microvm exec --stdin`"),
-    ("stdin round-tripped through the child", "no `microvm exec --stdin`"),
-    (
-        "writing stdin to a command that did not request it is refused",
-        "no `microvm stdin`, and the CLI never sets stdin:true",
-    ),
-    (
-        "nothing escaped the extraction root",
-        "no `microvm cp --tar` to extract a hostile archive",
-    ),
-)
-
-#: The four hostile archives, by the name the oracle gave each. Listed so the skip report
-#: names them individually — "hostile archives are not covered" is a sentence a reader
-#: cannot act on, and four named members is the same fact they can.
-HOSTILE_ARCHIVES = (
-    "parent traversal",
-    "absolute link target",
-    "symlink redirect",
-    "character device",
-)
+# ── the four hostile archives ────────────────────────────────────────────────
 
 
-def record_unsupported(results: Results) -> None:
-    """Every inexpressible check, printed once, before anything is launched.
+def build_hostile_archives() -> list[tuple[str, bytes]]:
+    """The four malicious archives, hand-built, exactly as the deleted oracle built them.
 
-    Before rather than after, so a reader watching the run knows what it is not going
-    to tell them *while* it is spending money — not in a summary they reach fifteen
-    minutes later.
+    `tarfile` rather than `tar(1)`, and that is not a convenience: GNU tar **sanitizes**
+    several of these — it strips a leading `../`, refuses to store an absolute link target
+    — so shelling out would produce four harmless archives and four checks that passed
+    against nothing. Each `TarInfo` is constructed field by field here so the hostile
+    member really is in the bytes.
+
+    Every one of these is a refused *member*, which the daemon answers 400 for and the
+    client maps to `ProtocolError`. A 413 would be a cap violation instead, and the
+    distinction matters: one means "this archive is hostile", the other means "this archive
+    is merely too big".
+
+    The names are the oracle's, so the four `hostile archive refused: <name>` lines in this
+    report diff against the four `SKIP` lines in the last one.
     """
-    print("\n== not expressible through this client ==")
-    for name, reason in UNSUPPORTED:
-        results.unsupported(name, reason)
-    for archive in HOSTILE_ARCHIVES:
-        results.unsupported(
-            f"hostile archive refused: {archive}",
-            "no `microvm cp --tar`: an archive cannot be handed to this client",
-        )
+    import io
+    import tarfile
+
+    def make(members: list[tuple[str, str, str | None, bytes]]) -> bytes:
+        buffer = io.BytesIO()
+        with tarfile.open(fileobj=buffer, mode="w") as tar:
+            for name, kind, target, data in members:
+                info = tarfile.TarInfo(name)
+                if kind == "file":
+                    info.size = len(data)
+                    tar.addfile(info, io.BytesIO(data))
+                elif kind == "sym":
+                    info.type = tarfile.SYMTYPE
+                    info.linkname = target or ""
+                    tar.addfile(info)
+                elif kind == "dev":
+                    info.type = tarfile.CHRTYPE
+                    info.devmajor, info.devminor = 1, 3
+                    tar.addfile(info)
+        return buffer.getvalue()
+
+    return [
+        # Writes outside the extraction root by walking up out of it.
+        ("parent traversal", make([("../../escaped.txt", "file", None, b"pwned")])),
+        # A symlink pointing at an absolute path in the guest, which would let a later
+        # write land on /etc/passwd.
+        ("absolute link target", make([("link", "sym", "/etc/passwd", b"")])),
+        # The two-member version, which defeats a naive per-member path check: `s` is an
+        # in-tree symlink to `..`, and `s/escaped.txt` then resolves outside the root
+        # without any member's own name containing `..`.
+        (
+            "symlink redirect",
+            make([("s", "sym", "..", b""), ("s/escaped.txt", "file", None, b"pwned")]),
+        ),
+        # A character device. Extracting one means the archive can create a node that
+        # reads host memory or produces attacker-chosen bytes.
+        ("character device", make([("dev", "dev", None, b"")])),
+    ]
 
 
 # ── the daemon-level checks, on raw httpx ────────────────────────────────────
@@ -815,19 +871,17 @@ def drive_lifecycle(
     )
 
     results.eq("run emitted its namespaced envelope type", launched.type, "microvm.run")
-    # A launch that returned at all means the CLI's `wait_until_ready` saw a bootstrapped
-    # daemon, since that call is what it waits on. A weaker assertion than the oracle's
-    # direct `health()` — it cannot observe the pre-bootstrap state — and it is the
-    # strongest one available without a `microvm health`.
+    # `health reachable through the endpoint` and `platform ran the run hook before
+    # forwarding traffic` were asserted here, weakly: a launch that returned at all implied
+    # `wait_until_ready` had seen a bootstrapped daemon, which was the strongest reading
+    # available without a `microvm health`. Both are now asserted directly in
+    # `drive_health`, against the health envelope's own `version` and `bootstrapped`, which
+    # is the oracle's original form. Duplicating them here would print each name twice and
+    # make the report's own totals a lie — so the launch keeps only what only it can say.
     results.check(
-        "health reachable through the endpoint",
+        "the launch reported an endpoint to attach to",
         bool(launched.data.get("endpoint")),
-        f"endpoint {launched.data.get('endpoint')!r} (implied by wait_until_ready)",
-    )
-    results.check(
-        "platform ran the run hook before forwarding traffic",
-        launched.data.get("execExitCode") is not None,
-        "an exec answered, so the token was installed before external traffic",
+        f"endpoint {launched.data.get('endpoint')!r}",
     )
     results.eq("exec exited 0", launched.data.get("execExitCode"), 0)
     stdout = launched.data.get("stdout") or ""
@@ -857,6 +911,30 @@ def drive_lifecycle(
     return launched
 
 
+def attach_args(cli: Cli, launched: Envelope, endpoint: str | None = None) -> list[str]:
+    """The identifier triple every attached command takes, plus the region.
+
+    One helper rather than the same six-element list written out in each section, which is
+    the same argument `microvms-cli`'s own `AttachFlags` makes: three of the four are
+    opaque strings of the same shape, so writing them out repeatedly is repeated chances to
+    put an endpoint where a token belongs.
+
+    `endpoint` overrides the launch's, for the post-resume sections: `resume` hands back the
+    endpoint it read, and following that rather than the launch's is what makes a changed
+    endpoint a followed change instead of a silent failure.
+    """
+    return [
+        "--endpoint",
+        endpoint or str(launched.data["endpoint"]),
+        "--agent-token",
+        str(launched.data["agentToken"]),
+        "--microvm-id",
+        str(launched.data["microvmId"]),
+        "--region",
+        cli.region,
+    ]
+
+
 def drive_exec(cli: Cli, launched: Envelope, results: Results) -> None:
     """`microvm exec` against the kept VM — the attach path, which `run` never exercises.
 
@@ -865,16 +943,7 @@ def drive_exec(cli: Cli, launched: Envelope, results: Results) -> None:
     process did not launch. TRAP-9 lives on that path.
     """
     print("\n-- exec (the attach path) --")
-    attach = [
-        "--endpoint",
-        str(launched.data["endpoint"]),
-        "--agent-token",
-        str(launched.data["agentToken"]),
-        "--microvm-id",
-        str(launched.data["microvmId"]),
-        "--region",
-        cli.region,
-    ]
+    attach = attach_args(cli, launched)
 
     first = cli.call("exec", "echo attached", *attach)
     results.eq("exec exited 0 on the attach path", first.data.get("exitCode"), 0)
@@ -916,32 +985,461 @@ def drive_exec(cli: Cli, launched: Envelope, results: Results) -> None:
     )
 
 
+def drive_health(cli: Cli, launched: Envelope, results: Results) -> None:
+    """`microvm health` — five checks, and the identity pair is the one with a measurement.
+
+    `identity_degraded` is the only guard whose unit tests inject a fake layout, so this is
+    the one place the real bind mount over real procfs is exercised. Measured 2026-08-06:
+    without `additionalOsCapabilities: ["ALL"]` the hostname and boot_id steps fail with
+    EPERM even though the daemon is root, and `identityDegraded` is how that surfaces.
+    Asserting it here is what makes the capability requirement impossible to drop by
+    accident — the launch above passes `--repair-identity`, and if core stopped injecting
+    `["ALL"]` this check would be the thing that noticed.
+    """
+    print("\n-- health --")
+    attach = attach_args(cli, launched)
+    health = cli.call("health", *attach)
+
+    results.check(
+        "health reachable through the endpoint",
+        bool(health.data.get("version")),
+        f"daemon version {health.data.get('version')!r}",
+    )
+    results.eq(
+        "platform ran the run hook before forwarding traffic",
+        health.data.get("bootstrapped"),
+        True,
+    )
+    results.eq(
+        "identity repair completed every step",
+        health.data.get("identityDegraded"),
+        False,
+    )
+    results.eq(
+        "identity repair actually ran", health.data.get("identityRepaired"), True
+    )
+
+
+def drive_exec_identity(cli: Cli, launched: Envelope, results: Results) -> None:
+    """Exec identity: `--exec-id`, `--detach`, `--poll`, and `microvm ack`. Seven checks.
+
+    The idempotency-key property is the interesting one and it needs a stable id to test at
+    all — which is why the oracle could express it and the CLI could not until `--exec-id`
+    landed. `MUST_NOT_RUN` in the retried command is the falsification: if the daemon
+    spawned a second child the string would appear in the output, and the check is a
+    substring search for its *absence*.
+
+    **`--detach` is what makes the rest of this section possible**, and the first live round
+    is what proved it. `microvm exec` without it is start-wait-**ack**: the ack releases the
+    output, so a later explicit `microvm ack` correctly 409s (`already_acked`) and a poll
+    correctly reports `acked` with nothing. Two checks here failed exactly that way. This
+    section needs an exec whose lifecycle it owns — start, poll while the output is still
+    buffered, ack once, watch the second ack refuse — which is the oracle's own
+    start/poll/ack decomposition and is now `--detach`'s reason to exist.
+    """
+    print("\n-- exec identity (--exec-id, --detach, --poll, ack) --")
+    attach = attach_args(cli, launched)
+
+    # Detached: started and nothing else. Without `--detach` this invocation would ack its
+    # own output and every check below would be reading an already-collected exec.
+    started = cli.call(
+        "exec", "echo identity-live", "--exec-id", "c1", "--detach", *attach
+    )
+    results.eq(
+        "exec start accepted with a caller-supplied id",
+        started.data.get("execId"),
+        "c1",
+    )
+    results.eq(
+        "a detached start reports running rather than a verdict",
+        started.data.get("phase"),
+        "running",
+    )
+
+    # The retry: the identical id, a *different* command. The daemon answers success for a
+    # known id without spawning anything (`agentd/src/exec.rs:366`, decided under the
+    # registry lock), so this must succeed and must not run the new command. Detached again,
+    # so the retry does not ack either.
+    results.ok(
+        "retried start accepted",
+        lambda: cli.call(
+            "exec", "echo MUST_NOT_RUN", "--exec-id", "c1", "--detach", *attach
+        ),
+    )
+
+    # `echo` is quick but not instant, and a poll issued in the same breath as the start can
+    # legitimately catch `running` with no output yet. Polled until it exits — which is also
+    # a live demonstration that polling is repeatable, since that is the property it rests on.
+    after = None
+    for _ in range(12):
+        after = cli.call("exec", "--poll", "c1", *attach)
+        if after.data.get("phase") != "running":
+            break
+        time.sleep(1)
+    assert after is not None
+    results.check(
+        "retried start did not spawn a second child",
+        "MUST_NOT_RUN" not in (after.data.get("stdout") or ""),
+        repr(after.data.get("stdout")),
+    )
+
+    # `--poll` is read-only, so the first exec's own output is still there — which is also
+    # what makes the ack below meaningful rather than a no-op. This is the check that caught
+    # the missing `--detach`: it read `''` because `exec` had already acked.
+    results.check(
+        "polling reads an exec without consuming it",
+        "identity-live" in (after.data.get("stdout") or ""),
+        repr((after.data.get("stdout") or "")[:80]),
+    )
+
+    results.ok("ack accepted", lambda: cli.call("ack", "c1", *attach))
+    # The second ack is a 409 rather than a 200 with an empty body, because an empty body
+    # would read as "the command produced no output" (`agentd/src/exec.rs:854`).
+    results.raises(
+        "second ack refused with 409",
+        "Conflict",
+        lambda: cli.call("ack", "c1", *attach),
+    )
+    results.raises(
+        "unknown exec id is 404",
+        "NotFound",
+        lambda: cli.call("exec", "--poll", "never-existed", *attach),
+    )
+
+
+def drive_output_cap(cli: Cli, launched: Envelope, results: Results) -> None:
+    """The 8 MiB cap trio. 32 MiB of output against it.
+
+    The daemon must truncate and **stay up**, not grow until the guest's OOM killer takes
+    it. `health` after the fact is the survival probe and is the reason this trio needed
+    `microvm health` to be expressible: an exec that answered would also prove the daemon
+    lived, but only for a daemon that was still serving *that* route — health is the
+    unauthenticated liveness question asked directly.
+    """
+    print("\n-- large output (the 8 MiB cap) --")
+    attach = attach_args(cli, launched)
+    noisy = cli.call(
+        "exec",
+        "dd if=/dev/zero bs=1M count=32 2>/dev/null | tr '\\0' 'x'",
+        "--timeout",
+        "180",
+        *attach,
+        timeout=300.0,
+    )
+    results.eq("noisy command still exits 0", noisy.data.get("exitCode"), 0)
+    results.eq("output past the cap was truncated", noisy.data.get("truncated"), True)
+    results.ok("daemon survived the truncation", lambda: cli.call("health", *attach))
+
+
+def drive_file_transfer(
+    cli: Cli, launched: Envelope, results: Results, workdir: Path
+) -> None:
+    """`microvm cp` and `cp --tar`: thirteen checks, including the four hostile archives.
+
+    The symlink pair is the one worth naming: harnesses pack symlinks deliberately, and a
+    daemon that refused links would break real uploads — so an in-tree link has to survive
+    the round trip *as a link* and still resolve to its target's content. Both halves are
+    asserted, because a round trip that dereferenced the link would satisfy the second on
+    its own.
+
+    `--tar` is asymmetric, and the asymmetry is the design rather than a rough edge. The
+    **local** side is an archive file, because neither `microvms-core` nor the CLI carries a
+    tar library — `session/files.rs:112` declines to add one, since Rust's standard library
+    has no equivalent of tarfile's `data` filter and "an extraction that looked safe and was
+    not is worse than none". The **`vm:`** side is a *directory*, because the daemon does
+    carry the crate and both routes are about trees: `GET /v1/fs/tar` packs a directory and
+    `PUT /v1/fs/tar` extracts into one, through the confined extractor that stays the only
+    extractor in the system.
+
+    So nothing outside the daemon ever packs or unpacks, which is also why this section no
+    longer shells out to `tar` in the guest: al2023-minimal has no `tar` binary, and a step
+    that needed one would be testing the base image's tooling rather than this client.
+    """
+    print("\n-- file transfer --")
+    attach = attach_args(cli, launched)
+
+    payload = workdir / "live.txt"
+    payload.write_bytes(b"written through the endpoint")
+    results.ok(
+        "single file write accepted",
+        lambda: cli.call(
+            "cp", str(payload), "vm:/tmp/live.txt", "--mode", "644", *attach
+        ),
+    )
+
+    read_back = workdir / "read-back.txt"
+    cli.call("cp", "vm:/tmp/live.txt", str(read_back), *attach)
+    results.eq(
+        "single file read returns the bytes",
+        read_back.read_bytes(),
+        b"written through the endpoint",
+    )
+    results.raises(
+        "read of an absent file is 404",
+        "NotFound",
+        lambda: cli.call("cp", "vm:/tmp/absent", str(workdir / "absent.txt"), *attach),
+    )
+
+    # The tree, built in the guest. A symlink packed deliberately, because that is the
+    # member a harness really sends.
+    tree = cli.call(
+        "exec",
+        "rm -rf /tmp/tree /tmp/dest && mkdir -p /tmp/tree/sub && "
+        "echo payload > /tmp/tree/a.txt && ln -sf a.txt /tmp/tree/link && "
+        "echo deep > /tmp/tree/sub/b.txt",
+        *attach,
+    )
+    results.eq("tree created for the round trip", tree.data.get("exitCode"), 0)
+
+    # `vm:` names the DIRECTORY, and the daemon packs it. That is the whole shape of these
+    # two routes and the first live round is what taught it: `GET /v1/fs/tar` requires a
+    # directory (`agentd/src/fs.rs:786` — a non-directory is an explicit 400 "use
+    # /v1/fs/file") and packs it itself with `pack_tree`, which carries the `tar` crate so
+    # that no client and no base image needs one.
+    #
+    # The first draft of this section ran `tar cf` in the guest and then pointed `--tar` at
+    # the resulting file. It failed twice over: al2023-minimal ships no `tar` binary (exit
+    # 127), and the file was the wrong thing to hand the route anyway. Both errors came from
+    # the same wrong belief — that something other than the daemon had to do the packing.
+    # The guest-tar step is gone rather than fixed: it tested the base image's tooling, not
+    # this client.
+    #
+    # Members are `./`-relative (`append_dir_all(".", root)`), so they land *flattened*
+    # under the destination — `/tmp/dest/link`, not `/tmp/dest/tree/link`. That is what the
+    # verification below reads, and it is what makes a downloaded archive re-uploadable,
+    # which `fs.rs:226` names as the one round trip a harness performs constantly.
+    archive = workdir / "tree.tar"
+    try:
+        cli.call("cp", "vm:/tmp/tree", str(archive), "--tar", *attach)
+        results.check(
+            "tar download succeeded",
+            archive.exists() and archive.stat().st_size > 0,
+            f"{archive.stat().st_size if archive.exists() else 0} bytes",
+        )
+    except (KindError, EnvelopeError) as exc:
+        results.check("tar download succeeded", False, repr(exc))
+
+    if archive.exists() and archive.stat().st_size > 0:
+        results.ok(
+            "tar upload accepted",
+            lambda: cli.call("cp", str(archive), "vm:/tmp/dest", "--tar", *attach),
+        )
+    else:
+        results.check(
+            "tar upload accepted", False, "no archive was downloaded to upload"
+        )
+
+    # `readlink` first, so a dereferenced round trip fails on the *link* assertion rather
+    # than passing the content one and looking fine. Paths are flattened under the
+    # destination, per the note above.
+    verify = cli.call(
+        "exec",
+        "readlink /tmp/dest/link; cat /tmp/dest/link; cat /tmp/dest/sub/b.txt",
+        *attach,
+    )
+    verified = verify.data.get("stdout") or ""
+    results.check(
+        "symlink survived the round trip as a symlink",
+        verified.startswith("a.txt"),
+        repr(verified[:120]),
+    )
+    results.check(
+        "symlink still resolves to its target's content",
+        "payload" in verified,
+        repr(verified[:120]),
+    )
+
+    # -- the four hostile archives -------------------------------------------
+    #
+    # Handed to `microvm cp --tar` as pre-built files. The expected failure is the
+    # DAEMON's, surfacing as `data.kind: ProtocolError` with exit 5 — the CLI does not
+    # pre-validate an archive, and `microvms-cli/src/guards.rs`'s byte-scan proves it. A
+    # client-side check would make these four pass against the client's copy of the member
+    # rules while the extractor that runs in production went untested.
+    print("\n-- hostile archives --")
+    for name, archive_bytes in build_hostile_archives():
+        path = workdir / f"hostile-{name.replace(' ', '-')}.tar"
+        path.write_bytes(archive_bytes)
+        results.raises(
+            f"hostile archive refused: {name}",
+            "ProtocolError",
+            lambda p=path: cli.call("cp", str(p), "vm:/tmp/hostile", "--tar", *attach),
+        )
+
+    escaped = cli.call(
+        "exec",
+        "ls /escaped.txt /tmp/escaped.txt 2>&1 | head -3; echo done",
+        *attach,
+    )
+    listing = escaped.data.get("stdout") or ""
+    results.check(
+        "nothing escaped the extraction root",
+        "No such file" in listing or "cannot access" in listing,
+        repr(listing[:160]),
+    )
+
+
+def drive_streaming(cli: Cli, launched: Envelope, results: Results) -> None:
+    """`exec --stream`: five checks, and the question is about AWS rather than the daemon.
+
+    Streaming is the capability an agent harness needs and the one no local tier can fully
+    validate: whether AWS's endpoint proxy actually **forwards** Server-Sent Events rather
+    than buffering them until the command ends. Documentation says it does; this is the
+    check, and it is the reason this section is worth its cost.
+
+    `--exec-id` is what makes the last check possible: streaming must not consume the exec,
+    so the same id is polled afterwards and its buffered output must still be there.
+    """
+    print("\n-- streaming --")
+    attach = attach_args(cli, launched)
+
+    events, envelope = cli.call_stream(
+        "exec",
+        "for i in 1 2 3 4 5; do echo chunk-$i; done; echo done-streaming",
+        "--stream",
+        "--exec-id",
+        "stream1",
+        *attach,
+    )
+
+    outputs = [event for event in events if event.get("event") == "output"]
+    gaps = [event for event in events if event.get("event") == "gap"]
+    exits = [event for event in events if event.get("event") == "exit"]
+    streamed = "".join(str(event.get("text") or "") for event in outputs)
+
+    results.check(
+        "SSE reached us through the endpoint proxy",
+        bool(outputs),
+        f"{len(outputs)} chunk(s), {envelope.data.get('bytes')} bytes",
+    )
+    results.check(
+        "streamed output is complete and ordered",
+        "chunk-1" in streamed
+        and "chunk-5" in streamed
+        and "done-streaming" in streamed
+        and streamed.index("chunk-1") < streamed.index("chunk-5"),
+        repr(streamed[:160]),
+    )
+    results.check(
+        "no gap was reported for a small stream", not gaps, f"{len(gaps)} gap(s)"
+    )
+    # The terminal event is why SSE was chosen over a raw byte stream: without it a client
+    # cannot tell a finished command from a dropped connection. Asserted on the event
+    # itself rather than only on the envelope's summary, because the summary is derived
+    # from it and would agree with its own absence.
+    results.check(
+        "the terminal exit event carried the real exit code",
+        bool(exits) and exits[-1].get("exitCode") == 0,
+        repr(exits[-1] if exits else None),
+    )
+
+    # Streaming must not consume the exec: poll is a separate view onto the same
+    # server-side object.
+    polled = cli.call("exec", "--poll", "stream1", *attach)
+    results.check(
+        "the exec survived being streamed and is still pollable",
+        "done-streaming" in (polled.data.get("stdout") or ""),
+        repr((polled.data.get("stdout") or "")[:80]),
+    )
+
+
+def drive_stdin(cli: Cli, launched: Envelope, results: Results) -> None:
+    """stdin: five checks. `cat` cannot exit until stdin closes, so this fails by hanging.
+
+    That is the shape worth stating. If EOF never reaches the child, `cat` blocks until its
+    timeout — which is exactly the trap where `Child::wait()` drops its own stdin handle but
+    not the daemon's. So the `--timeout 30` is load-bearing: it turns a hang into a
+    reported failure inside half a minute rather than at the suite's outer deadline.
+
+    The refusal at the end is the opt-in property: a command that did not ask for stdin
+    must not have one, or every task command inherits a surprise open descriptor. The daemon
+    answers **409** for it (`agentd/src/exec.rs:700`) — the request is well-formed and it is
+    the exec that cannot accept it — which is a different fact from the 410 a write after
+    EOF gets, and the kind is what says which.
+    """
+    print("\n-- stdin --")
+    attach = attach_args(cli, launched)
+
+    # `exec --stdin` feeds this process's stdin and closes it. Fed through the shell rather
+    # than by writing to the child's stdin from Python, so the whole path — local read,
+    # chunked write, EOF on the last chunk — is the one under test.
+    proc = subprocess.run(
+        cli.argv(
+            "exec", "cat", "--stdin", "--exec-id", "cat1", "--timeout", "30", *attach
+        ),
+        input="hello via stdin\n",
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=120.0,
+    )
+    argv = cli.argv("exec", "cat", "--stdin")
+    cli.log.append(shlex.join(cli.argv("exec", "cat", "--stdin", "--exec-id", "cat1")))
+    echoed = Cli.parse_stdout(proc.stdout, argv)
+
+    results.check(
+        "stdin write accepted",
+        echoed.status == "ok",
+        f"status={echoed.status} code={echoed.code!r}",
+    )
+    results.check(
+        "stdin close accepted",
+        echoed.status == "ok" and echoed.data.get("exitCode") is not None,
+        f"exitCode={echoed.data.get('exitCode')!r}",
+    )
+    # The load-bearing pair. `cat` exiting at all *is* the EOF having arrived.
+    results.eq(
+        "a child reading stdin exits once stdin closes",
+        echoed.data.get("exitCode"),
+        0,
+    )
+    results.eq(
+        "stdin round-tripped through the child",
+        echoed.data.get("stdout"),
+        "hello via stdin\n",
+    )
+
+    # Opt-in: an exec started without `--stdin` has /dev/null on its stdin.
+    cli.call("exec", "true", "--exec-id", "nostdin", *attach)
+    results.raises(
+        "writing stdin to a command that did not request it is refused",
+        "Conflict",
+        lambda: cli.call("stdin", "nostdin", "--data", "x", *attach),
+    )
+
+
 def drive_suspend_resume(cli: Cli, launched: Envelope, results: Results) -> None:
     """Checks that a suspended sandbox comes back whole, driven entirely through the CLI.
 
     The evidence is the oracle's: a ticker writing epoch seconds once a second, and a gap in
-    *its* timestamps is the suspension as the guest experienced it. Every read here goes
-    through `microvm exec` rather than `upload_file`/`download_file`, which is why this
-    section survives the CLI's missing file surface at all — a shell redirect is a file
-    write, and `cat` is a file read.
+    *its* timestamps is the suspension as the guest experienced it. The reads go through
+    `microvm exec` — a shell redirect is a file write and `cat` is a file read — which is
+    how this section worked before `microvm cp` existed, and it stays that way: the file
+    surface has its own section now, and threading it through here would test it twice and
+    the suspension no better.
+
+    The ticker is started with a **stable id** so the pre-suspend exec record can be polled
+    after the resume. That check was a documented substitute before `--poll` existed; it is
+    now the assertion the oracle actually ran.
     """
     microvm_id = str(launched.data["microvmId"])
-    attach = [
-        "--endpoint",
-        str(launched.data["endpoint"]),
-        "--agent-token",
-        str(launched.data["agentToken"]),
-        "--microvm-id",
-        microvm_id,
-        "--region",
-        cli.region,
-    ]
+    attach = attach_args(cli, launched)
 
     print("\n== suspend / resume ==")
+    # Detached, so the ticker's exec record is left **unacked** — which makes the
+    # pre-suspend-record check below strictly stronger in two ways. An unacked entry has no
+    # collection deadline at all (`agentd/src/exec.rs:214`: "an unacked entry has no deadline
+    # and is never collected"), so its survival across the freeze is the daemon's registry
+    # being intact rather than a 15-minute TTL not having elapsed; and its output is still
+    # buffered, so the poll can assert the record came back *with* what it captured instead of
+    # only that it answered.
     cli.call(
         "exec",
         "nohup sh -c 'i=0; while [ $i -lt 3000 ]; do date +%s >> /tmp/ticks.txt; "
         "i=$((i+1)); sleep 1; done' >/dev/null 2>&1 & echo started",
+        "--exec-id",
+        "ticker",
+        "--detach",
         *attach,
     )
     cli.call("exec", "echo 'written before the suspend' > /tmp/survives.txt", *attach)
@@ -966,16 +1464,7 @@ def drive_suspend_resume(cli: Cli, launched: Envelope, results: Results) -> None
 
     # `resume` hands back the endpoint it read; re-attach through it rather than through
     # the launch's, so a changed endpoint is followed rather than silently failed on.
-    after = [
-        "--endpoint",
-        str(resumed.data["endpoint"]),
-        "--agent-token",
-        str(launched.data["agentToken"]),
-        "--microvm-id",
-        microvm_id,
-        "--region",
-        cli.region,
-    ]
+    after = attach_args(cli, launched, endpoint=str(resumed.data["endpoint"]))
 
     answered = None
     for _ in range(12):
@@ -1028,13 +1517,29 @@ def drive_suspend_resume(cli: Cli, launched: Envelope, results: Results) -> None
         f"ticks grew by {n2 - n1} over 6s after resume",
     )
 
-    # An exec record from before the suspend cannot be polled — no `microvm exec --poll`
-    # — so the ticker's *output* standing in is the honest substitute, and it is named
-    # as a substitute rather than as the check the oracle ran.
-    results.unsupported(
-        "an exec record from before the suspend survived",
-        "no `microvm exec --poll <id>`; the ticker's own output is checked instead",
-    )
+    # The oracle's own check, restored. The ticker was started before the suspend with a
+    # stable id, so polling it now asks the daemon for a record that existed on the other
+    # side of a freeze — and a poll is read-only, so this costs the ticker nothing. Before
+    # `--poll` existed this was a documented substitute (the ticker's *output* standing in
+    # for its record); the substitute is still asserted above, and this is the real thing.
+    #
+    # The ticker was started `--detach`, so its record is unacked: the assertion is on the
+    # *output it captured* coming back, not merely on the poll answering. An acked entry would
+    # answer with an empty `stdout` and this would pass on nothing.
+    survived_record = None
+    try:
+        survived_record = cli.call("exec", "--poll", "ticker", *after)
+    except (KindError, EnvelopeError) as exc:
+        results.check(
+            "an exec record from before the suspend survived", False, repr(exc)
+        )
+    if survived_record is not None:
+        results.check(
+            "an exec record from before the suspend survived",
+            "started" in (survived_record.data.get("stdout") or ""),
+            f"phase={survived_record.data.get('phase')!r} "
+            f"stdout={(survived_record.data.get('stdout') or '')[:40]!r}",
+        )
 
 
 def drive_teardown(cli: Cli, launched: Envelope, results: Results) -> None:
@@ -1112,10 +1617,28 @@ def read_daemon_logs(logs: Any, image_name: str) -> list[str]:
 #: is the *whole* path — argv construction, stdout capture, the exit-code cross-check,
 #: `json.loads` over the entire stream. A mock at the `run` boundary would skip the two
 #: that have actually been wrong.
+#:
+#: The `stream*` cases below are the additions the flip needed, and they are why the stub
+#: exists at all rather than the reader being tested against a string: `Cli.call_stream`'s
+#: whole job is asserting a *multi-line stdout shape*, and the four ways that shape can be
+#: wrong — envelope first, envelope pretty-printed across lines, a non-envelope last line,
+#: the wrong discriminant — are only reachable by a process that really writes them.
 STUB_SOURCE = '''#!/usr/bin/env python3
 """A fake `microvm` for conformance/run_rs.py --self-test. Emits canned envelopes."""
 import json
 import sys
+
+STREAM_ENVELOPE = {
+    "status": "ok", "apiVersion": "1", "type": "microvm.exec.stream",
+    "data": {"execId": "x-1", "events": 2, "bytes": 8, "nextOffset": 8,
+             "exitCode": 0, "truncated": False, "gaps": 0},
+}
+STREAM_EVENTS = [
+    {"event": "output", "stream": "stdout", "offset": 0, "bytes": 8,
+     "text": "chunk-1\\n", "lossy": False},
+    {"event": "exit", "exitCode": 0, "signal": None, "truncated": False,
+     "writersMayBeAlive": False, "offset": 8},
+]
 
 CASES = {
     "ok": ({"status": "ok", "apiVersion": "1", "type": "microvm.state",
@@ -1142,6 +1665,36 @@ CASES = {
     "mismatch": ({"status": "error", "apiVersion": "1", "error": "boom",
                   "code": "ERR_PLATFORM", "exitCode": 9, "finding": "",
                   "suggestions": [], "data": {}}, 7),
+    # The five attached commands, so the self-test drives the argv this suite now builds
+    # for each of them rather than only the lifecycle ones.
+    "health": ({"status": "ok", "apiVersion": "1", "type": "microvm.health",
+                "data": {"version": "0.1.0", "bootstrapped": True,
+                         "identityDegraded": False, "identityRepaired": True,
+                         "diskAvailableBytes": 1024, "diskUnderPressure": False}}, 0),
+    "ack": ({"status": "ok", "apiVersion": "1", "type": "microvm.exec",
+             "data": {"execId": "x-1", "phase": "acked", "exitCode": 0,
+                      "stdout": "released", "stderr": "", "truncated": False}}, 0),
+    "poll": ({"status": "ok", "apiVersion": "1", "type": "microvm.exec",
+              "data": {"execId": "x-1", "phase": "running", "exitCode": None,
+                       "stdout": "", "stderr": "", "truncated": False}}, 0),
+    # `exec --detach`: started, nothing waited on, nothing acked. Same envelope shape as
+    # a poll of a running exec, which is the point — one `render_exec` serves both, so a
+    # consumer needs one parser rather than two.
+    "detach": ({"status": "ok", "apiVersion": "1", "type": "microvm.exec",
+                "data": {"execId": "c1", "phase": "running", "exitCode": None,
+                         "stdout": "", "stderr": "", "truncated": False}}, 0),
+    # A poll of a detached exec that has since exited, with its output still buffered
+    # because nothing acked it. This is the shape `polling reads an exec without
+    # consuming it` reads, and the shape the first live round could not produce.
+    "polldone": ({"status": "ok", "apiVersion": "1", "type": "microvm.exec",
+                  "data": {"execId": "c1", "phase": "exited", "exitCode": 0,
+                           "stdout": "identity-live\\n", "stderr": "",
+                           "truncated": False}}, 0),
+    "stdinwrite": ({"status": "ok", "apiVersion": "1", "type": "microvm.stdin",
+                    "data": {"execId": "x-1", "written": 5, "eof": True}}, 0),
+    "cp": ({"status": "ok", "apiVersion": "1", "type": "microvm.copy",
+            "data": {"direction": "upload", "bytes": 28, "local": "./f",
+                     "remote": "/tmp/f", "tar": False}}, 0),
 }
 
 args = [a for a in sys.argv[1:] if not a.startswith("--")]
@@ -1158,6 +1711,59 @@ if case == "progress":
 if case == "notjson":
     print("error ERR_PROTOCOL: 409")
     raise SystemExit(5)
+
+# -- the NDJSON stream cases, and its four malformations ---------------------
+if case == "stream":
+    for event in STREAM_EVENTS:
+        print(json.dumps(event))
+    print(json.dumps(STREAM_ENVELOPE))
+    raise SystemExit(0)
+if case == "streamfailed":
+    # A streamed exec whose workload exited non-zero: a SUCCESS envelope with a
+    # non-zero code, exactly as the non-streaming case does.
+    envelope = json.loads(json.dumps(STREAM_ENVELOPE))
+    envelope["data"]["exitCode"] = 4
+    for event in STREAM_EVENTS[:1]:
+        print(json.dumps(event))
+    print(json.dumps({"event": "exit", "exitCode": 4, "signal": None,
+                      "truncated": False, "writersMayBeAlive": False, "offset": 8}))
+    print(json.dumps(envelope))
+    raise SystemExit(13)
+if case == "streamenvelopefirst":
+    # The envelope leading: a consumer reading line by line hits the terminator
+    # before any output and concludes the command produced none.
+    print(json.dumps(STREAM_ENVELOPE))
+    for event in STREAM_EVENTS:
+        print(json.dumps(event))
+    raise SystemExit(0)
+if case == "streampretty":
+    # The envelope pretty-printed, so the terminating record is nine broken lines.
+    for event in STREAM_EVENTS:
+        print(json.dumps(event))
+    print(json.dumps(STREAM_ENVELOPE, indent=2))
+    raise SystemExit(0)
+if case == "streamnoenvelope":
+    # Events and no terminator at all.
+    for event in STREAM_EVENTS:
+        print(json.dumps(event))
+    raise SystemExit(0)
+if case == "streamwrongtype":
+    # NDJSON with the NON-streaming discriminant, which is the subtle one: the shape
+    # is right and a consumer branching on `type` would pick the wrong parser.
+    envelope = json.loads(json.dumps(STREAM_ENVELOPE))
+    envelope["type"] = "microvm.exec"
+    for event in STREAM_EVENTS:
+        print(json.dumps(event))
+    print(json.dumps(envelope))
+    raise SystemExit(0)
+if case == "streamerror":
+    # A stream that failed part-way: the events written stay written, and the failure
+    # envelope is the last line.
+    print(json.dumps(STREAM_EVENTS[0]))
+    print(json.dumps({"status": "error", "apiVersion": "1", "error": "cut",
+                      "code": "ERR_RETRYABLE", "exitCode": 3, "finding": "",
+                      "suggestions": [], "data": {"kind": "Transport"}}))
+    raise SystemExit(3)
 
 document, code = CASES[case]
 print(json.dumps(document))
@@ -1311,6 +1917,196 @@ def self_test() -> int:
                 "the disagreement was accepted",
             )
 
+        # -- the NDJSON stream reader -----------------------------------------
+        #
+        # `Cli.call_stream` is the one function in this file with a contract of its own, so
+        # it gets the same treatment `Results.raises` got above: the happy path, then every
+        # way it can be vacuous. A reader that accepted any multi-line stdout would make
+        # all five streaming checks pass against a CLI that had stopped streaming.
+        events, envelope = cli.call_stream("stream")
+        results.eq("a stream yields its events and its envelope", len(events), 2)
+        results.eq(
+            "a stream's envelope carries the streaming discriminant",
+            envelope.type,
+            "microvm.exec.stream",
+        )
+        results.check(
+            "a stream's events are events rather than envelopes",
+            all("status" not in event for event in events)
+            and events[0].get("event") == "output"
+            and events[-1].get("event") == "exit",
+            repr([event.get("event") for event in events]),
+        )
+        results.eq(
+            "a stream's summary reports the event count",
+            envelope.data.get("events"),
+            2,
+        )
+
+        # A streamed exec whose workload failed keeps its success envelope and a non-zero
+        # `$?` — the `already_reported` case on the streaming path, which `call_stream` must
+        # not raise on for the same reason `call` must not.
+        results.ok(
+            "a failing streamed workload does not raise",
+            lambda: cli.call_stream("streamfailed"),
+        )
+
+        print(
+            "  -- probing that call_stream() can fail (each PROBE line below is expected) --"
+        )
+        stream_probe = Results(probe=True)
+        for case, why in (
+            ("streamenvelopefirst", "the envelope written first"),
+            ("streampretty", "a pretty-printed envelope spanning lines"),
+            ("streamnoenvelope", "no envelope at all"),
+            ("streamwrongtype", "the non-streaming discriminant"),
+        ):
+            try:
+                cli.call_stream(case)
+            except EnvelopeError as exc:
+                stream_probe.check(f"caught: {why}", False, str(exc)[:70])
+            else:
+                stream_probe.check(
+                    f"NOT caught: {why}", True, "accepted a broken shape"
+                )
+        results.eq(
+            "call_stream() rejects all four malformed stream shapes",
+            len(stream_probe.failed),
+            4,
+        )
+        results.eq("and accepts none of them", len(stream_probe.passed), 0)
+
+        # A stream that failed mid-way raises with its kind, and the events already written
+        # are not the driver's problem — the failure is.
+        results.raises(
+            "a mid-stream failure raises with the daemon's kind",
+            "Transport",
+            lambda: cli.call_stream("streamerror"),
+        )
+
+        # -- the five attached commands' argv round-trips ----------------------
+        #
+        # Cheap, and it covers the one thing the live tier discovers expensively: an argv
+        # this suite builds that the CLI does not accept. The stub answers by its first
+        # non-flag argument, so what is exercised here is `Cli.call`'s construction and the
+        # envelope shape each section reads — not the CLI's parser, which `tests/manifest.rs`
+        # covers at the process boundary.
+        for case, kind, key in (
+            ("health", "microvm.health", "bootstrapped"),
+            ("ack", "microvm.exec", "phase"),
+            ("poll", "microvm.exec", "phase"),
+            ("stdinwrite", "microvm.stdin", "written"),
+            ("cp", "microvm.copy", "direction"),
+        ):
+            got = cli.call(case)
+            results.check(
+                f"the {case} envelope parses with its own discriminant",
+                got.type == kind and key in got.data,
+                f"type={got.type!r} keys={sorted(got.data)}",
+            )
+        # A running exec's poll: `exitCode` is present and null, which is the shape
+        # `--poll`'s "polling is not a failure" contract produces. Asserted because a
+        # *missing* key and a null one read the same way in a permissive consumer, and this
+        # suite's identity section branches on it.
+        polled = cli.call("poll")
+        results.check(
+            "a running exec polls as a success with a present-but-null exit code",
+            "exitCode" in polled.data and polled.data["exitCode"] is None,
+            repr(polled.data),
+        )
+
+        # -- the start/poll/ack decomposition `--detach` restores ---------------
+        #
+        # The shape the first live round could not produce. `exec` without `--detach` acks
+        # its own output, so `ack accepted` got a 409 and `polling reads an exec without
+        # consuming it` read `''`. What is checked here is that the driver's *reading* of the
+        # three-step sequence is right — a detached start reports `running` with no verdict,
+        # a later poll finds the exec exited with its output still buffered, and only then is
+        # there anything for an ack to release.
+        detached = cli.call("detach")
+        results.check(
+            "a detached start reports running with no verdict yet",
+            detached.data.get("phase") == "running"
+            and detached.data.get("exitCode") is None
+            and detached.data.get("execId") == "c1",
+            repr(detached.data),
+        )
+        done = cli.call("polldone")
+        results.check(
+            "a detached exec's output is still readable when it exits",
+            done.data.get("phase") == "exited"
+            and "identity-live" in (done.data.get("stdout") or ""),
+            repr(done.data),
+        )
+        # And the loop condition the identity section uses to wait for it: `phase != running`
+        # is the exit test, so a `running` poll must not satisfy it and an `exited` one must.
+        results.check(
+            "the poll loop's exit condition distinguishes running from exited",
+            cli.call("poll").data.get("phase") == "running"
+            and done.data.get("phase") != "running",
+            "running poll keeps looping, exited poll breaks",
+        )
+
+        # -- the four hostile archives really are hostile ----------------------
+        #
+        # Offline, and worth having offline: these are built with `tarfile` precisely
+        # because GNU tar sanitizes them, and an archive that had been silently sanitized
+        # would make four live checks pass against nothing. So the *bytes* are inspected
+        # here — with `tarfile` reading them back, which is the only reader that can see a
+        # member type — before any of them is ever handed to a real daemon.
+        import io
+        import tarfile
+
+        archives = dict(build_hostile_archives())
+        results.eq("all four hostile archives are built", len(archives), 4)
+
+        def members(name: str) -> list[tarfile.TarInfo]:
+            with tarfile.open(fileobj=io.BytesIO(archives[name]), mode="r") as tar:
+                return list(tar.getmembers())
+
+        traversal = members("parent traversal")
+        results.check(
+            "the traversal archive really escapes the root",
+            any(".." in member.name for member in traversal),
+            repr([member.name for member in traversal]),
+        )
+        absolute = members("absolute link target")
+        results.check(
+            "the absolute-link archive really names an absolute target",
+            any(
+                member.issym() and member.linkname.startswith("/")
+                for member in absolute
+            ),
+            repr([(member.name, member.linkname) for member in absolute]),
+        )
+        redirect = members("symlink redirect")
+        results.check(
+            "the redirect archive is a link to .. plus a file through it",
+            any(member.issym() and member.linkname == ".." for member in redirect)
+            and any(member.isfile() for member in redirect),
+            repr([(member.name, member.type) for member in redirect]),
+        )
+        device = members("character device")
+        results.check(
+            "the device archive really carries a character device",
+            any(member.ischr() for member in device),
+            repr([(member.name, member.type) for member in device]),
+        )
+
+        # -- the skip primitive still works, with no live caller ---------------
+        #
+        # `Results.skip` has no caller in the live path any more: the 34 entries it used to
+        # print became real checks. Exercised here against a throwaway `Results` so it
+        # cannot rot into a function that no longer runs — the next inexpressible check
+        # needs somewhere to be recorded, and a primitive nothing ever calls is one nobody
+        # notices has broken.
+        skip_probe = Results()
+        skip_probe.skip("a future gap", "recorded rather than silent")
+        results.eq(
+            "the skip primitive records rather than passing", len(skip_probe.skipped), 1
+        )
+        results.eq("and does not count as a pass", len(skip_probe.passed), 0)
+
         print("\n== self-test summary ==")
         print(f"  passed: {len(results.passed)}")
         print(f"  failed: {len(results.failed)}")
@@ -1391,7 +2187,12 @@ def main() -> int:
         dockerfile.write_text(conformance_dockerfile(resolve_base_ref()))
 
         try:
-            record_unsupported(results)
+            # `record_unsupported(results)` was here, printing 34 SKIP lines before
+            # anything was launched so a reader knew what the run would not tell them
+            # *while* it spent money. Every one of those became a real check when the CLI
+            # grew the five surfaces `docs/CLI-COVERAGE-PLAN.md` names, so there is nothing
+            # left to announce. The summary still prints a skip count, which should read
+            # zero — see `Results.skip`.
             drive_local_commands(cli, results)
             launched = drive_lifecycle(cli, binary, dockerfile, results)
 
@@ -1409,6 +2210,18 @@ def main() -> int:
             drive_daemon_lane(daemon, results)
 
             drive_exec(cli, launched, results)
+            drive_health(cli, launched, results)
+            drive_exec_identity(cli, launched, results)
+            drive_streaming(cli, launched, results)
+            drive_stdin(cli, launched, results)
+            drive_file_transfer(cli, launched, results, Path(tmp))
+            # The cap trio *after* the file and stream sections, deliberately: it pushes
+            # 32 MiB through the guest and asserts the daemon survived, so anything that
+            # ran before it is evidence the survival claim is about a daemon that was
+            # already doing real work — and anything after it would be confounded by it.
+            drive_output_cap(cli, launched, results)
+            # Suspend/resume last, because it is the only section that changes the VM's
+            # state for forty seconds and every section above wants a running one.
             drive_suspend_resume(cli, launched, results)
 
             print("\n== daemon logs ==")
@@ -1440,14 +2253,37 @@ def main() -> int:
     print("\n== summary ==")
     print(f"  passed:  {len(results.passed)}")
     print(f"  failed:  {len(results.failed)}")
-    print(f"  skipped: {len(results.skipped)} (no subcommand on this client)")
+    print(f"  skipped: {len(results.skipped)}")
     for name, detail in results.failed:
         print(f"    FAIL {name}: {detail}")
+    for name, reason in results.skipped:
+        print(f"    SKIP {name}: {reason}")
+
+    # `expressed` counts every check that ran either way, so the denominator is what this
+    # suite *attempted* rather than what it managed. A failing check is still an expressed
+    # one — the coverage claim and the pass/fail verdict are different facts, and folding
+    # them would make a red run look like a narrower suite.
+    expressed = len(results.passed) + len(results.failed)
+    total = expressed + len(results.skipped)
     print(
-        f"\n  {len(results.passed)} of {len(results.passed) + len(results.skipped)} named checks "
-        "are expressible through this client. The rest were the deleted Python\n"
-        "  oracle's, and no live suite covers them now — see this file's docstring."
+        f"\n  {expressed} of {total} named checks are expressible through this client."
     )
+    if results.skipped:
+        # Never reached today, and the branch stays: the moment a surface goes away or a
+        # check becomes inexpressible again, this is the line that says so instead of the
+        # count quietly shrinking.
+        print(
+            f"  {len(results.skipped)} are not, and each is named above with the surface "
+            "that would have to grow."
+        )
+    else:
+        print(
+            "  The 34 the deleted Python oracle alone could reach — file transfer, tar "
+            "round trips,\n  the four hostile archives, SSE ordering, the stdin lifecycle, "
+            "double-ack, the 8 MiB cap\n  trio, the identity-repair flags — are live checks "
+            "now, under the names run.py gave them.\n  This report diffs line for line "
+            "against the last oracle run in git history."
+        )
     print("\n  every invocation, for reproducing a failure by hand:")
     for line in cli.log:
         print(f"    {line}")

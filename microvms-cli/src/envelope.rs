@@ -29,6 +29,29 @@
 //! five [`microvms_core::WireKind`]s. `conformance/run_rs.py` asserts at the oracle's
 //! granularity (`Conflict` versus `NotFound`), so the fine kind travels in `data` where a
 //! shell need not look at it and a driver can.
+//!
+//! # `exec --stream` is the one named exception, and it is a different discriminant
+//!
+//! One invocation in this binary writes more than one object to stdout: a streamed exec emits
+//! **NDJSON** — one JSON object per event, then the envelope last. That is not a relaxation of
+//! CLI-4 but a second, narrower contract, and three things keep the two distinguishable.
+//!
+//! First, the *discriminant differs*: the final envelope's `type` is `microvm.exec.stream`, never
+//! `microvm.exec`. A consumer branching on `type` — which is the first field it reads — learns
+//! which parse applies from information it already has.
+//!
+//! Second, the manifest publishes it. `microvm manifest` names the streaming response type beside
+//! the ordinary one and states the exception in its `conventions` list, so a consumer discovers
+//! the shape rather than encountering it.
+//!
+//! Third, the envelope is written **compact** once a stream has started ([`Output::stream_line`]
+//! sets that), because "the last line is the envelope" is only true if the envelope is one line.
+//! A pretty-printed document at the end of an NDJSON stream would be seven broken records.
+//!
+//! Why the events cannot go on stderr instead, which would preserve the simpler rule: they are
+//! the command's **output**, not progress about it. Sending a workload's stdout to the caller's
+//! stderr would make `microvm exec --stream build.sh > log` write an empty log, and buffering the
+//! events to keep stdout a single document would remove the only reason to stream at all.
 
 use std::io::{IsTerminal, Write};
 
@@ -79,6 +102,13 @@ pub struct Output<O: Write, E: Write> {
     stderr: E,
     /// Set by [`Output::emit`], read by the drop check below.
     emitted: bool,
+    /// Set by [`Output::stream_line`]: an NDJSON stream is in progress on stdout.
+    ///
+    /// Two effects, and both are what keeps the streaming exception readable. It relaxes the
+    /// `debug_assert` in [`Output::emit`] — a stream's envelope is legitimately not the first
+    /// thing written — and it forces that envelope **compact**, because "the last line is the
+    /// envelope" is only a true sentence when the envelope occupies one line.
+    streaming: bool,
 }
 
 impl<O: Write, E: Write> Output<O, E> {
@@ -90,6 +120,7 @@ impl<O: Write, E: Write> Output<O, E> {
             stdout,
             stderr,
             emitted: false,
+            streaming: false,
         }
     }
 
@@ -133,6 +164,15 @@ impl<O: Write, E: Write> Output<O, E> {
             "a second envelope reached stdout in one invocation, which breaks CLI-4"
         );
         self.emitted = true;
+        // A stream's envelope is the last line of an NDJSON document, so it has to be one line.
+        // Pretty-printing it would turn the terminating record into seven broken ones, and the
+        // property `conformance/run_rs.py` asserts — "every line before the last parses as an
+        // event, the last parses as the envelope" — would be false for a correct stream.
+        if self.streaming && self.format.is_json() {
+            let _ = writeln!(self.stdout, "{envelope}");
+            let _ = self.stdout.flush();
+            return;
+        }
         match self.format {
             Format::Json => {
                 // Compact under `--dense`'s sibling flag combination is handled by
@@ -164,6 +204,51 @@ impl<O: Write, E: Write> Output<O, E> {
             return;
         }
         self.emit(envelope, text);
+    }
+
+    /// One NDJSON record of a streamed exec's output. See the module docs.
+    ///
+    /// Writes the compact document plus a newline and flushes, so a consumer reading line by line
+    /// sees each event as it happens rather than when a buffer fills — which is the whole point of
+    /// streaming, and is the difference between this and building a string.
+    ///
+    /// Deliberately **not** routed through [`Output::emit`]: emit's contract is one write per
+    /// invocation, and a method that could be called repeatedly through it would make that
+    /// contract unenforceable for every other command. Separate method, separate flag, and
+    /// `emitted` stays false — the envelope written afterwards is still emit's single write.
+    ///
+    /// A non-JSON format writes nothing here: the plain and dense paths render a streamed exec
+    /// exactly as a waited one, because a human reading a terminal wants the output and not a
+    /// transcript of the event framing. Only `--json` (and a pipe asking for it) gets NDJSON.
+    pub fn stream_line(&mut self, event: &Value) {
+        if !self.format.is_json() {
+            return;
+        }
+        self.streaming = true;
+        let _ = writeln!(self.stdout, "{event}");
+        let _ = self.stdout.flush();
+    }
+
+    /// Raw bytes of a streamed exec's output, for the human formats.
+    ///
+    /// Written to stdout because that is what the bytes *are* — the workload's own stdout — so
+    /// `microvm exec --stream ./build > log` has to fill `log`. Bytes rather than a string:
+    /// a child's output is not guaranteed UTF-8, and a lossy conversion in the one path whose
+    /// job is faithful delivery would corrupt exactly the case that needs it (a tarball on
+    /// stdout, a binary diff).
+    ///
+    /// No flag is set: this stream carries no JSON, so nothing about the envelope changes.
+    pub fn stream_bytes(&mut self, bytes: &[u8]) {
+        if self.format.is_json() {
+            return;
+        }
+        let _ = self.stdout.write_all(bytes);
+        let _ = self.stdout.flush();
+    }
+
+    /// Whether an NDJSON stream has been started on stdout.
+    pub fn streaming(&self) -> bool {
+        self.streaming
     }
 
     /// Whether anything has been written to stdout yet.

@@ -20,6 +20,7 @@
 //! dispatcher emits the envelope and *then* reads the field, so a second envelope is not
 //! merely discouraged: there is no code path that could write one.
 
+pub mod attached;
 pub mod cost;
 pub mod doctor;
 pub mod lifecycle;
@@ -98,7 +99,7 @@ pub struct Ctx<'a, O: Write, E: Write> {
 /// command added without an entry fails rather than shipping undescribed. That check is the
 /// only thing that keeps this table from being the hand-maintained artifact the manifest is
 /// forbidden to be.
-pub const RESPONSE_TYPES: [(&str, &str, &[&str]); 12] = [
+pub const RESPONSE_TYPES: [(&str, &str, &[&str]); 16] = [
     (
         "run",
         "microvm.run",
@@ -127,7 +128,44 @@ pub const RESPONSE_TYPES: [(&str, &str, &[&str]); 12] = [
     (
         "exec",
         "microvm.exec",
-        &["execId", "exitCode", "stdout", "stderr", "truncated"],
+        &[
+            "execId",
+            "exitCode",
+            "stdout",
+            "stderr",
+            "truncated",
+            "phase",
+        ],
+    ),
+    (
+        "health",
+        "microvm.health",
+        &[
+            "version",
+            "bootstrapped",
+            "identityDegraded",
+            "identityRepaired",
+            "diskAvailableBytes",
+            "diskUnderPressure",
+        ],
+    ),
+    (
+        "ack",
+        "microvm.exec",
+        &[
+            "execId",
+            "phase",
+            "exitCode",
+            "stdout",
+            "stderr",
+            "truncated",
+        ],
+    ),
+    ("stdin", "microvm.stdin", &["execId", "written", "eof"]),
+    (
+        "cp",
+        "microvm.copy",
+        &["direction", "bytes", "local", "remote", "tar"],
     ),
     ("suspend", "microvm.state", &["microvmId", "state"]),
     (
@@ -165,6 +203,34 @@ pub const RESPONSE_TYPES: [(&str, &str, &[&str]); 12] = [
     ),
     ("constants", "microvm.constants", &["constants"]),
 ];
+
+/// The discriminant `exec --stream` emits instead of `microvm.exec`, and the keys it carries.
+///
+/// # Why a second row rather than a flag on the first
+///
+/// `exec --stream` is the one invocation in this binary that writes more than one JSON object to
+/// stdout: one NDJSON line per event, then the envelope last. An agent handed a `microvm.exec`
+/// envelope is entitled to assume the whole of stdout was that envelope — that is what CLI-4
+/// promises — so the streaming shape has to announce itself with a **different discriminant**
+/// rather than the same one with an extra key. A consumer branching on `type` therefore learns
+/// which parse to use from the field it already reads first.
+///
+/// The keys are a *summary* rather than the output: the output was the NDJSON, and repeating it in
+/// the envelope would double a stream's memory cost for a consumer that has already seen every
+/// byte. `events` and `bytes` are what let a caller assert it read everything, and `nextOffset` is
+/// where a resume would continue.
+pub const STREAM_RESPONSE: (&str, &[&str]) = (
+    "microvm.exec.stream",
+    &[
+        "execId",
+        "events",
+        "bytes",
+        "nextOffset",
+        "exitCode",
+        "truncated",
+        "gaps",
+    ],
+);
 
 /// The `type` and `data` keys for `name`, or empty when the table has no row.
 ///

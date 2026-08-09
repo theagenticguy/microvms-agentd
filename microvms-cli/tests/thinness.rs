@@ -41,7 +41,7 @@ use std::path::{Path, PathBuf};
 /// An allowlist. See the module docs on why a denylist is not good enough. The reason strings are
 /// not decorative: this test asserts each is a real sentence, so a seventh entry cannot be added
 /// without someone writing down what it is for.
-const ALLOWED: [(&str, &str); 7] = [
+const ALLOWED: [(&str, &str); 8] = [
     (
         "microvms-core",
         "the product surface: every AWS call, every trap closure, the cost engine, the taxonomy",
@@ -53,6 +53,14 @@ const ALLOWED: [(&str, &str); 7] = [
     (
         "clap",
         "the command tree, which is the manifest's only source and the CLI-5 closed sets",
+    ),
+    (
+        "futures-util",
+        "the `Stream` trait `ExecHandle::stream_with` returns; core does not re-export it, and \
+         this crate cannot advance a stream without naming the trait's defining crate. A trait \
+         definition rather than a capability: it opens no socket and knows nothing about AWS, so \
+         it cannot be the second path to the control plane CLI-2 forbids. Removable once core \
+         grows a callback driver — packet gap C3-1",
     ),
     (
         "ratatui",
@@ -111,7 +119,7 @@ fn manifest_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml")
 }
 
-/// **The exact dependency set.** Six normal dependencies plus the one dev-dependency, and nothing
+/// **The exact dependency set.** Seven normal dependencies plus the one dev-dependency, and nothing
 /// else.
 ///
 /// The requirement under test, stated as an equality rather than as an absence. `cargo metadata`
@@ -153,8 +161,9 @@ fn the_direct_dependency_set_is_exactly_the_allowed_one() {
         allowed,
         "the CLI's dependency set changed. Added: {:?}. Removed: {:?}. CLI-2 says this crate \
          reaches AWS through microvms-core and nothing else, so a new dependency needs a line in \
-         ALLOWED saying what it is for — and if it is an HTTP or AWS crate, it needs a different \
-         design instead.",
+         ALLOWED saying what it is for — a real paragraph, on the terms CLI-2 is about: can this \
+         crate open a socket or sign a request with it? If it is an HTTP or AWS crate, it needs a \
+         different design instead.",
         actual
             .iter()
             .filter(|name| !allowed.contains(name))

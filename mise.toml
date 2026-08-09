@@ -225,19 +225,28 @@ run = "terraform -chdir=conformance/infra init -input=false && terraform -chdir=
 # discovered them.
 
 [tasks."live:conformance-rs"]
-description = "The live suite through the Rust client: 38 of the oracle's 56 checks, plus the CLI's own"
+description = "The live suite through the Rust client: all 75 checks, no SKIP"
 depends = ["build", "build:cli", "live:infra"]
 # Both binaries: `--binary` is the aarch64 daemon that gets baked into the image, and
 # `--microvm-binary` is the host-architecture CLI under test. Naming both is what makes the
 # two-target split above visible at the call site rather than only in a comment.
 #
-# 38 rather than 56, and the number is in the description on purpose. The CLI's `exec` is
-# one-shot with a generated exec id and there is no `microvm cp`, `ack`, `exec --stream`, or
-# `stdin` — so file transfer, tar round trips, the four hostile archives, SSE, stdin
-# lifecycle, and the health flags are not expressible through this client. The suite prints
-# each of the 34 it cannot express as SKIP with the missing subcommand named. Nothing runs
-# those 34 against real AWS now; `microvms-core`'s local tiers cover the same surfaces
-# against fakes. A description claiming 56 would be the more comfortable lie.
+# This description read "38 of the oracle's 56 checks" for a release, and the number was in
+# it on purpose: the CLI's `exec` was one-shot with a generated exec id and there was no
+# `microvm cp`, `ack`, `exec --stream`, or `stdin`, so file transfer, tar round trips, the
+# four hostile archives, SSE, the stdin lifecycle, and the health flags were not expressible
+# through this client. The suite printed each of the 34 as SKIP with the missing subcommand
+# named, and a description claiming 56 would have been the more comfortable lie.
+#
+# `docs/CLI-COVERAGE-PLAN.md` grew the five doors — `health`, exec identity
+# (`--exec-id`/`--poll`), `ack`, `cp` (+`--tar`), `--stream`, `stdin` — and every SKIP became
+# a real check under the name run.py gave it. 75 rather than 72 because two of the old 38
+# were weak readings off the launch envelope and are now asserted directly against
+# `microvm health`; the suite's own docstring names all three deltas.
+#
+# The number stays in the description for the same reason it did when it was 38: this task's
+# one line is where someone decides whether to trust the tier, and "the live suite" without
+# a count is a sentence that stays true while coverage shrinks.
 run = """
 ./conformance/run_rs.py \
   --binary target/$AGENTD_TARGET/release/agentd \
@@ -290,7 +299,9 @@ description = "Every live suite, then an independent leak check. BILLABLE."
 # client, and the Python tier moved to git history after the Rust port went live-green:
 # both suites passed against real AWS on the same commit, so the oracle's job was
 # finished rather than duplicated. `live:conformance-rs` is now the whole of the live
-# protocol coverage, and it is honest about the 34 checks it cannot express.
+# protocol coverage, and as of the CLI-coverage waves it expresses all 75 named checks
+# with none skipped — the 34 it used to name as inexpressible are real checks against the
+# five new attached subcommands.
 depends = ["live:rates", "live:conformance-rs", "live:verify-clean"]
 # Records the commit that was last proven against real AWS. The pre-push hook
 # reads it to tell you whether the daemon has changed since — advisory only,

@@ -38,6 +38,28 @@ pub fn build() -> Value {
         .map(|sub| {
             let name = sub.get_name();
             let (kind, keys) = response_type(name);
+            // `exec --stream` answers with a different discriminant and a different stdout shape,
+            // so the manifest publishes both rather than describing one and leaving the other to
+            // be discovered. Generated from the same command tree — the flag's presence is what
+            // decides, so a `--stream` removed from `exec` takes this with it.
+            let streaming = sub
+                .get_arguments()
+                .any(|arg| arg.get_long() == Some("stream"));
+            let alternate = streaming.then(|| {
+                let (stream_kind, stream_keys) = crate::commands::STREAM_RESPONSE;
+                json!({
+                    "when": "--stream",
+                    "responseType": stream_kind,
+                    "responseKeys": stream_keys,
+                    // The one place the exception is stated as a machine-readable fact rather
+                    // than as prose in a conventions string. A consumer that reads this knows to
+                    // parse stdout line by line before it ever sees the first line.
+                    "stdout": "ndjson — one event object per line, then this envelope as the \
+                               final line. The documented exception to the one-envelope rule: \
+                               stream chunks are the command's output, not progress, so they \
+                               cannot go on stderr.",
+                })
+            });
             json!({
                 "name": name,
                 // The first line of the doc comment, which clap keeps as `about`. The rest is
@@ -47,6 +69,10 @@ pub fn build() -> Value {
                 "supportsJson": true,
                 "responseType": kind,
                 "responseKeys": keys,
+                // Null for every command but `exec`, and present-and-null rather than absent for
+                // the same reason the failure envelope's `finding` is: a key that appears
+                // conditionally is a key every consumer has to guard.
+                "alternateResponse": alternate,
             })
         })
         .collect();
@@ -91,6 +117,14 @@ pub fn build() -> Value {
             // an agent that needs finer granularity than the exit code reads it there.
             "`data.kind` carries the daemon's own status name when the exit code is coarser \
              than the failure (ERR_PROTOCOL covers five)",
+            // The sixth, and the one that qualifies the first. Stated here as well as in `exec`'s
+            // `alternateResponse` because these two lists are read by different consumers: an
+            // agent choosing a command reads the command entry, and one writing a parser reads
+            // the conventions.
+            "`exec --stream` is the one exception to the line above: it writes NDJSON — one \
+             event object per line — and this envelope as the final line, with the \
+             discriminant `microvm.exec.stream` rather than `microvm.exec`. Every other \
+             invocation writes exactly one object",
         ],
     })
 }
@@ -241,7 +275,60 @@ mod tests {
             .map(|sub| sub.get_name().to_string())
             .collect();
         assert_eq!(listed, registered);
-        assert_eq!(listed.len(), 12, "eleven Python commands plus constants");
+        assert_eq!(
+            listed.len(),
+            16,
+            "the lifecycle six, the attached five, and the local five"
+        );
+    }
+
+    /// **`exec` publishes its streaming shape and no other command claims one.**
+    ///
+    /// The exception has to be discoverable or it is not an exception, it is a surprise. Asserted
+    /// in both directions: a `--stream` added to another command without a response row would
+    /// publish a second NDJSON shape nobody documented, and an `exec` that lost the entry would
+    /// leave a consumer parsing an NDJSON stream as one document.
+    #[test]
+    fn only_exec_publishes_an_alternate_streaming_response() {
+        let manifest = build();
+        let mut found = 0;
+        for command in manifest["commands"].as_array().expect("an array") {
+            let name = command["name"].as_str().unwrap_or_default();
+            let alternate = &command["alternateResponse"];
+            if name == "exec" {
+                assert_eq!(alternate["when"], "--stream");
+                assert_eq!(alternate["responseType"], "microvm.exec.stream");
+                assert_ne!(
+                    alternate["responseType"], command["responseType"],
+                    "the streaming shape must be a *different* discriminant, or a consumer \
+                     branching on `type` cannot tell which parse applies"
+                );
+                assert!(
+                    alternate["stdout"]
+                        .as_str()
+                        .expect("a description")
+                        .contains("ndjson"),
+                    "{alternate}"
+                );
+                assert!(
+                    !alternate["responseKeys"]
+                        .as_array()
+                        .expect("an array")
+                        .is_empty()
+                );
+                found += 1;
+            } else {
+                assert_eq!(
+                    *alternate,
+                    Value::Null,
+                    "{name} publishes an alternate response shape nothing documents"
+                );
+            }
+        }
+        assert_eq!(
+            found, 1,
+            "exec must be in the manifest for this to mean anything"
+        );
     }
 
     /// Every exit row reaches the manifest with its code, meaning, and finding.
@@ -398,16 +485,32 @@ mod tests {
         assert_eq!(keep["choices"], Value::Null);
     }
 
-    /// The conventions include the two honesty rules and the `data.kind` note.
+    /// The conventions include the two honesty rules, the `data.kind` note, and the one exception.
     #[test]
-    fn the_conventions_name_the_honesty_rules() {
+    fn the_conventions_name_the_honesty_rules_and_the_streaming_exception() {
         let conventions: Vec<String> = build()["conventions"]
             .as_array()
             .expect("an array")
             .iter()
             .map(|value| value.as_str().unwrap_or_default().to_string())
             .collect();
-        assert_eq!(conventions.len(), 5);
+        assert_eq!(conventions.len(), 6);
+        // The exception has to be *stated*, and it has to name the discriminant a consumer uses to
+        // detect it. A convention saying only "exec --stream is different" would leave a parser
+        // author guessing at how to tell.
+        let exception = conventions
+            .iter()
+            .find(|line| line.contains("--stream"))
+            .expect("the one exception to the one-envelope rule must be written down");
+        assert!(
+            exception.contains("ndjson") || exception.contains("NDJSON"),
+            "{exception}"
+        );
+        assert!(
+            exception.contains("microvm.exec.stream"),
+            "the convention must name the discriminant, which is how a consumer detects it: \
+             {exception}"
+        );
         assert!(
             conventions.iter().any(|line| line.contains("omits `usd`")),
             "{conventions:?}"
@@ -429,17 +532,27 @@ mod tests {
     fn the_human_rendering_names_every_command_and_exit_code() {
         let manifest = build();
         let rendered = render(&manifest, false);
-        for name in ["run", "build", "exec", "manifest", "constants"] {
+        for name in [
+            "run",
+            "build",
+            "exec",
+            "health",
+            "ack",
+            "stdin",
+            "cp",
+            "manifest",
+            "constants",
+        ] {
             assert!(rendered.contains(name), "{name} missing from {rendered}");
         }
         for code in ["ERR_INVALID_ARG", "ERR_EXEC_FAILED", "ERR_INTERRUPTED"] {
             assert!(rendered.contains(code), "{code} missing");
         }
-        assert!(rendered.contains("12 commands"), "{rendered}");
+        assert!(rendered.contains("16 commands"), "{rendered}");
 
         // The dense rendering is one line per command with its parameters.
         let dense = render(&manifest, true);
-        assert_eq!(dense.lines().count(), 12);
+        assert_eq!(dense.lines().count(), 16);
         assert!(
             dense
                 .lines()

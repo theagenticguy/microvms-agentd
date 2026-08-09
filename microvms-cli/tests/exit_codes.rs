@@ -207,6 +207,141 @@ fn a_success_with_progress_enabled_writes_one_json_document_on_stdout() {
     assert!(envelope["data"]["report"]["items"].is_array());
 }
 
+/// **The stream variant of the purity rule, at the process boundary.**
+///
+/// `exec --stream` is the one invocation allowed more than one object on stdout, and the shape has
+/// to be exact: every line before the last parses as an event, the last parses as the envelope.
+/// `conformance/run_rs.py` asserts that against real AWS; this asserts the *failure* half of it
+/// locally, which is the half a live run cannot reach cheaply.
+///
+/// The driver is a stream that never gets a session: `exec --stream` against an endpoint that does
+/// not resolve fails before the first event, so stdout carries exactly one document — the failure
+/// envelope. That is the property under test. A streaming command that emitted a partial NDJSON
+/// record before failing, or a progress line on stdout because "the stream path is different", would
+/// both break the parse here.
+///
+/// # Why the success path is not driven from here
+///
+/// It needs a daemon to stream from. `src/guards.rs` drives it against a scripted backend — where
+/// the events, their order, and the compact final envelope are all asserted — and the live tier
+/// drives it against a real one. What this file adds is the claim only a spawned child can make:
+/// that the shape survives into real file descriptors with progress interleaved on the other one.
+///
+/// **Falsification** — write a `println!` of the event count into `stream_exec` and this goes red on
+/// the parse. Verified; see the packet's guard proofs.
+#[test]
+fn a_streamed_exec_that_fails_before_any_event_writes_one_document_on_stdout() {
+    let outcome = run(
+        &[
+            "exec",
+            "true",
+            "--stream",
+            "--endpoint",
+            // A port nothing listens on, so the attach fails at the transport rather than at a
+            // credential — no account is involved and the test is deterministic offline.
+            "http://127.0.0.1:1",
+            "--agent-token",
+            "t",
+            "--microvm-id",
+            "mvm-1",
+            "--region",
+            "us-east-1",
+            "--timeout",
+            "1",
+            "--json",
+        ],
+        &[],
+    );
+    // Whatever the failure class, stdout is exactly one JSON document and nothing else. The parse
+    // *is* the assertion; `envelope()` panics with both streams on any stray write.
+    let envelope = outcome.envelope();
+    assert_eq!(envelope["status"], "error", "{envelope}");
+    assert_ne!(outcome.exit_code(), 0);
+    // And the envelope's own code agrees with `$?`, which is CLI-3 holding on the streaming path
+    // too — the one path where the failure envelope is written by a different branch of `report`.
+    assert_eq!(
+        envelope["exitCode"],
+        outcome.exit_code(),
+        "the streaming failure path must keep the two renderings in step"
+    );
+    // Not a single NDJSON record: nothing streamed, so nothing should have been written as though
+    // it had. A line here would mean an event record was emitted for an event that never arrived.
+    assert_eq!(
+        outcome.stdout.lines().count(),
+        serde_json::to_string_pretty(&envelope)
+            .expect("re-serializes")
+            .lines()
+            .count(),
+        "stdout is the envelope and nothing else: {}",
+        outcome.stdout
+    );
+}
+
+/// The manifest publishes the streaming exception, read off the real binary.
+///
+/// The in-crate test asserts the generator; this asserts the *binary an agent runs* — which is the
+/// difference that matters for a discoverability claim. An agent cannot be expected to know about
+/// NDJSON from a doc comment it never sees.
+#[test]
+fn the_binary_publishes_the_streaming_exception_in_its_manifest() {
+    let outcome = run(&["manifest", "--json"], &[]);
+    assert_eq!(outcome.exit_code(), 0);
+    let manifest = outcome.envelope()["data"].clone();
+
+    let exec = manifest["commands"]
+        .as_array()
+        .expect("an array")
+        .iter()
+        .find(|command| command["name"] == "exec")
+        .expect("exec is listed")
+        .clone();
+    assert_eq!(exec["responseType"], "microvm.exec");
+    assert_eq!(exec["alternateResponse"]["when"], "--stream");
+    assert_eq!(
+        exec["alternateResponse"]["responseType"], "microvm.exec.stream",
+        "the streaming shape must announce itself with a different discriminant: {exec}"
+    );
+
+    // And the conventions name it, because that is the list a parser author reads.
+    let conventions: Vec<String> = manifest["conventions"]
+        .as_array()
+        .expect("an array")
+        .iter()
+        .map(|line| line.as_str().unwrap_or_default().to_string())
+        .collect();
+    assert!(
+        conventions
+            .iter()
+            .any(|line| line.contains("microvm.exec.stream")),
+        "{conventions:?}"
+    );
+}
+
+/// Every attached command is discoverable with `--help` and takes the identifier triple.
+///
+/// A smoke test with a specific target: the five new commands all need three flags a caller cannot
+/// guess, so a command that shipped without one of them in `--help` would be a command nobody can
+/// invoke. Asserted through the binary because `--help` text is what a human actually reads.
+#[test]
+fn every_attached_command_documents_the_identifier_triple_in_its_help() {
+    for name in ["exec", "health", "ack", "stdin", "cp"] {
+        let outcome = run(&[name, "--help"], &[]);
+        assert_eq!(
+            outcome.exit_code(),
+            0,
+            "{name} --help must work: {}",
+            outcome.stderr
+        );
+        for flag in ["--endpoint", "--agent-token", "--microvm-id"] {
+            assert!(
+                outcome.stdout.contains(flag),
+                "{name} --help does not mention {flag}, which a caller cannot guess:\n{}",
+                outcome.stdout
+            );
+        }
+    }
+}
+
 /// `--quiet` silences progress and does not change the envelope.
 ///
 /// Both halves in one pair of invocations, because a `--quiet` that also suppressed the envelope

@@ -32,12 +32,12 @@ use microvms_core::sandbox::{RunRequest, Sandbox, TeardownOpts, TeardownReport};
 use microvms_core::{Error, ErrorKind};
 use serde_json::{Map, json};
 
-use crate::cli::{BuildArgs, ExecArgs, ResumeArgs, RunArgs, SuspendArgs, TerminateArgs};
+use crate::cli::{BuildArgs, ResumeArgs, RunArgs, SuspendArgs, TerminateArgs};
 use crate::commands::{Ctx, Rendered, response_type};
 use crate::exit::Exit;
 use crate::ledger::Ledger;
 use crate::render::RunOutcome;
-use crate::seam::{Attach, resolve_region, state_dir};
+use crate::seam::{resolve_region, state_dir};
 
 /// The future a launch races against. See the module docs.
 ///
@@ -292,7 +292,7 @@ async fn launch_and_exec<O: std::io::Write, E: std::io::Write>(
     let timeout = Duration::from_secs_f64(args.timeout.max(0.0));
     if let Some(command) = exec {
         ctx.out.progress(&format!("exec: {command}"));
-        let request = start_request(&command, None);
+        let request = start_request(StartSpec::command(&command));
         let result = sandbox
             .session()
             .expect("run() built one")
@@ -597,73 +597,34 @@ async fn upload_artifact<O: std::io::Write, E: std::io::Write>(
         .await
 }
 
-// ── exec ────────────────────────────────────────────────────────────────────
+// ── the shared start request ─────────────────────────────────────────────────
 
-/// Runs one command in a MicroVM that is already running.
-pub async fn exec<O: std::io::Write, E: std::io::Write>(
-    ctx: &mut Ctx<'_, O, E>,
-    args: &ExecArgs,
-) -> Result<Rendered, crate::exit::CliError> {
-    let region = resolve_region(
-        args.region.region.map(|r| r.region()),
-        args.region.unlisted_region.as_deref(),
-        ctx.env,
-    )?;
-    let session = ctx
-        .seam
-        .attach_session(
-            region,
-            Attach {
-                endpoint: args.endpoint.clone(),
-                agent_token: args.agent_token.clone(),
-                microvm_id: args.microvm_id.clone(),
-                port: args.port,
-            },
-        )
-        .await?;
+/// What a caller asks of one exec. See [`start_request`].
+///
+/// A struct rather than four parameters, because two of the four are `Option<String>` and
+/// `start_request(cmd, cwd, exec_id)` is how a working directory ends up as an idempotency key.
+/// `run`'s own exec fills only `command` and takes the defaults for the rest.
+pub struct StartSpec<'a> {
+    /// The shell line to run.
+    pub command: &'a str,
+    /// Omitted inherits the image WORKDIR, which is not the same as `/`.
+    pub cwd: Option<String>,
+    /// A caller-supplied stable id, or `None` for a fresh one. See [`start_request`].
+    pub exec_id: Option<String>,
+    /// Whether the child gets a writable stdin pipe.
+    pub stdin: bool,
+}
 
-    ctx.out.progress(&format!("exec: {}", args.command));
-    let request = start_request(&args.command, args.cwd.clone());
-    let exec_id = request.exec_id.clone();
-    let result = session
-        .run_sync(request, Duration::from_secs_f64(args.timeout.max(0.0)))
-        .await?;
-
-    let mut data = Map::new();
-    data.insert("execId".into(), json!(result.exec_id));
-    data.insert("exitCode".into(), json!(result.exit_code()));
-    data.insert("stdout".into(), json!(result.stdout()));
-    data.insert("stderr".into(), json!(result.stderr()));
-    let truncated = result
-        .outcome
-        .as_ref()
-        .is_some_and(|outcome| outcome.truncated);
-    data.insert("truncated".into(), json!(truncated));
-
-    let (kind, _) = response_type("exec");
-    let code = result.exit_code();
-    let dense = format!(
-        "exit\t{}\n{}",
-        code.map(|c| c.to_string()).unwrap_or_default(),
-        result.stdout()
-    );
-    let mut lines: Vec<String> = Vec::new();
-    for part in [result.stdout(), result.stderr()] {
-        if !part.is_empty() {
-            lines.push(part.trim_end_matches('\n').to_string());
+impl<'a> StartSpec<'a> {
+    /// The one-shot shape: a command, nothing else.
+    pub fn command(command: &'a str) -> Self {
+        Self {
+            command,
+            cwd: None,
+            exec_id: None,
+            stdin: false,
         }
     }
-    lines.push(match code {
-        Some(code) => format!("exit code: {code}"),
-        // A signal death is not an exit code, and reporting it as one — 0, or 128+n — is how
-        // a CI caller reads a killed process as a pass.
-        None => format!("exec {exec_id} died to a signal rather than exiting"),
-    });
-    let rendered = Rendered::ok(kind, data, lines.join("\n"), dense);
-    if code != Some(0) {
-        return Ok(rendered.reporting(Exit::ExecFailed));
-    }
-    Ok(rendered)
 }
 
 /// A start request for one shell command.
@@ -676,19 +637,27 @@ pub async fn exec<O: std::io::Write, E: std::io::Write>(
 /// The type comes from the `protocol` crate rather than from `microvms_core`, because
 /// `Session::run`'s signature names it and core does not re-export it. See the packet's gap
 /// note and the reason beside that dependency in `Cargo.toml`.
-fn start_request(command: &str, cwd: Option<String>) -> protocol::exec::StartRequest {
+///
+/// Shared with [`crate::commands::attached`] rather than duplicated, because the fields this
+/// deliberately leaves unset — `user`, `group`, `timeout_sec` — are decisions with reasons, and a
+/// second constructor is where one of them silently acquires a different answer.
+pub fn start_request(spec: StartSpec<'_>) -> protocol::exec::StartRequest {
     // Every field written out rather than `..Default::default()`, and not only because
     // `StartRequest` has no `Default`: this struct is the wire contract, so a field added on the
     // daemon side should break this build and make someone decide what the CLI sends. A struct
     // update would have silently defaulted it.
     protocol::exec::StartRequest {
-        // The idempotency key. A caller whose retry must be safe across its own restart
-        // supplies a stable one, which this surface deliberately does not expose: `microvm
-        // exec` is one shot, and an id flag would invite reusing one.
-        exec_id: format!("x-{:016x}", epoch_nanos()),
-        command: vec![command.to_string()],
+        // The idempotency key, generated unless the caller supplied one. The default is fresh and
+        // that is the safe direction: a reused id is answered from the first exec's record, so the
+        // second caller reads someone else's output. `exec --exec-id` is the opt-in for a caller
+        // whose retry must survive its own restart — the daemon returns success for a known id
+        // without spawning a second child, which is the whole value of a key.
+        exec_id: spec
+            .exec_id
+            .unwrap_or_else(|| format!("x-{:016x}", epoch_nanos())),
+        command: vec![spec.command.to_string()],
         shell: true,
-        cwd,
+        cwd: spec.cwd,
         env: std::collections::HashMap::new(),
         // No demotion: the daemon's own user is what the image chose, and a uid flag on this
         // surface would be a number with no way to check it means anything in that guest.
@@ -698,9 +667,10 @@ fn start_request(command: &str, cwd: Option<String>) -> protocol::exec::StartReq
         // as the *daemon's* budget too would kill the child at a deadline the caller cannot see
         // in the exit code.
         timeout_sec: None,
-        // Opt-in, and not asked for here: a child holding an open stdin pipe nobody will ever
-        // write to is a child that blocks forever the first time it reads.
-        stdin: false,
+        // Opt-in, and `run`'s exec never asks: a child holding an open stdin pipe nobody will
+        // ever write to is a child that blocks forever the first time it reads. `exec --stdin`
+        // sets this *and* feeds the pipe, which is the only combination that is safe.
+        stdin: spec.stdin,
     }
 }
 
@@ -990,7 +960,12 @@ mod tests {
     /// a binary literally named `ls -la`, because the daemon never whitespace-splits.
     #[test]
     fn a_shell_command_is_one_element_with_the_shell_flag_set() {
-        let request = start_request("pytest -q && echo done", Some("/workspace".into()));
+        let request = start_request(StartSpec {
+            command: "pytest -q && echo done",
+            cwd: Some("/workspace".into()),
+            exec_id: None,
+            stdin: false,
+        });
         assert!(request.shell, "a shell line needs the shell flag");
         assert_eq!(request.command, ["pytest -q && echo done"]);
         assert_eq!(request.cwd.as_deref(), Some("/workspace"));
@@ -1000,16 +975,62 @@ mod tests {
         );
     }
 
-    /// Two exec ids from one process differ.
+    /// Two exec ids from one process differ, **unless** the caller named one.
     ///
-    /// The id is the daemon's idempotency key: two execs sharing one means the second is
-    /// answered from the first's record and the caller reads someone else's output.
+    /// Both halves, because they are the two sides of one decision. The generated id must differ
+    /// per invocation: two execs sharing one means the second is answered from the first's record
+    /// and the caller reads someone else's output. And `--exec-id` must be forwarded *verbatim*,
+    /// because the entire value of an idempotency key is that the retry sends the identical one —
+    /// a key this CLI decorated (prefixed, suffixed, hashed) would address a different exec on the
+    /// retry and spawn the second child the key exists to prevent.
     #[test]
-    fn two_exec_ids_differ() {
-        let first = start_request("a", None).exec_id;
-        let second = start_request("b", None).exec_id;
+    fn a_generated_exec_id_is_fresh_and_a_supplied_one_is_forwarded_verbatim() {
+        let first = start_request(StartSpec::command("a")).exec_id;
+        let second = start_request(StartSpec::command("b")).exec_id;
         assert_ne!(first, second);
         assert!(first.starts_with("x-"), "{first}");
+
+        let stable = start_request(StartSpec {
+            command: "a",
+            cwd: None,
+            exec_id: Some("conformance-retry-1".into()),
+            stdin: false,
+        });
+        assert_eq!(
+            stable.exec_id, "conformance-retry-1",
+            "a decorated key addresses a different exec on the retry, which spawns the second \
+             child the key exists to prevent"
+        );
+        // And twice, so the forwarding is not merely a pass-through of the first call.
+        assert_eq!(
+            start_request(StartSpec {
+                command: "different command entirely",
+                cwd: Some("/elsewhere".into()),
+                exec_id: Some("conformance-retry-1".into()),
+                stdin: true,
+            })
+            .exec_id,
+            "conformance-retry-1"
+        );
+    }
+
+    /// `stdin: true` reaches the wire only when it was asked for.
+    ///
+    /// The opt-in property, at the one place it is decided. A default of `true` would give every
+    /// task command a surprise open descriptor, and the first tool that probes for input would
+    /// behave differently for a reason nobody could see.
+    #[test]
+    fn a_stdin_pipe_is_requested_only_when_asked_for() {
+        assert!(!start_request(StartSpec::command("cat")).stdin);
+        assert!(
+            start_request(StartSpec {
+                command: "cat",
+                cwd: None,
+                exec_id: None,
+                stdin: true,
+            })
+            .stdin
+        );
     }
 
     /// The wait carries the caller's deadline and never a negative one.

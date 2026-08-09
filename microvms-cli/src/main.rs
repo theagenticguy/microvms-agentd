@@ -316,6 +316,21 @@ fn report<O: std::io::Write, E: std::io::Write>(
         out.warn(&envelope::render_error(failure));
         return ExitCode::from(failure.exit.as_u8());
     }
+    // A stream that failed part-way through has written NDJSON events to stdout and no envelope.
+    // The failure envelope becomes the stream's **last line**, compact, which is what
+    // `Output::emit` does once `streaming` is set — and it is the right answer rather than a
+    // concession: an NDJSON consumer reading line by line needs a terminating record saying why
+    // the events stopped, and a document appearing on stderr instead would be one it never looks
+    // at. The already-written events stay written, because they are real output the caller
+    // received.
+    //
+    // On the human paths the same failure goes to stderr instead: `stream_bytes` put the child's
+    // raw output on stdout, and appending an error message to it would corrupt the file a caller
+    // was redirecting into.
+    if out.streaming() && !out.format().is_json() {
+        out.warn(&envelope::render_error(failure));
+        return ExitCode::from(failure.exit.as_u8());
+    }
     let text = if out.dense() {
         envelope::render_error_dense(failure)
     } else {
@@ -363,7 +378,12 @@ async fn handle<O: std::io::Write, E: std::io::Write>(
             commands::lifecycle::run(ctx, args, commands::lifecycle::on_ctrl_c()).await
         }
         Command::Build(args) => commands::lifecycle::build(ctx, args).await,
-        Command::Exec(args) => commands::lifecycle::exec(ctx, args).await,
+        // The attached block: five commands, one door. See `commands/attached.rs`.
+        Command::Exec(args) => commands::attached::exec(ctx, args).await,
+        Command::Health(args) => commands::attached::health(ctx, args).await,
+        Command::Ack(args) => commands::attached::ack(ctx, args).await,
+        Command::Stdin(args) => commands::attached::stdin(ctx, args).await,
+        Command::Cp(args) => commands::attached::cp(ctx, args).await,
         Command::Suspend(args) => commands::lifecycle::suspend(ctx, args).await,
         Command::Resume(args) => commands::lifecycle::resume(ctx, args).await,
         Command::Terminate(args) => commands::lifecycle::terminate(ctx, args).await,

@@ -20,13 +20,18 @@ path = "src/main.rs"
 
 # ── the dependency set is the requirement under test (CLI-2, AC-5-4) ────────
 #
-# Six direct dependencies and no seventh. There is no `reqwest`, no `aws-*`, no
+# Seven direct dependencies and no eighth. There is no `reqwest`, no `aws-*`, no
 # `hyper`, no `aws-sigv4`, and there cannot be one: `tests/thinness.rs` reads this
 # manifest through `cargo metadata` and asserts the direct dependency set is *exactly*
 # the names below. An allowlist rather than a denylist, because a denylist is defeated
 # by the one crate nobody thought to write down — which is the failure shape the
 # Python's three-legged static guard (`tests/test_cli.py:209`, `:261`, `:281`) was
 # built out of after each leg was defeated on purpose.
+#
+# It was six until `exec --stream` landed. The seventh is `futures-util`, and the
+# paragraph beside it is the price of adding one: the guard's failure message asks for
+# exactly that, on the grounds that a dependency nobody had to justify is how the set
+# stops meaning anything.
 #
 # The CLI reaches AWS through `microvms-core` and through nothing else. That is
 # CLI-2, and the honest way to state it is a manifest a test can read.
@@ -53,6 +58,29 @@ clap = { version = "4.6.6", features = ["derive"] }
 # is what `ratatui::init`/`restore` use and what installs the panic hook that
 # un-wedges a terminal (research-cli.yaml sources [8][9]).
 ratatui = "0.30.2"
+# `Stream`, and nothing else. `microvm exec --stream` consumes
+# `ExecHandle::stream_with`, whose return type is `impl Stream<Item = Result<ExecEvent,
+# Error>>` — and `Stream::poll_next` is the only way to advance it. The trait is not in
+# std and `microvms-core` does not re-export it, so a consumer of that method has to
+# name the crate that defines it. `microvms-py` and `microvms-js` both do, for the same
+# reason.
+#
+# This is a seventh direct dependency where the guard's whole point is that there were
+# six, so the reason has to hold up. It does, on the terms CLI-2 is actually about:
+# `futures-util` is a trait definition and a set of combinators over it. It opens no
+# socket, signs no request, and knows nothing about AWS — it cannot be a second path to
+# the control plane, which is the property `tests/thinness.rs` exists to protect. It is
+# also already in the build graph (`microvms-core` depends on it), so this adds a manifest
+# edge rather than a crate.
+#
+# The better fix belongs in core and is recorded as gap C3-1 in the task packet: a
+# callback driver — `ExecHandle::for_each_event(options, &mut dyn FnMut(..))` — would let
+# this crate consume a stream with no trait at all, and would serve the two bindings too.
+# When that lands, this line and its `ALLOWED` row go away.
+#
+# `default-features = false` with only `std`: the default set pulls in the executor and
+# the `io` module, neither of which is used here.
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
 # The envelope. Hand-rolling the JSON was considered and rejected: the envelope has a
 # string field carrying a service error message, and hand-escaping that is how a
 # quote in an AWS error breaks an agent's parse.
@@ -76,3 +104,20 @@ tokio = { version = "1.53", features = [
 # added transitively or through a renamed key is still an edge this sees. Parsing
 # `Cargo.toml` by hand would check the file, not the build.
 cargo_metadata = "0.23.1"
+# The same tokio, with the test clock. **Not an eighth dependency** — it is the
+# seventh again, and `tests/thinness.rs`'s equality dedups the two edges, which is
+# why that guard still reads seven names.
+#
+# `test-util` is what `#[tokio::test(start_paused = true)]` needs. One guard requires
+# it: the cut-stream test drives core's reconnect loop, which backs off up to four
+# seconds across twenty attempts, so a real clock spends about a minute inside one
+# test. `mise run check` is a pre-push gate, and a gate that costs a minute for one
+# assertion is a gate people learn to skip.
+#
+# A dev-dependency rather than a feature on the normal entry, deliberately: under
+# resolver 3 a dev-only feature is not unified into a non-test build, so `cargo build`
+# ships a binary with no test clock in it. Enabling `test-util` on the normal entry
+# would put tokio's time-manipulation surface in the shipped artifact for a test's
+# benefit, which is the same trade `envelope.rs` refuses with `into_streams` being
+# `cfg(test)`.
+tokio = { version = "1.53", features = ["test-util"] }
