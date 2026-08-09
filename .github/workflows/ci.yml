@@ -8,6 +8,34 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+# ── on the action versions below ────────────────────────────────────────────
+#
+# Every `uses:` in this file resolves to a Node **24** action, and that is a
+# requirement rather than a preference: the runner deprecated Node 20 on
+# 2025-09-19 and now forces such actions onto 24 anyway, printing a warning per
+# step. A warning that appears on every green run is a warning nobody reads, so
+# the versions here are chosen to emit none — `checkout@v5`, `setup-uv@v7`,
+# `upload-artifact@v6`, `setup-node@v5` are the first major of each on Node 24.
+#
+# Two of them could go further and deliberately do not:
+#
+# * `checkout` is on v5 rather than v7. v6 moved the persisted credential into a
+#   separate file and v7 blocks fork-PR checkout under `pull_request_target` and
+#   `workflow_run` — both good changes, and neither of them anything this repo
+#   uses (no workflow here has either trigger, and the only post-checkout git
+#   consumer is betterleaks reading history). v5 is the smallest version that
+#   satisfies the actual requirement, which is the Node runtime.
+# * `setup-uv` is on the `v7` **major** tag rather than the newer `v9.0.0`. From
+#   v8 astral stopped publishing major and minor tags on purpose, for supply-chain
+#   reasons — so v9 can only be referenced as an exact version or a git hash. This
+#   repo has no Dependabot, and an exact pin with nothing watching it is a pin that
+#   silently stops receiving patches; a rolling major keeps getting them. v7 is the
+#   last major that offers that and is already on Node 24. When a bot lands here,
+#   pin the hash instead and delete this paragraph.
+#
+# `dtolnay/rust-toolchain` and `aquasecurity/trivy-action` are composite actions
+# with no Node runtime at all, and `Swatinem/rust-cache@v2` is already Node 24.
+
 jobs:
   rust:
     name: lint, model, and test tiers (${{ matrix.os }})
@@ -24,7 +52,7 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
@@ -75,11 +103,24 @@ jobs:
     name: semgrep, secret history, license headers
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           # betterleaks scans history, and a shallow clone has none.
           fetch-depth: 0
-      - uses: astral-sh/setup-uv@v5
+      - uses: astral-sh/setup-uv@v7
+        with:
+          # No cache, deliberately. `enable-cache: auto` looks for a lockfile or a
+          # requirements file to key the cache on, finds none in this repo, and
+          # warns "No file matched to [**/uv.lock, ...]. The cache will never get
+          # invalidated" — because every Python entry point here is either a `uvx`
+          # tool invocation or a PEP 723 script whose dependencies live in its own
+          # header. There is no lockfile to point `cache-dependency-glob` at, and
+          # adding one to satisfy a cache key would be a file with no other reader.
+          # A cache that can never be invalidated is worse than no cache: it would
+          # pin a resolved `semgrep` or `boto3` for as long as the entry survived,
+          # and boto3's bundled service model is exactly what the drift gate exists
+          # to read fresh.
+          enable-cache: false
       # Shipped source only: test fixtures plant fake tokens on purpose, and the
       # INFO tier (std::env::args in a CLI, TempDir in tests) is idiom, not
       # defect. WARNING and ERROR fail the job.
@@ -114,7 +155,7 @@ jobs:
     name: SBOM and vulnerability scans
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       # syft writes the SBOM, grype audits the SBOM, trivy audits the tree
       # (vulns + IaC misconfig + secrets), osv-scanner audits the lockfiles
       # against OSV directly. Three scanners because their databases disagree
@@ -151,7 +192,7 @@ jobs:
       # attached per-run so any commit's inventory is downloadable, 90-day
       # default retention.
       - name: publish SBOMs
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: sbom-${{ github.sha }}
           path: sbom/
@@ -161,10 +202,15 @@ jobs:
     name: hardcoded constraints match the service model
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - uses: astral-sh/setup-uv@v5
+      - uses: astral-sh/setup-uv@v7
+        with:
+          # See the `security` job: no lockfile to key a cache on, and a cache that
+          # can never be invalidated would pin the boto3 whose bundled service model
+          # this job's whole purpose is to read fresh.
+          enable-cache: false
       # TRAP-12 says "in the build gate", and pre-push alone is not a gate — a
       # --no-verify push or a merge that trusts CI skips it. The script is a PEP
       # 723 uv script whose one dependency is boto3, for the botocore the model
@@ -187,11 +233,16 @@ jobs:
     name: python and node bindings
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - uses: astral-sh/setup-uv@v5
-      - uses: actions/setup-node@v4
+      - uses: astral-sh/setup-uv@v7
+        with:
+          # See the `security` job. Nothing here is locked either: `uvx maturin@1.14`
+          # pins its own version inline and the venv holds exactly `pytest`, so there
+          # is no file a cache key could watch.
+          enable-cache: false
+      - uses: actions/setup-node@v5
         with:
           node-version: '22'
       # The binding suites are where BIND-2/BIND-5 live: nine planted bypasses
@@ -215,7 +266,7 @@ jobs:
     name: static aarch64 binary
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-unknown-linux-musl

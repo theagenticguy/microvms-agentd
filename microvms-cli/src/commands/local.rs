@@ -89,6 +89,52 @@ fn joined(value: &Value) -> String {
 /// the CLI a second path to AWS, which is exactly what CLI-2 forbids and what the thinness
 /// guard is.
 ///
+/// # Adding a reader to core was assessed and refused, and not on grounds of size
+///
+/// The mechanics are genuinely cheap. `FilterLogEvents` is one signed POST to
+/// `logs.<region>.amazonaws.com` and `microvms-core/src/control/transport.rs` already signs
+/// SigV4 over an arbitrary method, path, and JSON body. It looks like well under a hundred
+/// lines plus a recorder fake. Three things say no anyway, and the third is decisive.
+///
+/// **The transport is single-service by construction, and that is load-bearing.** Its
+/// `signingName` is a `const` (`lambda`), the endpoint comes from one `endpoint_for(region)`,
+/// the API version is the drift gate's `MODEL_API_VERSION` prefixed onto every path, and
+/// `Call` has no header field at all — `content-type: application/json` is written inline
+/// before signing, because the signature covers it. CloudWatch Logs needs a **different
+/// signing name**, a **different host**, an **`X-Amz-Target` header**, and no API-version
+/// path segment. Every one of those is a parameter the type deliberately does not have.
+/// Adding them turns "this transport can only talk to lambda-microvms" — a property a
+/// reviewer checks by reading four constants — into a runtime argument, and that property is
+/// what makes `transport.rs`'s "nothing here reads the service model at runtime" checkable.
+/// A second, separate transport avoids that and is no longer the contained change; it is a
+/// second signer, a second error taxonomy (`classify_failure`'s seven statuses are the
+/// *lambda-microvms* modeled exceptions, documented as such), and a second recorder.
+///
+/// **The diagnostic it would strengthen is already unconditional, on purpose.**
+/// `control/image.rs`'s `build_failure` names the log-group prefix on every failure rather
+/// than only on an empty group, and its own comment calls that a deliberate weakening.
+/// Re-reading that page: naming the prefix always is *not much worse* than naming it
+/// conditionally, because the sentence a reader acts on ("the role must grant logs on
+/// `/aws/lambda-microvms/*`, and `/aws/lambda/microvms/*` is the plausible wrong one") is
+/// identical either way. What a reader loses is one bit — whether the group was empty — and
+/// they can get that bit from the `aws logs tail` line this command already suggests.
+///
+/// **And the read would most often fail with a permissions error, which is a worse
+/// diagnostic than this one.** `conformance/infra/main.tf` grants `logs:CreateLogGroup`,
+/// `CreateLogStream`, and `PutLogEvents` to the build and execution roles, and grants
+/// `FilterLogEvents`, `GetLogEvents`, and `DescribeLogStreams` to **nobody** — the caller's
+/// own identity included. So a reader shipped today would answer `AccessDeniedException` for
+/// a caller whose account is set up exactly as this project documents, and an
+/// `AccessDeniedException` about a log group is precisely the message that sends someone to
+/// audit the *build* role's log policy, which is the confusion the prefix finding exists to
+/// prevent. Making it work means also granting a read on the caller's identity, which is a
+/// Terraform change plus a documented new requirement — and at that point the caller has the
+/// `aws logs tail` invocation this command hands them anyway.
+///
+/// So: accepted. The remedy stays the suggestion below, and the honest reason it is a
+/// suggestion is that this client refuses to guess at a second service rather than that
+/// nobody has written the code.
+///
 /// So this command derives the group, names it in the payload, and exits `ERR_PRECONDITION`
 /// with the `aws logs` invocation that reads it. Deliberately a failure and not a success with
 /// `lines: []`, because an empty list is the wire shape for "the group exists and has no

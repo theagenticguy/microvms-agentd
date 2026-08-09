@@ -36,12 +36,32 @@
 
 use std::path::{Path, PathBuf};
 
+/// One name this crate deliberately does **not** depend on, and the API that replaced it.
+///
+/// Not on the forbidden list below, because it never was a capability — `futures-util` opens no
+/// socket and knows nothing about AWS, so it could not have been the second path to the control
+/// plane CLI-2 is about. It is here for a different reason: it was an allowed dependency, with a
+/// justification, for exactly as long as core's only stream API was one returning a trait `std`
+/// does not define. `ExecHandle::for_each_event` takes a `FnMut(ExecEvent) -> ControlFlow<()>`
+/// instead, so this crate consumes a stream with nothing but `microvms-core`.
+///
+/// Recorded as a named absence rather than left to the equality alone so a future contributor who
+/// reaches for `StreamExt` finds the alternative in the failure message instead of a bare "the
+/// dependency set changed".
+const RETIRED: [(&str, &str); 1] = [(
+    "futures-util",
+    "the `Stream` trait `ExecHandle::stream_with` returns. Retired: core's \
+     `ExecHandle::for_each_event(options, |event| ControlFlow::Continue(()))` drives the same \
+     state machine through a std callback, so there is no trait to name. See \
+     `commands/attached.rs`'s `stream_exec`",
+)];
+
 /// The exact set of direct dependencies this crate is allowed, and the reason for each.
 ///
 /// An allowlist. See the module docs on why a denylist is not good enough. The reason strings are
 /// not decorative: this test asserts each is a real sentence, so a seventh entry cannot be added
 /// without someone writing down what it is for.
-const ALLOWED: [(&str, &str); 8] = [
+const ALLOWED: [(&str, &str); 7] = [
     (
         "microvms-core",
         "the product surface: every AWS call, every trap closure, the cost engine, the taxonomy",
@@ -53,14 +73,6 @@ const ALLOWED: [(&str, &str); 8] = [
     (
         "clap",
         "the command tree, which is the manifest's only source and the CLI-5 closed sets",
-    ),
-    (
-        "futures-util",
-        "the `Stream` trait `ExecHandle::stream_with` returns; core does not re-export it, and \
-         this crate cannot advance a stream without naming the trait's defining crate. A trait \
-         definition rather than a capability: it opens no socket and knows nothing about AWS, so \
-         it cannot be the second path to the control plane CLI-2 forbids. Removable once core \
-         grows a callback driver — packet gap C3-1",
     ),
     (
         "ratatui",
@@ -119,7 +131,7 @@ fn manifest_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml")
 }
 
-/// **The exact dependency set.** Seven normal dependencies plus the one dev-dependency, and nothing
+/// **The exact dependency set.** Six normal dependencies plus the one dev-dependency, and nothing
 /// else.
 ///
 /// The requirement under test, stated as an equality rather than as an absence. `cargo metadata`
@@ -181,6 +193,20 @@ fn the_direct_dependency_set_is_exactly_the_allowed_one() {
             !actual.iter().any(|name| name == forbidden),
             "{forbidden} is a direct dependency of the CLI, which gives it a second path to AWS \
              or to HTTP — the requirement CLI-2 is"
+        );
+    }
+
+    // And explicitly none of the ones that came out again. A separate loop from FORBIDDEN because
+    // the message is different: a retired dependency has a *replacement*, and naming it is what
+    // stops the same edge being re-added by someone who reached for `StreamExt` and found the
+    // guard rather than the API.
+    for (name, replacement) in RETIRED {
+        assert!(
+            !actual.iter().any(|entry| entry == name),
+            "{name} is a direct dependency again. It was allowed once and came out for a reason \
+             — {replacement}. If the replacement genuinely does not cover the case, move the \
+             entry into ALLOWED with a paragraph saying which case, rather than restoring the \
+             old one."
         );
     }
 

@@ -94,12 +94,19 @@ pub const HOURS_PER_MONTH: Decimal = dec!(730);
 /// one line of output.
 pub const STALE_AFTER_DAYS: i64 = 90;
 
+/// Seconds in a day, for the one place a [`Duration`] is quoted in days.
+///
+/// Not a billing convention — AWS's month is [`SECONDS_PER_MONTH`] and nothing here
+/// derives a month from this. It exists so [`RateTable::minimum_retention_days`] reads
+/// its own unit off a name rather than off a literal beside a message.
+const SECONDS_PER_DAY: u64 = 24 * 60 * 60;
+
 /// Snapshot storage bills at least this long however briefly the snapshot exists
 /// (COST-8).
 ///
 /// One week. Why a create-and-destroy suite's floor is its image rather than its
 /// compute: a 2 GB image deleted after sixty seconds still bills about four cents.
-pub const MINIMUM_RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+pub const MINIMUM_RETENTION: Duration = Duration::from_secs(7 * SECONDS_PER_DAY);
 
 // ── the two float boundaries (COST-6) ────────────────────────────────────────
 
@@ -906,6 +913,19 @@ impl RateTable {
         self.minimum_retention
     }
 
+    /// The same minimum in whole days, which is the unit the note on a floored line
+    /// item quotes.
+    ///
+    /// Here rather than as an `as_secs() / 86_400` at the one call site, because that
+    /// spelling is a second place the seconds-to-days convention lives: the field is
+    /// the only thing that knows how long the window is, and a division written beside
+    /// the message would keep saying "7-day" after a rate row moved to a fortnight.
+    /// Truncating rather than rounding is deliberate — a floor quoted as longer than it
+    /// is would overstate the charge a reader is being told about.
+    pub fn minimum_retention_days(&self) -> u64 {
+        self.minimum_retention.as_secs() / SECONDS_PER_DAY
+    }
+
     /// MicroVMs bills per second with no per-request charge.
     ///
     /// A method returning a constant rather than a field, because it is a documented
@@ -1329,6 +1349,23 @@ pub enum CostPhase {
 }
 
 impl CostPhase {
+    /// Every phase, in lifecycle order.
+    ///
+    /// Public because a caller that has to *judge* a phase string needs the list to
+    /// refuse with, and the two bindings each grew their own copy of this array before
+    /// it existed here — a parallel table that would have gone stale the first time a
+    /// phase was added. [`CostPhase::from_str`] is the reader; the round-trip test below
+    /// is what stops a variant being added to the enum and forgotten here.
+    pub const ALL: [CostPhase; 7] = [
+        CostPhase::ImageBuild,
+        CostPhase::ImageStorage,
+        CostPhase::Launch,
+        CostPhase::Running,
+        CostPhase::Suspended,
+        CostPhase::Suspend,
+        CostPhase::Resume,
+    ];
+
     /// The wire spelling, identical to the Python `StrEnum` member.
     pub fn as_str(self) -> &'static str {
         match self {
@@ -1340,6 +1377,41 @@ impl CostPhase {
             CostPhase::Suspend => "suspend",
             CostPhase::Resume => "resume",
         }
+    }
+}
+
+impl FromStr for CostPhase {
+    type Err = Error;
+
+    /// A phase from its wire spelling, refusing anything else with the whole list.
+    ///
+    /// Here rather than in each caller because the callers are *bindings*: a Python or
+    /// JS `report.by_phase("running")` has a bare string where Rust has a variant, so
+    /// something has to judge it. Both bindings did, each with its own seven-element
+    /// array — two parallel tables over a closed set, which is one table too many and
+    /// two too many to keep in step with the enum. This is the single reader, and the
+    /// list it offers on a refusal is [`CostPhase::ALL`] rather than a written-out
+    /// sentence, so a phase added to the enum appears in the message without an edit.
+    ///
+    /// Note the asymmetry with [`Region::from_str`](crate::Region): a region's refusal
+    /// exists because an unlisted region is a *plausible* value this client has no
+    /// evidence for, and there is an opt-in. A phase has no opt-in and needs none — the
+    /// set is closed by the billing model, so an unrecognized spelling is a typo and
+    /// nothing more.
+    fn from_str(phase: &str) -> Result<CostPhase, Error> {
+        CostPhase::ALL
+            .into_iter()
+            .find(|candidate| candidate.as_str() == phase)
+            .ok_or_else(|| {
+                let offered = CostPhase::ALL
+                    .iter()
+                    .map(|candidate| candidate.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                Error::invalid_arg(format!(
+                    "{phase:?} is not a cost phase; the phases are {offered}"
+                ))
+            })
     }
 }
 
@@ -1564,9 +1636,13 @@ fn storage_line(
     let quantity = gb * billed / SECONDS_PER_MONTH;
     let mut note = format!("{} GB held {held}", gb.normalize());
     if billed > held_seconds {
+        // The day count comes off the rate row rather than out of a division here: the
+        // field is the only thing that knows how long the window is, and `as_secs() /
+        // 86_400` beside the message is a second convention that would keep saying
+        // "7-day" after the row moved.
         note.push_str(&format!(
             "; billed {}-day minimum retention ({floor}s) instead",
-            rates.minimum_retention().as_secs() / 86_400,
+            rates.minimum_retention_days(),
         ));
     }
     Ok(LineItem {
@@ -2530,6 +2606,79 @@ mod tests {
         assert_eq!(total.unpriced_reasons(), ["second", "first", "also first"]);
     }
 
+    /// **Every phase round-trips through its own spelling**, and nothing else parses.
+    ///
+    /// The forward direction is the one that matters for the bindings: `by_phase("running")`
+    /// has to find the same variant the report attributed the line to, so `from_str` must be
+    /// the exact inverse of `as_str` for all seven. The reverse — an unknown spelling — is
+    /// refused *with the whole list*, because the failure this replaces was a Python caller
+    /// typing `"suspending"` and getting an empty result set back rather than an error.
+    ///
+    /// `ALL` is asserted to be complete by exhaustion rather than by a length check: the
+    /// `match` below has no wildcard arm, so adding a variant to [`CostPhase`] fails to
+    /// compile here until it is added to `ALL` too. A `len() == 7` assertion would only have
+    /// caught the same mistake after someone changed the number.
+    ///
+    /// **Falsification** — drop `CostPhase::Suspend` from `ALL` and the exhaustive match
+    /// leaves it unreachable, so the round-trip assertion goes red on `"suspend"`; return
+    /// `Ok(CostPhase::Running)` for an unknown string and the refusal assertion goes red.
+    /// Verified; see the report at the end of this task.
+    #[test]
+    fn every_phase_parses_back_from_its_display_and_nothing_else_does() {
+        for phase in CostPhase::ALL {
+            // Both spellings, because `Display` pads and `as_str` does not — a `from_str`
+            // written against the padded form would fail on every column-formatted string a
+            // caller copied out of a report.
+            assert_eq!(
+                phase.as_str().parse::<CostPhase>().expect("a known phase"),
+                phase,
+                "{} did not round-trip through as_str",
+                phase.as_str()
+            );
+            assert_eq!(
+                phase
+                    .to_string()
+                    .parse::<CostPhase>()
+                    .expect("a known phase"),
+                phase,
+                "{phase} did not round-trip through Display"
+            );
+            // And the exhaustive match: a variant added to the enum but not to `ALL` fails
+            // to compile at this arm rather than silently going unparseable.
+            match phase {
+                CostPhase::ImageBuild
+                | CostPhase::ImageStorage
+                | CostPhase::Launch
+                | CostPhase::Running
+                | CostPhase::Suspended
+                | CostPhase::Suspend
+                | CostPhase::Resume => {}
+            }
+        }
+        assert_eq!(
+            CostPhase::ALL.len(),
+            7,
+            "the seven phases the billing model has"
+        );
+
+        // The near-misses a caller actually types: a lifecycle state that is not a cost
+        // phase, the underscore spelling, and the empty string.
+        for wrong in ["suspending", "image_build", "RUNNING", "", "total"] {
+            let error = wrong
+                .parse::<CostPhase>()
+                .expect_err("only the seven spellings parse");
+            assert_eq!(error.kind(), ErrorKind::InvalidArg);
+            let message = error.to_string();
+            for phase in CostPhase::ALL {
+                assert!(
+                    message.contains(phase.as_str()),
+                    "the refusal has to offer every phase so a typo is self-correcting, \
+                     {phase} missing from: {message}"
+                );
+            }
+        }
+    }
+
     /// Every rendered line's amount starts at the same column.
     ///
     /// The plain-text report is a table, and the phase column is what aligns it. `{:<14}`
@@ -2800,6 +2949,56 @@ mod tests {
         assert_eq!(
             storage[0].duration,
             Some(DurationP::Measured(Duration::from_secs(60)))
+        );
+    }
+
+    /// The note's day count is the rate row's own, not a division written beside the
+    /// message.
+    ///
+    /// The two halves are one requirement: `minimum_retention_days` reports what
+    /// `minimum_retention` holds, and the note quotes *that* rather than a second
+    /// convention. Asserted against a table whose floor is deliberately **not** a week,
+    /// which is the only input that separates the field from the literal — a hand-rolled
+    /// `as_secs() / 86_400` at the call site passes the seven-day case and then keeps
+    /// saying "7-day" here.
+    ///
+    /// **Falsification** — put `rates.minimum_retention().as_secs() / 86_400` back in
+    /// `storage_line` and this stays green; hard-code either `7` or the week's seconds and
+    /// it goes red naming the wrong day count. Verified: replacing the accessor's body
+    /// with `7` fails the first assertion, and writing `"; billed 7-day minimum retention
+    /// ({floor}s) instead"` fails the note assertion with `7-day` against a 14-day row.
+    #[test]
+    fn the_retention_note_reads_its_day_count_off_the_rate_row() {
+        let week = rates();
+        assert_eq!(week.minimum_retention_days(), 7);
+        assert_eq!(
+            week.minimum_retention(),
+            Duration::from_secs(week.minimum_retention_days() * 24 * 60 * 60),
+            "the days accessor and the duration must describe the same window"
+        );
+
+        // A fortnight, which no rate table ships — the point is that nothing but the
+        // field decides what the note says.
+        let mut fortnight = week.clone();
+        fortnight.minimum_retention = Duration::from_secs(14 * 24 * 60 * 60);
+        assert_eq!(fortnight.minimum_retention_days(), 14);
+
+        let item = storage_line(
+            CostPhase::ImageStorage,
+            dec!(2),
+            DurationP::Measured(Duration::from_secs(60)),
+            &fortnight,
+        )
+        .expect("a floored hold prices");
+        assert!(
+            item.note.contains("14-day minimum retention"),
+            "the note must quote the row's own window: {}",
+            item.note
+        );
+        assert!(
+            !item.note.contains("7-day"),
+            "a second day-count convention survived in the message: {}",
+            item.note
         );
     }
 

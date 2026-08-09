@@ -23,6 +23,32 @@
 //! consumer is being protected. A caller summing a dollar column must be stopped from doing
 //! float arithmetic on money; a caller comparing a duration against a timeout must not have
 //! to discover that one of the two clients quotes seconds in quotes.
+//!
+//! # A dollar string's trailing zeros may differ from the Python oracle's, and that is accepted
+//!
+//! `Decimal::to_string` prints a figure at the *scale* the arithmetic produced, and
+//! `rust_decimal` normalizes a product's scale differently from Python's `decimal` module. So
+//! this client can emit `0.0384` where `cli.py` emitted `0.03840000`, or the reverse, for the
+//! same line item.
+//!
+//! **The figures are numerically equal**, and that is the whole of the claim being made here:
+//! every dollar string in this envelope is `Decimal::to_string` over the exact same decimal
+//! arithmetic, so `Decimal(a) == Decimal(b)` holds for every pair the two clients produce.
+//! What differs is a representation detail of the string, not a value.
+//!
+//! Accepted rather than fixed, for two reasons. Rescaling to a fixed number of places would
+//! *round* a figure whose exactness is the reason it is a string at all — a create-and-destroy
+//! suite's compute line lives in the ninth decimal place, and the exact value is what makes a
+//! report reconcilable against the rate table it came from. And the fixed-places rendering the
+//! human column wants already exists, separately, in `microvms-core`'s `render_amount`, which
+//! is where the display decision belongs. A consumer comparing two envelopes must parse both
+//! sides as decimals; comparing the strings byte for byte was never a supported operation, and
+//! the conformance oracle does not.
+//!
+//! The one place scale *is* asserted byte for byte is
+//! `microvms-core/src/cost.rs`'s `every_rate_byte_matches_the_python_literal`, and it says why:
+//! a **rate** is a transcription, so `0.0038` and `0.00380000` are the same number but not the
+//! same transcription. A derived figure is not a transcription of anything.
 
 use microvms_core::cost::{Amount, CostReport, LineItem, ResidencyComparison};
 use serde_json::{Map, Value, json};

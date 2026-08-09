@@ -33,10 +33,10 @@
 //! releases output, and it is a separate command precisely so that is a decision rather than a
 //! side effect.
 
+use std::ops::ControlFlow;
 use std::time::Duration;
 
-use futures_util::StreamExt as _;
-use microvms_core::session::{ExecEvent, Session, StreamOptions};
+use microvms_core::session::{EndReason, ExecEvent, Session, StreamOptions};
 use microvms_core::{Error, ErrorKind};
 use serde_json::{Map, Value, json};
 
@@ -210,12 +210,26 @@ async fn poll_existing<O: std::io::Write, E: std::io::Write>(
 ///
 /// # The cursor arithmetic is core's, and this function must not have its own
 ///
-/// Every offset here is read off the events core delivers rather than counted locally.
+/// Every offset here comes from core rather than being counted locally.
 /// `microvms-core/src/session/exec.rs:16` states the two rules — advance only past bytes actually
 /// handed over, and advance past a `gap` too — and core's state machine already obeys them across
 /// reconnects. A second cursor maintained in this file would be a second implementation of the
 /// property under test, and the two would disagree exactly when a reconnect happened, which is the
-/// case nobody tests by hand.
+/// case nobody tests by hand. So `nextOffset` is read off [`StreamEnd::cursor`], not tallied here.
+///
+/// # The loop is core's callback driver, not a `Stream`
+///
+/// [`ExecHandle::for_each_event`] rather than `stream_with` plus `StreamExt::next`, and the reason
+/// is CLI-2. `Stream` is not in `std` and core does not re-export the trait, so advancing a stream
+/// here meant naming `futures-util` — a seventh direct dependency in a manifest whose exact
+/// contents `tests/thinness.rs` asserts, carried to call one method. The driver takes a
+/// `FnMut(ExecEvent) -> ControlFlow<()>` and both of those are `std`, so this crate needs nothing
+/// but `microvms-core` to consume a stream. The wire behaviour is identical: same state machine,
+/// same reconnects, same cursor.
+///
+/// [`ControlFlow::Continue`] on every event: this command streams to completion, and the `Break`
+/// arm exists for a consumer that stops early (a binding whose iterator was dropped). CLI-6's
+/// interrupt is a separate mechanism — a `select!` in `lifecycle.rs` — and not this.
 ///
 /// What this function owns is the *reporting*: an event per line, a summary in the envelope, and
 /// `nextOffset` so an interrupted consumer can pass it back as `--from-offset`.
@@ -232,23 +246,16 @@ async fn stream_exec<O: std::io::Write, E: std::io::Write>(
     let mut events = 0u64;
     let mut bytes = 0u64;
     let mut gaps = 0u64;
-    let mut next_offset = offset;
     let mut exit: Option<protocol::exec::ExitEvent> = None;
 
-    {
-        let mut stream = std::pin::pin!(handle.stream_with(options));
-        while let Some(item) = stream.next().await {
-            // A mid-stream failure is raised rather than summarised, and the events already
-            // written stay written. That asymmetry is correct: the bytes on stdout are real output
-            // the caller received, and rewriting history to pretend the stream never started would
-            // discard them. `main`'s failure path knows stdout has been used — `already_emitted`
-            // and `streaming` both say so — and puts the failure on stderr rather than appending a
-            // second document to an NDJSON stream.
-            let event = item?;
+    // A mid-stream failure is raised rather than summarised, and the events already written stay
+    // written. That asymmetry is correct: the bytes on stdout are real output the caller received,
+    // and rewriting history to pretend the stream never started would discard them. `main`'s
+    // failure path knows stdout has been used — `already_emitted` and `streaming` both say so —
+    // and puts the failure on stderr rather than appending a second document to an NDJSON stream.
+    let end = handle
+        .for_each_event(options, |event| {
             events += 1;
-            if let Some(end) = event.end() {
-                next_offset = next_offset.max(end);
-            }
             match &event {
                 ExecEvent::Output { data, .. } => bytes += data.len() as u64,
                 ExecEvent::Gap { .. } => gaps += 1,
@@ -262,8 +269,16 @@ async fn stream_exec<O: std::io::Write, E: std::io::Write>(
             if let ExecEvent::Exit(terminal) = event {
                 exit = Some(terminal);
             }
-        }
-    }
+            ControlFlow::Continue(())
+        })
+        .await?;
+    // Core's cursor, whatever the ending. A `Cut` reports where to resume, which is the case the
+    // `--from-offset` message below is for; an `Exited` reports the total.
+    let next_offset = end.cursor;
+    debug_assert!(
+        end.reason != EndReason::Stopped,
+        "this callback never breaks, so a Stopped ending would mean core reported one that did"
+    );
 
     let mut data = Map::new();
     data.insert("execId".into(), json!(exec_id));

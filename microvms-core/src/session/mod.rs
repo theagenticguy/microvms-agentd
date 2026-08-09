@@ -36,7 +36,7 @@ pub mod sse;
 use std::sync::Arc;
 use std::time::Duration;
 
-pub use exec::{ExecHandle, ExecResult, StreamOptions};
+pub use exec::{EndReason, ExecHandle, ExecResult, StreamEnd, StreamOptions};
 pub use http::{ChunkSource, HttpBackend, HttpRequest, HttpResponse, OpenStream, ReqwestBackend};
 pub use proxy::{
     Clock, DEFAULT_AGENT_PORT, DEFAULT_REFRESH_AFTER, MAX_TOKEN_LIFETIME, PROXY_AUTH_HEADER,

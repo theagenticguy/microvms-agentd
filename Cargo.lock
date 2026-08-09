@@ -2184,7 +2184,6 @@ version = "0.1.0"
 dependencies = [
  "cargo_metadata",
  "clap",
- "futures-util",
  "microvms-core",
  "protocol",
  "ratatui",

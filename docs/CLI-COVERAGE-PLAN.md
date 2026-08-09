@@ -1,9 +1,28 @@
 # Plan: full live coverage through the `microvm` CLI
 
-**Goal.** `conformance/run_rs.py` currently expresses 38 of 72 named checks and
-prints 34 as SKIP, each naming the missing subcommand. This plan adds the five
-CLI surfaces that close every SKIP, so the Rust suite alone gives live AWS
-coverage of everything the retired Python oracle covered. The daemon needs no
+> **Implemented. This document is history, kept for the reasoning rather than the
+> numbers.**
+>
+> All five waves shipped and the conformance flip landed. `conformance/run_rs.py`
+> expresses every named check with none skipped, and it no longer carries an
+> `UNSUPPORTED` table or an `unsupported()` helper — the suite *computes* its own
+> coverage line from what ran (`expressed = passed + failed`, denominator plus
+> skips) rather than quoting a figure a document has to keep in step. So the
+> "38 of 72" below is the state on the day the plan was written and is now wrong
+> twice over: the numerator is complete, and the denominator settled at **75**
+> rather than 72 once two of the original 38 turned out to be weak readings off
+> the launch envelope and were split into real checks (see `CHANGELOG.md`).
+>
+> Read this for *why* each surface exists and what the constraints were. For what
+> the suite covers today, run it — or read the summary block at the end of
+> `conformance/run_rs.py`, which is the only place that number is derived rather
+> than written down.
+
+**Goal (as written, before implementation).** `conformance/run_rs.py` currently
+expresses 38 of 72 named checks and prints 34 as SKIP, each naming the missing
+subcommand. This plan adds the five CLI surfaces that close every SKIP, so the
+Rust suite alone gives live AWS coverage of everything the retired Python oracle
+covered. The daemon needs no
 changes — every capability already exists in `microvms-core` (`session/files.rs`,
 `session/exec.rs` streaming and stdin, `protocol::Health`) and is exercised
 today by the fake-backed and turmoil tiers; what is missing is only the CLI

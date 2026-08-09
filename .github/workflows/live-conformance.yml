@@ -40,15 +40,25 @@ jobs:
     environment: live-aws
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - uses: dtolnay/rust-toolchain@stable
         # rust-toolchain.toml declares the aarch64-musl target, so it installs
         # without a step here.
 
       - uses: Swatinem/rust-cache@v2
-      - uses: astral-sh/setup-uv@v5
-      - uses: hashicorp/setup-terraform@v3
+      # Every `uses:` here is on a Node 24 major, for the reason `ci.yml`'s header
+      # paragraph gives. `configure-aws-credentials@v4` is the exception and there
+      # is no fix for it: v5 is still Node 20 upstream, so the deprecation warning
+      # on that one step is the upstream's to clear.
+      - uses: astral-sh/setup-uv@v7
+        with:
+          # See `ci.yml`'s `security` job: `conformance/run_rs.py` and
+          # `scripts/check-live-rates` are PEP 723 scripts carrying their own
+          # dependencies, so there is no lockfile a cache key could watch and
+          # `auto` warns rather than caching.
+          enable-cache: false
+      - uses: hashicorp/setup-terraform@v4
         with:
           terraform_wrapper: false
 

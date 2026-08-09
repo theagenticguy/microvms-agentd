@@ -117,6 +117,41 @@ impl ExecResult {
 /// What a stdin write accomplished.
 pub type StdinAck = protocol::exec::StdinResponse;
 
+/// Why a stream stopped, and where a resume would pick up.
+///
+/// Returned by [`ExecHandle::for_each_event`] so the three endings are distinguishable
+/// *without* a caller having to reason about which event it last saw. That distinction is
+/// the whole point of this module — a body that ended without an `exit` event was cut, and
+/// the byte sequence alone cannot say so — and asking every caller to re-derive it from a
+/// tally is how one of them gets it wrong and reports a truncated stream as a clean pass.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StreamEnd {
+    pub reason: EndReason,
+    /// The offset a resume would pass as [`StreamOptions::offset`].
+    ///
+    /// **Core's cursor, not a count of what the callback saw.** The two rules in this
+    /// module's docs (advance only past delivered bytes, and advance past a `gap`) are
+    /// obeyed by the state machine below; handing the number back means a caller resuming
+    /// does not maintain a second cursor that disagrees with this one exactly when a
+    /// reconnect happened.
+    pub cursor: u64,
+}
+
+/// The three ways a stream ends without an error.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EndReason {
+    /// The terminal `exit` event arrived and was delivered. The command is over.
+    Exited,
+    /// The callback answered [`ControlFlow::Break`]. Nothing is wrong; the caller stopped
+    /// reading, and [`StreamEnd::cursor`] is where it stopped.
+    Stopped,
+    /// The body ended with **no** `exit` event and `reconnect` was off, so the connection
+    /// was cut and this client was told not to re-attach. The command's outcome is
+    /// unknown — not zero — and a caller reporting success here would pass a CI step on
+    /// evidence it never received.
+    Cut,
+}
+
 /// How a stream should behave. See [`ExecHandle::stream_with`].
 #[derive(Clone, Debug)]
 pub struct StreamOptions {
@@ -247,6 +282,94 @@ impl ExecHandle {
                 async move { self.advance(state, &options).await }
             },
         )
+    }
+
+    /// Drives a stream to its end, handing every event to `on_event`.
+    ///
+    /// The same state machine [`Self::stream_with`] runs, driven by an ordinary loop
+    /// instead of wrapped in a [`Stream`]. Everything about the wire behaviour is
+    /// identical — same reconnects, same cursor, same terminal-event rule — and both share
+    /// [`Self::advance`], so there is one implementation of the property and two ways to
+    /// consume it.
+    ///
+    /// # Why a callback exists beside the `Stream`
+    ///
+    /// Because `Stream` is not in `std`. A consumer of [`Self::stream_with`] has to name
+    /// the crate that defines the trait in order to call `poll_next`, so a client that
+    /// wants to print a line per event acquires a dependency to advance a loop —
+    /// `microvms-cli` carried `futures-util` for exactly that and nothing else, and
+    /// `tests/thinness.rs` (CLI-2) asserts that crate's dependency set exactly. This
+    /// method is that dependency's replacement: `ControlFlow` and `async fn` are both std,
+    /// so a caller needs nothing but this crate.
+    ///
+    /// It is also the shape the **bindings** want, and that is not a coincidence. PyO3 and
+    /// napi-rs both consume a stream by pushing into a channel a foreign-language iterator
+    /// drains (`microvms-py/src/exec.rs`, `microvms-js/src/exec.rs`), and a
+    /// `FnMut(ExecEvent) -> ControlFlow<()>` is precisely a `sender.blocking_send(event)`
+    /// whose failure means the iterator was dropped — `Break` where the `StreamExt` loop
+    /// writes an early `return`. Neither binding is migrated yet; when either is, it drops
+    /// `futures-util` the same way the CLI did, and no third spelling of the reconnect loop
+    /// appears in the process.
+    ///
+    /// # What the return value says that a tally cannot
+    ///
+    /// [`StreamEnd::reason`] distinguishes an `exit` event from a cut body from a caller
+    /// that stopped reading. A caller counting events cannot: a cut stream and a finished
+    /// one differ only in the terminal event, which is the argument for SSE framing here in
+    /// the first place. [`StreamEnd::cursor`] is the state machine's own offset, so a
+    /// caller resuming does not maintain a second one.
+    ///
+    /// An error ends the drive with `Err` and the events already handed over **stay handed
+    /// over**. That asymmetry is deliberate: the bytes a callback already wrote are real
+    /// output the caller received, and there is nothing to unwind them with.
+    pub async fn for_each_event<F>(
+        &self,
+        options: StreamOptions,
+        mut on_event: F,
+    ) -> Result<StreamEnd, Error>
+    where
+        F: FnMut(ExecEvent) -> std::ops::ControlFlow<()>,
+    {
+        let mut state = StreamState::Reconnect {
+            cursor: options.offset,
+            attempts: 0,
+        };
+        // Seeded from the caller's own starting offset, so a drive that ends before any
+        // event arrives reports where it began rather than zero.
+        let mut cursor = options.offset;
+        loop {
+            let Some((item, next)) = self.advance(state, &options).await else {
+                // `advance` yields nothing only when the body ended without an `exit`
+                // event and reconnecting was refused — the `exit` case returns below,
+                // before the machine is stepped again. So this is the cut.
+                return Ok(StreamEnd {
+                    reason: EndReason::Cut,
+                    cursor,
+                });
+            };
+            // Read off the machine rather than recomputed from the event: the two rules in
+            // this module's docs live in `advance`, and a second `cursor.max(end)` here
+            // would be a second implementation that agrees until a `gap` arrives.
+            if let Some(advanced) = next.cursor() {
+                cursor = advanced;
+            }
+            state = next;
+
+            let event = item?;
+            let terminal = matches!(event, ExecEvent::Exit(_));
+            if on_event(event).is_break() {
+                return Ok(StreamEnd {
+                    reason: EndReason::Stopped,
+                    cursor,
+                });
+            }
+            if terminal {
+                return Ok(StreamEnd {
+                    reason: EndReason::Exited,
+                    cursor,
+                });
+            }
+        }
     }
 
     /// One step of the stream state machine.
@@ -543,6 +666,23 @@ enum StreamState {
         attempts: u32,
     },
     Done,
+}
+
+impl StreamState {
+    /// The cursor this state carries, or `None` for [`StreamState::Done`].
+    ///
+    /// `Done` has none on purpose: it is reached from three different places and inventing
+    /// one there would mean picking a number, where the caller
+    /// ([`ExecHandle::for_each_event`]) already holds the last real one. `None` says "this
+    /// state advanced nothing" rather than "the cursor is zero".
+    fn cursor(&self) -> Option<u64> {
+        match self {
+            StreamState::Reconnect { cursor, .. } | StreamState::Attached { cursor, .. } => {
+                Some(*cursor)
+            }
+            StreamState::Done => None,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -994,5 +1134,239 @@ mod tests {
         assert_eq!(result.stdout(), "");
         assert_eq!(result.exit_code(), None);
         assert!(!result.succeeded());
+    }
+
+    // ── the callback driver (`for_each_event`) ───────────────────────────────
+    //
+    // Four tests, mirroring the four `stream_with` properties that matter to a caller: the
+    // events arrive in order, `Break` stops the drive, a reconnect still joins at the
+    // cursor, and a cut without an exit event is *reported as a cut*. They are separate
+    // tests rather than a re-run of the loop above on purpose — the driver is what the CLI
+    // and (next) the bindings actually call, and "the `Stream` version works" is not a
+    // statement about it.
+
+    /// Drives a stream with `for_each_event` and returns what the callback saw.
+    async fn drive(
+        handle: &ExecHandle,
+        options: StreamOptions,
+    ) -> (Vec<ExecEvent>, Result<StreamEnd, Error>) {
+        let mut seen = Vec::new();
+        let end = handle
+            .for_each_event(options, |event| {
+                seen.push(event);
+                std::ops::ControlFlow::Continue(())
+            })
+            .await;
+        (seen, end)
+    }
+
+    /// **Events reach the callback in wire order, and the end names the terminal event.**
+    ///
+    /// Order is the property a callback API can silently break where a `Stream` cannot —
+    /// buffering to hand over in a batch would reverse or coalesce, and the reader of a
+    /// child's stdout would see the second chunk first. Asserted on the *offsets* rather
+    /// than only on the reassembled bytes, because two chunks concatenated the wrong way
+    /// round still yield the right total length.
+    ///
+    /// **Falsification** — push events onto a `Vec` inside `for_each_event` and call the
+    /// callback after the loop, and the reason still reads `Exited` while the offsets come
+    /// out of order only if the wire order was wrong; swap the two `Reply` chunks and this
+    /// is red on `[0, 5]`. Verified: reversing the callback's argument order (delivering
+    /// the second frame first) fails the offsets assertion.
+    #[tokio::test(start_paused = true)]
+    async fn the_driver_hands_every_event_to_the_callback_in_order() {
+        let recorder = Recorder::with([Reply::Chunks(
+            200,
+            vec![output(0, b"AAAAA"), output(5, b"BBBBB"), exit(10)],
+        )]);
+        let (session, _, _) = session_with(Arc::clone(&recorder));
+        let handle = session.exec("ordered");
+
+        let (seen, end) = drive(&handle, StreamOptions::default()).await;
+        let end = end.expect("the stream completes");
+
+        let offsets: Vec<u64> = seen
+            .iter()
+            .filter_map(|event| match event {
+                ExecEvent::Output { offset, .. } => Some(*offset),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(offsets, [0, 5], "the callback saw the frames out of order");
+        assert!(
+            matches!(seen.last(), Some(ExecEvent::Exit(_))),
+            "the terminal event has to be delivered, not merely observed: {seen:#?}"
+        );
+        assert_eq!(
+            end,
+            StreamEnd {
+                reason: EndReason::Exited,
+                cursor: 10,
+            },
+            "the end has to name the exit event and the total"
+        );
+        assert_eq!(recorder.requests().len(), 1);
+    }
+
+    /// **`ControlFlow::Break` stops the drive, and says so rather than reporting a cut.**
+    ///
+    /// Two assertions and the second is the load-bearing one. Stopping has to be
+    /// distinguishable from a truncated stream: both end without an exit event, and a
+    /// caller that read `Cut` after its own `Break` would report "the command's outcome is
+    /// unknown" about a command it chose not to watch. The cursor is where the callback
+    /// stopped, so passing it back as `--from-offset` resumes exactly there.
+    ///
+    /// **Falsification** — return `EndReason::Cut` for the break arm and the reason
+    /// assertion is red; drop the `is_break()` check and the drive runs to the exit event,
+    /// so `seen.len()` reads 3 instead of 1. Verified: removing the early return makes the
+    /// event-count assertion fail with 3.
+    #[tokio::test(start_paused = true)]
+    async fn control_flow_break_stops_the_stream_and_is_not_reported_as_a_cut() {
+        let recorder = Recorder::with([Reply::Chunks(
+            200,
+            vec![output(0, b"first\n"), output(6, b"second\n"), exit(13)],
+        )]);
+        let (session, _, _) = session_with(Arc::clone(&recorder));
+        let handle = session.exec("halted");
+
+        let mut seen = Vec::new();
+        let end = handle
+            .for_each_event(StreamOptions::default(), |event| {
+                seen.push(event);
+                // Stop on the first event, which is what a consumer with a `head -1` does.
+                std::ops::ControlFlow::Break(())
+            })
+            .await
+            .expect("stopping is not a failure");
+
+        assert_eq!(
+            seen.len(),
+            1,
+            "the drive kept going after Break, so a caller that stopped reading is still \
+             being read to: {seen:#?}"
+        );
+        assert_eq!(
+            end,
+            StreamEnd {
+                reason: EndReason::Stopped,
+                cursor: 6,
+            },
+            "a caller's own stop must not read as a cut stream, and the cursor is where it \
+             stopped"
+        );
+    }
+
+    /// **A cut mid-drive still reconnects at the cursor, losing and duplicating nothing.**
+    ///
+    /// The same property as the `Stream` version's first test, asserted through the
+    /// driver, because that is the path the CLI takes: if the driver dropped the cursor the
+    /// reconnect would ask for byte zero and the caller would see `AAAA` twice, and the
+    /// total byte count would look right. So the verdict is the reassembled bytes *and*
+    /// the offset the second attach asked for.
+    ///
+    /// **Falsification** — seed the driver's `cursor` from zero instead of
+    /// `options.offset`, or drop the `next.cursor()` read, and the reported end cursor is
+    /// wrong while the bytes still join (the machine's own cursor is what drives the
+    /// reconnect). Verified: replacing `next.cursor()` with `None` fails the `StreamEnd`
+    /// assertion at cursor 0.
+    #[tokio::test(start_paused = true)]
+    async fn the_driver_reconnects_at_the_cursor_across_a_cut() {
+        let recorder = Recorder::with([
+            Reply::Chunks(200, vec![output(0, b"AAAA\n"), output(5, b"BBBB\n")]),
+            Reply::Chunks(200, vec![output(10, b"CCCC\n"), exit(15)]),
+        ]);
+        let (session, _, _) = session_with(Arc::clone(&recorder));
+        let handle = session.exec("resumed-driver");
+
+        let (seen, end) = drive(&handle, StreamOptions::default()).await;
+        let end = end.expect("the reconnect lands");
+
+        let mut bytes = Vec::new();
+        for event in &seen {
+            if let ExecEvent::Output { data, .. } = event {
+                bytes.extend_from_slice(data);
+            }
+        }
+        assert_eq!(
+            String::from_utf8_lossy(&bytes),
+            "AAAA\nBBBB\nCCCC\n",
+            "the two attaches did not reconstruct the output through the driver"
+        );
+        assert_eq!(end.reason, EndReason::Exited);
+        assert_eq!(end.cursor, 15);
+
+        let seen_requests = recorder.requests();
+        assert_eq!(seen_requests.len(), 2, "the cut produced no reconnect");
+        assert_eq!(
+            requested_offset(&seen_requests[1]),
+            10,
+            "the reconnect asked for the wrong byte, so the seam is wrong"
+        );
+    }
+
+    /// **A body that ended with no exit event and no reconnect is reported as `Cut`.**
+    ///
+    /// The one ending a byte count cannot detect, and the reason this returns a typed
+    /// reason at all: `reconnect: false` is what a caller doing its own reconnection
+    /// passes, and it must be able to tell "the command finished" from "the connection
+    /// dropped and you told me not to retry". `cursor` is where its own reconnect starts.
+    ///
+    /// **Falsification** — report `EndReason::Exited` for the `advance` returned `None`
+    /// arm and this is red on the reason; a caller acting on that would report exit code
+    /// 0 for a command whose outcome nobody knows. Verified.
+    #[tokio::test(start_paused = true)]
+    async fn a_cut_with_reconnect_off_ends_the_drive_naming_the_cut() {
+        let recorder = Recorder::with([Reply::Chunks(200, vec![output(0, b"partial")])]);
+        let (session, _, _) = session_with(Arc::clone(&recorder));
+        let handle = session.exec("truncated");
+
+        let (seen, end) = drive(
+            &handle,
+            StreamOptions {
+                reconnect: false,
+                ..StreamOptions::default()
+            },
+        )
+        .await;
+        let end = end.expect("a cut is not an error when reconnect is off");
+
+        assert_eq!(seen.len(), 1);
+        assert!(
+            !seen.iter().any(|event| matches!(event, ExecEvent::Exit(_))),
+            "there was no terminal event to deliver"
+        );
+        assert_eq!(
+            end,
+            StreamEnd {
+                reason: EndReason::Cut,
+                cursor: 7,
+            },
+            "a stream with no exit event is a cut, and reporting anything else would let a \
+             caller pass a CI step on output it never received"
+        );
+        assert_eq!(recorder.requests().len(), 1);
+    }
+
+    /// A fatal error ends the drive with `Err`, and the events already delivered stay
+    /// delivered.
+    ///
+    /// The asymmetry `for_each_event`'s docs state, asserted: a 404 mid-stream is fatal
+    /// (the entry was collected, so reattaching can never succeed) and there is nothing to
+    /// unwind the bytes a callback already wrote with.
+    #[tokio::test(start_paused = true)]
+    async fn a_fatal_status_ends_the_drive_with_an_error() {
+        let recorder = Recorder::with([Reply::Body(404, b"{\"error\":\"unknown_exec\"}".to_vec())]);
+        let (session, _, _) = session_with(Arc::clone(&recorder));
+        let handle = session.exec("collected");
+
+        let (seen, end) = drive(&handle, StreamOptions::default()).await;
+        assert!(seen.is_empty(), "nothing was delivered: {seen:#?}");
+        let error = end.expect_err("a 404 on the attach is fatal");
+        assert_eq!(error.wire_kind(), Some(WireKind::NotFound));
+        assert_eq!(
+            recorder.requests().len(),
+            1,
+            "a fatal status was reattached, which can never succeed"
+        );
     }
 }

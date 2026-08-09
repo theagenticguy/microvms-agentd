@@ -775,8 +775,14 @@ impl PyCostReport {
     }
 
     /// The line items belonging to one phase.
+    ///
+    /// The string is judged by the core's own [`CostPhase::from_str`], which is where the
+    /// closed set lives. This module used to carry its own seven-element table for it — a
+    /// parallel list over an enum, which would have gone stale the first time a phase was
+    /// added and would have disagreed with the JS binding's identical copy in whichever
+    /// direction was edited first.
     fn by_phase(&self, phase: &str) -> PyCoreResult<Vec<PyLineItem>> {
-        let phase = parse_phase(phase)?;
+        let phase: CostPhase = phase.parse()?;
         Ok(self
             .inner
             .by_phase(phase)
@@ -921,36 +927,6 @@ impl PyResidencyComparison {
             .render()
             .unwrap_or_else(|error| format!("<unrenderable comparison: {error}>"))
     }
-}
-
-/// A `CostPhase` from its wire spelling.
-///
-/// The one place a bare string is judged, and the judgement is a name lookup over the
-/// core's own closed enum rather than a parallel table — so a phase added to the core is
-/// accepted here without an edit, and a typo is refused with the whole list.
-fn parse_phase(phase: &str) -> Result<CostPhase, microvms_core::Error> {
-    const PHASES: [CostPhase; 7] = [
-        CostPhase::ImageBuild,
-        CostPhase::ImageStorage,
-        CostPhase::Launch,
-        CostPhase::Running,
-        CostPhase::Suspended,
-        CostPhase::Suspend,
-        CostPhase::Resume,
-    ];
-    PHASES
-        .into_iter()
-        .find(|candidate| candidate.as_str() == phase)
-        .ok_or_else(|| {
-            let offered = PHASES
-                .iter()
-                .map(|candidate| candidate.as_str())
-                .collect::<Vec<_>>()
-                .join(", ");
-            microvms_core::Error::invalid_arg(format!(
-                "{phase:?} is not a cost phase; the phases are {offered}"
-            ))
-        })
 }
 
 // ── the report builders ──────────────────────────────────────────────────────

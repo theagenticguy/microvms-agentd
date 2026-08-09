@@ -27,6 +27,26 @@
 //! `Exit` event stays distinguishable from an output chunk that happens to be last —
 //! which the core's docs call out as the difference between a finished command and a cut
 //! connection.
+//!
+//! # Why this file still names `futures-util`
+//!
+//! `microvms_core::session::ExecHandle::for_each_event` exists precisely to let a caller
+//! drive a stream without the `Stream` trait — a `FnMut(ExecEvent) -> ControlFlow<()>`
+//! where `Break` is the early `return` in [`ExecStream::new`]'s loop. `microvms-cli` moved
+//! onto it and dropped the dependency, and `microvms-cli/tests/thinness.rs`'s `RETIRED`
+//! entry records that.
+//!
+//! This file has not, for a reason about backpressure rather than about the trait: the
+//! `send` below is `.await`ed, and a synchronous callback can only `blocking_send` — which
+//! would block the runtime worker the driver itself is running on. With capacity 1 that is
+//! not an edge case, it is every event the Python consumer has not drained yet. Closing it
+//! needs an async-callback overload in core (a `FnMut` returning a future, a different
+//! signature with a different set of borrow problems), and an unbounded channel is the fix
+//! the capacity-1 paragraph above refuses. `microvms-js/src/exec.rs` carries the same note
+//! for the same reason.
+//!
+//! [`crate::cost`]'s `by_phase` took the same shape of fix at a smaller scale: core grew
+//! `CostPhase::from_str` and both bindings' hand-rolled phase tables came out.
 
 use std::sync::Arc;
 use std::sync::Mutex;

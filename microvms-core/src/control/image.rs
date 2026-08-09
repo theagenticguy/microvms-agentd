@@ -367,7 +367,16 @@ impl ControlPlane {
     /// most often a build role granted the *plausible* prefix rather than the measured one.
     /// This client cannot check the log group — CloudWatch is not in its dependency set —
     /// so the prefix is named unconditionally rather than only when the group is empty,
-    /// which is a deliberate weakening of the Python diagnostic and is noted as such.
+    /// which is a deliberate weakening of the Python diagnostic.
+    ///
+    /// Weakening rather than gap, and it stays weakened deliberately: the *remedy sentence*
+    /// is what a reader acts on and it is the same either way, so what the conditional
+    /// bought was one bit. Adding a log reader to get that bit back would mean a second
+    /// signing name and a second host in a transport whose single-service-ness is four
+    /// readable constants, and it would answer `AccessDeniedException` in an account set up
+    /// as this project documents — no role here is granted a log *read*. The full assessment
+    /// is in `microvms-cli/src/commands/local.rs`'s `logs`, beside the command a caller
+    /// reaches for instead.
     fn build_failure(&self, name: &str, state: &str) -> Error {
         Error::new(
             ErrorKind::Platform,

@@ -34,8 +34,9 @@ bind mount over `boot_id` will work. Each is recorded in
 `docs/PLATFORM.md` with its date, and the transport tier was corrected so it fails
 against the old behavior.
 
-Not yet done: a repeat run in a second region, and the CI cross-compile job has never
-executed (there is no git remote).
+Not yet done: a repeat run in a second region. The CI cross-compile job now runs on every
+push and is green — the `aarch64-unknown-linux-musl` build is a required check rather than
+a claim.
 
 The coverage gap that used to sit here is closed. For one release, 34 of the deleted
 oracle's 56 checks — file transfer, tar round trips, the four hostile archives, SSE

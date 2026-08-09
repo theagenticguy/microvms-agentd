@@ -100,12 +100,15 @@ working tree, which is where microsecond branching genuinely applies. Ship the
 measured comparison, including the honest cost of the best available fork
 approximation.
 
-**3. Publish, then measure adoption.** The repository has no git remote. Four
-commits, CI that has never executed, one region. The genuinely novel asset — 54 live
-conformance checks and five platform defects no local test tier could have caught —
-is currently unreachable by the audience this memo names. No contract gets adopted
-from a repo nobody can clone, which makes this the precondition for the other two
-rather than a closing chore.
+**3. Publish, then measure adoption.** *Done, in part — kept here because the second
+half is not.* The repository now has a remote and CI runs on every push: lint, the
+test tiers on three platforms, the security and SBOM gates, the bindings, and the
+`aarch64-musl` cross-compile are all green. What has not happened is the measuring.
+The genuinely novel asset — the live conformance suite and the platform defects no
+local test tier could have caught — is now reachable by the audience this memo names,
+and nobody has yet checked whether that audience arrived. Still one region. So this
+remains the precondition for the other two, with the cheap half spent and the
+question it was asked to answer still open.
 
 ## What we are deliberately not doing
 

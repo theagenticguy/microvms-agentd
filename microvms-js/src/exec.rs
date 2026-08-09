@@ -28,6 +28,37 @@
 //! Capacity 1 on the channel is deliberate. The daemon's SSE body is the backpressure
 //! signal, and buffering a fast producer here would defeat the byte-offset cursor the core
 //! reconnects at.
+//!
+//! # This file can drop `futures-util`, and the API to do it with already exists
+//!
+//! The spawned task below is a `StreamExt::next` loop whose whole body is "send, and return
+//! if the receiver is gone". `microvms_core::session::ExecHandle::for_each_event` is exactly
+//! that shape without the trait — `FnMut(ExecEvent) -> ControlFlow<()>`, where `Break` is
+//! this loop's early `return`:
+//!
+//! ```ignore
+//! let end = handle
+//!     .for_each_event(options, |event| match sender.blocking_send(Ok(event)) {
+//!         Ok(()) => ControlFlow::Continue(()),
+//!         // The JS iterator was dropped, which is what `for await (…) break` does.
+//!         Err(_) => ControlFlow::Break(()),
+//!     })
+//!     .await;
+//! ```
+//!
+//! `microvms-cli` made that move and dropped the dependency (`tests/thinness.rs`'s `RETIRED`
+//! records it). This crate has not, and the reason is the `blocking_send` above: the callback
+//! is synchronous, so a full-channel wait would block the runtime thread the driver is
+//! running on rather than yielding it — and capacity 1 means the channel is full whenever the
+//! JS consumer is even slightly behind, which is the normal case. Closing that needs either
+//! an async-callback overload in core (a `FnMut` returning a future, which is a different
+//! signature and a different set of borrow problems) or an unbounded channel, and the second
+//! is the thing the capacity-1 paragraph above refuses. So the dependency stays here on
+//! purpose, and it stays for a reason about *backpressure* rather than about the trait.
+//!
+//! [`crate::cost`]'s `by_phase` took the same shape of fix on the smaller scale: core grew
+//! `CostPhase::from_str` and both bindings' local copies came out. The pattern is the same
+//! one — when two bindings and a CLI each hand-roll a thing, the thing belongs in core.
 
 use std::sync::Arc;
 

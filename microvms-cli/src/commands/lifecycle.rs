@@ -10,10 +10,48 @@
 //! `suspend`, `resume`, and `terminate` go through [`ControlPlane`] directly, because they
 //! address a VM this invocation did not launch and `Sandbox` cannot be pointed at one — its
 //! fields are private, which is exactly what makes the Z3 proofs claims about the struct
-//! rather than about prose. See the packet's §3b gap note for what the attached path loses
-//! and what stands in for each closure; the short version is that `suspendedDurationSeconds`
-//! is unknowable to a process that did not send the launch, so the service answers, which is
-//! the same choice `cli.py:1756` made and for the same stated reason.
+//! rather than about prose.
+//!
+//! # There is no `Sandbox::attach`, and adding one would cost the proofs
+//!
+//! The obvious tidy-up is a `Sandbox::attach(control, microvm_id)` that hands these three
+//! commands the same type `run` and `build` use. It was assessed and refused, and the reason
+//! is not the one that looks obvious.
+//!
+//! The obvious reason is STATE-12: `suspendedDurationSeconds` exists only in the
+//! `RunMicrovm` **request**, `GetMicrovm` does not return it, so a process that did not send
+//! the launch cannot know the window. That is true, and on its own it would only mean an
+//! attached sandbox carries `suspended_window: None` and lets the service answer — which is
+//! exactly what [`microvms_core::sandbox::Sandbox`]'s `require_open_suspended_window`
+//! already does for that case, and what `cli.py:1756` chose for the same stated reason. A
+//! documented limitation, not a blocker.
+//!
+//! The real reason is the **initial state**. `spec/core.symspec.json`'s state model declares
+//! exactly one — `vm_state = PENDING and token_installed = false and image_exists = false
+//! and was_terminated = false and bootstrap_count = 0` — and `model/src/client.rs`'s
+//! `init_states` returns exactly that one state. Every claim proved over either model is a
+//! claim about what is *reachable from there*: "bootstrap happens at most once" is a
+//! statement about paths out of `bootstrap_count = 0`, and "TERMINATED never returns to
+//! RUNNING" is a statement about paths out of PENDING. An `attach` constructor would
+//! manufacture a sandbox at `vm_state = RUNNING, token_installed = true, bootstrap_count =
+//! 1` — a second initial state neither model enumerates, so neither proof would say anything
+//! about it. That is not a limitation to document; it is a set of green checks that quietly
+//! stop covering the code they name.
+//!
+//! And the thing the constructor was supposed to buy is already here, in a better form.
+//! [`suspend`] below reads the state with `GetMicrovm` and refuses locally from anything but
+//! RUNNING — STATE-5's local half, on the attached path, costing one read. An attached
+//! `Sandbox` could not do better: it would have to be *told* its lifecycle at construction,
+//! and a constructor with a `lifecycle` parameter is a constructor a caller can lie to. The
+//! private fields exist precisely so that nobody can, so a door that takes the state as an
+//! argument is the one door that reopens what they close. The service's answer is the
+//! stronger source here, not the weaker one.
+//!
+//! What the attached path therefore gives up, in full: no `Drop` warning naming an
+//! abandoned VM (nothing owns the id past the command), no launch-time window guard (there
+//! is no window to guard — see above), and no `bootstrap_count`, which is correct because
+//! this invocation bootstrapped nothing. Each of those is a property of *having launched*,
+//! and a process that did not launch has none of them to lose.
 //!
 //! # The interrupt guard is a `select!`, and the sandbox outlives it (CLI-6)
 //!
@@ -634,9 +672,10 @@ impl<'a> StartSpec<'a> {
 /// never whitespace-split — so passing a shell line that way silently looks for a binary
 /// named `ls -la`.
 ///
-/// The type comes from the `protocol` crate rather than from `microvms_core`, because
-/// `Session::run`'s signature names it and core does not re-export it. See the packet's gap
-/// note and the reason beside that dependency in `Cargo.toml`.
+/// The type comes from the `protocol` crate rather than from `microvms_core`. Core does
+/// re-export it (`pub use protocol;`), so this is no longer forced — the reason beside that
+/// dependency in `Cargo.toml` says why the direct edge stays: it resolves identically either
+/// way, it is ARCH-2's own contract, and `tests/thinness.rs` allowlists it by name.
 ///
 /// Shared with [`crate::commands::attached`] rather than duplicated, because the fields this
 /// deliberately leaves unset — `user`, `group`, `timeout_sec` — are decisions with reasons, and a
@@ -679,10 +718,15 @@ pub fn start_request(spec: StartSpec<'_>) -> protocol::exec::StartRequest {
 /// Freezes a MicroVM.
 ///
 /// Reads the state first and refuses locally from anything but RUNNING. That costs one
-/// `GetMicrovm` where [`Sandbox::suspend`] costs none — see the packet's §3b note — and it is
-/// still worth doing: `SuspendMicrovm` against a non-running id answers about the id rather
-/// than saying which of two things the caller got wrong, and a suspend issued from SUSPENDED
-/// is a caller who believes they resumed.
+/// `GetMicrovm` where [`Sandbox::suspend`] costs none — a launched sandbox already knows its
+/// lifecycle, and this one cannot — and it is still worth doing: `SuspendMicrovm` against a
+/// non-running id answers about the id rather than saying which of two things the caller got
+/// wrong, and a suspend issued from SUSPENDED is a caller who believes they resumed.
+///
+/// This read is also what makes STATE-5's local half hold on the attached path at all, and
+/// the module docs' assessment of a `Sandbox::attach` constructor turns on it: the service's
+/// answer is a stronger source for "is this RUNNING" than a lifecycle a constructor would have
+/// to be handed.
 pub async fn suspend<O: std::io::Write, E: std::io::Write>(
     ctx: &mut Ctx<'_, O, E>,
     args: &SuspendArgs,

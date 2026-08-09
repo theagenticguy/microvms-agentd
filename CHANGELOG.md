@@ -38,13 +38,59 @@ Versions are [semantic](https://semver.org/spec/v2.0.0.html); the wire contract 
   progress, which is why they cannot go on stderr; buffering them to keep stdout one
   document would remove the only reason to stream.
 
-  One new direct dependency, `futures-util`, for the `Stream` trait
-  `ExecHandle::stream_with` returns. It is a trait definition rather than a capability — it
-  opens no socket and knows nothing about AWS — and `tests/thinness.rs` carries the
-  paragraph justifying it. A callback driver in `microvms-core` would remove the need; that
-  is recorded as the preferred fix.
+  This added a direct dependency on `futures-util` for the `Stream` trait
+  `ExecHandle::stream_with` returns, with a paragraph in `tests/thinness.rs` justifying it
+  and a note that a callback driver in `microvms-core` was the preferred fix. That fix has
+  since landed — see `ExecHandle::for_each_event` below — and the dependency is gone again,
+  so the CLI is back to six direct dependencies.
+
+- **`ExecHandle::for_each_event`** in `microvms-core`: a callback driver over the same
+  reconnecting stream state machine `stream_with` runs, taking a
+  `FnMut(ExecEvent) -> ControlFlow<()>` and returning a `StreamEnd` that names *why* the
+  stream ended — `Exited`, `Stopped` (the callback broke), or `Cut` (a body with no terminal
+  event) — plus core's own cursor to resume at. Both types are `std`, so a consumer no longer
+  has to name the crate that defines `Stream` in order to advance one.
+
+  `microvm exec --stream` moved onto it and `microvm`'s direct dependency on `futures-util`
+  came out with it; `microvms-cli/tests/thinness.rs` now asserts that edge stays out and
+  names the replacement API in its failure message. The bindings can make the same move and
+  have not: their stream tasks `.await` a bounded `send`, which a synchronous callback can
+  only do as a `blocking_send` — blocking the runtime worker the driver runs on. Both
+  `microvms-py/src/exec.rs` and `microvms-js/src/exec.rs` record that as the reason.
+
+- **`impl FromStr for CostPhase`** and **`CostPhase::ALL`** in `microvms-core`. Both
+  bindings judged a bare phase string against their own hand-written seven-element table —
+  two parallel lists over one closed enum. They now parse through core, and a phase added to
+  the enum appears in the refusal message without an edit. A round-trip test covers every
+  variant by exhaustive match, so adding one without adding it to `ALL` fails to compile.
+
+- **`RateTable::minimum_retention_days`**, so the floored-storage note reads its day count
+  off the rate row instead of dividing `as_secs()` by 86,400 beside the message.
 
 ### Changed
+
+- **CI runs on Node 24 actions throughout.** `checkout@v5`, `setup-uv@v7`,
+  `upload-artifact@v6`, `setup-node@v5`, `setup-terraform@v4` — the first major of each on
+  the runtime that replaced the Node 20 the runner deprecated, so every green run is now
+  warning-free instead of printing a deprecation notice per step. `ci.yml`'s header records
+  why `checkout` stops at v5 and why `setup-uv` stays on a rolling major. `enable-cache:
+  false` on every `setup-uv` step, because there is no lockfile in this repo to key a cache
+  on — every Python entry point is a `uvx` invocation or a PEP 723 script — and a cache that
+  can never be invalidated would pin the boto3 whose bundled service model the drift gate
+  exists to read fresh. `configure-aws-credentials@v4` is the one step still on Node 20;
+  upstream has no Node 24 major yet.
+
+- **Three accepted debts now carry their reasons in the code**, rather than in a session
+  document a reader cannot open: why there is no `Sandbox::attach` for the three attached
+  lifecycle commands (`microvms-cli/src/commands/lifecycle.rs` — adding one would
+  manufacture a second initial state, and both the symspec and stateright models declare
+  exactly one, so their proofs would stop covering it); why `microvm logs` refuses to read
+  CloudWatch rather than growing a reader (`commands/local.rs` — a second signing name and
+  host in a transport whose single-service-ness is four readable constants, for a read no
+  role in `conformance/infra` is granted); and why the JSON envelope's dollar strings may
+  differ in trailing zeros from the retired Python oracle's (`render.rs` — numerically equal,
+  `rust_decimal` normalizes scale differently, and rescaling would round a figure whose
+  exactness is why it is a string).
 
 - **`conformance/run_rs.py` expresses every named check.** The `UNSUPPORTED` table and its
   `unsupported()` primitive are gone: all 34 entries became real live check bodies under
@@ -168,9 +214,11 @@ built from this tree.
 - **No published binaries.** No release artifacts, no crates.io publish, no PyPI
   publish. CI uploads an `aarch64-musl` build artifact per run; that is not a
   release.
-- **CI has never executed against a remote.** The repository had no git remote
-  until this release, so every gate has only been run locally. The cross-compile
-  and symspec jobs in particular are unproven in GitHub's environment.
+- **CI had never executed against a remote** when this was written. It has since:
+  every job in `.github/workflows/ci.yml` runs on push and is green, cross-compile
+  included. The symspec job is the one that is still unproven, and for a different
+  reason — it is not in the workflow at all, because the version this repo needs is
+  not installable from a registry (the comment at the end of `ci.yml` says so).
 - **No fork or process-tree snapshot**, and none planned — see
   `docs/STRATEGY.md` for why it is unavailable above the hypervisor.
 - **No orchestrator, no PTY, no AgentCore parity.** Deliberately out of scope.
