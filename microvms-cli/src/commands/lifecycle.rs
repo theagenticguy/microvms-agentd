@@ -307,6 +307,13 @@ async fn launch_and_exec<O: std::io::Write, E: std::io::Write>(
     }
     outcome.running_seconds = run_started.elapsed().as_secs_f64();
     outcome.endpoint = Some(endpoint.clone());
+    // The token the sandbox minted (or was given): without it the envelope's
+    // agentToken is null and `run --keep` hands the caller a VM they cannot
+    // exec into — the first live run found exactly that, as a bootstrap
+    // replay that answered 409 to a token spelled "None".
+    outcome.agent_token = sandbox
+        .session()
+        .map(|session| session.agent_token().to_string());
     if let Some(vm) = sandbox.microvm() {
         outcome.microvm_id = Some(vm.id.clone());
         ledger.record_microvm(&vm.id);

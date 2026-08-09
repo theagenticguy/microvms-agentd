@@ -188,6 +188,17 @@ pub struct Session {
 impl Session {
     /// A session against `endpoint`, minting proxy tokens through `minter`.
     ///
+    /// The bearer this session authenticates with.
+    ///
+    /// Public because a caller who launched with a minted token needs to read it back
+    /// to reattach later (the Python oracle's `Session.agent_token` property, and what
+    /// the CLI's run envelope publishes for `microvm exec --agent-token`). The value is
+    /// still kept out of `Debug` — readable on purpose is different from printed by
+    /// accident.
+    pub fn agent_token(&self) -> &str {
+        &self.transport.agent_token
+    }
+
     /// Does not talk to the VM. Constructing a session is free and re-doable, and a
     /// constructor that probed would make "do I have a session" mean "is the VM up",
     /// which are different questions with different answers during a launch.
@@ -698,6 +709,17 @@ mod tests {
             Some("application/json"),
             "the exec start lost its content type to the auth header injection"
         );
+    }
+
+    /// The read-back the CLI's run envelope depends on: a caller who launched with a
+    /// minted token can only reattach if the session hands the token back. The first
+    /// live run published `agentToken: null` because nothing read it — the daemon then
+    /// saw a bootstrap replay from the literal string "None".
+    #[tokio::test]
+    async fn the_session_hands_back_the_token_it_authenticates_with() {
+        let recorder = Recorder::with([]);
+        let (session, _, _) = session_with(Arc::clone(&recorder));
+        assert_eq!(session.agent_token(), "agent-token-abcdef");
     }
 
     /// TRAP-7's send side, asserted on a recorded request rather than on a return
