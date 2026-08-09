@@ -2185,7 +2185,6 @@ dependencies = [
  "cargo_metadata",
  "clap",
  "microvms-core",
- "protocol",
  "ratatui",
  "serde",
  "serde_json",
@@ -2222,7 +2221,6 @@ dependencies = [
 name = "microvms-js"
 version = "0.1.0"
 dependencies = [
- "futures-util",
  "microvms-core",
  "napi",
  "napi-build",
@@ -2235,7 +2233,6 @@ dependencies = [
 name = "microvms-py"
 version = "0.1.0"
 dependencies = [
- "futures-util",
  "microvms-core",
  "protocol",
  "pyo3",

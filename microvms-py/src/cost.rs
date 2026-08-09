@@ -60,6 +60,8 @@
 //! quantities and dollars as strings, and an unpriced line item with no `usd` key. It was
 //! a transcription rather than a design, because the two clients had to be diffable
 //! against each other; the shape stays because consumers now read it.
+//!
+//! (cli.py line numbers resolve at `git show 'c4d396e^:clients/python/src/microvms_agentd/cli.py'` — the retired oracle.)
 
 use std::collections::BTreeMap;
 

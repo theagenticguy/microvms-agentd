@@ -1121,7 +1121,12 @@ fn phase_of(acked: bool, finished: bool) -> Phase {
 /// buffer blocks in `write` forever if nobody is reading, and a waiter that only
 /// reads after `wait()` returns deadlocks on exactly the noisy commands it was
 /// written for.
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the wait owns every channel of one child at once — pipes, deadline, kill \
+              signal, output caps — and a params struct would be built at exactly one \
+              call site to be destructured right back"
+)]
 async fn super_wait(
     child: &mut tokio::process::Child,
     stdout: Option<tokio::process::ChildStdout>,

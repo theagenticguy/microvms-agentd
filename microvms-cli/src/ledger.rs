@@ -30,6 +30,8 @@ use serde::{Deserialize, Serialize};
 /// `camelCase` on the wire, matching `cli.py:550`'s `as_dict`, so a ledger written by either
 /// client is readable by both — which matters because a caller debugging a leak will reach
 /// for whichever `microvm ls` is on their PATH.
+///
+/// (cli.py line numbers resolve at `git show 'c4d396e^:clients/python/src/microvms_agentd/cli.py'` — the retired oracle.)
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Record {
@@ -146,6 +148,10 @@ impl Ledger {
             return;
         }
         if let Some(path) = &self.path {
+            // Swallowed for the same reason `write` is (see the module doc): a
+            // failure to delete a clean run's record costs one stale file in the
+            // state dir, and raising here would replace the command's real
+            // outcome with a housekeeping error.
             let _ = std::fs::remove_file(path);
         }
     }

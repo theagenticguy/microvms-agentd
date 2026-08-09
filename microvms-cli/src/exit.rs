@@ -42,6 +42,8 @@
 //! branching on `$?` cannot act differently on a 400 than on a 409. A consumer that *can*
 //! reads `data.kind`, which [`CliError`] carries from
 //! [`microvms_core::Error::wire_kind`] — see [`crate::envelope`].
+//!
+//! (cli.py line numbers resolve at `git show 'c4d396e^:clients/python/src/microvms_agentd/cli.py'` — the retired oracle.)
 
 use std::fmt;
 

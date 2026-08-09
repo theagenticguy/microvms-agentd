@@ -310,6 +310,8 @@ impl LineItem {
 /// Hand-assembled rather than through a serde derive, because the shape's one load-bearing
 /// property — the `usd` key being *absent* rather than null for an unpriced line — is
 /// exactly what a derive over an `Option` field would get wrong.
+///
+/// (cli.py line numbers resolve at `git show 'c4d396e^:clients/python/src/microvms_agentd/cli.py'` — the retired oracle.)
 fn line_json(item: &CoreLineItem) -> String {
     let amount = match (item.amount.estimate(), item.amount.unpriced_reason()) {
         (Some(usd), _) => format!(

@@ -171,7 +171,7 @@ pub async fn exec<O: std::io::Write, E: std::io::Write>(
         // with no output — which reads as a command that produced none.
         let started = microvms_core::session::ExecResult {
             exec_id: exec_id.clone(),
-            phase: protocol::exec::Phase::Running,
+            phase: microvms_core::protocol::exec::Phase::Running,
             outcome: None,
         };
         return Ok(render_exec(&exec_id, &started));
@@ -246,7 +246,7 @@ async fn stream_exec<O: std::io::Write, E: std::io::Write>(
     let mut events = 0u64;
     let mut bytes = 0u64;
     let mut gaps = 0u64;
-    let mut exit: Option<protocol::exec::ExitEvent> = None;
+    let mut exit: Option<microvms_core::protocol::exec::ExitEvent> = None;
 
     // A mid-stream failure is raised rather than summarised, and the events already written stay
     // written. That asymmetry is correct: the bytes on stdout are real output the caller received,
@@ -347,8 +347,8 @@ fn event_to_json(event: &ExecEvent) -> Value {
             json!({
                 "event": "output",
                 "stream": match stream {
-                    protocol::exec::StreamKind::Stdout => "stdout",
-                    protocol::exec::StreamKind::Stderr => "stderr",
+                    microvms_core::protocol::exec::StreamKind::Stdout => "stdout",
+                    microvms_core::protocol::exec::StreamKind::Stderr => "stderr",
                 },
                 "offset": offset,
                 "bytes": data.len(),
@@ -435,11 +435,11 @@ fn render_exec(exec_id: &str, result: &microvms_core::session::ExecResult) -> Re
 /// Matched rather than `Debug`-formatted: `Debug` would emit `Running` and the protocol's own
 /// `rename_all = "snake_case"` makes it `running` on the wire. A consumer comparing against the
 /// daemon's own JSON must not have to know which of the two this CLI happened to print.
-fn phase_name(phase: protocol::exec::Phase) -> &'static str {
+fn phase_name(phase: microvms_core::protocol::exec::Phase) -> &'static str {
     match phase {
-        protocol::exec::Phase::Running => "running",
-        protocol::exec::Phase::Exited => "exited",
-        protocol::exec::Phase::Acked => "acked",
+        microvms_core::protocol::exec::Phase::Running => "running",
+        microvms_core::protocol::exec::Phase::Exited => "exited",
+        microvms_core::protocol::exec::Phase::Acked => "acked",
     }
 }
 
@@ -961,7 +961,7 @@ mod tests {
     #[test]
     fn an_output_event_reports_bytes_and_says_when_the_text_is_lossy() {
         let clean = event_to_json(&ExecEvent::Output {
-            stream: protocol::exec::StreamKind::Stdout,
+            stream: microvms_core::protocol::exec::StreamKind::Stdout,
             offset: 7,
             data: b"chunk-1\n".to_vec(),
         });
@@ -975,7 +975,7 @@ mod tests {
         // 0xff is not valid UTF-8, so the text is a replacement character and the flag says so.
         // `bytes` is still the true length, which is the corroborating evidence.
         let binary = event_to_json(&ExecEvent::Output {
-            stream: protocol::exec::StreamKind::Stderr,
+            stream: microvms_core::protocol::exec::StreamKind::Stderr,
             offset: 0,
             data: vec![0xff, 0xfe],
         });
@@ -998,7 +998,7 @@ mod tests {
         assert_eq!(gap["from"], 10);
         assert_eq!(gap["to"], 4096);
 
-        let exit = event_to_json(&ExecEvent::Exit(protocol::exec::ExitEvent {
+        let exit = event_to_json(&ExecEvent::Exit(microvms_core::protocol::exec::ExitEvent {
             exit_code: Some(4),
             signal: None,
             truncated: true,
@@ -1021,7 +1021,7 @@ mod tests {
     #[test]
     fn an_event_record_is_always_exactly_one_line() {
         let multiline = event_to_json(&ExecEvent::Output {
-            stream: protocol::exec::StreamKind::Stdout,
+            stream: microvms_core::protocol::exec::StreamKind::Stdout,
             offset: 0,
             data: b"first\nsecond\nthird\n".to_vec(),
         });
@@ -1044,7 +1044,7 @@ mod tests {
     fn a_running_exec_polls_as_a_success_with_no_exit_code() {
         let running = microvms_core::session::ExecResult {
             exec_id: "x-1".into(),
-            phase: protocol::exec::Phase::Running,
+            phase: microvms_core::protocol::exec::Phase::Running,
             outcome: None,
         };
         let rendered = render_exec("x-1", &running);
@@ -1059,12 +1059,12 @@ mod tests {
     fn a_finished_failing_exec_earns_the_exec_failed_row() {
         let failed = microvms_core::session::ExecResult {
             exec_id: "x-2".into(),
-            phase: protocol::exec::Phase::Exited,
-            outcome: Some(protocol::exec::Outcome {
+            phase: microvms_core::protocol::exec::Phase::Exited,
+            outcome: Some(microvms_core::protocol::exec::Outcome {
                 exit_code: Some(4),
                 stdout: "partial\n".into(),
                 truncated: true,
-                ..protocol::exec::Outcome::default()
+                ..microvms_core::protocol::exec::Outcome::default()
             }),
         };
         let rendered = render_exec("x-2", &failed);
@@ -1082,11 +1082,11 @@ mod tests {
     fn a_signal_death_is_not_rendered_as_an_exit_code() {
         let killed = microvms_core::session::ExecResult {
             exec_id: "x-3".into(),
-            phase: protocol::exec::Phase::Exited,
-            outcome: Some(protocol::exec::Outcome {
+            phase: microvms_core::protocol::exec::Phase::Exited,
+            outcome: Some(microvms_core::protocol::exec::Outcome {
                 exit_code: None,
                 signal: Some(9),
-                ..protocol::exec::Outcome::default()
+                ..microvms_core::protocol::exec::Outcome::default()
             }),
         };
         let rendered = render_exec("x-3", &killed);
@@ -1105,9 +1105,18 @@ mod tests {
     /// know which of `Running` and `running` this CLI happened to print.
     #[test]
     fn the_phase_names_are_the_wire_spellings() {
-        assert_eq!(phase_name(protocol::exec::Phase::Running), "running");
-        assert_eq!(phase_name(protocol::exec::Phase::Exited), "exited");
-        assert_eq!(phase_name(protocol::exec::Phase::Acked), "acked");
+        assert_eq!(
+            phase_name(microvms_core::protocol::exec::Phase::Running),
+            "running"
+        );
+        assert_eq!(
+            phase_name(microvms_core::protocol::exec::Phase::Exited),
+            "exited"
+        );
+        assert_eq!(
+            phase_name(microvms_core::protocol::exec::Phase::Acked),
+            "acked"
+        );
     }
 
     /// The stdin chunk size is under the daemon's default per-write cap.

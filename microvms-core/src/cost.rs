@@ -469,6 +469,8 @@ impl DurationP {
     /// a duration should not have to branch on which client produced the envelope,
     /// while a consumer doing arithmetic on a dollar figure should be reading the
     /// string and told so.
+    ///
+    /// (cli.py line numbers resolve at `git show 'c4d396e^:clients/python/src/microvms_agentd/cli.py'` — the retired oracle.)
     pub fn seconds_f64(self) -> f64 {
         self.duration().as_secs_f64()
     }

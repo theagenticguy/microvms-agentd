@@ -49,6 +49,8 @@
 //! `microvms-core/src/cost.rs`'s `every_rate_byte_matches_the_python_literal`, and it says why:
 //! a **rate** is a transcription, so `0.0038` and `0.00380000` are the same number but not the
 //! same transcription. A derived figure is not a transcription of anything.
+//!
+//! (cli.py line numbers resolve at `git show 'c4d396e^:clients/python/src/microvms_agentd/cli.py'` — the retired oracle.)
 
 use microvms_core::cost::{Amount, CostReport, LineItem, ResidencyComparison};
 use serde_json::{Map, Value, json};

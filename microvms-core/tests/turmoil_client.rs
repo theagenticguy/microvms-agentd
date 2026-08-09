@@ -459,7 +459,11 @@ fn wire_error(request: &HttpRequest, err: &io::Error) -> Error {
 
 /// Reads a response head, returning the status, headers, leftover body bytes, the
 /// declared length, and whether the body is chunked.
-#[allow(clippy::type_complexity)]
+#[allow(
+    clippy::type_complexity,
+    reason = "a test harness's one-shot parse result; naming a struct for it would put \
+              a fifth type between the reader and the five values it is about to assert on"
+)]
 async fn read_response_head(
     stream: &mut TcpStream,
 ) -> io::Result<(u16, HashMap<String, String>, Vec<u8>, Option<usize>, bool)> {

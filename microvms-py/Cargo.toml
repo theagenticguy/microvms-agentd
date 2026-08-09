@@ -40,6 +40,10 @@ pyo3 = { version = "0.29", features = ["abi3-py39"] }
 # released. `sync` is the bounded channel the stream iterator hands events
 # across; `time` is what the core's poll loops sleep on.
 tokio = { version = "1.53", features = ["rt-multi-thread", "sync", "time"] }
-# `Stream` is not in std and `ExecHandle::stream_with` answers with one, so the
-# trait has to be nameable to poll it. Same version as the core carries.
-futures-util = { version = "0.3", default-features = false, features = ["std"] }
+
+# No `futures-util`, and its absence is the point. It was here to name the
+# `Stream` trait `ExecHandle::stream_with` answers with, because `Stream` is not
+# in std and a `poll_next` needs the trait in scope. Core's
+# `for_each_event_async` drives the same state machine through an `AsyncFnMut`,
+# and both of those are std — so `src/exec.rs` advances the stream with nothing
+# but this crate's own dependencies. Retired 2026-08-09.

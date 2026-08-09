@@ -340,6 +340,8 @@ mod tests {
 
     impl Drop for TempFile {
         fn drop(&mut self) {
+            // A leaked temp file in a test is noise, and a panic inside Drop
+            // during unwind is an abort — swallowing is the only correct choice.
             let _ = std::fs::remove_file(&self.0);
         }
     }

@@ -44,17 +44,10 @@ path = "src/main.rs"
 # The whole product surface. Every AWS call, every trap closure, the cost engine,
 # and the error taxonomy the exit table is a rendering of.
 microvms-core = { path = "../microvms-core" }
-# The daemon↔client wire contract. Core now re-exports it (`pub use protocol;`,
-# microvms-core/src/lib.rs) so this direct edge is no longer forced — it stays
-# because Cargo features and versions resolve identically either way and the
-# thinness test allowlists it explicitly as ARCH-2's own crate. Dropping it in
-# favor of `microvms_core::protocol::` paths is a fine future cleanup.
-#
-# It is also the *right* dependency to have if you have to have one: it is ARCH-2's
-# shared contract, carries no transport, and its whole purpose is that a field renamed
-# on the daemon side breaks this build. It is on the thinness guard's expected set with
-# this reason attached.
-protocol = { path = "../protocol" }
+# No direct `protocol` edge: the wire types are named through
+# `microvms_core::protocol::` (core's re-export), so this crate has exactly one
+# door to everything below it. The direct edge existed while core lacked the
+# re-export and was retired as the "fine future cleanup" its own comment named.
 # 4.6.6 was the registry's max_stable_version on 2026-08-08 (research-cli.yaml).
 # `derive` because the command tree is the manifest's only source: a builder tree
 # would be a second place the surface is written down.

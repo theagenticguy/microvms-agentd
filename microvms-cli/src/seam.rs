@@ -33,6 +33,8 @@
 //! `aws-config`'s. A CLI that resolved differently would derive a connector ARN for one
 //! region and a client for another, and the failure reads as a malformed connector rather
 //! than as a region disagreement.
+//!
+//! (cli.py line numbers resolve at `git show 'c4d396e^:clients/python/src/microvms_agentd/cli.py'` — the retired oracle.)
 
 use std::path::PathBuf;
 use std::sync::Arc;

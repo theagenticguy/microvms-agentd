@@ -4,21 +4,20 @@
 //! # The stream is the one shape that needed real work
 //!
 //! Everything else on this surface is "call an async method, block on it". A stream is
-//! not: `ExecHandle::stream_with` answers a `Stream` borrowing the handle, and a Python
-//! `__next__` has to return between items — so the future cannot be held across the
-//! return, and a borrow cannot outlive the call.
+//! not: driving one means holding a future across a Python `__next__` that has to return
+//! between items, and a borrow of the handle cannot outlive the call.
 //!
 //! The shape that works is a task and a channel. [`ExecStream::new`] spawns the stream's
-//! consumer onto the shared runtime with an owned [`microvms_core::session::ExecHandle`]
+//! driver onto the shared runtime with an owned [`microvms_core::session::ExecHandle`]
 //! and a bounded `mpsc` sender, and `__next__` blocks on `recv`. The bound is 1, which is
 //! deliberate: the daemon's SSE body is the backpressure signal, and an unbounded channel
 //! would buffer a fast producer's whole output in the binding while the Python consumer
 //! fell behind — which is the failure the core's byte-offset cursor exists to make
 //! unnecessary.
 //!
-//! Dropping the iterator drops the receiver, the next `send` fails, and the task ends.
-//! That is what `for event in handle.stream(): break` has to do, and it is why the task
-//! owns everything it touches rather than borrowing from the handle.
+//! Dropping the iterator drops the receiver, the next `send` fails, and the drive ends on
+//! `ControlFlow::Break`. That is what `for event in handle.stream(): break` has to do, and
+//! it is why the task owns everything it touches rather than borrowing from the handle.
 //!
 //! # Events are classes, not tuples
 //!
@@ -28,22 +27,15 @@
 //! which the core's docs call out as the difference between a finished command and a cut
 //! connection.
 //!
-//! # Why this file still names `futures-util`
+//! # The stream is driven by core's async callback driver
 //!
-//! `microvms_core::session::ExecHandle::for_each_event` exists precisely to let a caller
-//! drive a stream without the `Stream` trait — a `FnMut(ExecEvent) -> ControlFlow<()>`
-//! where `Break` is the early `return` in [`ExecStream::new`]'s loop. `microvms-cli` moved
-//! onto it and dropped the dependency, and `microvms-cli/tests/thinness.rs`'s `RETIRED`
-//! entry records that.
-//!
-//! This file has not, for a reason about backpressure rather than about the trait: the
-//! `send` below is `.await`ed, and a synchronous callback can only `blocking_send` — which
-//! would block the runtime worker the driver itself is running on. With capacity 1 that is
-//! not an edge case, it is every event the Python consumer has not drained yet. Closing it
-//! needs an async-callback overload in core (a `FnMut` returning a future, a different
-//! signature with a different set of borrow problems), and an unbounded channel is the fix
-//! the capacity-1 paragraph above refuses. `microvms-js/src/exec.rs` carries the same note
-//! for the same reason.
+//! [`ExecStream::new`]'s task calls `microvms_core::session::ExecHandle::for_each_event_async`
+//! and `.await`s its capacity-1 `send` inside the callback, where `ControlFlow::Break` is the
+//! dropped-iterator case. The `Stream` path — `stream_with` plus `StreamExt::next` — was
+//! retired here on 2026-08-09, and `futures-util` came out of this crate's manifest with it.
+//! The sync driver could not have served this: its only available send is `blocking_send`,
+//! which would park the runtime worker the driver runs on, and with capacity 1 that is every
+//! event the Python consumer has not drained yet.
 //!
 //! [`crate::cost`]'s `by_phase` took the same shape of fix at a smaller scale: core grew
 //! `CostPhase::from_str` and both bindings' hand-rolled phase tables came out.
@@ -52,7 +44,6 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
 
-use futures_util::StreamExt;
 use microvms_core::session::{ExecEvent, ExecHandle, ExecResult, StreamOptions};
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
@@ -424,14 +415,33 @@ impl ExecStream {
         // producer here would defeat the cursor the core reconnects at.
         let (sender, receiver) = tokio::sync::mpsc::channel(1);
         runtime::handle().spawn(async move {
-            let mut stream = std::pin::pin!(handle.stream_with(options));
-            while let Some(event) = stream.next().await {
-                // A send failure means the Python iterator was dropped. Ending the task
-                // here is what makes `break` out of a `for` loop stop the stream rather
-                // than leave a task reading a body nobody reads.
-                if sender.send(event).await.is_err() {
-                    return;
-                }
+            let end = handle
+                .for_each_event_async(options, |event| {
+                    // Cloned per event rather than borrowed: core's callback future is a plain
+                    // type parameter, which cannot name a borrow of this closure's captures —
+                    // see `for_each_event_async`'s docs for why that signature and not
+                    // `AsyncFnMut`. One atomic increment per event.
+                    let sender = sender.clone();
+                    async move {
+                        // `.await`ed, not `blocking_send`ed. With capacity 1 the channel is
+                        // full whenever the Python consumer is even slightly behind, and
+                        // blocking here would park the runtime worker this driver runs on —
+                        // which is the whole reason core grew the async overload.
+                        match sender.send(Ok(event)).await {
+                            Ok(()) => std::ops::ControlFlow::Continue(()),
+                            // The Python iterator was dropped. `Break` ends the drive, which
+                            // is what makes `break` out of a `for` loop stop the stream rather
+                            // than leave a task reading a body nobody reads.
+                            Err(_) => std::ops::ControlFlow::Break(()),
+                        }
+                    }
+                })
+                .await;
+            // A stream error is delivered as an item so `__next__` raises it. The events
+            // already sent stay sent: the bytes a caller received are real output, and the
+            // asymmetry is the driver's own documented one.
+            if let Err(error) = end {
+                let _ = sender.send(Err(error)).await;
             }
         });
         Self {

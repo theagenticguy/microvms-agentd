@@ -33,6 +33,8 @@
 //! What survives all three is the thing actually worth forbidding: a `RunMicrovm` that is a token
 //! the compiler resolves. A CLI cannot invoke an operation without naming it that way, and it
 //! cannot be prevented from *explaining* one.
+//!
+//! (cli.py line numbers resolve at `git show 'c4d396e^:clients/python/src/microvms_agentd/cli.py'` — the retired oracle.)
 
 use std::path::{Path, PathBuf};
 
@@ -59,16 +61,13 @@ const RETIRED: [(&str, &str); 1] = [(
 /// The exact set of direct dependencies this crate is allowed, and the reason for each.
 ///
 /// An allowlist. See the module docs on why a denylist is not good enough. The reason strings are
-/// not decorative: this test asserts each is a real sentence, so a seventh entry cannot be added
+/// not decorative: this test asserts each is a real sentence, so a new entry cannot be added
 /// without someone writing down what it is for.
-const ALLOWED: [(&str, &str); 7] = [
+const ALLOWED: [(&str, &str); 6] = [
     (
         "microvms-core",
-        "the product surface: every AWS call, every trap closure, the cost engine, the taxonomy",
-    ),
-    (
-        "protocol",
-        "the daemon wire contract, named in `Session::run`'s signature; core re-exports it too, and either path resolves identically",
+        "the product surface: every AWS call, every trap closure, the cost engine, the taxonomy — \
+         and the wire types, via its `pub use protocol` re-export, so one door covers everything",
     ),
     (
         "clap",
@@ -131,7 +130,7 @@ fn manifest_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml")
 }
 
-/// **The exact dependency set.** Seven normal dependencies plus the one dev-dependency, and
+/// **The exact dependency set.** Six normal dependencies plus the one dev-dependency, and
 /// nothing else — the ALLOWED table above is the count's source of truth, not this sentence.
 ///
 /// The requirement under test, stated as an equality rather than as an absence. `cargo metadata`
@@ -210,7 +209,7 @@ fn the_direct_dependency_set_is_exactly_the_allowed_one() {
         );
     }
 
-    // Every allowance states its purpose, so a seventh cannot be added silently.
+    // Every allowance states its purpose, so a new one cannot be added silently.
     for (name, reason) in ALLOWED {
         assert!(
             reason.len() > 25,

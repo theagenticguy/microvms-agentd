@@ -66,6 +66,8 @@ pub fn cost<O: std::io::Write, E: std::io::Write>(
     // does *not* launch — an `is_some()` here would have made a zero-sized image claim a
     // snapshot read the plan never pays for. A launch reads a snapshot, so claiming one that
     // did not happen adds a transfer line.
+    //
+    // (cli.py line numbers resolve at `git show 'c4d396e^:clients/python/src/microvms_agentd/cli.py'` — the retired oracle.)
     let launched = args.running_sec > 0.0 || args.image_gb.is_some_and(|gb| gb != 0.0);
 
     let report = if args.estimate {

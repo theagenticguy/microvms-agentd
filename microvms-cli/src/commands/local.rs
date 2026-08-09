@@ -143,6 +143,8 @@ fn joined(value: &Value) -> String {
 /// that write no logs at all, every failure then reads `reason=unknown`, and a client that
 /// answered identically for "I cannot read" and "there was nothing to read" would make that
 /// indistinguishable a second time.
+///
+/// (cli.py line numbers resolve at `git show 'c4d396e^:clients/python/src/microvms_agentd/cli.py'` — the retired oracle.)
 pub fn logs<O: std::io::Write, E: std::io::Write>(
     _ctx: &mut Ctx<'_, O, E>,
     args: &LogsArgs,

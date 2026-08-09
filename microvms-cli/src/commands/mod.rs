@@ -19,6 +19,8 @@
 //! Here it is [`Rendered::already_reported`], a field on the value the handler returns. The
 //! dispatcher emits the envelope and *then* reads the field, so a second envelope is not
 //! merely discouraged: there is no code path that could write one.
+//!
+//! (cli.py line numbers resolve at `git show 'c4d396e^:clients/python/src/microvms_agentd/cli.py'` — the retired oracle.)
 
 pub mod attached;
 pub mod cost;

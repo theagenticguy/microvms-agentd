@@ -50,6 +50,8 @@ const SENTINEL: &str = "seam-was-refused-a1b2c3";
 /// assertions possible. The third — *which* door — is the one the Python found it needed after
 /// the second was defeated on purpose: a handler that constructed its own client would still
 /// fail with the patched error while having bypassed the seam entirely.
+///
+/// (cli.py line numbers resolve at `git show 'c4d396e^:clients/python/src/microvms_agentd/cli.py'` — the retired oracle.)
 struct RefusingSeam {
     entered: Mutex<Vec<Door>>,
 }
@@ -1146,7 +1148,7 @@ fn exec_command(shape: impl FnOnce(&mut ExecArgs)) -> Command {
 
 /// `PollResponse`, in the protocol's own snake_case spelling, with the outcome **flattened**.
 ///
-/// Written out rather than serialized from `protocol::exec::PollResponse`, which is the whole point:
+/// Written out rather than serialized from `microvms_core::protocol::exec::PollResponse`, which is the whole point:
 /// a body produced by the same serializer the client deserializes with agrees with a renamed field
 /// by construction. This one does not — and it earned its keep immediately. The first draft nested
 /// the outcome under a `"result"` key, because that is what the Rust field is called. It is

@@ -21,40 +21,23 @@
 //!
 //! `#[napi(async_iterator)]` plus an `AsyncGenerator` impl gives JS `for await (const event
 //! of handle.stream())`. The trait's `next` must answer a `Send + 'static` future, so the
-//! stream's consumer runs as a spawned task feeding a bounded channel and `next` awaits
-//! `recv` — the same shape as the Python iterator, for the same reason: a `Stream` borrowing
+//! stream's driver runs as a spawned task feeding a bounded channel and `next` awaits
+//! `recv` — the same shape as the Python iterator, for the same reason: a drive borrowing
 //! the handle cannot be held across a return into the host language.
 //!
 //! Capacity 1 on the channel is deliberate. The daemon's SSE body is the backpressure
 //! signal, and buffering a fast producer here would defeat the byte-offset cursor the core
 //! reconnects at.
 //!
-//! # This file can drop `futures-util`, and the API to do it with already exists
+//! # The stream is driven by core's async callback driver
 //!
-//! The spawned task below is a `StreamExt::next` loop whose whole body is "send, and return
-//! if the receiver is gone". `microvms_core::session::ExecHandle::for_each_event` is exactly
-//! that shape without the trait — `FnMut(ExecEvent) -> ControlFlow<()>`, where `Break` is
-//! this loop's early `return`:
-//!
-//! ```ignore
-//! let end = handle
-//!     .for_each_event(options, |event| match sender.blocking_send(Ok(event)) {
-//!         Ok(()) => ControlFlow::Continue(()),
-//!         // The JS iterator was dropped, which is what `for await (…) break` does.
-//!         Err(_) => ControlFlow::Break(()),
-//!     })
-//!     .await;
-//! ```
-//!
-//! `microvms-cli` made that move and dropped the dependency (`tests/thinness.rs`'s `RETIRED`
-//! records it). This crate has not, and the reason is the `blocking_send` above: the callback
-//! is synchronous, so a full-channel wait would block the runtime thread the driver is
-//! running on rather than yielding it — and capacity 1 means the channel is full whenever the
-//! JS consumer is even slightly behind, which is the normal case. Closing that needs either
-//! an async-callback overload in core (a `FnMut` returning a future, which is a different
-//! signature and a different set of borrow problems) or an unbounded channel, and the second
-//! is the thing the capacity-1 paragraph above refuses. So the dependency stays here on
-//! purpose, and it stays for a reason about *backpressure* rather than about the trait.
+//! The spawned task below calls `microvms_core::session::ExecHandle::for_each_event_async` and
+//! `.await`s its capacity-1 `send` inside the callback, where `ControlFlow::Break` is what
+//! `for await (…) break` does. The `Stream` path — `stream_with` plus `StreamExt::next` — was
+//! retired here on 2026-08-09, and `futures-util` came out of this crate's manifest with it.
+//! The sync driver could not have served this: its only available send is `blocking_send`,
+//! which would park the runtime thread the driver runs on, and capacity 1 means the channel is
+//! full whenever the JS consumer is even slightly behind — the normal case.
 //!
 //! [`crate::cost`]'s `by_phase` took the same shape of fix on the smaller scale: core grew
 //! `CostPhase::from_str` and both bindings' local copies came out. The pattern is the same
@@ -62,7 +45,6 @@
 
 use std::sync::Arc;
 
-use futures_util::StreamExt;
 use microvms_core::session::{
     ExecEvent, ExecHandle as CoreHandle, ExecResult as CoreResult, StreamOptions,
 };
@@ -70,7 +52,7 @@ use napi::bindgen_prelude::AsyncGenerator;
 use napi_derive::napi;
 use tokio::sync::Mutex;
 
-use crate::errors::{AsyncError, js, js_async, to_napi};
+use crate::errors::{AsyncError, js, js_async};
 
 /// The default wait for `wait`/`waitAndAck`, matching the Python client's 300s.
 const DEFAULT_WAIT: f64 = 300.0;
@@ -234,17 +216,43 @@ impl ExecStream {
     fn new(handle: Arc<CoreHandle>, options: StreamOptions) -> Self {
         // Capacity 1: the SSE body is the backpressure signal.
         let (sender, receiver) = tokio::sync::mpsc::channel(1);
-        // Spawned on napi's managed runtime, which is the runtime every `#[napi] async fn`
-        // in this crate already runs on — so there is no second runtime to keep in step.
-        napi::tokio::spawn(async move {
-            let mut stream = std::pin::pin!(handle.stream_with(options));
-            while let Some(event) = stream.next().await {
-                // A send failure means the JS iterator was dropped or `break`-ed out of.
-                // Ending the task here is what stops a `break` leaving a task reading a
-                // body nobody reads.
-                if sender.send(event).await.is_err() {
-                    return;
-                }
+        // `napi::bindgen_prelude::spawn` and **not** `napi::tokio::spawn`, and the difference
+        // aborts the process rather than degrading. `napi::tokio` is napi's re-export of the
+        // tokio crate itself, so `tokio::spawn` there needs an *ambient* runtime — and this
+        // function is synchronous (`stream()` is a plain `#[napi] fn`, because an async one
+        // could not return a borrow-free iterator), so it is called on the JS main thread with
+        // no runtime entered. The result was `there is no reactor running` followed by
+        // `fatal runtime error: failed to initiate panic` — a panic across the FFI boundary,
+        // which takes Node with it. `bindgen_prelude::spawn` submits to napi's *managed*
+        // runtime, which is the same runtime every `#[napi] async fn` here already runs on, and
+        // needs no ambient context. `__test__/exec.mjs` is the regression.
+        napi::bindgen_prelude::spawn(async move {
+            let end = handle
+                .for_each_event_async(options, |event| {
+                    // Cloned per event rather than borrowed: core's callback future is a plain
+                    // type parameter, which cannot name a borrow of this closure's captures —
+                    // see `for_each_event_async`'s docs for why that signature and not
+                    // `AsyncFnMut`. One atomic increment per event.
+                    let sender = sender.clone();
+                    async move {
+                        // `.await`ed, not `blocking_send`ed: with capacity 1 the channel is
+                        // full whenever the JS consumer is behind, and blocking would park the
+                        // runtime thread this driver is running on.
+                        match sender.send(Ok(event)).await {
+                            Ok(()) => std::ops::ControlFlow::Continue(()),
+                            // The JS iterator was dropped or `break`-ed out of. `Break` ends
+                            // the drive, which stops a `break` leaving a task reading a body
+                            // nobody reads.
+                            Err(_) => std::ops::ControlFlow::Break(()),
+                        }
+                    }
+                })
+                .await;
+            // A stream error is delivered as an item so the iteration *rejects* rather than
+            // ending silently — an `OutputGap` under `errorOnGap` is the case that matters,
+            // and a silent end there would read as complete output.
+            if let Err(error) = end {
+                let _ = sender.send(Err(error)).await;
             }
         });
         Self {
@@ -270,10 +278,16 @@ impl AsyncGenerator for ExecStream {
                 // A stream error rejects the iteration rather than ending it silently — an
                 // `OutputGap` with `errorOnGap` set is the case that matters, and a silent
                 // end there would read as complete output.
-                Some(Err(error)) => Err(napi::Error::new(
-                    napi::Status::GenericFailure,
-                    to_napi(&error).reason,
-                )),
+                //
+                // Through `js_async` and **not** by rebuilding a bare `napi::Error` from the
+                // reason string. The reason alone carries the message and drops the cause
+                // chain, so `err.cause.message` was `undefined` here while it is the `ERR_*`
+                // code on every other path — the one rule [`crate::errors`] documents as
+                // uniform, broken exactly on the rejection a caller is most likely to branch
+                // on. `js_async` is the same conversion every `#[napi] async fn` here uses, so
+                // the chain (`cause.message` = code, `cause.cause.message` = wire kind) is
+                // identical. `__test__/exec.mjs` is the regression.
+                Some(Err(error)) => Err(js_async(error).into()),
                 None => Ok(None),
             }
         }

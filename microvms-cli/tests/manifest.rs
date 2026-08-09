@@ -189,6 +189,8 @@ fn the_published_exit_table_agrees_with_what_the_binary_exits() {
 ///
 /// The only consumer that asks for a manifest is one that parses it, so a bare invocation is
 /// already what it wants — which is `cli.py:2278`'s `json: bool = True` and the reason for it.
+///
+/// (cli.py line numbers resolve at `git show 'c4d396e^:clients/python/src/microvms_agentd/cli.py'` — the retired oracle.)
 #[test]
 fn a_bare_manifest_invocation_emits_json() {
     let outcome = run(&["manifest"], &[]);

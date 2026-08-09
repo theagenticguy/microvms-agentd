@@ -65,6 +65,8 @@ fn main() -> ExitCode {
     // failure never reaches a handler — and an agent that asked for JSON must get JSON even when
     // what it gets is an argument error. This is `cli.py:2318`'s trick and it is necessary for
     // the same reason.
+    //
+    // (cli.py line numbers resolve at `git show 'c4d396e^:clients/python/src/microvms_agentd/cli.py'` — the retired oracle.)
     let tokens: Vec<String> = std::env::args().skip(1).collect();
     let wants = |flag: &str| tokens.iter().any(|token| token == flag);
     let mut out = Output::for_flags(wants("--json"), wants("--dense"), wants("--quiet"));

@@ -44,6 +44,38 @@ Versions are [semantic](https://semver.org/spec/v2.0.0.html); the wire contract 
   since landed — see `ExecHandle::for_each_event` below — and the dependency is gone again,
   so the CLI is back to six direct dependencies.
 
+- **A unit-test tier for both bindings.** 198 Python tests across five files plus a
+  `conftest.py`, and 152 Node tests across four files plus a `support/` directory, organized
+  to mirror `src/` module for module: cost, errors, exec, region/session. Where the two
+  pre-existing smoke files assert what the surfaces *refuse* — no `valueOf`, no `__float__`,
+  no client-token parameter — these assert what they **answer**, which is not the same
+  coverage: a binding whose `EstimatedUsd` correctly coerces to `NaN` can still report the
+  wrong dollar figure or omit a line item, and neither throws anything. Cost figures are
+  compared as exact decimal strings (BigInt in Node, `Decimal` in Python) rather than parsed
+  to a float, because parsing would perform the laundering step the types exist to prevent.
+
+  The exec/stream surface gets real behavioural coverage rather than argument checks, through
+  an offline SSE server on loopback in each suite: scripted frame lists, one list per attach,
+  so a two-element script *is* a cut-and-reconnect and the offset a second attach asks for is
+  assertable. Both helpers state their own boundary rather than leaving it to be discovered —
+  the frame shapes are that suite's transcription of what `microvms-core/src/session/sse.rs`
+  parses, so nothing there proves `agentd` emits them; if the daemon's framing changed these
+  would stay green while the conformance suite went red. `microvms-js/package.json` gains
+  `test:smoke` and `test:unit` so the two tiers run apart; CI's `bindings` job already globbed
+  the directory, so no workflow change was needed.
+
+  Two pre-existing JS defects were found by writing them, both now fixed with the measurement
+  recorded at the site. `stream()` was spawning onto `napi::tokio::spawn` — tokio's own
+  `spawn`, which needs an *ambient* runtime — from a synchronous `#[napi] fn` called on the JS
+  main thread, producing `there is no reactor running` and then `fatal runtime error: failed
+  to initiate panic`: a panic across the FFI boundary, which takes Node with it. It is now
+  `napi::bindgen_prelude::spawn`, onto napi's managed runtime, which needs no ambient context.
+  And a stream rejection was rebuilt as a bare `napi::Error` from the error's reason string,
+  which dropped the cause chain and left `err.cause.message` `undefined` on the one rejection
+  a caller is most likely to branch on — while `src/errors.rs` documents `cause.message` as
+  the uniform rule. It goes through `js_async` now, like every other path. `__test__/exec.mjs`
+  is the regression for both.
+
 - **`ExecHandle::for_each_event`** in `microvms-core`: a callback driver over the same
   reconnecting stream state machine `stream_with` runs, taking a
   `FnMut(ExecEvent) -> ControlFlow<()>` and returning a `StreamEnd` that names *why* the
@@ -53,10 +85,33 @@ Versions are [semantic](https://semver.org/spec/v2.0.0.html); the wire contract 
 
   `microvm exec --stream` moved onto it and `microvm`'s direct dependency on `futures-util`
   came out with it; `microvms-cli/tests/thinness.rs` now asserts that edge stays out and
-  names the replacement API in its failure message. The bindings can make the same move and
-  have not: their stream tasks `.await` a bounded `send`, which a synchronous callback can
-  only do as a `blocking_send` — blocking the runtime worker the driver runs on. Both
-  `microvms-py/src/exec.rs` and `microvms-js/src/exec.rs` record that as the reason.
+  names the replacement API in its failure message. The bindings could not make the same
+  move, for a reason about backpressure rather than about the trait — see
+  `ExecHandle::for_each_event_async` below, which is what let them.
+
+- **`ExecHandle::for_each_event_async`** in `microvms-core`: `for_each_event` for a callback
+  that **awaits**. Same loop, same `advance` state machine, same three endings; the only
+  difference is that the per-event callback answers a future which is `.await`ed before the
+  next attach read starts — so a slow consumer slows the stream rather than buffering behind
+  it, which is what makes it usable as backpressure. `for_each_event` is now written in terms
+  of it through `std::future::ready`, so the ordering, the cursor read, and the `Break` arm
+  have one implementation rather than two that agree until one is edited.
+
+  This is what the bindings were waiting for. Both consume a stream by pushing into a
+  **capacity-1** channel a foreign-language iterator drains, and capacity 1 means the channel
+  is full whenever the host consumer is even slightly behind — normally. With a synchronous
+  callback the only available send is `blocking_send`, which would park the runtime worker the
+  driver itself runs on; `send(..).await` inside the callback yields it instead. Both bindings
+  moved onto it and `futures-util` came out of both manifests, with its absence documented
+  where the dependency used to be. Four tests cover the new driver, the load-bearing one being
+  a capacity-1 channel with a deliberately slow consumer that loses none of five events.
+
+  The signature is `FnMut(ExecEvent) -> Fut` and **not** `AsyncFnMut`, which is measured rather
+  than stylistic: a caller cannot `tokio::spawn` a drive that uses `AsyncFnMut` without the
+  unstable `async_fn_traits` feature, because proving the returned future `Send` requires
+  naming `F::CallRefFuture<'a>` under a `for<'a>` bound. Both bindings spawn this drive, so
+  that is not a corner they can avoid. The cost is a per-event `Sender::clone` instead of a
+  borrow — one atomic increment — and it is written down beside the signature.
 
 - **`impl FromStr for CostPhase`** and **`CostPhase::ALL`** in `microvms-core`. Both
   bindings judged a bare phase string against their own hand-written seven-element table —
@@ -69,6 +124,51 @@ Versions are [semantic](https://semver.org/spec/v2.0.0.html); the wire contract 
 
 ### Changed
 
+- **The security job's four scanner downloads are version-pinned and checksummed.** betterleaks
+  1.7.3, syft 1.50.0, grype 0.116.1, and osv-scanner 2.5.0, each fetched at an exact release tag
+  and verified with `sha256sum -c -` before it runs. What they were: two `curl … install.sh | sh`
+  off a `main` branch, a `releases/latest` tarball piped straight into `tar xz`, and a
+  `releases/latest` binary written to `/usr/local/bin` — four unverified executables in the two
+  jobs whose entire output is a supply-chain assurance, and the one debt cluster in the repo with
+  no acceptance written anywhere. Thirty lines of the same file reason carefully about which
+  action major is on Node 24; that care now reaches the tools those jobs actually execute.
+
+  The cost is stated where the pins are: refreshing one means updating the version *and* the hash
+  from that release's `checksums.txt`, by hand, because this repo still has no Dependabot. That is
+  the same gap `ci.yml`'s header paragraph names for `setup-uv`, and it applies to five pins now
+  rather than one. The trade is deliberate — an unpinned fetch is a live hole, a stale pin is a
+  delayed patch — but it is a trade.
+
+- **`microvms-cli` drops its direct `protocol` dependency**, naming the wire types through
+  `microvms_core::protocol::` instead. The edge existed while core lacked the re-export and was
+  kept afterwards because resolution is identical either way; its own manifest comment called
+  dropping it "a fine future cleanup", and this is that. The crate now has exactly one door to
+  everything below it, `tests/thinness.rs`'s `ALLOWED` table is six entries, and the entry that
+  went away is the one whose reason string still claimed "core does not re-export it" — false
+  since `microvms-core/src/lib.rs` grew `pub use protocol;`. Worth noting what did *not* change:
+  the only assertion that guard makes over a reason is `reason.len() > 25`, so the mechanism that
+  let a reason go stale is intact. This instance closed; the class did not.
+
+- **Every `#[allow]` in the tree carries a `reason =` string.** Two did not — `too_many_arguments`
+  on `agentd`'s `super_wait` and `type_complexity` on the turmoil harness's response-head parse —
+  in a codebase where the other twelve all did. Both now argue their specific case rather than
+  restating the lint.
+
+- **Four filesystem-failure swallows gained or were confirmed to have a local reason.** The debt
+  register had counted five unreasoned `let _ = std::fs::…` sites; a per-site read found two of
+  them already reasoned (`identity.rs`'s pre-create `remove_file`, whose failure mode *is* the
+  expected case, and `fs.rs`'s replace-on-extract, which exists so a retried partial extraction
+  converges). The two that genuinely lacked one — `Ledger::clear` and `doctor`'s `TempFile::drop`
+  — now have it, the second because a panic inside `Drop` during unwind is an abort, which makes
+  swallowing the only correct choice rather than the convenient one.
+
+- **Every file citing the retired Python oracle by line number says how to reach it.** Sixteen
+  files carry `cli.py:<line>` citations that resolve only at `c4d396e^`, and the recovery hash was
+  written down once, in a document marked as history. Each now carries a one-line anchor naming
+  the `git show 'c4d396e^:clients/python/src/microvms_agentd/cli.py'` that resolves it. The line
+  numbers stay historical on purpose: they cite a file that no longer exists, and rewriting one to
+  point at live code would be a claim about code that never carried the argument.
+
 - **CI runs on Node 24 actions throughout.** `checkout@v5`, `setup-uv@v7`,
   `upload-artifact@v6`, `setup-node@v5`, `setup-terraform@v4` — the first major of each on
   the runtime that replaced the Node 20 the runner deprecated, so every green run is now
@@ -77,8 +177,10 @@ Versions are [semantic](https://semver.org/spec/v2.0.0.html); the wire contract 
   false` on every `setup-uv` step, because there is no lockfile in this repo to key a cache
   on — every Python entry point is a `uvx` invocation or a PEP 723 script — and a cache that
   can never be invalidated would pin the boto3 whose bundled service model the drift gate
-  exists to read fresh. `configure-aws-credentials@v4` was the one step still on Node 20 (v6 has since landed on node24 and the workflow moved to it);
-  upstream has no Node 24 major yet.
+  exists to read fresh. `configure-aws-credentials@v4` was the one step still on Node 20, and
+  it was the last: the rolling v6 tag has since landed on node24 — checked against the tag's
+  own `action.yml` — and `live-conformance.yml` is on `@v6`. No step in the repo is on a Node
+  20 action.
 
 - **Three accepted debts now carry their reasons in the code**, rather than in a session
   document a reader cannot open: why there is no `Sandbox::attach` for the three attached

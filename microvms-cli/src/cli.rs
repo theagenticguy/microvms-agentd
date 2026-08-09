@@ -35,6 +35,8 @@
 //! `--unlisted-region <NAME>`, conflicting with `--region`, with the cost in its help text —
 //! rather than `--region` accepting a free string and quietly widening. A reader of a command
 //! line can see that someone opted in.
+//!
+//! (cli.py line numbers resolve at `git show 'c4d396e^:clients/python/src/microvms_agentd/cli.py'` — the retired oracle.)
 
 use std::path::PathBuf;
 

@@ -36,8 +36,13 @@ napi-derive = "3"
 # provides the runtime, and this names the features the futures require. No
 # `rt-multi-thread` — napi owns the runtime, and a library does not choose it.
 tokio = { version = "1.53", features = ["time", "sync"] }
-# `ExecHandle::stream_with` answers a `Stream`, which the async iterator drains.
-futures-util = { version = "0.3", default-features = false, features = ["std"] }
+
+# No `futures-util`, and its absence is the point. It was here to name the
+# `Stream` trait `ExecHandle::stream_with` answers with, because `Stream` is not
+# in std and a `poll_next` needs the trait in scope. Core's
+# `for_each_event_async` drives the same state machine through an `AsyncFnMut`,
+# and both of those are std — so `src/exec.rs` advances the stream with nothing
+# but this crate's own dependencies. Retired 2026-08-09.
 
 [build-dependencies]
 # Omitting `napi_build::setup()` produces undefined-symbol link failures, which

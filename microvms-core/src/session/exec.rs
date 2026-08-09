@@ -119,7 +119,8 @@ pub type StdinAck = protocol::exec::StdinResponse;
 
 /// Why a stream stopped, and where a resume would pick up.
 ///
-/// Returned by [`ExecHandle::for_each_event`] so the three endings are distinguishable
+/// Returned by [`ExecHandle::for_each_event`] and
+/// [`ExecHandle::for_each_event_async`] so the three endings are distinguishable
 /// *without* a caller having to reason about which event it last saw. That distinction is
 /// the whole point of this module — a body that ended without an `exit` event was cut, and
 /// the byte sequence alone cannot say so — and asking every caller to re-derive it from a
@@ -302,14 +303,12 @@ impl ExecHandle {
     /// method is that dependency's replacement: `ControlFlow` and `async fn` are both std,
     /// so a caller needs nothing but this crate.
     ///
-    /// It is also the shape the **bindings** want, and that is not a coincidence. PyO3 and
-    /// napi-rs both consume a stream by pushing into a channel a foreign-language iterator
-    /// drains (`microvms-py/src/exec.rs`, `microvms-js/src/exec.rs`), and a
-    /// `FnMut(ExecEvent) -> ControlFlow<()>` is precisely a `sender.blocking_send(event)`
-    /// whose failure means the iterator was dropped — `Break` where the `StreamExt` loop
-    /// writes an early `return`. Neither binding is migrated yet; when either is, it drops
-    /// `futures-util` the same way the CLI did, and no third spelling of the reconnect loop
-    /// appears in the process.
+    /// A **synchronous** callback is the right shape for a caller whose per-event work is
+    /// synchronous — the CLI writes a line and returns. A caller whose per-event work is an
+    /// `await` (both bindings: a bounded-channel `send`) wants
+    /// [`Self::for_each_event_async`], which is the same loop with an awaited callback.
+    /// Using this one there would mean `blocking_send` on a runtime worker, which is why
+    /// the overload exists.
     ///
     /// # What the return value says that a tally cannot
     ///
@@ -329,6 +328,63 @@ impl ExecHandle {
     ) -> Result<StreamEnd, Error>
     where
         F: FnMut(ExecEvent) -> std::ops::ControlFlow<()>,
+    {
+        // Delegated rather than a second copy of the loop. A synchronous callback *is* an
+        // async one whose future is already complete, and `std::future::ready` says exactly
+        // that — so the ordering, the cursor read, the `Break` arm, and the three endings
+        // have one implementation instead of two that agree until one is edited.
+        self.for_each_event_async(options, |event| std::future::ready(on_event(event)))
+            .await
+    }
+
+    /// [`Self::for_each_event`] for a callback that **awaits**.
+    ///
+    /// The same loop and the same [`Self::advance`] state machine; the only difference is
+    /// that the per-event callback answers a future, which is `.await`ed before the next
+    /// step is taken. So the events are still delivered strictly in order and still one at a
+    /// time — a callback that awaits between events holds the drive rather than racing it,
+    /// which is what makes this usable as backpressure.
+    ///
+    /// # Why the overload exists, and what it closed
+    ///
+    /// Both bindings consume a stream by pushing into a **capacity-1** `mpsc` channel that a
+    /// foreign-language iterator drains (`microvms-py/src/exec.rs`, `microvms-js/src/exec.rs`).
+    /// The channel bound is deliberate — the daemon's SSE body is the backpressure signal —
+    /// and it means the channel is full whenever the host-language consumer is even slightly
+    /// behind, i.e. normally. With [`Self::for_each_event`] the only available send is
+    /// `blocking_send`, which would block the very runtime worker the driver is running on;
+    /// so both bindings kept the `Stream` path, and `futures-util` with it, for a reason
+    /// about backpressure rather than about the trait. `send(..).await` inside an
+    /// `AsyncFnMut` yields the worker instead, and both bindings dropped the dependency on
+    /// 2026-08-09.
+    ///
+    /// # `FnMut(ExecEvent) -> Fut` rather than `AsyncFnMut`
+    ///
+    /// Measured, not stylistic, and the measurement is the reason the signature looks older
+    /// than the edition. `AsyncFnMut` is the obvious spelling and it compiles here — but a
+    /// caller cannot `tokio::spawn` a drive that uses it. Proving the returned future `Send`
+    /// requires naming `F::CallRefFuture<'a>` under a `for<'a>` bound, which is the unstable
+    /// `async_fn_traits` feature; without it the spawn fails with *"`Send` would have to be
+    /// implemented for the type `&ExecHandle`… but `Send` is actually implemented for
+    /// `&'0 ExecHandle`, for some specific lifetime"*. Both bindings spawn this drive onto a
+    /// runtime, so that is not a corner they can avoid, and the unstable bound additionally
+    /// forces the callback's captures to `'static`.
+    ///
+    /// So `Fut` is a plain type parameter. The cost is that the callback's future cannot
+    /// *borrow* from the closure's captures — it has no lifetime to name them with — so a
+    /// caller sending on a channel clones the sender per event rather than holding `&sender`.
+    /// For a `tokio::sync::mpsc::Sender` that is one atomic increment, which is the right
+    /// price for a signature that can cross a spawn.
+    ///
+    /// The return value and the error asymmetry are [`Self::for_each_event`]'s, unchanged.
+    pub async fn for_each_event_async<F, Fut>(
+        &self,
+        options: StreamOptions,
+        mut on_event: F,
+    ) -> Result<StreamEnd, Error>
+    where
+        F: FnMut(ExecEvent) -> Fut,
+        Fut: std::future::Future<Output = std::ops::ControlFlow<()>>,
     {
         let mut state = StreamState::Reconnect {
             cursor: options.offset,
@@ -357,7 +413,10 @@ impl ExecHandle {
 
             let event = item?;
             let terminal = matches!(event, ExecEvent::Exit(_));
-            if on_event(event).is_break() {
+            // Awaited before the loop advances, which is the whole point: the next attach
+            // read does not start until the callback's own work is done, so a slow consumer
+            // slows the stream rather than buffering behind it.
+            if on_event(event).await.is_break() {
                 return Ok(StreamEnd {
                     reason: EndReason::Stopped,
                     cursor,
@@ -1367,6 +1426,263 @@ mod tests {
             recorder.requests().len(),
             1,
             "a fatal status was reattached, which can never succeed"
+        );
+    }
+
+    // ── the async callback driver (`for_each_event_async`) ────────────────────
+    //
+    // Four tests. Three mirror `for_each_event`'s — order, `Break` stops, a reconnect joins at
+    // the cursor — because "the sync driver works" is not a statement about this one even though
+    // the sync driver is now written in terms of it: the delegation could be inverted tomorrow,
+    // and the bindings call *this* method. The fourth is the property only an awaited callback
+    // has, and it is the reason the overload exists at all: a callback that awaits between
+    // events loses none of them.
+
+    /// Drives a stream with the async driver and returns what the callback saw.
+    async fn drive_async(
+        handle: &ExecHandle,
+        options: StreamOptions,
+    ) -> (Vec<ExecEvent>, Result<StreamEnd, Error>) {
+        let mut seen = Vec::new();
+        let end = handle
+            .for_each_event_async(options, |event| {
+                seen.push(event);
+                std::future::ready(std::ops::ControlFlow::Continue(()))
+            })
+            .await;
+        (seen, end)
+    }
+
+    /// **Events reach an async callback in wire order, and the end names the terminal event.**
+    ///
+    /// Asserted on the *offsets* rather than only on the reassembled bytes, because two chunks
+    /// concatenated the wrong way round still yield the right total length. Order is the
+    /// property an awaited callback could break where the sync one cannot: a driver that
+    /// launched each callback future without awaiting it, or awaited them out of order, would
+    /// deliver a child's second stdout chunk before its first.
+    ///
+    /// **Falsification** — remove the `.await` on `on_event(event)` and the loop does not
+    /// compile; replace it with a driver that collects the futures and joins them at the end
+    /// and the offsets come out in completion order rather than wire order. Verified by
+    /// reversing the `Reply::Chunks` frame order, which fails this assertion on `[5, 0]`.
+    #[tokio::test(start_paused = true)]
+    async fn the_async_driver_hands_every_event_to_the_callback_in_order() {
+        let recorder = Recorder::with([Reply::Chunks(
+            200,
+            vec![output(0, b"AAAAA"), output(5, b"BBBBB"), exit(10)],
+        )]);
+        let (session, _, _) = session_with(Arc::clone(&recorder));
+        let handle = session.exec("ordered-async");
+
+        let (seen, end) = drive_async(&handle, StreamOptions::default()).await;
+        let end = end.expect("the stream completes");
+
+        let offsets: Vec<u64> = seen
+            .iter()
+            .filter_map(|event| match event {
+                ExecEvent::Output { offset, .. } => Some(*offset),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(offsets, [0, 5], "the callback saw the frames out of order");
+        assert!(
+            matches!(seen.last(), Some(ExecEvent::Exit(_))),
+            "the terminal event has to be delivered, not merely observed: {seen:#?}"
+        );
+        assert_eq!(
+            end,
+            StreamEnd {
+                reason: EndReason::Exited,
+                cursor: 10,
+            },
+            "the end has to name the exit event and the total"
+        );
+        assert_eq!(recorder.requests().len(), 1);
+    }
+
+    /// **`ControlFlow::Break` from an async callback stops the drive and is not a cut.**
+    ///
+    /// The load-bearing half is the reason: stopping has to be distinguishable from a truncated
+    /// stream, because both end without an exit event. A binding whose host-language iterator
+    /// was dropped answers `Break` here — a failed channel send — and it must not read as "the
+    /// command's outcome is unknown".
+    ///
+    /// **Falsification** — return `EndReason::Cut` from the break arm and the reason assertion
+    /// is red; drop the `is_break()` check and the drive runs to the exit event, so `seen.len()`
+    /// reads 3 instead of 1. Verified: deleting the early return fails the event-count assertion
+    /// with 3.
+    #[tokio::test(start_paused = true)]
+    async fn an_async_callback_breaking_stops_the_stream_and_is_not_reported_as_a_cut() {
+        let recorder = Recorder::with([Reply::Chunks(
+            200,
+            vec![output(0, b"first\n"), output(6, b"second\n"), exit(13)],
+        )]);
+        let (session, _, _) = session_with(Arc::clone(&recorder));
+        let handle = session.exec("halted-async");
+
+        let mut seen = Vec::new();
+        let end = handle
+            .for_each_event_async(StreamOptions::default(), |event| {
+                seen.push(event);
+                // Stop on the first event, which is what a dropped binding iterator does.
+                std::future::ready(std::ops::ControlFlow::Break(()))
+            })
+            .await
+            .expect("stopping is not a failure");
+
+        assert_eq!(
+            seen.len(),
+            1,
+            "the drive kept going after Break, so a consumer that stopped reading is still \
+             being read to: {seen:#?}"
+        );
+        assert_eq!(
+            end,
+            StreamEnd {
+                reason: EndReason::Stopped,
+                cursor: 6,
+            },
+            "a consumer's own stop must not read as a cut stream, and the cursor is where it \
+             stopped"
+        );
+    }
+
+    /// **A cut mid-drive still reconnects at the cursor through the async driver.**
+    ///
+    /// The same seam property, asserted through the path the bindings take. If the driver lost
+    /// the cursor the reconnect would ask for byte zero and the consumer would see `AAAA` twice
+    /// while the total byte count still looked plausible — so the verdict is the reassembled
+    /// bytes *and* the offset the second attach asked for.
+    ///
+    /// **Falsification** — seed `cursor` from zero instead of `options.offset`, or drop the
+    /// `next.cursor()` read, and the reported end cursor is wrong while the bytes still join.
+    /// Verified: replacing `next.cursor()` with `None` fails the end-cursor assertion at 0.
+    #[tokio::test(start_paused = true)]
+    async fn the_async_driver_reconnects_at_the_cursor_across_a_cut() {
+        let recorder = Recorder::with([
+            Reply::Chunks(200, vec![output(0, b"AAAA\n"), output(5, b"BBBB\n")]),
+            Reply::Chunks(200, vec![output(10, b"CCCC\n"), exit(15)]),
+        ]);
+        let (session, _, _) = session_with(Arc::clone(&recorder));
+        let handle = session.exec("resumed-async");
+
+        let (seen, end) = drive_async(&handle, StreamOptions::default()).await;
+        let end = end.expect("the reconnect lands");
+
+        let mut bytes = Vec::new();
+        for event in &seen {
+            if let ExecEvent::Output { data, .. } = event {
+                bytes.extend_from_slice(data);
+            }
+        }
+        assert_eq!(
+            String::from_utf8_lossy(&bytes),
+            "AAAA\nBBBB\nCCCC\n",
+            "the two attaches did not reconstruct the output through the async driver"
+        );
+        assert_eq!(end.reason, EndReason::Exited);
+        assert_eq!(end.cursor, 15);
+
+        let seen_requests = recorder.requests();
+        assert_eq!(seen_requests.len(), 2, "the cut produced no reconnect");
+        assert_eq!(
+            requested_offset(&seen_requests[1]),
+            10,
+            "the reconnect asked for the wrong byte, so the seam is wrong"
+        );
+    }
+
+    /// **A callback that awaits between events loses none of them.**
+    ///
+    /// The one property only this overload has, set up as the exact shape both bindings use: a
+    /// **capacity-1** `mpsc` channel the callback `send`s into and a separate consumer drains,
+    /// with the consumer deliberately slower than the producer so the channel is full for every
+    /// event after the first. That is the configuration the sync driver could not serve — its
+    /// only available send is `blocking_send`, which would park the runtime worker the driver
+    /// itself is running on — and it is why `microvms-py` and `microvms-js` kept the `Stream`
+    /// path until this method existed.
+    ///
+    /// Five events go in and five come out, in wire order, terminal event included. The
+    /// verdict is the sequence and not a count: a driver that dropped an event under
+    /// backpressure would still report `Exited` with the right cursor, because the cursor is the
+    /// state machine's and not the callback's.
+    ///
+    /// **Falsification** — replace the awaited `send` with `try_send` and ignore the failure
+    /// (the shape of a driver that does not respect backpressure) and this is red with three
+    /// of five events delivered. Verified.
+    #[tokio::test(start_paused = true)]
+    async fn an_async_callback_that_awaits_between_events_loses_none_of_them() {
+        let recorder = Recorder::with([Reply::Chunks(
+            200,
+            vec![
+                output(0, b"AA"),
+                output(2, b"BB"),
+                output(4, b"CC"),
+                output(6, b"DD"),
+                exit(8),
+            ],
+        )]);
+        let (session, _, _) = session_with(Arc::clone(&recorder));
+        let handle = session.exec("backpressured");
+
+        // Capacity 1, the bindings' own bound: the SSE body is the backpressure signal, and
+        // buffering here would defeat the cursor the core reconnects at.
+        let (sender, mut receiver) = tokio::sync::mpsc::channel::<String>(1);
+        let consumer = tokio::spawn(async move {
+            let mut drained = Vec::new();
+            while let Some(described) = receiver.recv().await {
+                // Slower than the producer, so every send after the first waits.
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                drained.push(described);
+            }
+            drained
+        });
+
+        let end = handle
+            .for_each_event_async(StreamOptions::default(), |event| {
+                let described = match &event {
+                    ExecEvent::Output { offset, data, .. } => {
+                        format!("out@{offset}:{}", String::from_utf8_lossy(data))
+                    }
+                    ExecEvent::Gap { from, to } => format!("gap@{from}..{to}"),
+                    ExecEvent::Exit(exit) => format!("exit:{:?}", exit.exit_code),
+                };
+                // Cloned per event rather than borrowed, which is what the plain-`Fut`
+                // signature requires and what both bindings do. One atomic increment.
+                let sender = sender.clone();
+                async move {
+                    match sender.send(described).await {
+                        Ok(()) => std::ops::ControlFlow::Continue(()),
+                        // A closed receiver is the dropped-iterator case, not this path.
+                        Err(_) => std::ops::ControlFlow::Break(()),
+                    }
+                }
+            })
+            .await
+            .expect("the stream completes even though the consumer lags");
+        // Closing the sender is what ends the consumer's `recv` loop.
+        drop(sender);
+
+        let drained = consumer.await.expect("the consumer task does not panic");
+        assert_eq!(
+            drained,
+            [
+                "out@0:AA",
+                "out@2:BB",
+                "out@4:CC",
+                "out@6:DD",
+                "exit:Some(0)",
+            ],
+            "a lagging capacity-1 consumer lost or reordered events, which is the failure the \
+             awaited callback exists to prevent"
+        );
+        assert_eq!(
+            end,
+            StreamEnd {
+                reason: EndReason::Exited,
+                cursor: 8,
+            },
+            "the ending must still name the exit event and the total"
         );
     }
 }

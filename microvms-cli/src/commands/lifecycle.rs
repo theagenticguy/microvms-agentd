@@ -62,6 +62,8 @@
 //! is what makes the teardown able to name a VM whose launch never finished, which is the
 //! whole of CLI-6: the identifiers are the remedy, and an image wedged in `CREATING` cannot be
 //! deleted later at all.
+//!
+//! (cli.py line numbers resolve at `git show 'c4d396e^:clients/python/src/microvms_agentd/cli.py'` — the retired oracle.)
 
 use std::time::Duration;
 
@@ -680,12 +682,12 @@ impl<'a> StartSpec<'a> {
 /// Shared with [`crate::commands::attached`] rather than duplicated, because the fields this
 /// deliberately leaves unset — `user`, `group`, `timeout_sec` — are decisions with reasons, and a
 /// second constructor is where one of them silently acquires a different answer.
-pub fn start_request(spec: StartSpec<'_>) -> protocol::exec::StartRequest {
+pub fn start_request(spec: StartSpec<'_>) -> microvms_core::protocol::exec::StartRequest {
     // Every field written out rather than `..Default::default()`, and not only because
     // `StartRequest` has no `Default`: this struct is the wire contract, so a field added on the
     // daemon side should break this build and make someone decide what the CLI sends. A struct
     // update would have silently defaulted it.
-    protocol::exec::StartRequest {
+    microvms_core::protocol::exec::StartRequest {
         // The idempotency key, generated unless the caller supplied one. The default is fresh and
         // that is the safe direction: a reused id is answered from the first exec's record, so the
         // second caller reads someone else's output. `exec --exec-id` is the opt-in for a caller
