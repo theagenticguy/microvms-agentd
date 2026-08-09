@@ -68,7 +68,7 @@ const ALLOWED: [(&str, &str); 7] = [
     ),
     (
         "protocol",
-        "the daemon wire contract, named in `Session::run`'s signature; core does not re-export it",
+        "the daemon wire contract, named in `Session::run`'s signature; core re-exports it too, and either path resolves identically",
     ),
     (
         "clap",
@@ -131,8 +131,8 @@ fn manifest_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml")
 }
 
-/// **The exact dependency set.** Six normal dependencies plus the one dev-dependency, and nothing
-/// else.
+/// **The exact dependency set.** Seven normal dependencies plus the one dev-dependency, and
+/// nothing else — the ALLOWED table above is the count's source of truth, not this sentence.
 ///
 /// The requirement under test, stated as an equality rather than as an absence. `cargo metadata`
 /// is the source rather than the TOML text, because it resolves path dependencies and workspace

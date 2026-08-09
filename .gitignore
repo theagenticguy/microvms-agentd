@@ -22,3 +22,5 @@ microvms-js/index.js
 microvms-js/index.d.ts
 microvms-js/node_modules/
 sbom/
+docs/.repomix/
+docs/.packets/

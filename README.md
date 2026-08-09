@@ -1,212 +1,127 @@
 # microvms-agentd
 
-An exec-and-file-transfer daemon for AWS Lambda MicroVMs, and the verification
-harness that keeps it honest.
+A verified client stack and in-VM daemon for AWS Lambda MicroVMs, in Rust: an
+exec-and-file-transfer daemon (`agentd`), a client library whose types make the
+platform's measured traps unwritable (`microvms-core`), a CLI (`microvm`),
+Python and Node bindings, and a live conformance suite that proves all of it
+against the real service.
 
 The service gives you an isolated Firecracker VM and no way to run anything in
 it: there is no exec API and no file-transfer API. Every harness that wraps
-Lambda MicroVMs therefore writes an in-VM daemon to supply both, and the first
-one we wrote — 787 lines of Python inside Harbor PR #2469 — accumulated 28 review
-findings across six rounds, nearly all of them in that daemon or in the service's
-lifecycle semantics. This project exists so the next team does not repeat it.
+Lambda MicroVMs therefore writes an in-VM daemon to supply both — and then
+rediscovers, one billable failure at a time, that the platform's answers point
+away from their causes. An unsupported region answers `AccessDeniedException`
+with a null message. A reused `clientToken` wedges an image in `CREATING` for
+fifteen hours with no error at all. A `minimumMemoryInMiB` of 512 produces a
+guest that reports 2 GB. This project spent those measurements once, recorded
+each in [docs/PLATFORM.md](docs/PLATFORM.md) with its date and region, and then
+built a client where the type system carries the findings.
 
-**Status: proven against the real service.** Most recently on 2026-08-06 the daemon was
-cross-compiled to a 1.41 MB static `aarch64-unknown-linux-musl` binary, baked into
-a MicroVM image as the container `CMD`, launched in us-east-1, and driven through
-every protocol rule via the platform's own endpoint: 56 checks passed, none
-failed, and teardown left the account clean. The Rust local tiers are green
-alongside it. That run went through the Python client, which was this project's
-discovery instrument and is now git history: the `microvm` CLI has since driven the
-same suite live and green, so the oracle's job is finished.
+**Status: every conformance check runs live and green.** The most recent
+`mise run live` built an image, launched a real MicroVM in us-east-1, and drove
+75 checks through the `microvm` CLI — full lifecycle, tar round trips through
+the daemon's confined packer, hostile archives refused, SSE ordering with
+mid-stream reconnect at a byte cursor, stdin lifecycle, start/poll/ack
+decomposition, suspend/resume preserving the token, filesystem, and a running
+process — 75 passed, 0 failed, 0 skipped, teardown left the account clean, and
+the pinned rate table matched the AWS Pricing API on all five rates.
 
-That live run covers the things only the real service can answer, including
-Server-Sent Events surviving the endpoint proxy, stdin round-tripping through a
-child, and a suspend/resume cycle preserving everything.
+## The shape of the workspace
 
-Three rounds of live runs found six defects no local tier could have caught, all of
-them wrong assumptions about the service rather than bugs in the daemon's logic:
-the lifecycle hooks live under a fixed `/aws/lambda-microvms/runtime/v1/` prefix,
-two of them (`ready`, `validate`) are called at image-build time, `runHookPayload`
-arrives wrapped in an envelope rather than as the request body, network connectors
-are ARNs, `CreateMicrovmAuthToken` returns a header map, and a guest running as
-root still needs `additionalOsCapabilities: ["ALL"]` before `sethostname` or a
-bind mount over `boot_id` will work. Each is recorded in
-`docs/PLATFORM.md` with its date, and the transport tier was corrected so it fails
-against the old behavior.
-
-Not yet done: a repeat run in a second region. The CI cross-compile job now runs on every
-push and is green — the `aarch64-unknown-linux-musl` build is a required check rather than
-a claim.
-
-The coverage gap that used to sit here is closed. For one release, 34 of the deleted
-oracle's 56 checks — file transfer, tar round trips, the four hostile archives, SSE
-ordering, the stdin lifecycle, double-ack, the 8 MiB cap trio, the identity-repair
-health flags — had no live coverage, because the `microvm` CLI had no subcommand for
-them; the live suite reported each as SKIP by name rather than letting the gap go
-quiet. `docs/CLI-COVERAGE-PLAN.md` grew the five doors that close them — `microvm
-health`, exec identity (`--exec-id`, `--poll`, `--detach`), `microvm ack`, `microvm cp`
-(with `--tar`), `exec --stream`, and `microvm stdin` — and `conformance/run_rs.py` now
-expresses all 75 named checks with none skipped, each under the name the oracle gave it.
-
-The first live round of those paths came back 69/7, and the pattern held: every failure
-was in the *driver* rather than in the new subcommands — a tar chain that shelled out to
-a `tar` binary al2023-minimal does not carry, and a start/poll/ack sequence that could
-not be expressed because `exec` acked its own output. The second gap is what `exec
---detach` exists for. Both fixed; the tier has not been rerun since.
-
-## Suspend and resume preserve everything
-
-Measured 2026-08-05, and it inverted what this project previously assumed.
-`SuspendMicrovm` then `ResumeMicrovm` is a freeze and restore: the in-memory agent
-token, the filesystem, exec records including unacked output, and even running
-background processes all survive, and the endpoint URL is unchanged. The evidence
-is a ticker writing epoch seconds once a second, showing a single 46-second gap
-across a 40-second suspension and then resuming its count.
-
-So a warm pool of suspended sandboxes needs no token re-delivery and no
-re-bootstrap: suspend an idle VM instead of terminating it, and the next task lands
-in one that still has its filesystem, installed tools, and credentials. The one
-caveat is that a guest process observes the suspension as a single jump in wall
-time, so anything holding a timeout, lease, or session across a suspend sees it
-expire at once.
-
-## What is in the repo
-
-```
-agentd/   the daemon: axum router, one-shot bootstrap, exec engine, fs engine,
-          disk-pressure guard, identity repair, generated schema
-          tests/panic_guard.rs       — a panic must not strand the VM
-          tests/proptest_tar.rs      — tar confinement properties
-          tests/schema_artifact.rs   — the published schema cannot go stale
-          tests/turmoil_transport.rs — deterministic transport faults
-microvms-core/  the client library: control plane, in-VM session, cost engine,
-          lifecycle state machine, and every platform-trap guard
-microvms-cli/   the `microvm` CLI: one JSON envelope, a documented exit-code table
-microvms-py/, microvms-js/  the PyO3 and napi-rs bindings
-conformance/  the live AWS suite driving the CLI, and its Terraform
-model/    stateright model of bootstrap + exec lifecycle, with safety properties
-spec/     symspec requirements document, Z3-verified consistent
-docs/     PROTOCOL.md (wire contract), PLATFORM.md (measured AWS behavior),
-          TRUST.md (threat model and identity repair), STRATEGY.md, schema.json
+```text
+protocol/        the daemon↔client wire types; drift is a compile error
+agentd/          the in-VM daemon: exec, file transfer, one-shot bootstrap
+model/           stateright models of the daemon and the client lifecycle
+microvms-core/   the client: control plane, session, cost engine, sandbox
+microvms-cli/    the microvm binary — 16 commands, JSON envelopes, a manifest
+microvms-py/     PyO3 binding (thin; every trap closure inherited from core)
+microvms-js/     napi-rs binding (same contract)
+conformance/     run_rs.py — the live suite; every check expressible via the CLI
+spec/            51 formal requirements; three lifecycle invariants proved in Z3
 ```
 
-### `agentd/` — the daemon
+One dependency direction: `cli → core → protocol`, bindings → core, `agentd →
+protocol`. The CLI has no lib target and an allowlisted dependency set, both
+asserted by tests — it cannot reach AWS except through the library.
 
-A static binary intended to run as the container `CMD`. With the workspace's
-size-tuned profile the release build is 1.41 MB for
-`aarch64-unknown-linux-musl` — the shipping target, since MicroVMs are ARM64
-only — and 1.98 MB on x86-64.
+## How strongly a mistake is closed
 
-The module seams follow the defect classes rather than the HTTP surface:
-`state.rs` owns the one-shot bootstrap, `auth.rs` decides authorization before any
-body byte is read, `exec.rs` owns idempotent exec with pipe-based output capture,
-`fs.rs` owns streaming tar with CPython `data`-filter parity, and `serve.rs` is
-generic over the listener so the transport tier can substitute a simulated network
-without touching production code.
+The spec ranks every guard ([docs/insights/business-logic.md](docs/insights/business-logic.md)
+catalogs all 41):
 
-### `model/` — the state machine, checked
+- **S1 — inexpressible.** `Region` is a closed enum over the five regions that
+  carry MicroVMs. `SizeClass` is the five documented baselines. Run-hook and
+  build-hook timeouts are two types with no conversion (their ceilings differ
+  60x). A dollar figure has no road to a bare float. No create path accepts a
+  caller-supplied idempotency token.
+- **S2 — rejected locally**, before any billable call, with an error naming the
+  `docs/PLATFORM.md` finding that measured the behavior.
+- **S3 — correct by default, overridable**, with the override's cost stated.
 
-`cargo test -p agentd-model` enumerates every reachable state of the bootstrap and
-exec lifecycle and checks seven safety properties plus six coverage properties.
-The safety properties are the claims that were argued in prose during the PR:
+Every guard carries a falsification: a specific plausible regression that turns
+a specific test red. Four guards in this repo's history passed against
+deliberately broken code until that rule was enforced.
 
-- an in-VM attacker never obtains authority over the control API,
-- bootstrap is one-shot, so a losing racer never replaces the winner's token,
-- only the installed token is ever accepted,
-- the control API stays closed until bootstrap completes,
-- exec output is never released before the caller acks it,
-- a retried `/exec/start` never spawns a second child,
-- there is at most one exec entry per caller-minted id.
+## Cost honesty
 
-The coverage properties exist because a safety property can pass over a state
-space that never reached the interesting states. That failure mode is not
-hypothetical: in the PR, a test named
-`test_create_token_is_not_a_permanent_key` passed against broken code because it
-varied an input that nothing varies in reality.
+The cost engine renders estimates, never bills. Durations carry provenance
+(measured vs projected) as an enum variant, so an unlabeled duration does not
+construct. An unbilled phase is `Unpriced { reason }`, never zero. A total
+containing any unpriced line renders as a lower bound naming its phases. Rates
+are pinned with their retrieval date, ARM-only (the Architecture enum has one
+member; the x86 column the Pricing API also returns overstates compute by
+17.9%), and `mise run live:rates` compares the pinned table against the live
+Pricing API — with a twin copy in `scripts/check-live-rates` as an independent
+oracle.
 
-The model also runs a second configuration where the deployment invariant is
-broken — a base image that starts its own process before bootstrap — and asserts
-that stateright *finds* the attack path. That prices the invariant instead of
-asserting it is fine.
+## Quick start
 
-### `spec/` — the requirements, proved consistent
+```bash
+mise run install         # git hooks
+mise run check           # the definition of done: lint, security, all test
+                         # tiers, schema freshness, model drift, cross-compile
+cargo build --release -p microvms-cli
+target/release/microvm manifest        # the machine-readable command surface
+target/release/microvm doctor          # is this machine ready to launch?
+```
 
-`spec/agentd.symspec.json` holds the bootstrap and authorization requirements in
-EARS form, checked by [symspec](https://github.com/theagenticguy/symspec), which
-hands them to Z3. It currently reports `verified: true`, which that tool treats as
-an earned claim rather than the absence of findings: every requirement shares
-vocabulary with a peer, every opposition candidate is triaged, and a
-cross-requirement comparison actually ran.
+The live tier is deliberately separate — it creates real MicroVMs and costs
+money:
 
-Getting there required one committed glossary link, recorded in the document:
-"install the agent token" and "accept the bootstrap request" name one action, so
-the solver compares them instead of treating them as unrelated. That is the
-neurosymbolic split working as intended — a local model proposes the synonym, a
-human commits it, and only then does the sound layer decide.
+```bash
+mise run live            # conformance + rates + leak check, ~5 minutes
+```
 
-### `docs/PLATFORM.md` — what we measured, with dates
-
-Observations of someone else's system, each carrying its date, region, and API
-version. The load-bearing ones:
-
-- The platform's own `/run` hook arrives from `127.0.0.1`, indistinguishable at
-  the socket level from an in-VM process. A source-address rule on that route is
-  wrong, not merely unverified, and would break every launch.
-- A `clientToken` derived from stable content is a *permanent* idempotency key.
-  Deleting and recreating an image under the same name replays the original create
-  as a no-op, wedging the image in `CREATING` where it cannot be deleted.
-- Build logs go to `/aws/lambda-microvms/<image-name>`. The wrong prefix in an IAM
-  policy produces builds with no logs, and every failure then reports
-  `reason=unknown`.
+`microvm --json` emits exactly one envelope object per invocation on stdout
+(agents and scripts parse it; `data.kind` carries the fine-grained error
+taxonomy). `exec --stream` is the documented exception: NDJSON events, envelope
+last. See [docs/reference/cli.md](docs/reference/cli.md).
 
 ## Verification stack
 
-Five tiers, each owning a defect class the others cannot see:
-
-| Tier | Tool | Owns |
+| Tier | What it proves | Where |
 | --- | --- | --- |
-| Requirements | symspec + Z3 | contradictions between stated requirements |
-| Design | stateright | unsafe interleavings of hooks, client, and attacker |
-| Wire contract | schemars + JSON Schema | client/server drift on request and response shapes; `docs/schema.json` is generated and CI fails if it goes stale |
-| Transport | turmoil | deterministic network and time faults: framing, mid-body disconnect, token expiry mid-exec |
-| Filesystem | proptest | tar extraction confinement and stdlib `data`-filter parity |
+| symspec + Z3 | 51 requirements consistent; bootstrap-once, no suspend outside RUNNING, terminated never RUNNING — proved over unbounded runs | `spec/core.symspec.json`, `mise run spec:core` |
+| stateright | The daemon model and the client lifecycle model, including a real interleaving bug the checker found | `model/` |
+| proptest | Token collision-freedom, payload boundaries, decimal arithmetic | in-crate |
+| turmoil | Reconnect-at-cursor and proxy-token expiry under simulated network faults | `microvms-core/tests/` |
+| drift gate | 33 hardcoded service constraints against the pinned botocore model | `scripts/check-model-drift`, in `mise run check` |
+| live conformance | All 75 checks against real AWS through the CLI | `conformance/run_rs.py`, `mise run live` |
 
-Live conformance against real AWS remains the ground truth anchor, because the
-model is not the binary. The bridge is a conformance suite that pins the real
-daemon to the same properties the model proves.
+Security gates run in `mise run check` and CI: semgrep, betterleaks over full
+git history, SPDX license headers, plus SBOM generation (CycloneDX + SPDX) with
+grype/trivy/osv-scanner in their own CI job.
 
-## Why Rust
+## Documentation
 
-The Python predecessor was constrained by its deployment: a single file baked into
-a harness layer, running under whatever `python3` the task's base image happened
-to provide, which forced compatibility work back to 3.8. A static musl binary
-deletes that constraint instead of accommodating it, and it moves HTTP/1.1 framing
-into hyper, which is where roughly a quarter of the PR's defects lived.
-
-## Running the checks
-
-```bash
-mise run install   # once per clone: installs the git hooks
-mise run check     # every local gate: lint, 155 tests, schema, cross-compile
-mise run live      # the real-AWS suites. BILLABLE, ~15 min.
-mise tasks         # everything else
-```
-
-`cargo test --all` runs 155 tests across six targets: 107 daemon unit tests, 5
-panic-containment tests, 8 tar-confinement properties, 11 schema-artifact checks,
-18 transport-fault simulations, and 6 model checks. Every guard in the suite was
-verified to fail against the code without its fix; a property that passes either
-way is a false answer, not a passing test.
-
-CI (`.github/workflows/ci.yml`) runs the same gates in five jobs: Rust lint and
-tests plus the schema staleness check, the service-model drift gate and ruff over
-the remaining Python tooling, the binding suites, the `aarch64-unknown-linux-musl`
-cross-compile, and the symspec requirements gate. A fifth workflow, `live-conformance.yml`, runs the real-AWS suites — manual
-dispatch only, behind a GitHub environment so a human approves each run, using
-OIDC rather than a stored key.
-
-Neither workflow has ever executed, because the repository has no remote yet.
+[docs/README.md](docs/README.md) is the index. The hand-written, authoritative
+documents are [PLATFORM.md](docs/PLATFORM.md) (the measured findings),
+[PROTOCOL.md](docs/PROTOCOL.md), and [TRUST.md](docs/TRUST.md). The generated
+tree (architecture, reference, behavior, analysis, diagrams, insights) carries
+machine-verified `path:line` citations throughout — start with the
+[system overview](docs/architecture/system-overview.md) or the
+[debugging guide](docs/insights/debugging-guide.md).
 
 ## License
 
-Apache-2.0.
+Apache-2.0. Source-only: nothing here is published to crates.io, PyPI, or npm.
