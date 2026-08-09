@@ -21,6 +21,16 @@ pre-commit:
       # pay for a clippy pass.
       glob: "*.{rs,py,toml,tf}"
 
+    - name: secrets
+      # Staged changes only — the fast scan for the thing a commit can newly
+      # introduce. The full-history scan lives in `mise run security` (and CI),
+      # because history does not change on commit.
+      run: betterleaks git . --staged
+
+    - name: license headers
+      run: ./scripts/check-license-headers
+      glob: "*.{rs,py}"
+
 pre-push:
   # Sequential: the point is to fail on the first cheap gate rather than to make
   # a fast green run faster.

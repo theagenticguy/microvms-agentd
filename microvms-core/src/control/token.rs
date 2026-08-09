@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Idempotency tokens, unique per attempt by construction (TRAP-1).
 //!
 //! # What a `clientToken` actually is

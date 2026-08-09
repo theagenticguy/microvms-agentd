@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! The `microvms-agentd` wire contract as types, shared by the daemon and every
 //! Rust client of it.
 //!

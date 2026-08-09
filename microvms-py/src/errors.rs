@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! The exception hierarchy, and the one conversion from a core [`Error`].
 //!
 //! # One exception per `ErrorKind`, all under one base

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! `doctor`: check every prerequisite and say which one is wrong.
 //!
 //! The command that saves an hour on a first attempt, and the only one that must run with

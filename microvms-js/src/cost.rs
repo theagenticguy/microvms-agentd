@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! The cost types as napi **classes**, which is the whole of BIND-5 on this side.
 //!
 //! # `#[napi]` classes, never `#[napi(object)]`

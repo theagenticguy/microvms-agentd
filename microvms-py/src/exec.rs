@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! One exec, and the stream as a Python iterator.
 //!
 //! # The stream is the one shape that needed real work

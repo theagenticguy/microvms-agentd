@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Serving the router, over either a real socket or a simulated one.
 //!
 //! Since axum 0.8, `axum::serve` accepts anything implementing

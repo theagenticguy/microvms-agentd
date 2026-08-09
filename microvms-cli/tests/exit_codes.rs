@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! **CLI-3 and CLI-4 at the process boundary**: the exit code a shell reads, and the single
 //! document on stdout.
 //!

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Exec wire types: the bodies, queries, and SSE event payloads of `/v1/exec/*`.
 //!
 //! Every type here derives both halves of serde. The daemon needs only one half of

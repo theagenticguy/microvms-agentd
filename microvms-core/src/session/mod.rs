@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! The in-VM client: one MicroVM's control API, with the proxy auth handled for you.
 //!
 //! Talks to `agentd` through the endpoint proxy — the minted proxy token read from the

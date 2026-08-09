@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Router assembly: lifecycle hooks, the control API, and health.
 
 use axum::extract::rejection::JsonRejection;

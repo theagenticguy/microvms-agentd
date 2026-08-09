@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! The five regions that carry MicroVMs, and the one named way past them (TRAP-6).
 //!
 //! # Why a class with factory methods rather than a string parameter

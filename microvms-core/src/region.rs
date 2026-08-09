@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! The five regions that carry MicroVMs, as a closed enum (TRAP-6).
 //!
 //! The Python client checks a region against a frozenset at construction time

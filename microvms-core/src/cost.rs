@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! What a run cost, and what a plan will cost, with every figure labelled.
 //!
 //! MicroVMs has no standalone pricing page. The rates appear only inside worked

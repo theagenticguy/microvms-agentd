@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Bootstrap state and the exec registry.
 //!
 //! The one-shot bootstrap lives here. Its behavior is specified by the

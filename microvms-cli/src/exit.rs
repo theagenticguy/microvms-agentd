@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! The exit-code contract, and the one function that maps a failure onto it.
 //!
 //! # Append-only, because a consumer branches on these

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! The one build-time requirement napi-rs has.
 //!
 //! `napi_build::setup()` emits the link configuration the addon needs. It is not a

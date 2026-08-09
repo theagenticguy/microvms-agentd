@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Regenerates `docs/schema.json` from the daemon's own types.
 //!
 //! `cargo run -p agentd --bin schema` writes the file; `--check` compares without

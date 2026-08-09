@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! The one door to AWS, as a trait — which is what makes CLI-2's behavioral guard possible.
 //!
 //! # Why a trait, where the Python had monkeypatching

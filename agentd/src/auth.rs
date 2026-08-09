@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Authorization, decided before any request body byte is read.
 //!
 //! Two properties this module exists to hold:

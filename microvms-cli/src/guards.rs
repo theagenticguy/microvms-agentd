@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! The guards that need to reach inside the crate: the behavioral thinness check (CLI-2), the
 //! interrupt teardown (CLI-6), and the classification half of the exit catalogue (CLI-3).
 //!

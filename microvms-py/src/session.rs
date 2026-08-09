@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! The control API of one running MicroVM.
 //!
 //! # A session holds no state worth keeping

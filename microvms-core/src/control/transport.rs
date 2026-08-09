@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! The signed rest-json transport, and the seam a test replaces it at.
 //!
 //! # Why this is hand-rolled

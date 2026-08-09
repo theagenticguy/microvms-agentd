@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! **ARCH-3, ARCH-4, ARCH-5, and BIND-1**: the workspace's dependency edges, asserted exactly.
 //!
 //! Four requirements that are all the same claim from different sides — the CLI depends on core,

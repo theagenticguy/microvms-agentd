@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! The wire shapes, transcribed member-for-member from the pinned service model.
 //!
 //! # The honest-fake rule

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Client-fault tier: the session's retry, mint, and cursor logic under a deterministic
 //! network.
 //!

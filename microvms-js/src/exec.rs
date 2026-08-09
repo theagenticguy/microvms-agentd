@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! One exec, and the stream as a JS async iterator.
 //!
 //! # Async maps straight through, and that is the whole difference from the Python side

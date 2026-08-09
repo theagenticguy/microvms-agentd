@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! The machine-readable wire contract, derived from the types that carry it.
 //!
 //! # Why this exists

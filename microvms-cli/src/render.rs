@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! The four renderers over one result type: JSON, dense, plain, and (in [`crate::tui`]) a
 //! ratatui frame.
 //!

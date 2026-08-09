@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! What one invocation created, on disk, so an interrupt can name what it could not delete.
 //!
 //! # On disk rather than in memory only

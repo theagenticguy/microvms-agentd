@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Smoke tests for the PyO3 binding, built with `maturin develop`.
 
 Every test here is a **guard proof for BIND-2 or BIND-5**, not a coverage exercise. The rule

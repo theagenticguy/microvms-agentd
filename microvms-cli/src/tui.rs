@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! The interactive surface (CLI-1), and the rule that keeps it off a pipe.
 //!
 //! # It draws only when stdout is a terminal

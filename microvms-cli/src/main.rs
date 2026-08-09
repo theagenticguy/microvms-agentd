@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! `microvm`: a working sandbox in one command, and nothing `microvms-core` does not do.
 //!
 //! # Two audiences share one library

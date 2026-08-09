@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! `run`, `build`, `exec`, `suspend`, `resume`, `terminate` — the commands that touch AWS.
 //!
 //! # Two paths, and the split is not arbitrary

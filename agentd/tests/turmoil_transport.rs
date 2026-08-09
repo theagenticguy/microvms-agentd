@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Transport-fault tier: the HTTP layer under a deterministic network.
 //!
 //! Roughly a quarter of the Python predecessor's defects lived below the router —

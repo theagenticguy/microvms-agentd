@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! One conversion from a core [`Error`] out to JS, and the `ERR_*` code contract.
 //!
 //! # What a JS caller branches on

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Network connectors: a closed intent enum, and the ARN each one derives (TRAP-4).
 //!
 //! # Why an enum rather than a string

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! One handler per command, and the result type all four renderers read.
 //!
 //! # A handler never writes to stdout

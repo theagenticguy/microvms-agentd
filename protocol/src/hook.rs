@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Lifecycle-hook wire types and the prefix the platform calls them under.
 //!
 //! Not client types. A consumer must never post to these paths — they are the

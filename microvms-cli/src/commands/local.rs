@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! `ls`, `logs`, `manifest`, `constants` — the commands that touch no account.
 //!
 //! Grouped by that property rather than by shape, because it is the property the behavioral

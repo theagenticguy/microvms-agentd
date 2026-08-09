@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! The build artifact: a zip of the daemon binary and a Dockerfile.
 //!
 //! What `CreateMicrovmImage`'s `codeArtifact.uri` points at (`sandbox.py:523`

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! The endpoint proxy's authentication: two headers, and a token minted inside the
 //! request path.
 //!

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! The command tree, and the closed sets that make CLI-5 a parser property.
 //!
 //! # CLI-5 is enforced here or nowhere

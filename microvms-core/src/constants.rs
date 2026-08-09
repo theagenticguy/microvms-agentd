@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Every hardcoded service constraint, and the JSON the build gate checks them with.
 //!
 //! Each number and pattern below is transcribed from the botocore service model for

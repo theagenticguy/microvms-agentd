@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! One tokio runtime for the process, and the two ways to block on it.
 //!
 //! # Why sync bindings over an async core

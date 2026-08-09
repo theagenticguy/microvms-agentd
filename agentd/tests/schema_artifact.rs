@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! The committed `docs/schema.json` is the published contract, so this tier asks
 //! the two questions a consumer's trust rests on: is it what the code says, and
 //! does it describe the surface the daemon actually serves?

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Disk-pressure guard for the write paths.
 //!
 //! # Why refusing beats proceeding

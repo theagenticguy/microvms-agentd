@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! The whole surface, generated from the clap tree and the exit table.
 //!
 //! # Never hand-maintained, and that is structural rather than a promise

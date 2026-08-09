@@ -10,8 +10,19 @@ env:
 
 jobs:
   rust:
-    name: lint, model, and test tiers
-    runs-on: ubuntu-latest
+    name: lint, model, and test tiers (${{ matrix.os }})
+    # The daemon ships to Linux only (a MicroVM guest), but the CLI, the library,
+    # and the bindings run wherever a developer sits — so the client tiers build
+    # and test on all three platforms. The matrix is here rather than in a
+    # separate job so a platform break fails the same required check as a logic
+    # break; ubuntu remains the only place the full daemon suite runs, because
+    # agentd's exec/fs tiers assume a Unix process model on purpose (the guest
+    # is one).
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -19,12 +30,34 @@ jobs:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all -- --check
-      - run: cargo clippy --all-targets -- -D warnings
-      # One command covers all five tiers: the daemon's unit tests, the
+        if: matrix.os == 'ubuntu-latest'
+      - name: clippy (client crates everywhere, everything on linux)
+        shell: bash
+        run: |
+          if [ "${{ matrix.os }}" = "ubuntu-latest" ]; then
+            cargo clippy --all-targets -- -D warnings
+          else
+            # Not the binding crates: pyo3 wants a Python to link against on
+            # Windows and napi wants its build tooling; both get their real
+            # coverage in the `bindings` job, under the toolchains that ship them.
+            cargo clippy -p protocol -p microvms-core -p microvms-cli -p agentd-model --all-targets -- -D warnings
+          fi
+      # Linux: one command covers all six tiers — the daemon's unit tests, the
       # stateright model over every reachable state, the proptest tar-confinement
-      # properties, the turmoil transport-fault simulation, and the schema
-      # artifact's staleness and route-coverage checks.
-      - run: cargo test --all
+      # properties, the turmoil transport-fault simulation, the panic guard, and
+      # the schema artifact's staleness and route-coverage checks.
+      # macOS/Windows: the client crates only — protocol, core (incl. its turmoil
+      # tier), the CLI's five test targets, and the model. agentd stays behind:
+      # it is guest software, and nix/sethostname/bind-mounts do not exist to
+      # test on a laptop OS.
+      - name: test
+        shell: bash
+        run: |
+          if [ "${{ matrix.os }}" = "ubuntu-latest" ]; then
+            cargo test --all
+          else
+            cargo test -p protocol -p microvms-core -p microvms-cli -p agentd-model
+          fi
       # Belt to the test suite's braces, and not redundant: this runs the real
       # generator against the real path and fails with the regenerate command in
       # the log, so a contributor whose PR turns the artifact stale is told how to
@@ -35,7 +68,46 @@ jobs:
       # because it is generated, and nothing about a diff reveals that a document
       # was left describing a protocol nobody serves.
       - name: schema artifact is not stale
+        if: matrix.os == 'ubuntu-latest'
         run: cargo run -p agentd --bin schema -- --check
+
+  security:
+    name: semgrep, secret history, license headers
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # betterleaks scans history, and a shallow clone has none.
+          fetch-depth: 0
+      - uses: astral-sh/setup-uv@v5
+      # Shipped source only: test fixtures plant fake tokens on purpose, and the
+      # INFO tier (std::env::args in a CLI, TempDir in tests) is idiom, not
+      # defect. WARNING and ERROR fail the job.
+      - name: semgrep
+        run: |
+          uvx semgrep scan --config p/rust --config p/secrets \
+            --severity WARNING --severity ERROR --error --quiet --metrics=off \
+            protocol/src agentd/src model/src microvms-core/src microvms-cli/src microvms-py/src microvms-js/src
+      # The whole history, not the tree: a secret committed and later deleted is
+      # published the moment the repo is public.
+      - name: betterleaks over full history
+        run: |
+          curl -sSfL https://github.com/betterleaks/betterleaks/releases/latest/download/betterleaks_Linux_x86_64.tar.gz | tar xz betterleaks
+          ./betterleaks git .
+      - name: license headers
+        run: ./scripts/check-license-headers
+      # The LICENSE file itself, and the crate manifests agreeing with it. Not a
+      # dependency-license audit (every dep is permissive today and cargo-deny
+      # would be the tool when that matters); this asserts the repo's own claim
+      # is consistent.
+      - name: license consistency
+        shell: bash
+        run: |
+          test -s LICENSE
+          grep -q "Apache License" LICENSE
+          for m in $(git ls-files '*/Cargo.toml'); do
+            grep -Eq 'license(\.workspace)?[[:space:]]*=' "$m" || { echo "$m declares no license"; exit 1; }
+          done
 
   drift:
     name: hardcoded constraints match the service model

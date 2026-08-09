@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! The control API of one running MicroVM.
 //!
 //! # A launched session lives inside its sandbox

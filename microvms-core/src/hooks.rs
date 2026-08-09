@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! The two hook-timeout ceilings, as two types that cannot be swapped.
 //!
 //! Two families of lifecycle hook with ceilings 60x apart:

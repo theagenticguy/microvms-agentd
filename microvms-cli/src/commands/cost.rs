@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! `cost`: what a run cost, or what a plan will cost. Every figure labelled.
 //!
 //! Touches no account — the rate table is pinned in `microvms-core` — which is why it is one

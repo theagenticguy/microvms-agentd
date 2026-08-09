@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! `microvms-agentd` — exec and file transfer inside an AWS Lambda MicroVM.
 //!
 //! The service provides an isolated Firecracker VM and no way to run anything in

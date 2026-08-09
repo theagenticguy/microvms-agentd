@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! The HTTP seam: one request/response shape, two backends.
 //!
 //! # Why a trait rather than reqwest directly

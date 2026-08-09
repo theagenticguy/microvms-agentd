@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! The one JSON object per invocation, and the stream discipline that keeps it alone there.
 //!
 //! # Exactly one envelope on stdout (CLI-4)

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Command execution: idempotent start, read-only poll, ack-gated release, and
 //! process-group kill.
 //!

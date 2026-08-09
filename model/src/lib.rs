@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! A checked model of the `microvms-agentd` bootstrap and exec lifecycle.
 //!
 //! This crate contains no daemon code. It is an executable specification: a state

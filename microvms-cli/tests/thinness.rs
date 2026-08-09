@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! **CLI-2's static half.** The CLI reaches AWS through `microvms-core` and through nothing else,
 //! asserted from the manifest and from the source.
 //!

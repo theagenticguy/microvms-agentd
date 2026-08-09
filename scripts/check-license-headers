@@ -1,0 +1,81 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = []
+# ///
+# SPDX-License-Identifier: Apache-2.0
+"""Every source file carries the SPDX line; this proves it and can add it.
+
+One line rather than a header block: `SPDX-License-Identifier: Apache-2.0` is
+machine-readable, survives reformatting, and does not push the actual code below
+a screen of boilerplate. The check is a closed set over tracked `.rs` and `.py`
+files so a new file cannot land unlicensed; `--fix` inserts the line after a
+shebang or PEP 723 script block where one exists, at the top otherwise.
+"""
+
+from __future__ import annotations
+
+import subprocess
+import sys
+from pathlib import Path
+
+SPDX = "SPDX-License-Identifier: Apache-2.0"
+
+
+def tracked_sources() -> list[Path]:
+    out = subprocess.run(
+        ["git", "ls-files", "*.rs", "*.py"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return [Path(line) for line in out.stdout.splitlines() if line]
+
+
+def has_spdx(path: Path) -> bool:
+    # The line must appear near the top: a mention buried in a doc later in the
+    # file is documentation, not a license declaration.
+    head = "\n".join(path.read_text(encoding="utf-8").splitlines()[:12])
+    return SPDX in head
+
+
+def insertion_point(lines: list[str], path: Path) -> int:
+    """After a shebang and any PEP 723 block, before everything else."""
+    at = 0
+    if lines and lines[0].startswith("#!"):
+        at = 1
+    if path.suffix == ".py" and at < len(lines) and lines[at].startswith("# /// script"):
+        while at < len(lines) and lines[at] != "# ///":
+            at += 1
+        at += 1  # past the closing marker
+    return at
+
+
+def fix(path: Path) -> None:
+    lines = path.read_text(encoding="utf-8").splitlines()
+    at = insertion_point(lines, path)
+    marker = f"// {SPDX}" if path.suffix == ".rs" else f"# {SPDX}"
+    lines.insert(at, marker)
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def main() -> int:
+    apply = "--fix" in sys.argv[1:]
+    missing = [p for p in tracked_sources() if not has_spdx(p)]
+    if not missing:
+        print(f"license headers: all {len(tracked_sources())} tracked source files carry the SPDX line")
+        return 0
+    if apply:
+        for path in missing:
+            fix(path)
+        print(f"license headers: added the SPDX line to {len(missing)} files")
+        return 0
+    print(f"license headers: {len(missing)} files are missing '{SPDX}':")
+    for path in missing:
+        print(f"  {path}")
+    print("run scripts/check-license-headers --fix")
+    return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Image create, the build wait, and the stalled-build probe (TRAP-1, TRAP-2).
 //!
 //! # Why the wait needs a probe at all

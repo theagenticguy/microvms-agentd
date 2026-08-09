@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! The cost types, wrapped without loosening any of them (BIND-5).
 //!
 //! # What "without loosening" means here concretely

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! The control-plane client: SigV4-signed rest-json, and every trap closed before the
 //! request leaves the process.
 //!

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! File and tar transfer. Four routes, opaque bodies, one query type.
 //!
 //! There are no request or response *bodies* to model here — a file's contents and an

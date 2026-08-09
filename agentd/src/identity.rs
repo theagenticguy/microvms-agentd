@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Identity repair for VMs derived from a shared image.
 //!
 //! # The problem

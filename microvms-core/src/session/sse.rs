@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Incremental Server-Sent Events parsing, and the typed events the daemon emits.
 //!
 //! # Incremental because the transport picks the read boundaries

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Runtime configuration.
 //!
 //! Every bound here exists because an unbounded version of it was a defect in the

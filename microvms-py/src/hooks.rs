@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! The two hook-timeout families, kept as two types (BIND-2).
 //!
 //! # Why two classes and not two integer parameters

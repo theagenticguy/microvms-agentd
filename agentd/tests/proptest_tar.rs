@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Property tier: tar extraction confinement, and hostile header handling.
 //!
 //! The 18 example tests in `fs.rs` each pin one rule of the CPython `data`-filter

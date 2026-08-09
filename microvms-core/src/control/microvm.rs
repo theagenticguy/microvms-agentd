@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Launch, the launch wait, the lifecycle calls, and the proxy token (TRAP-5, TRAP-8).
 //!
 //! # TRAP-5: the payload ceiling is 4096 bytes, inclusive

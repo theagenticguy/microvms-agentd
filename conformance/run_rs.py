@@ -3,6 +3,7 @@
 # requires-python = ">=3.11"
 # dependencies = ["boto3>=1.40", "httpx>=0.27"]
 # ///
+# SPDX-License-Identifier: Apache-2.0
 """Live conformance run driving the **Rust** client stack through the `microvm` CLI.
 
 This is now the only live suite. `conformance/run.py` was the oracle — 56 checks

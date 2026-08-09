@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Python bindings over `microvms-core`: a thin wrapper that cannot reopen a trap.
 //!
 //! # What this crate is, and what it deliberately is not

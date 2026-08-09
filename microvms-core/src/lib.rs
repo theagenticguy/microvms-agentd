@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! The MicroVMs client: the control plane, the in-VM daemon, the cost engine, and
 //! every trap closure, in one library crate (ARCH-1).
 //!

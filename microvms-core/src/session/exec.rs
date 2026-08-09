@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! The handle a caller holds for one running exec.
 //!
 //! The whole reason this module exists is [`ExecHandle::stream`]. Everything else here

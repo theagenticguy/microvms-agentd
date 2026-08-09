@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! The `Sandbox` lifecycle: one VM's whole life, with the state machine the symspec
 //! model describes made true of the code.
 //!

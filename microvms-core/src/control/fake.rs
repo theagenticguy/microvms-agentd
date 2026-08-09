@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! The contract recorder: a fake control plane that asserts on what was *emitted*.
 //!
 //! # The rule this fake follows

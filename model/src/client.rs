@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! A checked model of the **client's** view of one MicroVM's lifecycle.
 //!
 //! Sibling to the daemon model in [`crate`], and deliberately a sibling rather than an

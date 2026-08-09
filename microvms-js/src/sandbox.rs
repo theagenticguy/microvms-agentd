@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! One MicroVM's whole life.
 //!
 //! # The sandbox is one object, and that is why it wraps cleanly

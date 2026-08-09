@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! The manifest cross-check, at the process boundary: what `microvm manifest` actually emits
 //! matches what `microvm --help` actually accepts.
 //!

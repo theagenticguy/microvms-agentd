@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Spawning the real binary, which is the only way an integration test can reach this crate.
 //!
 //! # Why a spawned child rather than a function call

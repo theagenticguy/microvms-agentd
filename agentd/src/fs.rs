@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! File transfer: one file at a time, or a streamed tar in either direction.
 //!
 //! # Why the single-file routes are not confined to a root

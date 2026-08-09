@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Size classes: what `minimumMemoryInMiB` actually buys, and what it bills.
 //!
 //! `minimumMemoryInMiB` does not size a VM. It selects a *class*, and the class has

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! File-transfer wire types: the one query string every `/v1/fs/*` route takes.
 //!
 //! There are no body types here. The fs bodies are opaque byte streams — a file's

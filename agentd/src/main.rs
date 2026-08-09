@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Daemon entrypoint.
 //!
 //! Runs as the container `CMD` inside an AWS Lambda MicroVM. Being `CMD` is what

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! The panic guard, driven through a real layered `tower` stack.
 //!
 //! # Why this tier rather than a unit test
