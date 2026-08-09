@@ -35,3 +35,13 @@ restore) was actually run. A guard that was never watched failing is a guess.
    the Python oracle does not emit — so the parity bug survived review. When a
    guard pins an output contract, pin it to the ORACLE's literal output, never
    to what the implementation currently prints.
+
+5. **(live addendum) The fake's parser is more forgiving than the real one.**
+   310 fake-backed tests were green over a client whose auth-header injection
+   REPLACED the request headers, stripping content-type — the real daemon's
+   typed extractor answered 400 where every fake parsed the body regardless.
+   And the run envelope published a null agentToken through 139 CLI tests
+   because nothing round-tripped the envelope into a second command. Both
+   found only by the billable tier. A fake that accepts what the real server
+   rejects converts integration bugs into production bugs; run the live tier
+   before trusting a transport that has only ever spoken to fakes.

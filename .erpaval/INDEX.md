@@ -22,7 +22,7 @@ lessons before starting work.
 ### test-failures
 - [A confinement property that only checks the filesystem measures nothing](solutions/test-failures/proptest-and-dst-tiers-need-verdict-assertions.md) — assert the verdict, not just containment; vacuous model properties
 - [A deterministic simulator has two clocks, and a spawned child obeys the wrong one](solutions/test-failures/simulated-time-and-real-children-are-two-clocks.md) — virtual timers against real work; never pace a child with `sleep` under turmoil
-- [Four ways a guard passed against broken code in one session](solutions/test-failures/guards-that-passed-against-broken-code.md) — unpinned compile_fail, expiry-vs-margin fakes, uniform draws, oracle-contradicting assertions
+- [Four ways a guard passed against broken code in one session](solutions/test-failures/guards-that-passed-against-broken-code.md) — unpinned compile_fail, expiry-vs-margin fakes, uniform draws, oracle-contradicting assertions, fakes more forgiving than the real parser
 
 ## Recent additions
 
