@@ -22,6 +22,10 @@ uv = "latest"
 ruff = "latest"
 semgrep = "latest"
 betterleaks = "latest"
+syft = "latest"
+grype = "latest"
+trivy = "latest"
+osv-scanner = "latest"
 terraform = "latest"
 lefthook = "latest"
 node = "22"
@@ -66,6 +70,33 @@ run = [
   "semgrep scan --config p/rust --config p/secrets --severity WARNING --severity ERROR --error --quiet --metrics=off protocol/src agentd/src model/src microvms-core/src microvms-cli/src microvms-py/src microvms-js/src",
   "betterleaks git .",
   "./scripts/check-license-headers",
+]
+
+[tasks.sbom]
+description = "CycloneDX + SPDX SBOMs into sbom/ (gitignored; CI publishes them as artifacts)"
+# Excludes are the difference between an SBOM of what ships and an inventory of
+# the workshop: .terraform/ holds a vendored Go provider binary (402 modules of
+# someone else's dependency tree), target/ and node_modules/ are build output.
+run = """
+mkdir -p sbom
+syft . --exclude './conformance/infra/.terraform/**' --exclude './target/**' --exclude './microvms-js/node_modules/**' \
+  -o cyclonedx-json=sbom/microvms-agentd.cdx.json \
+  -o spdx-json=sbom/microvms-agentd.spdx.json -q
+"""
+
+[tasks.vuln]
+description = "Grype + trivy + osv-scanner over the tree and the fresh SBOM"
+depends = ["sbom"]
+# Three scanners because their databases disagree at the margins and each has a
+# lane the others lack: grype reads the SBOM (so it audits what we publish),
+# trivy adds IaC misconfig and its own secret pass over the tree, osv-scanner
+# reads the lockfiles against OSV directly. Every accepted finding lives in
+# .trivyignore.yaml / osv-scanner.toml WITH its reason — an ignore without a
+# reason is a finding someone silenced.
+run = [
+  "grype sbom:sbom/microvms-agentd.cdx.json --fail-on high -q",
+  "trivy fs --scanners vuln,misconfig,secret --skip-dirs conformance/infra/.terraform --skip-dirs target --exit-code 1 --severity HIGH,CRITICAL --ignorefile .trivyignore.yaml -q .",
+  "osv-scanner scan source -r .",
 ]
 
 [tasks.test]

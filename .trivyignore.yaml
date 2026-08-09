@@ -1,0 +1,13 @@
+# SPDX-License-Identifier: Apache-2.0
+# Accepted findings, each with its reason. An ignore without a reason is a
+# finding someone silenced; an ignore with one is a decision someone made.
+misconfigurations:
+  - id: AVD-AWS-0132
+    paths:
+      - conformance/infra/main.tf
+    statement: >-
+      The conformance bucket holds a zipped daemon binary and a Dockerfile for
+      the minutes a live run takes, then empties. SSE-S3 (AES256) already
+      encrypts at rest; a customer-managed KMS key would add key policy,
+      rotation, and per-request cost to protect a public repository's build
+      artifact. Revisit if the bucket ever carries anything secret.

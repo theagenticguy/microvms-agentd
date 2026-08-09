@@ -1,0 +1,13 @@
+# SPDX-License-Identifier: Apache-2.0
+# Accepted findings, each with its reason (same rule as .trivyignore.yaml: an
+# ignore without a reason is a finding someone silenced).
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0235"
+# rkyv 0.7 appears in Cargo.lock only as an OPTIONAL dependency of rust_decimal
+# whose feature this workspace never enables — `cargo tree -i rkyv` prints
+# "nothing to print" because no crate actually depends on it and it is never
+# compiled. The lockfile records optional deps regardless; the advisory's code
+# cannot be reached from any built artifact. Re-check if rust_decimal's
+# `rkyv` feature is ever turned on.
+reason = "optional rust_decimal feature, never enabled; not compiled into any artifact"

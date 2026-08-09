@@ -110,6 +110,53 @@ jobs:
             grep -Eq 'license(\.workspace)?[[:space:]]*=' "$m" || { echo "$m declares no license"; exit 1; }
           done
 
+  sbom:
+    name: SBOM and vulnerability scans
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # syft writes the SBOM, grype audits the SBOM, trivy audits the tree
+      # (vulns + IaC misconfig + secrets), osv-scanner audits the lockfiles
+      # against OSV directly. Three scanners because their databases disagree
+      # at the margins; every accepted finding lives in .trivyignore.yaml or
+      # osv-scanner.toml with its reason recorded.
+      - name: install syft and grype
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b /usr/local/bin
+          curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh | sh -s -- -b /usr/local/bin
+      - name: generate SBOMs (CycloneDX + SPDX)
+        run: |
+          mkdir -p sbom
+          syft . --exclude './conformance/infra/.terraform/**' --exclude './target/**' --exclude './microvms-js/node_modules/**' \
+            -o cyclonedx-json=sbom/microvms-agentd.cdx.json \
+            -o spdx-json=sbom/microvms-agentd.spdx.json -q
+      - name: grype (audits what the SBOM publishes)
+        run: grype sbom:sbom/microvms-agentd.cdx.json --fail-on high
+      - name: trivy (vulns, IaC misconfig, secrets)
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln,misconfig,secret
+          severity: HIGH,CRITICAL
+          exit-code: '1'
+          skip-dirs: conformance/infra/.terraform,target
+          trivyignores: .trivyignore.yaml
+      - name: osv-scanner (lockfiles against OSV)
+        run: |
+          curl -sSfL -o /usr/local/bin/osv-scanner https://github.com/google/osv-scanner/releases/latest/download/osv-scanner_linux_amd64
+          chmod +x /usr/local/bin/osv-scanner
+          osv-scanner scan source -r .
+      # The SBOMs are the artifact consumers actually want from this job —
+      # attached per-run so any commit's inventory is downloadable, 90-day
+      # default retention.
+      - name: publish SBOMs
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-${{ github.sha }}
+          path: sbom/
+          if-no-files-found: error
+
   drift:
     name: hardcoded constraints match the service model
     runs-on: ubuntu-latest
