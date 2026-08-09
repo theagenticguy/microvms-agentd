@@ -15,7 +15,8 @@ and live AWS conformance at the end.
 
 ## Why this port exists
 
-The Python client (`clients/python/`) was the discovery instrument: it found and
+The Python client (`clients/python/`, deleted after this port went live-green; see
+git history) was the discovery instrument: it found and
 closed fifteen client-side API traps, measured the platform's pricing and
 lifecycle semantics, and encoded cost-reporting honesty rules. All of that is now
 settled and pinned — in `docs/PLATFORM.md` (every claim dated and measured), in
@@ -143,6 +144,8 @@ the Architecture enum has exactly one member).
 
 `microvms-py` replaces `clients/python` eventually, but do not delete the Python
 package in this session: it is the conformance oracle and the API reference.
+(Resolved: it was deleted in a later session, once both suites ran green against
+real AWS on the same commit.)
 The binding crates ship the same surface shape (Sandbox, Session, ExecHandle,
 cost report types) and inherit every closure from core. Build them with maturin
 / napi-cli but do NOT publish anything — this repo is source-only, no push to

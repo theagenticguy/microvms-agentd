@@ -1,17 +1,18 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["microvms-agentd-client", "boto3>=1.40", "httpx>=0.27"]
-#
-# [tool.uv.sources]
-# microvms-agentd-client = { path = "../clients/python" }
+# dependencies = ["boto3>=1.40", "httpx>=0.27"]
 # ///
 """Live conformance run driving the **Rust** client stack through the `microvm` CLI.
 
-`conformance/run.py` stays the oracle. This is the same suite pointed at the other
-client: every check name here is byte-identical to run.py's, so two runs diff
-cleanly and a name that appears in one report and not the other is a coverage
-statement rather than a puzzle.
+This is now the only live suite. `conformance/run.py` was the oracle — 56 checks
+through the Python client — and it went away with that client once both suites ran
+green against real AWS on the same commit (Python 56/56, this one 38/38). Every
+check name here is still byte-identical to the name run.py gave it, and the
+`UNSUPPORTED` list below still names all 34 checks only that client could express.
+Both facts are kept deliberately: they are what lets a reader of this report diff it
+against the last recorded oracle run in git history, and what makes the coverage this
+client does not have a statement rather than a silence.
 
 A hybrid driver, and each of the three lanes is deliberate
 ---------------------------------------------------------
@@ -23,13 +24,20 @@ A hybrid driver, and each of the three lanes is deliberate
    `println!` anywhere in the Rust crate turns this suite red rather than being
    noticed by nobody.
 
-2. **The Python `Transport`, for six checks that test the DAEMON.** The raw run-hook
-   POST and the raw status-code sends. These are the two reach-arounds run.py:157
-   and run.py:199 already document: the only callers of `/run` are the platform
+2. **Raw `httpx`, for six checks that test the DAEMON.** The raw run-hook POST and
+   the raw status-code sends. These are the two reach-arounds `conformance/run.py`
+   documented before it was deleted: the only callers of `/run` are the platform
    itself and an attacker inside the VM, and the other four assert on a status
    integer the daemon chose. They are not about the client, so the client they go
    through does not matter — and adding a raw-request escape to the CLI so they
    could go through it would violate CLI-2 and CLI-5 to make a report look tidier.
+
+   Raw rather than through a client library, and that is the *stronger* shape for
+   what these six mean. They assert on the status integer directly — 409, 200, 401,
+   400 — where the deleted Python suite asserted on the exception its own taxonomy
+   mapped that integer to. One layer fewer between the daemon's decision and the
+   assertion about it, and no way for a client's status table to be the thing that
+   passes.
 
 3. **`unsupported()`, for the checks this CLI has no subcommand for.** Named, listed,
    and counted, never quietly dropped. See the next section, because this lane is
@@ -43,21 +51,23 @@ What this suite does NOT cover, and why that is a property rather than a bug
 `exec` is one-shot `run_sync` (start, wait, ack) with a generated exec id, and there
 is no `microvm cp`, no `microvm ack`, no `microvm exec --stream`, no `microvm stdin`.
 
-So the protocol-detail half of run.py — file transfer, tar round trips, hostile
-archives, SSE ordering, stdin lifecycle, double-ack, the 8 MiB output cap, the
-identity-repair health flags — is **not expressible through this client**, and every
-one of those checks is recorded `SKIP` with the reason. That is the honest report,
-and the alternative was worse in a specific way: falling back to the Python session
-for those checks would produce a green run over a Rust stack that was never asked to
-do them, which is the same false assurance `scripts/check-model-drift` exists to
-refuse ("a checker that reports clean while a constraint has drifted is worse than
-no checker").
+So the protocol-detail half of the old oracle — file transfer, tar round trips,
+hostile archives, SSE ordering, stdin lifecycle, double-ack, the 8 MiB output cap,
+the identity-repair health flags — is **not expressible through this client**, and
+every one of those checks is recorded `SKIP` with the reason. That is the honest
+report, and the alternative was worse in a specific way: reaching for a second client
+so those checks could go green would produce a green run over a Rust stack that was
+never asked to do them, which is the same false assurance
+`scripts/check-model-drift` exists to refuse ("a checker that reports clean while a
+constraint has drifted is worse than no checker").
 
 What is left is exactly the half only this client can answer: the lifecycle, the
 suspend/resume evidence, the teardown ordering, and the CLI's own requirements —
 CLI-3's exit codes, CLI-4's one envelope, CLI-6's named leak on interrupt. Those
-live nowhere in the Python suite, so the two reports are complements rather than
-duplicates. A `SKIP` here becomes a `PASS` the day the CLI grows the subcommand.
+never existed in the oracle at all. A `SKIP` here becomes a `PASS` the day the CLI
+grows the subcommand, and until then the SSE and tar surfaces are covered locally by
+`microvms-core`'s own tiers rather than against real AWS — which is a real gap, named
+here rather than papered over.
 
 Money
 -----
@@ -91,18 +101,38 @@ from pathlib import Path
 from typing import Any
 
 import boto3
-from microvms_agentd import ProtocolError, Session, Unauthorized
+import httpx
 
 SERVICE = "lambda-microvms"
 REGION = os.environ.get("AWS_REGION", "us-east-1")
 AGENT_PORT = 9000
 BASELINE_MEMORY_MIB = 1024
-# Same value and same reason as run.py:74 — every public ARM64 base leaves WorkingDir
-# empty, so a baked WORKDIR is the only way to test cwd inheritance at all.
+# Every public ARM64 base we measured (al2023-minimal, python:3.12-slim,
+# node:20-slim, 2026-08-05) leaves WorkingDir empty, so a baked WORKDIR is the only
+# way to test cwd inheritance at all. The deleted oracle used the same value.
 BAKED_WORKDIR = "/opt/baked-workdir"
 # Long enough for a frozen guest and a running one to be distinguishable: a live
-# ticker adds roughly forty entries across this window. run.py uses the same 40s.
+# ticker adds roughly forty entries across this window. The oracle used the same 40s.
 SUSPEND_WINDOW_SEC = 40
+
+#: The managed base image the Rust client defaults to.
+DEFAULT_BASE_IMAGE = "al2023-1"
+
+#: Managed base image name -> the Dockerfile `FROM` that pairs with it. A map rather
+#: than one loose literal because the two must agree and used to be able to disagree:
+#: the *name* goes into `baseImageArn`, the *ref* goes into the Dockerfile `FROM`, and
+#: `microvms-core` refuses a Dockerfile whose `FROM` disagrees with the create call's
+#: `baseImageArn` (`control/artifact.rs:233`). Pairing them means selecting one thing
+#: and having both follow, which is the shape the deleted `sandbox.BASE_IMAGES` had.
+#:
+#: `al2023-1` is the managed base every measurement in `docs/PLATFORM.md` from
+#: 2026-08-06 onward used, paired with the `amazonlinux:2023-minimal` registry ref the
+#: same builds used as `FROM`. Literals here rather than a read of
+#: `microvm constants --emit-json`, because that dump carries API constraints and not
+#: base images — see `resolve_base_ref` for what that costs.
+BASE_IMAGE_REFS = {
+    "al2023-1": "public.ecr.aws/amazonlinux/amazonlinux:2023-minimal",
+}
 
 
 # ── the envelope, and the exception it becomes ───────────────────────────────
@@ -169,7 +199,7 @@ class Envelope:
 class KindError(Exception):
     """A failure envelope, as something `Results.raises` can assert on.
 
-    **Why the kind and not the code.** `Results.raises` in run.py asserts the client
+    **Why the kind and not the code.** `Results.raises` in the deleted oracle asserted the client
     exception *type* — `Conflict` versus `NotFound` — because "a 404 arriving where a
     400 belongs fails here as loudly as it should". The CLI's exit code cannot carry
     that: `microvms-cli/src/exit.rs:40` collapses five `WireKind`s onto one
@@ -283,7 +313,7 @@ class Cli:
 class Results:
     """Every check's outcome, so the summary reports facts rather than a feeling.
 
-    The four primitives are run.py's, with the same names and the same semantics, plus
+    The four primitives are the oracle's, with the same names and the same semantics, plus
     `unsupported`. `skipped` is a *third* list rather than a pass with a note, because
     a skip folded into `passed` is how a suite that covers half of what it claims looks
     identical to one that covers all of it.
@@ -365,12 +395,13 @@ class Results:
 
 # ── the checks the CLI has no subcommand for ─────────────────────────────────
 
-#: `(check name, reason)` for every run.py check this client cannot express.
+#: `(check name, reason)` for every oracle check this client cannot express.
 #:
-#: Written out rather than derived by diffing run.py at runtime, and the reason is the
-#: measure-coupling lesson: a runtime diff would silently shrink the moment run.py
-#: renamed a check, reporting better coverage for a suite that had not changed. A
-#: literal list disagrees instead, which is what a reader needs from it.
+#: Written out rather than derived by diffing the oracle at runtime, and the reason was
+#: the measure-coupling lesson: a runtime diff would have silently shrunk the moment the
+#: oracle renamed a check, reporting better coverage for a suite that had not changed. It
+#: is now the *only* record of those 34 names, which is the second reason it is a literal
+#: list: a derived one would have vanished with the file it derived from.
 #:
 #: Each reason names the missing subcommand rather than saying "unsupported", because
 #: the actionable half is which surface would have to grow.
@@ -389,8 +420,10 @@ UNSUPPORTED: tuple[tuple[str, str], ...] = (
     ),
     (
         "retried start did not spawn a second child",
-        "no stable --exec-id: the CLI mints one per invocation (TRAP-1's shape), so the "
-        "idempotency-key retry cannot be replayed",
+        (
+            "no stable --exec-id: the CLI mints one per invocation (TRAP-1's shape), so "
+            "the idempotency-key retry cannot be replayed"
+        ),
     ),
     ("retried start accepted", "no stable --exec-id; see the check above"),
     (
@@ -407,8 +440,10 @@ UNSUPPORTED: tuple[tuple[str, str], ...] = (
     ("read of an absent file is 404", "no `microvm cp`"),
     (
         "tree created for the round trip",
-        "expressible through `microvm exec`, but the round trip it sets up is not — so "
-        "building the tree would assert nothing",
+        (
+            "expressible through `microvm exec`, but the round trip it sets up is not — "
+            "so building the tree would assert nothing"
+        ),
     ),
     ("tar download succeeded", "no `microvm cp --tar`"),
     ("tar upload accepted", "no `microvm cp --tar`"),
@@ -447,7 +482,7 @@ UNSUPPORTED: tuple[tuple[str, str], ...] = (
     ),
 )
 
-#: The four hostile archives, by the name run.py gives each. Listed so the skip report
+#: The four hostile archives, by the name the oracle gave each. Listed so the skip report
 #: names them individually — "hostile archives are not covered" is a sentence a reader
 #: cannot act on, and four named members is the same fact they can.
 HOSTILE_ARCHIVES = (
@@ -475,75 +510,174 @@ def record_unsupported(results: Results) -> None:
         )
 
 
-# ── the daemon-level checks that stay on the Python transport ────────────────
+# ── the daemon-level checks, on raw httpx ────────────────────────────────────
 
 
-def post_run_hook(session: Session, token: str) -> int:
+@dataclass
+class Daemon:
+    """Raw HTTP to one MicroVM's daemon, through the platform's endpoint proxy.
+
+    Not a client library and deliberately so: every method here returns the status
+    integer the daemon chose, and the six checks that use it assert on that integer.
+    The deleted Python suite asserted on the exception *its* status table mapped the
+    integer to, which is one more layer that could be the thing that passes. Status
+    codes are what those checks always meant.
+
+    **Two headers, not one.** `X-aws-proxy-auth` carries a JWE scoped to a MicroVM id
+    and a port set; `X-aws-proxy-port` names which of that token's allowed ports this
+    request targets. Omitting the second is a rejection that reads like a bad token.
+    Both measured 2026-08-05; see `docs/PLATFORM.md`.
+    """
+
+    endpoint: str
+    agent_token: str
+    microvm_id: str
+    #: The boto3 `lambda-microvms` client, for minting the proxy token.
+    microvm_client: Any
+    port: int = AGENT_PORT
+    timeout: float = 60.0
+    _client: httpx.Client | None = None
+    _proxy_token: str | None = None
+
+    def __post_init__(self) -> None:
+        if not self.endpoint.startswith("http"):
+            self.endpoint = f"https://{self.endpoint}"
+        self._client = httpx.Client(timeout=self.timeout, verify=True)
+
+    def close(self) -> None:
+        if self._client is not None:
+            self._client.close()
+
+    def proxy_token(self) -> str:
+        """The endpoint proxy token, minted once and cached for this run.
+
+        `authToken` is a **map of header name to value**, not a bare string — the API
+        is shaped for schemes needing more than one header, and reading it as a string
+        is one of the six defects the first live run found. 60 minutes is the ceiling
+        the service enforces rather than a choice, and it comfortably outlasts the six
+        checks below, so there is no refresh path here (the CLI's own client has one).
+        """
+        if self._proxy_token is None:
+            response = self.microvm_client.create_microvm_auth_token(
+                microvmIdentifier=self.microvm_id,
+                expirationInMinutes=60,
+                allowedPorts=[{"port": self.port}],
+            )
+            self._proxy_token = str(response["authToken"]["X-aws-proxy-auth"])
+        return self._proxy_token
+
+    def headers(self, token: str | None) -> dict[str, Any]:
+        """Both proxy headers, plus the bearer when one was named.
+
+        `token=None` means send no `Authorization` at all, which is how the hook route
+        is exercised — so it is a real value here rather than "use the default".
+
+        The bearer is **bytes**, not str. httpx encodes a str header as ASCII and
+        refuses anything else, which would make the non-ASCII token check below
+        unsendable; the daemon's stated property is that it compares header bytes
+        without decoding them, and that is only testable if a client can put arbitrary
+        bytes on the wire. Verified: `httpx.Headers({"Authorization": "Bearer tökén"})`
+        raises `UnicodeEncodeError`, and the bytes form puts
+        `b'Bearer t\\xc3\\xb6k\\xc3\\xa9n'` on the wire.
+        """
+        headers: dict[str, Any] = {
+            "X-aws-proxy-auth": self.proxy_token(),
+            "X-aws-proxy-port": str(self.port),
+        }
+        if token is not None:
+            headers["Authorization"] = b"Bearer " + token.encode("utf-8")
+        return headers
+
+    def status(
+        self,
+        method: str,
+        path: str,
+        *,
+        token: str | None = None,
+        json_body: Any = None,
+    ) -> int:
+        """One request, and the status the daemon answered with.
+
+        Never raises on a status: these checks assert on 401 and 409 as *expected*
+        outcomes, and a caller that could only reach them through exceptions would be
+        a caller that cannot test the protocol. A wire failure still raises, because a
+        dropped connection is not a status and must not be reported as one — which is
+        exactly what the non-ASCII token check is asserting the daemon does not do.
+        """
+        assert self._client is not None
+        response = self._client.request(
+            method,
+            f"{self.endpoint}{path}",
+            headers=self.headers(token),
+            json=json_body,
+            timeout=self.timeout,
+        )
+        return response.status_code
+
+
+def post_run_hook(daemon: Daemon, token: str) -> int:
     """Posts the platform's run hook and returns the raw status.
 
-    Byte-identical to run.py:146 and reached around the client for the identical
-    reason: the only callers of this route are the platform itself and an attacker
-    inside the VM, so an affordance for it in *any* client would be a footgun with no
-    legitimate use. Adding one to the CLI to make this suite tidier would break CLI-2
-    and CLI-5 both.
+    Reached around the client under test for the reason the deleted oracle gave: the
+    only callers of this route are the platform itself and an attacker inside the VM,
+    so an affordance for it in *any* client would be a footgun with no legitimate use.
+    Adding one to the CLI to make this suite tidier would break CLI-2 and CLI-5 both.
+
+    No `Authorization` header, and the body is the platform's envelope rather than our
+    payload directly: the string given to `RunMicrovm` arrives wrapped as
+    `{"runHookPayload": "<it>"}`.
     """
-    response = session.transport.request(
+    return daemon.status(
         "POST",
         "/aws/lambda-microvms/runtime/v1/run",
         token=None,
-        json={"runHookPayload": json.dumps({"agent_token": token})},
+        json_body={"runHookPayload": json.dumps({"agent_token": token})},
     )
-    return response.status_code
 
 
-def drive_daemon_lane(session: Session, results: Results) -> None:
+def drive_daemon_lane(daemon: Daemon, results: Results) -> None:
     """The six checks that test the daemon rather than the client under test.
 
-    They keep run.py's names and its `Results.raises` semantics on the Python side —
-    `Unauthorized`, `ProtocolError` — because the assertion here is about a status the
-    *daemon* chose, and routing it through a second client would test the client twice
-    and the daemon no better.
+    Same six names the oracle used, asserting on the status integer the daemon chose.
+    Routing them through a client library would test that library twice and the daemon
+    no better; asserting on the integer is what they always meant.
     """
     print("\n-- bootstrap and authorization (daemon lane) --")
     results.eq(
         "post-bootstrap hijack refused with 409",
-        post_run_hook(session, "attacker-token"),
+        post_run_hook(daemon, "attacker-token"),
         409,
     )
     results.eq(
         "identical bootstrap replay accepted",
-        post_run_hook(session, session.agent_token),
+        post_run_hook(daemon, daemon.agent_token),
         200,
     )
 
     for name, token in (
         ("wrong token refused with 401", "wrong-token"),
+        # The daemon must *answer* a token it cannot decode rather than drop the
+        # connection, which is why this asserts a status at all: a `TransportError`
+        # out of `Daemon.status` is the failure, and `results.eq` reports it as the
+        # exception it is rather than as a wrong status.
         ("non-ASCII token header answered, not a dropped connection", "tökén"),
     ):
-        try:
-            session.transport.send("GET", "/v1/exec/nope", token=token)
-        except Unauthorized as exc:
-            results.check(name, True, type(exc).__name__)
-        except Exception as exc:  # noqa: BLE001 - any other error is the finding
-            results.check(name, False, f"expected Unauthorized, raised {exc!r}")
-        else:
-            results.check(name, False, "expected Unauthorized, nothing raised")
+        results.eq(name, daemon.status("GET", "/v1/exec/nope", token=token), 401)
 
     for name, method, path, body in (
         ("malformed body is 400, not 404", "POST", "/v1/exec/start", {"bogus": True}),
         ("missing path key is 400", "GET", "/v1/fs/file", None),
     ):
-        try:
-            if body is None:
-                session.transport.send(method, path)
-            else:
-                session.transport.send(method, path, json=body)
-        except ProtocolError as exc:
-            results.check(name, True, type(exc).__name__)
-        except Exception as exc:  # noqa: BLE001 - any other error is the finding
-            results.check(name, False, f"expected ProtocolError, raised {exc!r}")
-        else:
-            results.check(name, False, "expected ProtocolError, nothing raised")
+        # 400 rather than 404 is the whole assertion, and it is why this compares the
+        # integer instead of catching a class: the deleted client mapped both onto
+        # separate exceptions, but the defect being guarded against — a phantom
+        # missing file where the request was simply malformed — is a 404 arriving
+        # where a 400 belongs, and only the integer says which came back.
+        results.eq(
+            name,
+            daemon.status(method, path, token=daemon.agent_token, json_body=body),
+            400,
+        )
 
 
 # ── the CLI lane ────────────────────────────────────────────────────────────
@@ -578,14 +712,29 @@ def conformance_dockerfile(base_ref: str) -> str:
 def resolve_base_ref() -> str:
     """The Dockerfile `FROM` the Rust client pairs with its default base image.
 
-    Read from the Python client's own table, which the drift gate holds equal to the
-    Rust one — `check-model-drift`'s cross-comparison is what makes reading either side
-    here sound. Reading it from `microvm constants` would be better still, except that
-    the constants dump carries constraints rather than base images.
-    """
-    from microvms_agentd.sandbox import DEFAULT_BASE_IMAGE, resolve_base_image
+    A module table (`BASE_IMAGE_REFS`) rather than a value read out of the client under
+    test, which is a real limitation and worth naming. It used to be read from the
+    Python client's `BASE_IMAGES`, held equal to the Rust one by `check-model-drift`'s
+    cross-comparison; that table went with the client. Reading it from
+    `microvm constants --emit-json` would be better and is not possible — that dump
+    carries API constraints, not base images.
 
-    return resolve_base_image(DEFAULT_BASE_IMAGE).docker_ref
+    The failure mode is bounded and loud. If `microvms-core`'s default base image
+    changes and this table does not, the build fails on `control/artifact.rs:233`'s
+    refusal — the `FROM` disagreeing with `baseImageArn` — which names both values.
+    That is a suite that fails to run rather than one that passes wrongly, and it is
+    the same shape the check already had when the two tables could disagree. A base
+    image not in the table fails here instead, before anything is launched.
+    """
+    try:
+        return BASE_IMAGE_REFS[DEFAULT_BASE_IMAGE]
+    except KeyError:
+        raise SystemExit(
+            f"no Dockerfile FROM paired with base image {DEFAULT_BASE_IMAGE!r}. The name "
+            "alone does not say what `FROM` goes with it, and guessing is how the two fell "
+            f"out of step before — add the pair to BASE_IMAGE_REFS (have: "
+            f"{', '.join(sorted(BASE_IMAGE_REFS))})."
+        ) from None
 
 
 def drive_local_commands(cli: Cli, results: Results) -> None:
@@ -636,7 +785,7 @@ def drive_lifecycle(
     """`run --keep`, which is build plus launch plus exec in one invocation.
 
     `--keep` because every check after this one needs the VM, and the teardown is the
-    caller's `finally` — the same shape run.py uses, for the same reason: a teardown
+    caller's `finally` — the same shape the oracle used, for the same reason: a teardown
     that runs from inside the happy path is a teardown that does not run when it matters.
     """
     print("\n== run (build + launch + exec) ==")
@@ -666,7 +815,7 @@ def drive_lifecycle(
 
     results.eq("run emitted its namespaced envelope type", launched.type, "microvm.run")
     # A launch that returned at all means the CLI's `wait_until_ready` saw a bootstrapped
-    # daemon, since that call is what it waits on. A weaker assertion than run.py's
+    # daemon, since that call is what it waits on. A weaker assertion than the oracle's
     # direct `health()` — it cannot observe the pre-bootstrap state — and it is the
     # strongest one available without a `microvm health`.
     results.check(
@@ -734,7 +883,7 @@ def drive_exec(cli: Cli, launched: Envelope, results: Results) -> None:
         repr(first.data.get("stdout")),
     )
 
-    # run.py's three shell edge cases, same names. `shell: true` with a single script
+    # The oracle's three shell edge cases, same names. `shell: true` with a single script
     # string is what both clients send, so an unbalanced brace must stay one command.
     for name, script in (
         ("empty", ""),
@@ -769,7 +918,7 @@ def drive_exec(cli: Cli, launched: Envelope, results: Results) -> None:
 def drive_suspend_resume(cli: Cli, launched: Envelope, results: Results) -> None:
     """Checks that a suspended sandbox comes back whole, driven entirely through the CLI.
 
-    The evidence is run.py's: a ticker writing epoch seconds once a second, and a gap in
+    The evidence is the oracle's: a ticker writing epoch seconds once a second, and a gap in
     *its* timestamps is the suspension as the guest experienced it. Every read here goes
     through `microvm exec` rather than `upload_file`/`download_file`, which is why this
     section survives the CLI's missing file surface at all — a shell redirect is a file
@@ -864,7 +1013,7 @@ def drive_suspend_resume(cli: Cli, launched: Envelope, results: Results) -> None
         f"largest gap {largest}s across a ~{SUSPEND_WINDOW_SEC}s suspension",
     )
 
-    # Differential liveness, run.py's shape: two counts a few seconds apart rather than
+    # Differential liveness, the oracle's shape: two counts a few seconds apart rather than
     # a `pgrep` pattern threaded through two layers of shell quoting, where a false
     # negative is indistinguishable from a real one.
     first = cli.call("exec", "wc -l < /tmp/ticks.txt", *after)
@@ -880,7 +1029,7 @@ def drive_suspend_resume(cli: Cli, launched: Envelope, results: Results) -> None
 
     # An exec record from before the suspend cannot be polled — no `microvm exec --poll`
     # — so the ticker's *output* standing in is the honest substitute, and it is named
-    # as a substitute rather than as the check run.py runs.
+    # as a substitute rather than as the check the oracle ran.
     results.unsupported(
         "an exec record from before the suspend survived",
         "no `microvm exec --poll <id>`; the ticker's own output is checked instead",
@@ -930,7 +1079,7 @@ def read_daemon_logs(logs: Any, image_name: str) -> list[str]:
 
     Through boto3 rather than through the CLI on purpose: `microvm logs` refuses to read
     CloudWatch by design (CLI-2), and this check is about whether the *daemon* wrote
-    anything. Same shape and same reason as run.py:599.
+    anything. Same shape and same reason as the oracle's own log read.
     """
     lines: list[str] = []
     for group in (f"/aws/lambda-microvms/{image_name}", "/aws/lambda-microvms"):
@@ -1222,7 +1371,7 @@ def main() -> int:
             print(f"{label} not found: {path}")
             return 2
 
-    # The same three Terraform outputs run.py reads, handed to the CLI through the
+    # The same three Terraform outputs the oracle read, handed to the CLI through the
     # environment rather than as flags: `MICROVM_BUCKET` and the two role ARNs are the
     # names `seam.rs:324` resolves, so this is how a human runs it too.
     outputs = json.loads(sh(["terraform", "output", "-json"], cwd=infra))
@@ -1234,6 +1383,7 @@ def main() -> int:
     cli = Cli(binary=microvm)
     results = Results()
     launched: Envelope | None = None
+    daemon: Daemon | None = None
 
     with tempfile.TemporaryDirectory() as tmp:
         dockerfile = Path(tmp) / "Dockerfile"
@@ -1244,19 +1394,18 @@ def main() -> int:
             drive_local_commands(cli, results)
             launched = drive_lifecycle(cli, binary, dockerfile, results)
 
-            # The daemon lane needs a Session, built from what the CLI reported. Composed
-            # rather than duplicated: the Rust client launched the VM and the Python
-            # transport pokes the daemon, which is the honest division of labour for six
-            # checks that are about neither client.
+            # The daemon lane pokes the VM the CLI launched, over raw HTTP. Composed
+            # rather than duplicated: the Rust client launched it and this reaches
+            # around every client, which is the honest division of labour for six
+            # checks that are about neither one.
             aws = boto3.Session(region_name=cli.region)
-            session = Session(
+            daemon = Daemon(
                 endpoint=str(launched.data["endpoint"]),
                 agent_token=str(launched.data["agentToken"]),
                 microvm_id=str(launched.data["microvmId"]),
                 microvm_client=aws.client(SERVICE),
-                port=AGENT_PORT,
             )
-            drive_daemon_lane(session, results)
+            drive_daemon_lane(daemon, results)
 
             drive_exec(cli, launched, results)
             drive_suspend_resume(cli, launched, results)
@@ -1271,15 +1420,17 @@ def main() -> int:
                 f"{len(lines)} lines",
             )
         finally:
+            if daemon is not None:
+                daemon.close()
             if args.keep:
                 print("\n== teardown SKIPPED (--keep) ==")
             elif launched is None:
                 print("\n== teardown: nothing was launched ==")
             else:
-                # Never raises out of here, for run.py's reason: an exception in teardown
-                # would replace the real failure with a teardown failure. The log group is
-                # reported LAST because the service can recreate a group deleted before its
-                # image — which is how six of them leaked.
+                # Never raises out of here: an exception in teardown would replace the
+                # real failure with a teardown failure. The log group is reported LAST
+                # because the service can recreate a group deleted before its image —
+                # which is how six of them leaked.
                 try:
                     drive_teardown(cli, launched, results)
                 except Exception as exc:  # noqa: BLE001 - a teardown failure is a finding
@@ -1293,8 +1444,8 @@ def main() -> int:
         print(f"    FAIL {name}: {detail}")
     print(
         f"\n  {len(results.passed)} of {len(results.passed) + len(results.skipped)} named checks "
-        "are expressible through this client. The rest are the Python suite's, and\n"
-        "  `conformance/run.py` remains the oracle for them — see this file's docstring."
+        "are expressible through this client. The rest were the deleted Python\n"
+        "  oracle's, and no live suite covers them now — see this file's docstring."
     )
     print("\n  every invocation, for reproducing a failure by hand:")
     for line in cli.log:

@@ -14,8 +14,10 @@ lifecycle semantics. This project exists so the next team does not repeat it.
 cross-compiled to a 1.41 MB static `aarch64-unknown-linux-musl` binary, baked into
 a MicroVM image as the container `CMD`, launched in us-east-1, and driven through
 every protocol rule via the platform's own endpoint: 56 checks passed, none
-failed, and teardown left the account clean. 155 Rust tests across six local
-tiers and 83 Python client tests are green alongside it.
+failed, and teardown left the account clean. The Rust local tiers are green
+alongside it. That run went through the Python client, which was this project's
+discovery instrument and is now git history: the `microvm` CLI has since driven the
+same suite live and green, so the oracle's job is finished.
 
 That live run covers the things only the real service can answer, including
 Server-Sent Events surviving the endpoint proxy, stdin round-tripping through a
@@ -33,8 +35,10 @@ bind mount over `boot_id` will work. Each is recorded in
 against the old behavior.
 
 Not yet done: a repeat run in a second region, the CI cross-compile job has never
-executed (there is no git remote), and `Sandbox` in the Python client is verified
-only against fakes plus the conformance run.
+executed (there is no git remote), and 34 of the oracle's 56 checks — file transfer,
+tar round trips, SSE ordering, stdin lifecycle, the health flags — are no longer
+covered against real AWS, because the `microvm` CLI has no subcommand for them. The
+live suite reports each one as SKIP by name rather than letting the gap go quiet.
 
 ## Suspend and resume preserve everything
 
@@ -61,9 +65,11 @@ agentd/   the daemon: axum router, one-shot bootstrap, exec engine, fs engine,
           tests/proptest_tar.rs      — tar confinement properties
           tests/schema_artifact.rs   — the published schema cannot go stale
           tests/turmoil_transport.rs — deterministic transport faults
-clients/  python/ — session library: proxy-token refresh, streaming with
-          offset reconnect, typed error taxonomy, AWS lifecycle helper
-conformance/  live AWS suite plus the suspend/resume probe, and its Terraform
+microvms-core/  the client library: control plane, in-VM session, cost engine,
+          lifecycle state machine, and every platform-trap guard
+microvms-cli/   the `microvm` CLI: one JSON envelope, a documented exit-code table
+microvms-py/, microvms-js/  the PyO3 and napi-rs bindings
+conformance/  the live AWS suite driving the CLI, and its Terraform
 model/    stateright model of bootstrap + exec lifecycle, with safety properties
 spec/     symspec requirements document, Z3-verified consistent
 docs/     PROTOCOL.md (wire contract), PLATFORM.md (measured AWS behavior),
@@ -178,10 +184,10 @@ panic-containment tests, 8 tar-confinement properties, 11 schema-artifact checks
 verified to fail against the code without its fix; a property that passes either
 way is a false answer, not a passing test.
 
-CI (`.github/workflows/ci.yml`) runs the same gates in four jobs: Rust lint and
-tests plus the schema staleness check, the `aarch64-unknown-linux-musl`
-cross-compile, the Python client's tests and ruff, and the symspec requirements
-gate. A fifth workflow, `live-conformance.yml`, runs the real-AWS suites — manual
+CI (`.github/workflows/ci.yml`) runs the same gates in five jobs: Rust lint and
+tests plus the schema staleness check, the service-model drift gate and ruff over
+the remaining Python tooling, the binding suites, the `aarch64-unknown-linux-musl`
+cross-compile, and the symspec requirements gate. A fifth workflow, `live-conformance.yml`, runs the real-AWS suites — manual
 dispatch only, behind a GitHub environment so a human approves each run, using
 OIDC rather than a stored key.
 

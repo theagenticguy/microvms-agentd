@@ -28,7 +28,7 @@ If in a MicroVM: region, API version, base image, baseline memory.
 
 - Commit or tag:
 - Build target (`x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-musl`, …):
-- `clients/python` version, if involved:
+- Client, if involved (`microvm` CLI, `microvms-py`, `microvms-js`):
 
 ## Logs
 

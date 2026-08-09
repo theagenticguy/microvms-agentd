@@ -36,7 +36,7 @@ AGENTD_TARGET = "aarch64-unknown-linux-musl"
 description = "Format everything (writes)"
 run = [
   "cargo fmt --all",
-  "ruff format clients/python conformance scripts",
+  "ruff format conformance scripts",
   "terraform -chdir=conformance/infra fmt",
 ]
 
@@ -45,8 +45,8 @@ description = "Format check + clippy + ruff, no writes"
 run = [
   "cargo fmt --all -- --check",
   "cargo clippy --all-targets -- -D warnings",
-  "ruff check clients/python conformance scripts",
-  "ruff format --check clients/python conformance scripts",
+  "ruff check conformance scripts",
+  "ruff format --check conformance scripts",
   "terraform -chdir=conformance/infra fmt -check",
 ]
 
@@ -54,9 +54,13 @@ run = [
 description = "All six Rust tiers: unit, model, proptest, turmoil, panic, schema"
 run = "cargo test --all"
 
-[tasks."test:python"]
-description = "Client library tests against a fake daemon over a real socket"
-run = "uv run --with pytest --with httpx --with boto3 pytest clients/python -q"
+# `test:python` was here: 83 client-library tests against a fake daemon over a real
+# loopback socket. The Python tier moved to git history after the Rust port went
+# live-green — both suites passed against real AWS on the same commit (Python oracle
+# 56/56, Rust CLI 38/38), which is what made the oracle's job finished rather than
+# merely duplicated. The two Python files left in the tree are tooling, not a client:
+# `conformance/run_rs.py` drives the Rust CLI, and the two `scripts/check-*` gates read
+# botocore's model and the AWS Pricing API. Both are still linted by `fmt` and `lint`.
 
 [tasks.schema]
 description = "Regenerate docs/schema.json from the serde types"
@@ -113,12 +117,15 @@ description = "Fail if a hardcoded API constraint no longer matches botocore's s
 # network, no credentials, no money — so it costs the same as a lint and belongs
 # where the gate is unconditional.
 #
-# Compares THREE ways now, which is TRAP-12's "verify each hardcoded service constraint
-# against the pinned botocore service model in the build gate": the Python client's
-# constants against the model, `microvms-core`'s against the same model, and the two
-# clients against each other. The cross-comparison is not decoration — `MICROVM_REGIONS`
-# and the sizing table are measurement-backed, so the model can say nothing about them and
-# client-vs-client is the only check they can ever have.
+# TRAP-12's "verify each hardcoded service constraint against the pinned botocore service
+# model in the build gate": `microvms-core`'s constants, read through
+# `microvm constants --emit-json`, against the shipped model.
+#
+# It compared THREE ways while the Python client existed — each client against the model,
+# then the two against each other. `MICROVM_REGIONS` and the sizing table are
+# measurement-backed, so the model can say nothing about them and client-vs-client was the
+# only check they could ever have. The script now holds its own pinned copies of those two
+# and compares against them, which keeps a second reader for the two values that need one.
 #
 # No `depends = ["build-cli"]`, because the script reaches the Rust constants through
 # `cargo run -q -p microvms-cli` itself. A prebuilt path would be faster and can be *stale*,
@@ -146,7 +153,7 @@ run = "cargo build --release -p microvms-cli"
 
 [tasks.check]
 description = "The full local gate — the definition of done"
-depends = ["lint", "test", "test:python", "schema:check", "model:check", "build"]
+depends = ["lint", "test", "schema:check", "model:check", "build"]
 
 # ── live AWS suites (billable, manual) ──────────────────────────────────────
 
@@ -154,44 +161,45 @@ depends = ["lint", "test", "test:python", "schema:check", "model:check", "build"
 description = "Apply the conformance stack (idempotent)"
 run = "terraform -chdir=conformance/infra init -input=false && terraform -chdir=conformance/infra apply -auto-approve -input=false"
 
-[tasks."live:conformance"]
-description = "56 checks against a real MicroVM through the platform endpoint"
-depends = ["build", "live:infra"]
-run = "./conformance/run.py --binary target/$AGENTD_TARGET/release/agentd"
+# `live:conformance` was here: 56 checks through `conformance/run.py` and the Python
+# client. The Python tier moved to git history after the Rust port went live-green — both
+# suites passed against real AWS on the same commit, which is what retired the oracle
+# rather than merely duplicating it. `live:conformance-rs` below is the live suite now,
+# and it says in its own description how much of the 56 it can express.
+#
+# `live:probe` went the same way: `conformance/probe_suspend_resume.py` measured what a
+# real suspend/resume cycle preserves, and its measurements live on in
+# `docs/PLATFORM.md`, "Suspend and resume preserve everything". The suspend/resume
+# *assertions* it fed are still run, by `live:conformance-rs`'s own suspend/resume
+# section — the ticker gap, the surviving token, the surviving filesystem, the
+# backgrounded process still counting. What is gone is the standalone probe that
+# discovered them.
 
 [tasks."live:conformance-rs"]
-description = "The same suite through the Rust client: 22 of the 56 checks the CLI can express"
+description = "The live suite through the Rust client: 38 of the oracle's 56 checks, plus the CLI's own"
 depends = ["build", "build:cli", "live:infra"]
 # Both binaries: `--binary` is the aarch64 daemon that gets baked into the image, and
 # `--microvm-binary` is the host-architecture CLI under test. Naming both is what makes the
 # two-target split above visible at the call site rather than only in a comment.
 #
-# 22 rather than 56, and the number is in the description on purpose. The CLI's `exec` is
+# 38 rather than 56, and the number is in the description on purpose. The CLI's `exec` is
 # one-shot with a generated exec id and there is no `microvm cp`, `ack`, `exec --stream`, or
 # `stdin` — so file transfer, tar round trips, the four hostile archives, SSE, stdin
 # lifecycle, and the health flags are not expressible through this client. The suite prints
-# each of the 34 as SKIP with the missing subcommand named, and `conformance/run.py` remains
-# the oracle for them. A description claiming 56 would be the more comfortable lie.
-#
-# Its own task rather than a flag on `live:conformance`, because the two suites answer
-# different questions and both should run: the Python one covers the protocol in depth, this
-# one covers the lifecycle plus CLI-3/CLI-4/CLI-6, which live nowhere else.
+# each of the 34 it cannot express as SKIP with the missing subcommand named. Nothing runs
+# those 34 against real AWS now; `microvms-core`'s local tiers cover the same surfaces
+# against fakes. A description claiming 56 would be the more comfortable lie.
 run = """
 ./conformance/run_rs.py \
   --binary target/$AGENTD_TARGET/release/agentd \
   --microvm-binary target/release/microvm
 """
 
-[tasks."live:probe"]
-description = "Measure what a real suspend/resume cycle preserves"
-depends = ["build", "live:infra"]
-run = "./conformance/probe_suspend_resume.py --binary target/$AGENTD_TARGET/release/agentd"
-
 [tasks."live:rates"]
 description = "Fail if the pinned rate table no longer matches the AWS Pricing API"
 # The same argument as `schema:check`: a stale pinned artifact is worse than none,
 # because a consumer trusts a price *because* it is pinned and no diff reveals that
-# it describes a bill nobody pays. `cost.STALE_AFTER` could only say nobody had
+# it describes a bill nobody pays. `STALE_AFTER_DAYS` could only say nobody had
 # looked; this looks.
 #
 # In `live` rather than `check` despite costing nothing — the Pricing API is free
@@ -199,12 +207,14 @@ description = "Fail if the pinned rate table no longer matches the AWS Pricing A
 # is defined by needing neither. A gate that fails on a plane without AWS creds is
 # a gate people learn to skip, and `check` is the one command that must never be
 # skipped.
-# Not `python -m microvms_agentd.pricing`: the package `__init__` imports `pricing`,
-# so `-m` re-executes an already-imported module and warns about it on every run. A
-# gate whose normal output includes a RuntimeWarning is a gate whose real warnings
-# get skimmed past.
-run = "uv run --with boto3 python -c 'from microvms_agentd.pricing import main; raise SystemExit(main())'"
-dir = "clients/python"
+#
+# A standalone script rather than a module in a client, because it used to be the Python
+# client's `pricing` module and that client is now git history. The pinned figures are
+# inlined there as literals — a deliberate second copy of `microvms-core`'s
+# `pinned_rates()`, since a drift check that imported the values it checks would compare
+# a table against itself. `scripts/check-live-rates --twin-only` runs that cross-check
+# alone, offline and free, and it also runs first on this path.
+run = "./scripts/check-live-rates"
 
 [tasks."live:verify-clean"]
 description = "Ask the account what leaked, rather than trusting teardown"
@@ -226,13 +236,13 @@ description = "Every live suite, then an independent leak check. BILLABLE."
 # tests all go through an injected seam, so `ControlPlane::new` and everything past it are
 # unexercised against the real service. A suite that only runs when someone names it is a
 # suite that runs the week it is written.
-depends = [
-  "live:rates",
-  "live:conformance",
-  "live:conformance-rs",
-  "live:probe",
-  "live:verify-clean",
-]
+#
+# Three members rather than five. `live:conformance` and `live:probe` drove the Python
+# client, and the Python tier moved to git history after the Rust port went live-green:
+# both suites passed against real AWS on the same commit, so the oracle's job was
+# finished rather than duplicated. `live:conformance-rs` is now the whole of the live
+# protocol coverage, and it is honest about the 34 checks it cannot express.
+depends = ["live:rates", "live:conformance-rs", "live:verify-clean"]
 # Records the commit that was last proven against real AWS. The pre-push hook
 # reads it to tell you whether the daemon has changed since — advisory only,
 # because only a human knows whether a given change could touch the platform

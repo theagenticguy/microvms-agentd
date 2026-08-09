@@ -12,10 +12,10 @@
 //! measurement, and this crate is where that measurement is spent once so no caller
 //! has to make it again.
 //!
-//! The Python client at `clients/python/` closes the same traps and stays in the tree
-//! as the conformance oracle and the API reference. This crate is the port, and the
-//! reason to port is that Rust can make several of those closures *unavailable*
-//! rather than merely rejected — see the strength ladder below.
+//! The Python client closed the same traps and stayed in the tree as the conformance
+//! oracle and the API reference until this port had driven the live suite green; it is
+//! git history now. The reason to port was that Rust can make several of those closures
+//! *unavailable* rather than merely rejected — see the strength ladder below.
 //!
 //! # How strongly a trap is closed
 //!

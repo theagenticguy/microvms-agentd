@@ -52,13 +52,13 @@
 //!   by value would not compile, which is the closest thing to "the core has no
 //!   constructor for a bill" that a binding can hold.
 //!
-//! # The JSON shape is `cli.py`'s, not a re-invention
+//! # The JSON shape is the Python oracle's, not a re-invention
 //!
-//! [`CostReport::to_dict`] emits the `report_to_dict` shape from
-//! `clients/python/src/microvms_agentd/cli.py:688` — camelCase keys, `estimated: true` as
-//! a literal field, quantities and dollars as strings, and an unpriced line item with no
-//! `usd` key. The two clients have to be diffable against each other, so this is a
-//! transcription rather than a design.
+//! [`CostReport::to_dict`] emits the `report_to_dict` shape the deleted Python client's
+//! `cli.py:688` produced — camelCase keys, `estimated: true` as a literal field,
+//! quantities and dollars as strings, and an unpriced line item with no `usd` key. It was
+//! a transcription rather than a design, because the two clients had to be diffable
+//! against each other; the shape stays because consumers now read it.
 
 use std::collections::BTreeMap;
 

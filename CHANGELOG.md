@@ -4,6 +4,30 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versions are [semantic](https://semver.org/spec/v2.0.0.html); the wire contract in
 `docs/PROTOCOL.md` is the public surface that versioning applies to.
 
+## Unreleased
+
+### Removed
+
+- **`clients/python`** — the Python client, its 83 tests, and the two conformance
+  scripts that imported it (`conformance/run.py`, the 56-check oracle;
+  `conformance/probe_oom.py` and `conformance/probe_suspend_resume.py`). It was
+  the discovery instrument: it found and closed fifteen client-side API traps and
+  measured the platform's pricing and lifecycle semantics. All of that is pinned
+  elsewhere now — in `docs/PLATFORM.md`, in `spec/core.symspec.json`, and in
+  `microvms-core`'s own guards — and the Rust port has driven the live suite green
+  against real AWS on the same commit the oracle last passed on. Git history keeps
+  every line.
+
+  What moved rather than went away: the rate-drift check is now
+  `scripts/check-live-rates` (a PEP 723 uv script with its own pinned table, held
+  equal to `microvms-core`'s `pinned_rates()`), and `scripts/check-model-drift`
+  pins the region list and sizing table against its own literals, since those two
+  values were verified by the Python-vs-Rust cross-comparison and by nothing else.
+
+  What is genuinely lost: 34 of the oracle's 56 checks have no live coverage, because
+  the `microvm` CLI has no `cp`, `ack`, `exec --stream`, `stdin`, or `health`
+  subcommand. `conformance/run_rs.py` reports each one as SKIP by name.
+
 ## [0.1.0] — 2026-08-06
 
 First release. Source only: there are no published binaries, and the daemon is

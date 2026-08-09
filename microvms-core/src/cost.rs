@@ -6,11 +6,10 @@
 //! product should be able to ask "what did that run cost" without reading a pricing
 //! page sideways.
 //!
-//! Two rules hold everywhere below. The Python client
-//! (`clients/python/src/microvms_agentd/cost.py`) enforced both at runtime — a
-//! `TypeError` from a keyword-only field, a `NotImplemented` from `__add__`. Here
-//! they are the shape of the types, so the enforcement happens before the program
-//! runs.
+//! Two rules hold everywhere below. The Python client's `cost.py` enforced both at
+//! runtime — a `TypeError` from a keyword-only field, a `NotImplemented` from
+//! `__add__`. Here they are the shape of the types, so the enforcement happens before
+//! the program runs.
 //!
 //! **Seconds are measured, dollars are estimated.** [`DurationP`] is an enum whose
 //! every variant names its provenance, so there is no unlabelled constructor to
@@ -2477,16 +2476,16 @@ mod tests {
     /// publish, in the field a reader scans for "which phase" — and the separator is
     /// `", "` rather than `"; "`.
     ///
-    /// The expected string is copied from the oracle rather than assembled here:
+    /// The expected string is copied from the oracle rather than assembled here. What its
+    /// `run_report` printed for a 2048 MiB size with 3600 s running, a 300 s measured image
+    /// build, and a 2 GB image:
     ///
     /// ```text
-    /// cd clients/python && uv run --with boto3 python -c "
-    /// from microvms_agentd.cost import run_report, Duration
-    /// r = run_report(size=2048, running=Duration.measured(3600),
-    ///                image_build=Duration.measured(300), image_gb=2.0, label='run')
-    /// print(repr(str(r.total)))"
-    /// # 'at least ~$0.166533 (estimated), plus 1 unpriced (image-build)'
+    /// at least ~$0.166533 (estimated), plus 1 unpriced (image-build)
     /// ```
+    ///
+    /// A transcript rather than a command: that client was deleted once this one had driven
+    /// the live suite green, and git history is where the code behind the figure lives.
     ///
     /// **Falsification** — restore `unpriced.join("; ")` over the reasons in
     /// [`Total`]'s `Display` and this is red on the whole parenthetical while every
@@ -3479,9 +3478,9 @@ mod tests {
     }
 
     /// **The golden.** The break-even hold at 2 GB, pinned against the Python oracle
-    /// rather than against a re-derivation: `compare_residency(size=2048,
+    /// rather than against a re-derivation: its `compare_residency(size=2048,
     /// hold_seconds=730*3600, cycles=1).break_even_seconds` printed
-    /// `1371.2916483478837` when run against `clients/python/src` in this session.
+    /// `1371.2916483478837` when it was run in the session that wrote this test.
     ///
     /// Worth recording that the task packet predicted ≈1357s. The oracle decides, and it
     /// says 1371.29 — a re-derivation would have been the wrong check here, because it

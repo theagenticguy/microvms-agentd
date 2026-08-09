@@ -2,8 +2,8 @@
 //!
 //! # Append-only, because a consumer branches on these
 //!
-//! Fourteen rows, 0 through 13, byte-identical to `clients/python/src/microvms_agentd/cli.py`'s
-//! `Exit`/`Code`/`EXIT_TABLE` trio. Split by *what the caller should do next*, which is the
+//! Fourteen rows, 0 through 13, byte-identical to the deleted Python client's
+//! `Exit`/`Code`/`EXIT_TABLE` trio (see git history). Split by *what the caller should do next*, which is the
 //! only distinction worth a separate integer: `ERR_RETRYABLE` means run it again unchanged,
 //! `ERR_CREDENTIALS` means fix an identity and no amount of waiting helps. The three
 //! platform codes are separate because each names a different `docs/PLATFORM.md` finding

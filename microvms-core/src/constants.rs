@@ -27,12 +27,13 @@
 //!
 //! # The drift gate (TRAP-12)
 //!
-//! [`as_json`] emits every value in this module as one object, keyed with the same
-//! names `clients/python/src/microvms_agentd/sandbox.py` uses. That is what makes the
-//! gate possible: `scripts/check-model-drift` already imports the Python module and
-//! compares each constant against the pinned model, and it can consume this object
-//! the same way — plus a Python-vs-Rust cross-comparison, so the two clients cannot
-//! quietly disagree with each other while both agreeing with nothing.
+//! [`as_json`] emits every value in this module as one object, keyed with the names the
+//! deleted Python client's `sandbox.py` used. That is what makes the gate possible:
+//! `scripts/check-model-drift` reads this object and compares each constant against the
+//! pinned model. It used to compare the Python module the same way and then the two
+//! clients against each other; with one client left, the two values no model states —
+//! `MICROVM_REGIONS` and `SIZE_CLASSES` — are compared against pinned literals in that
+//! script instead, since a value compared only against itself passes by construction.
 //!
 //! The names are therefore a contract with a script, not a style choice. Renaming
 //! `MAX_RUN_HOOK_PAYLOAD_BYTES` here without renaming it there does not fail

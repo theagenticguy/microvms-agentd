@@ -329,7 +329,9 @@ same as the build being free.
 
 ## Seeing an OOM: the process case works, the VM case is still unmeasured
 
-Measured 2026-08-07, us-east-1, via `conformance/probe_oom.py`. The customer
+Measured 2026-08-07, us-east-1, via `conformance/probe_oom.py` (deleted with the
+Python client after the Rust port went live-green; the probe is in git history and
+this entry is its result). The customer
 question is "is there a `dmesg`?" and it splits in two.
 
 **A process killed inside a living VM should be visible twice over, and the
@@ -372,8 +374,10 @@ under pressure, and `/v1/health` stayed reachable and bootstrapped throughout.
 ## Suspend/resume is a freeze and restore, not a stop and start
 
 Measured 2026-08-05, us-east-1, `al2023-1` base, 1024 MiB baseline, via
-`conformance/probe_suspend_resume.py`. `SuspendMicrovm`, held 45 seconds, then
-`ResumeMicrovm`. Everything survived:
+`conformance/probe_suspend_resume.py` — deleted with the Python client after the Rust
+port went live-green, so the probe is in git history and this entry is its result.
+The same assertions now run inside `conformance/run_rs.py`'s suspend/resume section.
+`SuspendMicrovm`, held 45 seconds, then `ResumeMicrovm`. Everything survived:
 
 | What | Result |
 | --- | --- |

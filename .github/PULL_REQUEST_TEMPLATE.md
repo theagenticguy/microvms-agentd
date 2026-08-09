@@ -13,8 +13,8 @@ message here: name what was measured, and admit what is unverified. -->
 - [ ] `cargo run -p agentd --bin schema -- --check` (regenerated if the protocol changed)
 - [ ] `cargo build --release -p agentd --target aarch64-unknown-linux-musl`
 - [ ] `symspec check spec/agentd.symspec.json --strict` (if `spec/` changed)
-- [ ] `uv run --with pytest --with httpx --with boto3 pytest clients/python -q` (if `clients/python` changed — CI does not run this)
-- [ ] `uvx ruff check clients/python && uvx ruff format --check clients/python` (same)
+- [ ] `uvx ruff check conformance scripts && uvx ruff format --check conformance scripts` (if either changed)
+- [ ] `./conformance/run_rs.py --self-test` (if `conformance/` changed — offline and free)
 - [ ] Live conformance run, if this touches the wire protocol or AWS lifecycle.
       Region and pass/fail counts:
 

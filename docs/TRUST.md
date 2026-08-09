@@ -121,8 +121,14 @@ inputs containing non-ASCII characters; the header is entirely attacker-controll
 so `Authorization: Bearer tökén` killed the predecessor's handler thread and returned
 `RemoteDisconnected` instead of a status the client could act on. That exact input is
 now a unit test (`agentd/src/auth.rs`, `a_non_ascii_header_is_compared_not_crashed`)
-and a live conformance check (`conformance/run.py`, "non-ASCII token header answered,
-not a dropped connection").
+and a live conformance check (`conformance/run_rs.py`, "non-ASCII token header
+answered, not a dropped connection" — same name it had in the deleted Python oracle,
+and it now asserts the 401 directly rather than the exception a client mapped it to).
+The client sending it has to put the bytes on the wire itself: `httpx` encodes a `str`
+header as ASCII and refuses anything else, so the driver builds
+`b"Bearer " + token.encode("utf-8")`. Verified 2026-08-09 — the `str` form raises
+`UnicodeEncodeError` before the request leaves, which would make this property
+untestable rather than merely untested.
 
 Where it is *not* sufficient, stated rather than glossed: length inequality
 short-circuits before the constant-time compare, so token length is observable. The

@@ -56,11 +56,14 @@ push. `.cargo/config.toml` pins `rust-lld`, so `rustup target add
 aarch64-unknown-linux-musl` is the only setup step — you do not need an external
 cross toolchain.
 
-Python client:
+Python tooling — the live suite's driver and the two drift gates. There is no
+Python client any more; `clients/python` is in git history, and the clients are the
+`microvm` CLI and the `microvms-py` / `microvms-js` bindings.
 
 ```bash
-uv run --with pytest --with httpx --with boto3 pytest clients/python -q
-uvx ruff check clients/python && uvx ruff format --check clients/python
+uvx ruff check conformance scripts && uvx ruff format --check conformance scripts
+./conformance/run_rs.py --self-test    # the live suite's offline half. Free.
+./scripts/check-live-rates --twin-only # the pinned rate tables agree. Offline, free.
 ```
 
 Requirements verification (Node ≥ 22):
@@ -120,16 +123,33 @@ that encodes the artifact as expected behavior.
 
 ## The live conformance suite
 
-`conformance/run.py` is the ground truth anchor, because the model is not the
-binary. It is also the only part of this repo that spends money.
+`conformance/run_rs.py` is the ground truth anchor, because the model is not the
+binary. It is also the only part of this repo that spends money. `mise run live`
+runs it alongside the rate-drift check and the leak check; by hand:
 
 ```bash
 terraform -chdir=conformance/infra init
 terraform -chdir=conformance/infra apply
 cargo build --release -p agentd --target aarch64-unknown-linux-musl
-conformance/run.py --binary target/aarch64-unknown-linux-musl/release/agentd
-conformance/probe_suspend_resume.py --binary <same path>   # the platform probe
+cargo build --release -p microvms-cli
+conformance/run_rs.py \
+  --binary target/aarch64-unknown-linux-musl/release/agentd \
+  --microvm-binary target/release/microvm
 ```
+
+`conformance/run.py` — the 56-check Python oracle — and the standalone
+suspend/resume probe were here until the Rust port drove this suite green against
+real AWS on the same commit. Both are in git history. The suspend/resume
+assertions they fed still run, inside this suite; the 34 protocol-detail checks
+only the Python client could express do not, because the `microvm` CLI has no
+`cp`, `ack`, `exec --stream`, `stdin`, or `health` subcommand. The suite prints
+each of those as SKIP with the missing subcommand named, which is the honest
+report and the actionable one: a SKIP becomes a PASS the day the CLI grows the
+subcommand.
+
+`--self-test` is the offline half — it drives the envelope-to-exception mapping
+against a stub `microvm` and touches no account, so it is free and belongs in any
+PR that changes `conformance/`.
 
 It needs real AWS credentials in a Lambda MicroVMs region, and it creates real
 resources: an S3 artifact, a MicroVM image build (up to a 45-minute timeout), and

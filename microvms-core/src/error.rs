@@ -119,7 +119,7 @@ impl Error {
 
 /// The coarse failure classes, one per non-zero row of the CLI's exit table.
 ///
-/// Exactly the thirteen codes `clients/python/src/microvms_agentd/cli.py` defines.
+/// Exactly the thirteen codes the deleted Python client's `cli.py` defined.
 /// The integer exit code lives in the CLI, not here: a library that owned process
 /// exit codes would be a library with an opinion about being a process.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]

@@ -413,19 +413,20 @@ mod tests {
     /// The old `seconds <= 0.0` filter treated `-5` the same as `0`: the phase vanished and
     /// the CLI printed a clean report of a run that could not have happened, exit 0. That is
     /// the worst available answer — an inverted clock is a bug in the caller's timing and a
-    /// report is the last place it should be laundered into silence. The oracle refuses:
+    /// report is the last place it should be laundered into silence. What the Python oracle
+    /// printed for `cost --json --running-sec=-5`, and the exit code it returned:
     ///
     /// ```text
-    /// cd clients/python && uv run --with boto3 python -c "
-    /// from microvms_agentd.cli import dispatch
-    /// print(dispatch(['cost','--json','--running-sec=-5']))"
-    /// # {"status": "error", "error": "a duration cannot be negative: -5.0s",
-    /// #  "code": "ERR_INVALID_ARG", "exitCode": 2, ...}
-    /// # 2
+    /// {"status": "error", "error": "a duration cannot be negative: -5.0s",
+    ///  "code": "ERR_INVALID_ARG", "exitCode": 2, ...}
+    /// 2
     /// ```
     ///
+    /// A transcript rather than a command: that client was deleted once this one had driven
+    /// the live suite green, so this is the record of what it answered.
+    ///
     /// All three flags and both paths, because `--estimate` and the measured path reached
-    /// the check through different constructors and the oracle refuses on all six.
+    /// the check through different constructors and the oracle refused on all six.
     ///
     /// **Falsification** — restore `if seconds <= 0.0 { return Ok(None) }` and drop the
     /// up-front loop: every case here goes red on `expect_err`, while the report the CLI

@@ -437,21 +437,21 @@ mod tests {
     ///
     /// The seconds half is the same assertion pointed the other way, and it is pinned here
     /// rather than left implicit because the two rules look contradictory side by side and the
-    /// natural "tidy-up" is to make them agree. `cli.py:743` emits `duration.seconds` as a
-    /// float, so a string here is a field a consumer has to branch on by client — which is
-    /// exactly the substitutability `breakEvenSeconds` was already a number to preserve. The
-    /// oracle, verbatim:
+    /// natural "tidy-up" is to make them agree. The Python oracle's `cli.py:743` emitted
+    /// `duration.seconds` as a float, so a string here is a field a consumer has to branch on
+    /// by client — which is exactly the substitutability `breakEvenSeconds` was already a
+    /// number to preserve.
+    ///
+    /// The oracle's recorded output for `cost --json --running-sec=3600`, read off
+    /// `data.report.items[0].duration.seconds`:
     ///
     /// ```text
-    /// cd clients/python && uv run --with boto3 python -c "
-    /// import io, contextlib, json
-    /// from microvms_agentd.cli import dispatch
-    /// buf = io.StringIO()
-    /// with contextlib.redirect_stdout(buf): dispatch(['cost','--json','--running-sec=3600'])
-    /// i = json.load(io.StringIO(buf.getvalue()))['data']['report']['items'][0]
-    /// print(repr(i['duration']['seconds']))"
-    /// # 3600.0
+    /// 3600.0
     /// ```
+    ///
+    /// A transcript rather than a command, because that client was deleted once this one had
+    /// driven the live suite green. The figure is what it printed; git history is where the
+    /// code that printed it is.
     ///
     /// **Falsification** — put `.to_string()` back on either seconds field and the matching
     /// arm here is red while every dollar assertion stays green, which is what says the two
@@ -652,25 +652,24 @@ mod tests {
 
     /// The dense cost rendering is the oracle's three fields, with no total row.
     ///
-    /// `cli.py:2203-2207` emits `phase\tunit\tamount` and stops. Both divergences this pins are
-    /// silent under a type check and loud under a pipe: a fourth `quantity` field moved the
-    /// amount to field four, so the same `cut -f3` read the *unit* from one client and the
-    /// amount from the other, and the appended `total` row put a line in the stream whose first
-    /// field is not a phase — `awk '$1=="running"'` is fine, `wc -l` and any per-phase
-    /// aggregation are not.
+    /// The Python oracle's `cli.py:2203-2207` emitted `phase\tunit\tamount` and stopped. Both
+    /// divergences this pins are silent under a type check and loud under a pipe: a fourth
+    /// `quantity` field moved the amount to field four, so the same `cut -f3` read the *unit*
+    /// from one client and the amount from the other, and the appended `total` row put a line
+    /// in the stream whose first field is not a phase — `awk '$1=="running"'` is fine, `wc -l`
+    /// and any per-phase aggregation are not.
     ///
-    /// The field names are checked positionally against the oracle's literal output:
+    /// The field names are checked positionally against what the oracle printed for
+    /// `cost --dense --running-sec=3600 --build-sec=300 --image-gb=2`:
     ///
     /// ```text
-    /// cd clients/python && uv run --with boto3 python -c "
-    /// import io, contextlib
-    /// from microvms_agentd.cli import dispatch
-    /// buf = io.StringIO()
-    /// with contextlib.redirect_stdout(buf):
-    ///     dispatch(['cost','--dense','--running-sec=3600','--build-sec=300','--image-gb=2'])
-    /// print(repr(buf.getvalue()))"
-    /// # 'image-build\tseconds\tunpriced\nimage-storage\tGB-months\t0.0373...\n...'
+    /// image-build\tseconds\tunpriced
+    /// image-storage\tGB-months\t0.0373...
+    /// ...
     /// ```
+    ///
+    /// A transcript rather than a command, for the reason the seconds-vs-dollars test above
+    /// gives: that client is git history now.
     ///
     /// **Falsification** — add the quantity field back, or push the total row back on, and this
     /// is red on the field count or the line count respectively. Verified for both.

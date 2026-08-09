@@ -355,18 +355,17 @@ fn a_piped_ls_with_an_empty_ledger_says_nothing_outstanding() {
 ///
 /// Three fields per line and no total row, through the real binary — the same contract
 /// `render::report_dense`'s unit test pins, asserted here across the process boundary because
-/// this is the shape a shell pipeline actually receives. The oracle for these exact arguments:
+/// this is the shape a shell pipeline actually receives. What the Python oracle printed for
+/// `cost --running-sec 3600 --build-sec 600 --image-gb 2 --dense` — seven lines, no total:
 ///
 /// ```text
-/// cd clients/python && uv run --with boto3 python -c "
-/// import io, contextlib
-/// from microvms_agentd.cli import dispatch
-/// buf = io.StringIO()
-/// with contextlib.redirect_stdout(buf):
-///     dispatch(['cost','--running-sec','3600','--build-sec','600','--image-gb','2','--dense'])
-/// print(repr(buf.getvalue()))"
-/// # 'image-build\tseconds\tunpriced\n...\nresume\tGB\t0.003100\n'   # seven lines, no total
+/// image-build\tseconds\tunpriced
+/// ...
+/// resume\tGB\t0.003100
 /// ```
+///
+/// A transcript rather than a command: that client was deleted once this one had driven the
+/// live suite green, and git history is where the code behind these figures lives.
 ///
 /// This test used to require a trailing `lower-bound` row, which is why the divergence
 /// survived: the guard asserted the wrong shape confidently. The total is still reachable —

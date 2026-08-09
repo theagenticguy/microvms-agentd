@@ -65,6 +65,13 @@ jobs:
       - name: build the shipping binary
         run: cargo build --release -p agentd --target aarch64-unknown-linux-musl
 
+      # The host-architecture CLI, which is the client the suite drives. NOT the
+      # aarch64 target above: the daemon cross-compiles because it runs inside the
+      # guest, and a CLI built for the guest's architecture could not execute on
+      # this runner.
+      - name: build the microvm CLI
+        run: cargo build --release -p microvms-cli
+
       - name: apply the conformance stack
         env:
           AWS_REGION: ${{ inputs.region }}
@@ -72,15 +79,26 @@ jobs:
           terraform -chdir=conformance/infra init -input=false
           terraform -chdir=conformance/infra apply -auto-approve -input=false
 
+      # The Python oracle (`conformance/run.py`) and the standalone suspend/resume
+      # probe ran here until the Rust port went live-green on the same commit; both
+      # are in git history now, and this suite carries the suspend/resume assertions
+      # they fed. It reports the 34 checks it cannot express as SKIP rather than
+      # letting them go quiet.
       - name: conformance suite
         env:
           AWS_REGION: ${{ inputs.region }}
-        run: ./conformance/run.py --binary target/aarch64-unknown-linux-musl/release/agentd
+        run: |
+          ./conformance/run_rs.py \
+            --binary target/aarch64-unknown-linux-musl/release/agentd \
+            --microvm-binary target/release/microvm
 
-      - name: suspend/resume probe
+      # Free, creates nothing, and the only thing here that can tell you a price
+      # this repo publishes has gone wrong. Runs after the suite so a rate that
+      # moved does not stop the account from being torn down.
+      - name: pinned rates match the Pricing API
         env:
           AWS_REGION: ${{ inputs.region }}
-        run: ./conformance/probe_suspend_resume.py --binary target/aarch64-unknown-linux-musl/release/agentd
+        run: ./scripts/check-live-rates
 
       # `if: always()` on both cleanup steps: a failed suite is exactly when
       # resources are most likely to survive, so cleanup must not be skipped by

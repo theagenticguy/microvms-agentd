@@ -511,11 +511,20 @@ mod tests {
     /// Scanning is linear in the buffer, not quadratic.
     ///
     /// The measured shape of the defect: 800 unterminated 8 KiB reads — 6.4 MiB, one read
-    /// under the ceiling per feed — took **31 seconds** to rescan from byte zero every
-    /// time. A generous budget rather than a tight one, because this runs on shared CI
-    /// hardware and the difference being caught is four orders of magnitude.
+    /// under the ceiling per feed — rescanned from byte zero every time.
     ///
-    /// **Falsification** — restore the scan from byte zero and this takes half a minute.
+    /// **The budget is 10 s for a workload that takes ~0.75 s fixed and ~160 s broken.**
+    /// Deliberately nowhere near the fixed figure, because the two populations are 200x
+    /// apart and the only way to lose that discrimination is to make the threshold tight
+    /// enough for load to cross it. It was 500 ms and did exactly that: measured
+    /// 2026-08-09 on a 16-core box at load average 26, the fixed path took 706-847 ms
+    /// across nine runs and this assertion failed every time — a red gate over code with
+    /// no defect in it, which is the failure mode that teaches people to skip a gate.
+    /// A 13x margin over the fixed path still leaves a 16x margin under the broken one.
+    ///
+    /// **Falsification** — replace `from` with `0` in `feed` and this takes 160 s
+    /// (verified 2026-08-09), so the guard fails by two orders of magnitude rather than
+    /// by a hair.
     #[test]
     fn scanning_an_unterminated_buffer_stays_linear() {
         let chunk = vec![b'x'; 8 * 1024];
@@ -533,8 +542,10 @@ mod tests {
         }
         let elapsed = started.elapsed();
         assert!(
-            elapsed < std::time::Duration::from_millis(500),
-            "800 x 8 KiB unterminated feeds took {elapsed:?}; the quadratic rescan is back"
+            elapsed < std::time::Duration::from_secs(10),
+            "800 x 8 KiB unterminated feeds took {elapsed:?}, over the 10s budget; the \
+             quadratic rescan is back (the linear path is ~0.75s even under heavy load, \
+             and the quadratic one is ~160s)"
         );
     }
 

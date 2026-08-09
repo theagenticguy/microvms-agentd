@@ -46,14 +46,22 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - uses: astral-sh/setup-uv@v5
       # TRAP-12 says "in the build gate", and pre-push alone is not a gate — a
-      # --no-verify push or a merge that trusts CI skips it. The script needs the
-      # botocore model, which lives inside the clients/python venv locally; here
-      # uv provides botocore directly. It compares three ways: Python constants
-      # against the model, the Rust constants (via `cargo run -q -p microvms-cli
-      # -- constants --emit-json`) against the same model, and the two clients
-      # against each other — the cross-check is the only possible guard for
-      # measurement-backed values like the region list, which no model states.
+      # --no-verify push or a merge that trusts CI skips it. The script is a PEP
+      # 723 uv script whose one dependency is boto3, for the botocore the model
+      # ships inside. It reads the Rust constants via `cargo run -q -p
+      # microvms-cli -- constants --emit-json` and compares them to the model,
+      # plus two pinned literals of its own for the region list and the sizing
+      # table — the values no model states, which lost their cross-client reader
+      # when the Python client was deleted.
       - run: ./scripts/check-model-drift
+
+      # Both remaining Python files, linted here rather than in a job of their
+      # own. `conformance/run_rs.py` is the live suite's driver and the two
+      # `scripts/check-*` gates are this job's own tooling, so the lint belongs
+      # beside the thing it lints. The `python` job that ran the client library's
+      # 83 tests went away with that client.
+      - run: uvx ruff check conformance scripts
+      - run: uvx ruff format --check conformance scripts
 
   bindings:
     name: python and node bindings
@@ -113,19 +121,6 @@ jobs:
         run: |
           ls -l target/aarch64-unknown-linux-musl/release/agentd
           file target/aarch64-unknown-linux-musl/release/agentd
-
-  python:
-    name: client library
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
-      # The client's tests run against a fake daemon over a real loopback socket,
-      # so they need no AWS credentials and no built binary. That is deliberate:
-      # a client test suite that required either would not run here at all.
-      - run: uv run --with pytest --with httpx --with boto3 pytest clients/python -q
-      - run: uvx ruff check clients/python conformance
-      - run: uvx ruff format --check clients/python
 
   spec:
     name: requirements verification

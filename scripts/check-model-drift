@@ -1,16 +1,14 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["boto3>=1.40", "httpx>=0.27", "cyclopts>=4.20,<5"]
+# dependencies = ["boto3>=1.40"]
 # ///
 #
-# boto3 is here for the botocore it bundles, which is what carries the model. httpx
-# and cyclopts are here only because importing `microvms_agentd.sandbox` runs the
-# package `__init__`, which pulls the wire layer and the CLI. Paid deliberately: the
-# alternative is parsing the constants out of `sandbox.py` as text, which makes this
-# script a *second* reader of the same values and lets the two disagree — precisely
-# the failure it exists to catch.
-"""Check the constraints *both* clients hardcode against the shipped service model.
+# boto3 is here for the botocore it bundles, which is what carries the model. It used
+# to carry httpx and cyclopts too, because importing `microvms_agentd.sandbox` ran that
+# package's `__init__` and pulled the wire layer and the CLI with it. The Python client
+# is gone, so those two went with it.
+"""Check the constraints the client hardcodes against the shipped service model.
 
 botocore ships a machine-readable model for `lambda-microvms` that states many of
 the constraints this project had been restating in prose by hand. Nobody had
@@ -39,28 +37,33 @@ belongs in `mise run check` alongside `schema:check`, whose argument it shares: 
 generated artifact consumers trust *because* it is generated is the most dangerous
 thing to leave stale.
 
-There are now TWO clients, and that is what TRAP-12 needs from this script
---------------------------------------------------------------------------
+There is ONE client now, and two of these comparisons lost their second reader
+---------------------------------------------------------------------------
 
-The Rust `microvms-core` crate carries the same constraints in
-`microvms-core/src/constants.rs`, and `microvm constants --emit-json` prints them as
-one object keyed with `sandbox.py`'s own names. So this script runs the *same* named
-comparisons twice — once with the Python module's values, once with the Rust
-object's — and then a third time against each other.
+`microvms-core` carries every constraint in `microvms-core/src/constants.rs`, and
+`microvm constants --emit-json` prints them as one object. That is the only client.
+This script used to run each named comparison twice — once against the Python
+module's values, once against the Rust object's — and then a third time against each
+other; the Python client was deleted once the Rust port went live-green, so the
+client-vs-client pass went with it.
 
-The cross-comparison is not redundant with the two model comparisons, and the
-region list is why. `MICROVM_REGIONS` is measurement-backed only: no service model
-states it and the two botocore calls that look like they might disagree with each
-other, so the model can say nothing about it in either client. Python-vs-Rust is the
-*only* check that value can ever have. The same holds for the sizing table, which is
-read from AWS documentation rather than from the model.
+**Two values were only ever checked by that cross-comparison, and they are now
+checked against literals in this file.** `MICROVM_REGIONS` is measurement-backed
+only: no service model states it, and the two botocore calls that look like they
+might substitute for one disagree with each other (see the note where it is checked).
+`SIZE_CLASSES` is read from AWS documentation and two measured rows, not from any
+shape. So the model can say nothing about either, and Python-vs-Rust was the whole of
+their verification. `PINNED_REGIONS` and `PINNED_SIZE_CLASSES` below are that second
+reader, restored as a deliberate copy rather than left as a self-comparison that
+cannot fail — which is what the two `c.record` calls degenerated to the moment the
+other client went away.
 
 Failing loudly when the Rust side cannot be read is the whole discipline here.
 "there is no binary so nothing disagreed" is the same false assurance as "there is
 no model so nothing disagreed", which is why `--rust-binary`'s absence is a
-`SystemExit` naming the build command rather than a skipped section. `--skip-rust`
-exists for the one honest case — a Python-only checkout — and it *says so in the
-report*, so a green run always states which clients it compared.
+`SystemExit` naming the build command rather than a skipped section. With one client
+left there is no honest `--skip-rust` case, so that flag is gone: skipping the only
+client would leave this script comparing nothing at all.
 
 Exit 0 when every checked constraint agrees, 1 on drift, a missing model, or a Rust
 source that could not be read.
@@ -73,7 +76,7 @@ import gzip
 import json
 import subprocess
 import sys
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -143,14 +146,13 @@ def load_model() -> tuple[dict[str, Any], Path]:
 
 
 #: Every constant name the gate compares, spelled as `microvms-core`'s `as_json()` keys
-#: them — which is `sandbox.py`'s own spelling for all but the two exceptions below.
+#: them.
 #:
-#: This tuple is the contract between three files in two languages, and it is asserted
-#: as a *closed set* on both sides: a name here that neither client carries fails, and
-#: a key the Rust object carries that is not here fails too. Both directions, because
-#: the failure mode is a rename that makes a comparison silently stop happening rather
-#: than start disagreeing — which no compiler on either side can catch, since the
-#: coupling is a string in another language's file.
+#: Asserted as a *closed set* in both directions: a name here the client does not carry
+#: fails, and a key the Rust object carries that is not here fails too. Both directions,
+#: because the failure mode is a rename that makes a comparison silently stop happening
+#: rather than start disagreeing — which no compiler catches, since the coupling is a
+#: string in a file the compiler never reads.
 CONSTANT_NAMES = (
     "MODEL_API_VERSION",
     "MAX_RUN_HOOK_PAYLOAD_BYTES",
@@ -173,15 +175,13 @@ CONSTANT_NAMES = (
     "SIZE_CLASSES",
 )
 
-#: Names whose value is a *set* in one client and an ordered list in the other.
+#: Names whose value is a set rather than an ordered sequence.
 #:
-#: Python spells these as `frozenset`, Rust as a fixed-size array, so the wire forms are
-#: `["TERMINATING", "TERMINATED"]` in some order and `["TERMINATED", "TERMINATING"]` in
-#: another. Sorted before comparison, which is the honest reading: the code that consumes
-#: them does membership tests, so an order difference is not a disagreement. Listed
-#: explicitly rather than inferred from the value's type, because `SIZE_CLASSES` is a
-#: list whose order *is* meaningful (smallest baseline first) and sorting it would hide a
-#: reordering that matters.
+#: Sorted before comparison, which is the honest reading: the code that consumes them
+#: does membership tests, so an order difference is not a disagreement. Listed explicitly
+#: rather than inferred from the value's type, because `SIZE_CLASSES` is a list whose
+#: order *is* meaningful (smallest baseline first) and sorting it would hide a reordering
+#: that matters.
 UNORDERED_NAMES = frozenset(
     {
         "CAPABILITIES",
@@ -194,40 +194,56 @@ UNORDERED_NAMES = frozenset(
     }
 )
 
-#: The two names the Python client does not spell the way Rust does, and why.
-#:
-#: `_TOLERATED_IMAGE_READY_STATES` is private in `sandbox.py` because no consumer should
-#: branch on a legacy spelling; Rust has no leading-underscore convention, so its
-#: `pub const` drops it. `SIZE_CLASSES` lives in `sizing.py` rather than `sandbox.py`
-#: because the sizing table is documentation-backed rather than model-backed — a
-#: distinction the module split makes visible and this map preserves.
-#:
-#: A map rather than a rename on either side: both spellings are right where they are, and
-#: making one file wrong to save three lines here would be the wrong trade.
-PYTHON_SPELLINGS: dict[str, tuple[str, str]] = {
-    "TOLERATED_IMAGE_READY_STATES": ("sandbox", "_TOLERATED_IMAGE_READY_STATES"),
-    "SIZE_CLASSES": ("sizing", "SIZE_CLASSES"),
-}
+# ── the two values the model cannot check, and their second reader ────────────
+#
+# Both of these were verified by the Python-vs-Rust cross-comparison and by nothing
+# else, because the model states neither. That comparison went away with the Python
+# client, so these literals are what replaces it: a deliberate second copy, held here
+# rather than imported, for the same reason the cross-check was never optional
+# decoration — a value compared only against itself passes by construction.
+#
+# Port a change to both sides in the same commit. That is the cost of the pattern and
+# it is the intended one; this repo's harbor-harvest sibling makes the same trade for
+# its tool/library twins.
+
+#: Measured 2026-08-07, and `microvms-core`'s `MICROVM_REGIONS` must equal this.
+PINNED_REGIONS = (
+    "ap-northeast-1",
+    "eu-west-1",
+    "us-east-1",
+    "us-east-2",
+    "us-west-2",
+)
+
+#: The documented sizing table, smallest baseline first. Two of the five rows are
+#: measured rather than documented (512 -> ~2 GB guest, 2048 -> ~8 GB); TRAP-13 is why
+#: the rows are *read* rather than computed as 4x the baseline, so a formula here would
+#: be the bug the table exists to prevent.
+PINNED_SIZE_CLASSES = (
+    {"baseline_mib": 512, "baseline_vcpu": 0.25, "peak_mib": 2048, "peak_vcpu": 1.0},
+    {"baseline_mib": 1024, "baseline_vcpu": 0.5, "peak_mib": 4096, "peak_vcpu": 2.0},
+    {"baseline_mib": 2048, "baseline_vcpu": 1.0, "peak_mib": 8192, "peak_vcpu": 4.0},
+    {"baseline_mib": 4096, "baseline_vcpu": 2.0, "peak_mib": 16384, "peak_vcpu": 8.0},
+    {"baseline_mib": 8192, "baseline_vcpu": 4.0, "peak_mib": 32768, "peak_vcpu": 16.0},
+)
 
 
 @dataclass(frozen=True)
 class Source:
     """One client's constants, and where they were read from.
 
-    Both clients arrive here as a plain name-to-value mapping rather than as a module or
-    a JSON object, so `check` below runs against a shape that cannot tell them apart —
-    which is what makes "the same named comparisons" a fact rather than an intention. A
-    second `check` written for the Rust side is a second thing that can be wrong.
+    Values arrive as a plain name-to-value mapping rather than as a module or a JSON
+    object, so `check` below runs against a shape that says nothing about where it came
+    from. That was what made "the same named comparisons" a fact when there were two
+    clients; it is kept now because a `check` written against the JSON object directly
+    would have to be rewritten to compare a second source again.
     """
 
-    #: `python` or `rust`. Prefixes every result name, so a mixed report is readable.
+    #: Prefixes every result name, so the report says whose constant drifted.
     label: str
     #: The file or the argv the values came from, printed in the header.
     origin: str
     values: dict[str, Any]
-    #: The token minters, when this client exposes them. Empty for the Rust source; see
-    #: the note where the minted-token checks run.
-    minted: dict[str, Callable[[str], str]] = field(default_factory=dict)
 
     def get(self, name: str) -> Any:
         """The value for `name`, or a loud failure.
@@ -253,19 +269,21 @@ def normalize(name: str, value: Any) -> Any:
     """One client's value in the form the other's can be compared against.
 
     Tuples, sets, and frozensets all become lists; the set-like names are sorted (see
-    `UNORDERED_NAMES`); a `SizeClass` dataclass becomes the four-key object the Rust side
-    emits. Everything else passes through, so an int stays an int and a mismatch between
+    `UNORDERED_NAMES`); a sizing row becomes the four-key object with its vCPU counts as
+    floats. Everything else passes through, so an int stays an int and a mismatch between
     4096 and "4096" is still a mismatch.
+
+    Still applied to both sides even though only one client is read from a subprocess
+    now, because `PINNED_SIZE_CLASSES` goes through it too — which is what makes the
+    comparison a comparison of values rather than of JSON spellings.
     """
     if name == "SIZE_CLASSES":
         return [
             {
-                "baseline_mib": row["baseline_mib"] if isinstance(row, dict) else row.baseline_mib,
-                "baseline_vcpu": float(
-                    row["baseline_vcpu"] if isinstance(row, dict) else row.baseline_vcpu
-                ),
-                "peak_mib": row["peak_mib"] if isinstance(row, dict) else row.peak_mib,
-                "peak_vcpu": float(row["peak_vcpu"] if isinstance(row, dict) else row.peak_vcpu),
+                "baseline_mib": row["baseline_mib"],
+                "baseline_vcpu": float(row["baseline_vcpu"]),
+                "peak_mib": row["peak_mib"],
+                "peak_vcpu": float(row["peak_vcpu"]),
             }
             for row in value
         ]
@@ -275,53 +293,19 @@ def normalize(name: str, value: Any) -> Any:
     return value
 
 
-def read_python_source(repo: Path) -> Source:
-    """The Python client's constants, imported rather than parsed.
-
-    Imported as a module because parsing `sandbox.py` as text would make this script a
-    *second* reader of the same values and let the two disagree — which is precisely the
-    failure it exists to catch. That argument is why the script carries httpx and
-    cyclopts as dependencies at all.
-    """
-    sys.path.insert(0, str(repo / "clients" / "python" / "src"))
-    import microvms_agentd.sandbox as sandbox
-    import microvms_agentd.sizing as sizing
-
-    modules = {"sandbox": sandbox, "sizing": sizing}
-    values: dict[str, Any] = {}
-    for name in CONSTANT_NAMES:
-        module_key, attribute = PYTHON_SPELLINGS.get(name, ("sandbox", name))
-        module = modules[module_key]
-        if not hasattr(module, attribute):
-            raise SystemExit(
-                f"clients/python's {module_key}.py has no {attribute!r}, which this gate "
-                f"compares as {name!r}. See the note above PYTHON_SPELLINGS."
-            )
-        values[name] = normalize(name, getattr(module, attribute))
-    return Source(
-        label="python",
-        origin=str(Path(sandbox.__file__).relative_to(repo)),
-        values=values,
-        # Read here rather than called here: the worst-case scope is chosen by `check`,
-        # beside the assertion it feeds.
-        minted={
-            "create": sandbox._create_token,
-            "run": sandbox._run_token,
-        },
-    )
-
-
 def read_rust_source(argv: Sequence[str], repo: Path) -> Source:
     """The Rust client's constants, through `microvm constants --emit-json`.
 
-    A subprocess rather than a parse of `constants.rs`, for the same reason the Python
-    side is an import: the CLI prints `microvms_core::constants::as_json()` verbatim, so
-    the object this reads is a function of the `pub const`s themselves and cannot drift
-    from them. `as_json` is emitted through `serde_json` rather than formatted by hand for
-    the same reason.
+    A subprocess rather than a parse of `constants.rs`: the CLI prints
+    `microvms_core::constants::as_json()` verbatim, so the object this reads is a function
+    of the `pub const`s themselves and cannot drift from them. `as_json` is emitted
+    through `serde_json` rather than formatted by hand for the same reason. (The two
+    literal tables above — `PINNED_REGIONS`, `PINNED_SIZE_CLASSES` — are the deliberate
+    exception, because a comparison needs two readers and the model is not one of them for
+    those values.)
 
     Every failure mode here is an exit rather than an empty source. A gate that reports
-    "no drift" because it could not read one of its two clients is worse than no gate.
+    "no drift" because it could not read its one client is worse than no gate.
     """
     try:
         proc = subprocess.run(
@@ -329,11 +313,12 @@ def read_rust_source(argv: Sequence[str], repo: Path) -> Source:
         )
     except FileNotFoundError as exc:
         raise SystemExit(
-            f"could not run {' '.join(argv)}: {exc}. The Rust constants are one of this "
-            "gate's two sources (TRAP-12), and skipping them would leave "
-            "microvms-core's hardcoded constraints compared against nothing. Build the "
-            "CLI, point --rust-binary at it, or pass --skip-rust to state in the report "
-            "that only the Python client was checked."
+            f"could not run {' '.join(argv)}: {exc}. The Rust constants are this gate's "
+            "only source (TRAP-12), so failing to read them leaves microvms-core's "
+            "hardcoded constraints compared against nothing — and a gate that reports no "
+            "drift because it read no client is worse than no gate. Build the CLI with "
+            "`mise run build:cli` and point --rust-binary at it, or run this without a "
+            "flag and let `cargo run` build it."
         ) from None
     if proc.returncode != 0:
         raise SystemExit(
@@ -370,8 +355,9 @@ def parse_rust_object(text: str, origin: str) -> dict[str, Any]:
         raise SystemExit(
             f"{origin} emits constant(s) this gate does not compare: {extra}. A constant "
             "in the dump with no comparison written for it reads as covered and is not. "
-            "Add it to CONSTANT_NAMES and give it a comparison, or a check against the "
-            "other client if the model states nothing about it."
+            "Add it to CONSTANT_NAMES and give it a comparison — against the model, or "
+            "against a pinned literal here if the model states nothing about it (see "
+            "PINNED_REGIONS)."
         )
     return {name: normalize(name, parsed[name]) for name in parsed}
 
@@ -419,9 +405,25 @@ class Checker:
                 "cannot interpret, so it fails rather than skipping the constraint."
             ) from None
 
-    def record(self, name: str, ours: Any, model: Any, *, note: str = "") -> None:
+    def record(
+        self,
+        name: str,
+        ours: Any,
+        model: Any,
+        *,
+        note: str = "",
+        sides: tuple[str, str] = ("ours", "model"),
+    ) -> None:
+        """One comparison. `sides` names the two printed values on a failure.
+
+        Defaulted to `("ours", "model")` because most comparisons here really are against
+        the model. The two that are not — `MICROVM_REGIONS` and `SIZE_CLASSES`, which the
+        model says nothing about — pass their own, so a disagreement does not name the
+        model as the source of a value it never stated and send the reader to the wrong
+        file to fix it.
+        """
         tagged = f"[{self.label}] {name}" if self.label else name
-        self.results.append(Result(tagged, ours, model, ours == model, note))
+        self.results.append(Result(tagged, ours, model, ours == model, note, sides))
 
     def enum(self, label: str, shape: str, ours: Iterable[str]) -> None:
         self.touched.add(shape)
@@ -496,7 +498,7 @@ def check(src: Source, model: dict[str, Any]) -> Checker:
         "MODEL_IMAGE_READY_STATES ⊆ MicrovmImageState",
         unknown_ready,
         [],
-        note="tolerated-legacy spellings are held separately, in _TOLERATED_IMAGE_READY_STATES",
+        note="tolerated-legacy spellings are held separately, in TOLERATED_IMAGE_READY_STATES",
     )
     c.record(
         "TOLERATED_IMAGE_READY_STATES ∩ MicrovmImageState = ∅",
@@ -584,91 +586,55 @@ def check(src: Source, model: dict[str, Any]) -> Checker:
             src.get("MAX_CLIENT_TOKEN_LEN"),
         )
 
-    # The tokens this client actually mints, against that ceiling. A bound the client
-    # satisfies today is not the same claim as a bound it satisfies for the worst
-    # legal input, and the worst legal input is what broke it.
-    #
-    # Only the Python source can run this here, and that is not a gap the Rust side
-    # leaves open. `microvms-core/src/control/token.rs` asserts the identical property
-    # in-crate — `the_worst_legal_scope_fits_the_hundred_twenty_eight_character_ceiling`
-    # mints against the same worst legal ARN — and it does it better, because it can also
-    # pin the arithmetic behind the cap. Exporting a token minter through
-    # `constants --emit-json` so this script could re-derive it would put a nonce in a
-    # drift dump for no gain: the check is a length bound, and the crate that owns the
+    # The tokens this client mints against that ceiling are NOT checked here, and that
+    # is not a gap. `microvms-core/src/control/token.rs` asserts the property in-crate —
+    # `the_worst_legal_scope_fits_the_hundred_twenty_eight_character_ceiling` mints
+    # against the worst legal 64-character-image-name ARN in the longest-named region —
+    # and it does it better, because it can also pin the arithmetic behind the cap. This
+    # script used to run it too, through the Python client's minters; exporting a minter
+    # through `constants --emit-json` so it could keep doing so would put a nonce in a
+    # drift dump for no gain. The check is a length bound, and the crate that owns the
     # minting is the right place to bound it.
-    if src.minted:
-        worst_scope = f"arn:aws:lambda:ap-northeast-1:123456789012:microvm-image:{'n' * 64}"
-        ceiling = src.get("MAX_CLIENT_TOKEN_LEN")
-        for verb, mint in src.minted.items():
-            token = mint(worst_scope)
-            c.record(
-                f"minted {verb} token ≤ clientToken max",
-                len(token) <= ceiling,
-                True,
-                note=f"{len(token)} chars",
-            )
 
-    # The client's `MICROVM_REGIONS` cannot be checked against the model at all, and
-    # saying so is the point. The model states no region list, and the two botocore
-    # calls that look like they might substitute for one disagree: get_available_endpoints
-    # returns an empty list while get_available_regions returns all 34 Lambda regions,
-    # since `endpointPrefix` is `lambda`. Neither is the five-region truth, so that
-    # constraint is measurement-backed only and this script must not imply otherwise.
+    # `MICROVM_REGIONS` cannot be checked against the model at all, and saying so is the
+    # point. The model states no region list, and the two botocore calls that look like
+    # they might substitute for one disagree: get_available_endpoints returns an empty
+    # list while get_available_regions returns all 34 Lambda regions, since
+    # `endpointPrefix` is `lambda`. Neither is the five-region truth.
     #
-    # The cross-client comparison below is the one real check this value can have, which
-    # is why `cross_check` is not optional decoration on top of the model comparisons.
+    # So this compares the client against `PINNED_REGIONS` — a literal in this file. It
+    # was the Python-vs-Rust cross-comparison until that client was deleted, and what is
+    # left in its place has to be a *second reader*: the previous shape here compared
+    # `len(src.get(...))` against itself, which was honest while the cross-check carried
+    # the real assertion and is vacuous without it.
     c.record(
         "MICROVM_REGIONS",
-        len(src.get("MICROVM_REGIONS")),
-        len(src.get("MICROVM_REGIONS")),
-        note="NOT model-backed: the model states no regions. Measured 2026-08-07 only.",
+        src.get("MICROVM_REGIONS"),
+        sorted(PINNED_REGIONS),
+        note="NOT model-backed: measured 2026-08-07, held against this script's literal",
+        sides=(src.label, "pinned here"),
     )
-    # Same status, same reason: the five-row sizing table is read from AWS documentation
-    # and two measured rows (512 → ~2 GB guest, 2048 → ~8 GB), not from any model shape.
-    # TRAP-13 is why the rows are read rather than computed as 4x the baseline, so the
-    # only thing this gate can say about them is that both clients read the same table.
+    # Same status, same reason, same replacement: the five-row sizing table is read from
+    # AWS documentation and two measured rows (512 → ~2 GB guest, 2048 → ~8 GB), not from
+    # any model shape. TRAP-13 is why the rows are read rather than computed as 4x the
+    # baseline.
     c.record(
         "SIZE_CLASSES",
-        len(src.get("SIZE_CLASSES")),
-        len(src.get("SIZE_CLASSES")),
-        note="NOT model-backed: documented table, two rows measured 2026-08-07 (TRAP-13).",
+        src.get("SIZE_CLASSES"),
+        normalize("SIZE_CLASSES", PINNED_SIZE_CLASSES),
+        note="NOT model-backed: documented table, two rows measured 2026-08-07 (TRAP-13)",
+        sides=(src.label, "pinned here"),
     )
 
     return c
 
 
-def cross_check(first: Source, second: Source) -> list[Result]:
-    """Every constant, compared between the two clients rather than against the model.
-
-    Not redundant with running `check` twice, and `MICROVM_REGIONS` is the proof: the
-    model states no region list, so *both* model comparisons for it are self-comparisons
-    that cannot fail. This is the only check that value can ever have, and the same holds
-    for `SIZE_CLASSES`.
-
-    For the model-backed names it is still worth doing, because it fails *sooner and more
-    specifically*: two clients that disagree with each other produce one result naming
-    the constant, where the model comparisons produce a pass and a drift the reader has
-    to line up by eye.
-
-    Compared over `CONSTANT_NAMES` rather than over either client's key set, so a name
-    absent from one side is `Source.get`'s loud failure rather than a silently smaller
-    intersection.
-    """
-    results: list[Result] = []
-    for name in CONSTANT_NAMES:
-        ours = first.get(name)
-        theirs = second.get(name)
-        results.append(
-            Result(
-                f"[{first.label} vs {second.label}] {name}",
-                ours,
-                theirs,
-                ours == theirs,
-                note="the two clients must not disagree with each other",
-                sides=(first.label, second.label),
-            )
-        )
-    return results
+# `cross_check` lived here: every constant compared between the two clients rather than
+# against the model. It went with the Python client. What it uniquely covered —
+# `MICROVM_REGIONS` and `SIZE_CLASSES`, the two values no model shape states — is now
+# covered by `PINNED_REGIONS` and `PINNED_SIZE_CLASSES` inside `check`, which is a second
+# reader rather than a second client. Everything else it covered is still covered by the
+# model comparison it ran alongside.
 
 
 #: Constraints below are held here rather than imported because nothing in the
@@ -750,76 +716,50 @@ def main() -> int:
             "crate. Not a normal mode — a hand-written file is not what ships"
         ),
     )
-    parser.add_argument(
-        "--skip-rust",
-        action="store_true",
-        help=(
-            "compare only the Python client, and say so in the report. For a checkout "
-            "with no Rust toolchain; never the default, because a silently one-client "
-            "run is what TRAP-12 asks this gate not to be"
-        ),
-    )
     args = parser.parse_args()
 
     repo = Path(__file__).resolve().parent.parent
     model, path = load_model()
 
-    sources = [read_python_source(repo)]
-    if args.skip_rust:
-        pass
-    elif args.rust_json:
+    # One source, and no flag that can skip it. `--skip-rust` used to exist for a
+    # Python-only checkout; with the Python client deleted, skipping this would leave the
+    # gate comparing nothing and reporting no drift, which is the one outcome the
+    # docstring above forbids.
+    if args.rust_json:
         text = args.rust_json.read_text()
-        sources.append(
-            Source(
-                label="rust",
-                origin=f"{args.rust_json} (--rust-json)",
-                values=parse_rust_object(text, str(args.rust_json)),
-            )
+        source = Source(
+            label="rust",
+            origin=f"{args.rust_json} (--rust-json)",
+            values=parse_rust_object(text, str(args.rust_json)),
         )
     elif args.rust_binary:
-        sources.append(
-            read_rust_source([str(args.rust_binary), "constants", "--emit-json"], repo)
+        source = read_rust_source(
+            [str(args.rust_binary), "constants", "--emit-json"], repo
         )
     else:
-        sources.append(read_rust_source(RUST_SOURCE_ARGV, repo))
+        source = read_rust_source(RUST_SOURCE_ARGV, repo)
 
-    # The API version, on every side, before anything is compared. A constraint checked
-    # against a different model version is a constraint that was not checked, so this is
-    # a hard stop rather than a drift line among thirty others.
-    for src in sources:
-        if src.get("MODEL_API_VERSION") != API_VERSION:
-            print(
-                f"DRIFT the {src.label} client's MODEL_API_VERSION is "
-                f"{src.get('MODEL_API_VERSION')!r} but this script compares against "
-                f"{API_VERSION!r} ({src.origin})"
-            )
-            return 1
+    # The API version before anything is compared. A constraint checked against a
+    # different model version is a constraint that was not checked, so this is a hard
+    # stop rather than a drift line among thirty others.
+    if source.get("MODEL_API_VERSION") != API_VERSION:
+        print(
+            f"DRIFT the {source.label} client's MODEL_API_VERSION is "
+            f"{source.get('MODEL_API_VERSION')!r} but this script compares against "
+            f"{API_VERSION!r} ({source.origin})"
+        )
+        return 1
 
-    checkers = [check(src, model) for src in sources]
-    results = [result for checker in checkers for result in checker.results]
-    if len(sources) == 2:
-        results.extend(cross_check(sources[0], sources[1]))
-    # The union, so the coverage report answers "what did this not look at" across both
-    # clients rather than for whichever one ran last.
-    touched: set[str] = set()
-    for checker in checkers:
-        touched |= checker.touched
+    checker = check(source, model)
+    results = checker.results
+    touched = checker.touched
     drifted = [r for r in results if not r.ok]
     missing = uncovered(model, touched)
 
     print(f"service model: {SERVICE} {API_VERSION}")
     print(f"  from: {path}")
-    print(f"\n{len(sources)} client(s) compared:")
-    for src in sources:
-        print(f"  {src.label:7} {src.origin}")
-    if args.skip_rust:
-        # Printed rather than assumed: a green run has to say which clients it compared,
-        # or "no drift" over one client looks the same as "no drift" over both.
-        print(
-            "  NOTE --skip-rust: microvms-core's constants were NOT compared. TRAP-12 asks\n"
-            "       for the hardcoded constraints in the *build gate*, and this run checked\n"
-            "       only the Python client's."
-        )
+    print("\n1 client compared:")
+    print(f"  {source.label:7} {source.origin}")
     print(f"\n{len(results)} constraint(s) compared:")
     for result in results:
         mark = "ok  " if result.ok else "DRIFT"
@@ -845,19 +785,20 @@ def main() -> int:
         print(f"  {', '.join(missing[:8])}{', ...' if len(missing) > 8 else ''}")
         print("  (--verbose for all, with the value each one states)")
     print(
-        "  These are constraints AWS states that nothing in either client is pinned to.\n"
+        "  These are constraints AWS states that nothing in the client is pinned to.\n"
         "  Not a failure — most are response-only or unused shapes — but they are the\n"
         "  answer to 'what did this not check', and that answer has to be printable."
     )
 
     if drifted:
         print(f"\n{len(drifted)} constraint(s) drifted. Either the model moved, one of our")
-        print("values was wrong, or the two clients disagree with each other. Read the model,")
-        print("fix the constant, and re-measure if it is a ceiling.")
+        print("values was wrong, or a value the model cannot state disagrees with this")
+        print("script's pinned copy of it. Read the model, fix the constant, and re-measure")
+        print("if it is a ceiling.")
         return 1
     print(
-        f"\nno drift: {len(results)} constraint(s) agree across "
-        f"{', '.join(src.label for src in sources)} and the shipped model"
+        f"\nno drift: {len(results)} constraint(s) agree across {source.label} and the "
+        "shipped model"
     )
     return 0
 
