@@ -1,26 +1,27 @@
 # microvms-agentd · Impact analysis
 
-A **high-impact surface** here is a definition ranked by *inbound reference count across the whole
-tree* — all seven Rust crates, the Python conformance driver, the two shell gate scripts, and the
-committed artifacts. Reference count rather than public-export count, because this workspace's
-public API is small and its couplings are wide.
+A **high-impact surface** here is a definition with a high inbound reference count across the whole
+tree: all seven Rust crates, the Python conformance driver, the two shell gate scripts, and the
+committed artifacts. We rank by reference count rather than by public-export count because this
+workspace's public API is small and its couplings are wide.
 
-Two things make that criterion the right one, and they are why a pure `cargo`-based import graph
-would understate the blast radius:
+Two properties of the tree make reference count the right criterion. The same two properties explain
+why a pure `cargo`-based import graph would understate the blast radius:
 
-- **Three of the eight surfaces below are coupled to a consumer by string, not by type.**
-  `constants::as_json()` is read by a Python script that looks its keys up by name
-  (`microvms-core/src/constants.rs:40`); `pinned_rates()`'s decimal literals are *parsed out of the
-  Rust source* by another Python script (`scripts/check-live-rates:147`); the conformance oracle
-  asserts on `WireKind`'s rendered strings (`conformance/run_rs.py:190`). None of those break
-  compilation. All three make a check silently stop comparing.
+- **Three of the eight surfaces below are coupled to a consumer through string matching rather than
+  through the type system.** `constants::as_json()` is read by a Python script that looks its keys
+  up by name (`microvms-core/src/constants.rs:40`); `pinned_rates()`'s decimal literals are parsed
+  out of the Rust source by another Python script (`scripts/check-live-rates:147`); the conformance
+  oracle asserts on `WireKind`'s rendered strings (`conformance/run_rs.py:190`). When one of those
+  couplings changes, compilation still succeeds, and the corresponding check silently stops
+  comparing.
 - **Two surfaces have a committed artifact downstream.** `docs/schema.json` is generated from the
   protocol types and byte-compared (`agentd/tests/schema_artifact.rs:39`), and the CLI manifest is
   generated from the exit table and the clap tree (`microvms-cli/src/manifest.rs:34`).
 
-`Touch on change` answers: *does this consumer need an edit, or at minimum a deliberate read, in the
-same commit?* `yes` means an edit is required. `likely` means it compiles but a reviewer has to
-look. `no` means only a behavioral change reaches it.
+The `Touch on change` column answers whether a consumer needs an edit, or at minimum a deliberate
+read, in the same commit. `yes` means an edit is required. `likely` means it compiles but a reviewer
+has to look. `no` means only a behavioral change reaches it.
 
 Where a surface has more consumers than are useful to list, the top rows are the ones with the
 highest reference count and a `(N more …)` row summarizes the rest.
@@ -57,13 +58,13 @@ downstream. Five crates name the `protocol` crate directly: `agentd/Cargo.toml:1
 
 ### Blast-radius notes
 
-- **Every type derives both halves of serde, and that is load-bearing rather than tidiness.**
+- **Every type derives both halves of serde, and the pairing is a requirement of the design.**
   `protocol/src/lib.rs:23` states the rule: a type carrying one half is a type the other side has
   to hand-write. `protocol/src/exec.rs:275` drives a round trip to prove it. Adding a
   `Serialize`-only type reopens the drift class the crate was extracted to close.
 - **The schema is generated under *two* serde contracts and their `$defs` are merged.**
   `agentd/src/schema.rs:241`-`:246` builds a `for_serialize` and a `for_deserialize` generator;
-  `:331 merge_definitions` reports rather than resolves a name whose content differs, and
+  `:331 merge_definitions` reports a name whose content differs instead of resolving it, and
   `:742` asserts `definition_collisions` stays empty. A `#[serde(default)]` or
   `skip_serializing_if` added to one field can therefore fail the build on a collision rather than
   on the field itself.
@@ -79,9 +80,9 @@ downstream. Five crates name the `protocol` crate directly: `agentd/Cargo.toml:1
 Defined at: `microvms-core/src/error.rs:43` (`Error`), `:127` (`ErrorKind`, 13 variants),
 `:219` (`WireKind`, 13 variants).
 
-38 files reference `ErrorKind` or `WireKind`. The split is two contracts to two different consumers:
-`ErrorKind` answers the exit-code question and `WireKind` answers which-status-did-the-daemon-choose
-(`microvms-core/src/error.rs:18`).
+38 files reference `ErrorKind` or `WireKind`. The two types are two contracts serving two different
+consumers. `ErrorKind` answers which exit code applies, and `WireKind` answers which status the
+daemon chose (`microvms-core/src/error.rs:18`).
 
 | Downstream | Type | Touch on change | Citation |
 | --- | --- | --- | --- |
@@ -109,9 +110,9 @@ Defined at: `microvms-core/src/error.rs:43` (`Error`), `:127` (`ErrorKind`, 13 v
   (`:370`).
 - **`from_status` has no generic 4xx fallback, and that absence is a tested invariant.**
   `microvms-core/src/error.rs:343` maps nine statuses explicitly; `:519` asserts 402/403/405/418/429/451
-  resolve to `None`. A "helpful" fallback would make a protocol typo look like a missing file, which
-  is `docs/PROTOCOL.md:49`'s named defect. 5xx *does* fall back, to `ServerError`, with 503 excepted
-  (`:535`).
+  resolve to `None`. A generic fallback would make a protocol typo look like a missing file, which
+  is the defect named in `docs/PROTOCOL.md:49`. 5xx statuses do fall back, to `ServerError`, with
+  503 excepted (`:535`).
 - **The retryable set is derived from the kind, never stored, and the test compares it against an
   independently restated table.** `microvms-core/src/error.rs:116 Error::retryable` reads
   `ErrorKind::Retryable`; `:408 WireKind::retryable` is a `#[cfg(test)]` restatement of the same
@@ -123,8 +124,8 @@ Defined at: `microvms-core/src/error.rs:43` (`Error`), `:127` (`ErrorKind`, 13 v
 Defined at: `microvms-cli/src/exit.rs:76` (`Exit`, `#[repr(u8)]` with explicit discriminants) and
 `:171` (`EXIT_TABLE`, 14 rows).
 
-Append-only, and the 14 rows are the contract three consumers read: a shell reading `$?`, an agent
-reading the `--json` envelope's `code`, and the conformance oracle reading `exitCode`.
+The table is append-only. Its 14 rows are the contract three consumers read: a shell reading `$?`,
+an agent reading the `--json` envelope's `code`, and the conformance oracle reading `exitCode`.
 
 | Downstream | Type | Touch on change | Citation |
 | --- | --- | --- | --- |
@@ -141,31 +142,34 @@ reading the `--json` envelope's `code`, and the conformance oracle reading `exit
 
 ### Blast-radius notes
 
-- **The table is indexed by the discriminant, so `Exit::row` is infallible — and a reordered row
-  silently returns a neighbour's data.** `microvms-cli/src/exit.rs:117` indexes
+- **The table is indexed by the discriminant, so `Exit::row` is infallible. The same indexing means
+  a reordered row silently returns a neighbour's data.** `microvms-cli/src/exit.rs:117` indexes
   `EXIT_TABLE[self.as_u8() as usize]`, and `:450` is the test that pins the correspondence. The
   explicit `#[repr(u8)]` discriminants at `:77`-`:99` exist because a variant inserted mid-enum
   renumbers everything after it, which for this type means silently rewriting the contract.
-- **The kind-to-exit mapping is injective, deliberately, and a "simplification" is what breaks it.**
+- **The kind-to-exit mapping is deliberately injective, and merging rows breaks it.**
   `microvms-cli/src/exit.rs:510` asserts no two `ErrorKind`s collapse onto one row. The named
-  temptation is routing `Precondition` to `InvalidArg` because both look like the caller's fault;
-  one is fixed by editing a flag and the other by applying a Terraform stack.
-- **Five `WireKind`s collapse onto `ERR_PROTOCOL` on purpose, and `data.kind` is what preserves the
+  temptation is routing `Precondition` to `InvalidArg` because both look like the caller's fault.
+  They need separate rows because the fixes differ: one is fixed by editing a flag and the other by
+  applying a Terraform stack.
+- **Five `WireKind`s collapse onto `ERR_PROTOCOL` on purpose, and `data.kind` preserves the
   distinction.** `microvms-cli/src/exit.rs:532` pins the collapsing set to exactly
   `Conflict`/`NotFound`/`ProtocolError`/`StdinClosed`/`TooLarge`. Widening the exit table to split
-  them would break the append-only rule; narrowing `data.kind` would blind the conformance oracle.
+  them would break the append-only rule; narrowing `data.kind` would leave the conformance oracle
+  unable to distinguish them.
 
 ## constants.rs and its JSON emission
 
 Defined at: `microvms-core/src/constants.rs:53`-`:149` (the constants) and `:176` (`as_json`).
 
 Every value here is transcribed from the botocore service model for `lambda-microvms`, API version
-`2025-09-09`. The module's own docs (`:29`) state the coupling: the JSON key names are a contract
-with a Python script, not a style choice.
+`2025-09-09`. The JSON key names are a contract with a Python script, so renaming a key is a
+breaking change even though the compiler accepts it. The module's own docs state this coupling
+(`:29`).
 
 | Downstream | Type | Touch on change | Citation |
 | --- | --- | --- | --- |
-| `scripts/check-model-drift` | config | yes | reads the object via `cargo run -q -p microvms-cli -- constants --emit-json` (`:92 RUST_SOURCE_ARGV`); a renamed key does not fail compilation, it makes a check stop comparing (`constants.rs:40`) |
+| `scripts/check-model-drift` | config | yes | reads the object via `cargo run -q -p microvms-cli -- constants --emit-json` (`:92 RUST_SOURCE_ARGV`); a renamed key still compiles, but it makes the check stop comparing (`constants.rs:40`) |
 | `.github/workflows/ci.yml` | config | no | `:222` runs the drift script as the `drift` job; `mise.toml:185` is the local twin |
 | `microvms-cli/src/commands/local.rs` | direct import | yes | `:217` calls `as_json()`; `:223` prints the *bare* object as the one non-envelope stdout write in the binary |
 | `microvms-core/src/control/mod.rs` | direct import | yes | `:379` checks `MAX_DURATION_SEC`; `:404`/`:413` check `MAX_IMAGE_NAME_LEN` and `is_valid_image_name`; `:397` names `MODEL_API_VERSION` in the refusal |
@@ -182,16 +186,16 @@ with a Python script, not a style choice.
 
 ### Blast-radius notes
 
-- **The reason these guards exist at all is that botocore does not enforce them.**
+- **These guards exist because botocore does not enforce the limits itself.**
   `microvms-core/src/constants.rs:13` records the measurement: `VALIDATED_METADATA_ATTRS` is
   `{'required', 'min', 'document', 'union'}`, so `max`, `pattern`, and `enum` violations reach the
-  wire. The obvious future simplification — "the SDK validates the model, delete these" — silently
-  reopens all of them. `IdlePolicy.maxIdleDurationSeconds` is the counter-example and deliberately
+  wire. Deleting the guards on the assumption that the SDK validates the model would silently
+  reopen all of them. `IdlePolicy.maxIdleDurationSeconds` is the counter-example and deliberately
   has no constant (`:24`).
 - **`DEAD_STATES` is a strict subset of `TERMINAL_STATES` and `SUSPENDED` must stay out of it.**
-  `microvms-core/src/constants.rs:312` asserts both halves. `SUSPENDED` is a death before RUNNING
-  *and* an ordinary waypoint on the resume path, so a resume that failed fast on it would fail on
-  every resume (`:144`).
+  `microvms-core/src/constants.rs:312` asserts both halves. `SUSPENDED` means death when it occurs
+  before RUNNING, and it is also an ordinary waypoint on the resume path. Because of that second
+  role, a resume that failed fast on `SUSPENDED` would fail on every resume (`:144`).
 - **The two ready-state sets must stay disjoint, or the gate reports a tolerated spelling as
   model-backed.** `microvms-core/src/constants.rs:326`. `MODEL_IMAGE_READY_STATES` is checked
   against the model exactly; `TOLERATED_IMAGE_READY_STATES` exists because the service has answered
@@ -202,8 +206,9 @@ with a Python script, not a style choice.
 Defined at: `microvms-core/src/sizing.rs:68` (`SIZE_CLASSES`, 5 rows / 20 numbers) and `:113`
 (`SizeClass`).
 
-`minimumMemoryInMiB` does not size a VM — it selects a class whose two numbers differ by 4x. The
-table is the only place any of the twenty numbers appears (`microvms-core/src/sizing.rs:20`).
+`minimumMemoryInMiB` selects a class whose two numbers differ by 4x; it does not size a VM
+directly. The table is the only place any of the twenty numbers appears
+(`microvms-core/src/sizing.rs:20`).
 
 | Downstream | Type | Touch on change | Citation |
 | --- | --- | --- | --- |
@@ -226,28 +231,31 @@ table is the only place any of the twenty numbers appears (`microvms-core/src/si
 ### Blast-radius notes
 
 - **Every shipped peak is exactly 4x its baseline, and nothing may compute it.**
-  `microvms-core/src/sizing.rs:15` names this as the one thing the module must not do: the
-  regularity is AWS's, not ours, and a sixth row breaking the pattern would silently get the pattern
-  applied. The guard is falsifiable because the lookups are table-parameterized (`:247 row_in`,
-  `:255 class_for_baseline_in`) — `:298` drives them over a table whose peak is 9000, which a
-  computed implementation cannot answer.
-- **An off-table baseline is refused rather than snapped, and refusing is a *billing* decision.**
-  `microvms-core/src/sizing.rs:146 from_baseline_mib` rejects anything not in the table. The two
-  plausible readings of 1500 — round up, or take it literally — differ in both the memory the guest
-  gets and the rate it is billed at, and neither has been measured (`:25`). The proptest at `:454`
-  deliberately samples the 1..=8192 band, because a uniform `u32` draw almost never lands where
-  snapping is even possible (`:418`).
+  `microvms-core/src/sizing.rs:15` names computing the peak as the one thing the module must not
+  do. The regularity comes from AWS, not from this codebase, so a sixth row breaking the pattern
+  would silently get the pattern applied. The guard can be tested against a broken pattern because
+  the lookups are table-parameterized (`:247 row_in`, `:255 class_for_baseline_in`). The test at
+  `:298` drives them over a table whose peak is 9000, which a computed implementation cannot
+  answer.
+- **An off-table baseline is refused rather than snapped, and the refusal is a billing decision.**
+  `microvms-core/src/sizing.rs:146 from_baseline_mib` rejects anything not in the table. A request
+  of 1500 has two plausible readings, round up or take it literally. The readings differ in both
+  the memory the guest gets and the rate it is billed at, and neither has been measured (`:25`).
+  The proptest at `:454` deliberately samples the 1..=8192 band, because a uniform `u32` draw
+  almost never lands where snapping is even possible (`:418`).
 - **2048 and 8192 are each both a baseline and a peak, so a caller echoing back a `MemTotal` gets a
   different class silently.** `microvms-core/src/sizing.rs:384` records that nothing can be done
-  about it — both are legal requests — which is why `Display` always names both numbers (`:226`).
-  A `Display` that named only one would let someone budget for memory they are not billed for.
+  about it, because both are legal requests. That ambiguity is why `Display` always names both
+  numbers (`:226`). A `Display` that named only one would let someone budget for memory they are
+  not billed for.
 
 ## The region list
 
 Defined at: `microvms-core/src/region.rs:45` (`Region`) and `:73` (`MICROVM_REGIONS`, 5 entries).
 
-Not model-backed and it cannot be: no service model states the set, and the two botocore calls that
-look like substitutes disagree with each other (`microvms-core/src/region.rs:21`).
+This list is maintained by hand rather than derived from a service model. No service model states
+the set, and the two botocore calls that look like substitutes disagree with each other
+(`microvms-core/src/region.rs:21`).
 
 | Downstream | Type | Touch on change | Citation |
 | --- | --- | --- | --- |
@@ -270,29 +278,29 @@ look like substitutes disagree with each other (`microvms-core/src/region.rs:21`
 
 ### Blast-radius notes
 
-- **The correctness condition runs in both directions, and the *extra* direction is worse.**
-  `microvms-core/src/region.rs:24` states it: a missing region refuses a launch AWS would have
-  accepted (safe-ish, and what `Region::unlisted` is for), while an extra region reopens the
-  null-message trap for a name nothing will reject. `eu-central-1` was on this list until
-  2026-08-07 and does not carry MicroVMs (`:30`) — which is why it is the specific value four
-  separate tests name.
+- **The correctness condition runs in both directions, and an extra entry causes more damage than a
+  missing one.** `microvms-core/src/region.rs:24` states both cases. A missing region refuses a
+  launch AWS would have accepted, which is recoverable; `Region::unlisted` exists for that case. An
+  extra region reopens the null-message trap for a name nothing will reject. `eu-central-1` was on
+  this list until 2026-08-07 and does not carry MicroVMs (`:30`). Because of that history, four
+  separate tests name it as the specific refused value.
 - **`unlisted()` normalizes a supported name back to its variant, so there is never a second
   spelling of one region.** `microvms-core/src/region.rs:107`, asserted at `:243`. Removing that
   normalization would make `unlisted("us-east-1")` an unequal value that every downstream `match`
   has to handle twice.
 - **`supported()` is the single reader of the five spellings, and both `FromStr` and `unlisted` go
-  through it.** `microvms-core/src/region.rs:119`. A second lookup table added anywhere — including
-  in a binding — is a table that can drift from this one; the round-trip test at `:219` is what
-  keeps `as_str` and the parse path one table.
+  through it.** `microvms-core/src/region.rs:119`. A second lookup table added anywhere, including
+  in a binding, could drift from this one. The round-trip test at `:219` keeps `as_str` and
+  the parse path on one table.
 
 ## The pinned cost rate table
 
 Defined at: `microvms-core/src/cost.rs:1009` (`pinned_rates`), returning the `RateTable` declared at
 `:847`.
 
-Five decimal literals read from the Lambda pricing page on 2026-08-07 in us-east-1, one of them
-(`storage_gb_month`) derived rather than read. The rate fields are private and there are exactly two
-ways to obtain a table (`microvms-core/src/cost.rs:44`).
+The table holds five decimal literals read from the Lambda pricing page on 2026-08-07 in us-east-1.
+One of them (`storage_gb_month`) is derived rather than read. The rate fields are private and there
+are exactly two ways to obtain a table (`microvms-core/src/cost.rs:44`).
 
 | Downstream | Type | Touch on change | Citation |
 | --- | --- | --- | --- |
@@ -310,21 +318,21 @@ ways to obtain a table (`microvms-core/src/cost.rs:44`).
 
 ### Blast-radius notes
 
-- **Renaming `pinned_rates` breaks the twin check by *name*, not by compilation.**
+- **Renaming `pinned_rates` breaks the twin check by name, not by compilation.**
   `scripts/check-live-rates:133` finds the function by the literal string `"pub fn pinned_rates()"`,
-  and `:179` is the error it raises when it cannot — with an explicit instruction to repoint
-  `TWIN_FN` rather than delete the check. The script's pinned figures are a deliberate second copy
-  (`:115`), because a drift check that imported the values it checks would compare a table against
-  itself.
-- **Money is `Decimal` or it is wrong, and `EstimatedUsd` is the only door out.**
-  `microvms-core/Cargo.toml` pins `rust_decimal` with `serde-with-str` so a rate stays
+  and `:179` is the error it raises when it cannot. That error carries an explicit instruction to
+  repoint `TWIN_FN` rather than delete the check. The script's pinned figures are a deliberate
+  second copy (`:115`), because a drift check that imported the values it checks would compare a
+  table against itself.
+- **Money is always represented as `Decimal`, and `EstimatedUsd` is the only type that leaves the
+  module.** `microvms-core/Cargo.toml` pins `rust_decimal` with `serde-with-str` so a rate stays
   `"0.0000276944"` in JSON rather than becoming an f64 that has already lost the exactness. Summing
   a few thousand ARM rates in binary floating point drifts toward a bill nobody can reproduce.
-- **`storage_gb_month` is derived, and it carries a drift scar inline.**
-  `microvms-core/src/cost.rs:1016` records that it was `0.08` — a plausible round number that
-  understated every stored GB by 1.37% — and that the correct figure is the API's GB-hour rate times
+- **`storage_gb_month` is derived, and the code records an earlier wrong value inline.**
+  `microvms-core/src/cost.rs:1016` records that the figure was `0.08`, a plausible round number
+  that understated every stored GB by 1.37%. The correct figure is the API's GB-hour rate times
   730. `CatalogLine::unit` (`:1089`) checks the unit the API reports for exactly this reason: if AWS
-  restated storage per GB-month the number would change by 730x and every downstream arithmetic
+  restated storage per GB-month, the number would change by 730x and every downstream arithmetic
   check would still pass, because they all read the same table.
 
 ## The CLI manifest
@@ -332,8 +340,9 @@ ways to obtain a table (`microvms-core/src/cost.rs:44`).
 Defined at: `microvms-cli/src/manifest.rs:34` (`build`), reading `Cli::command()`,
 `microvms-cli/src/exit.rs:171 EXIT_TABLE`, and `microvms-cli/src/commands/mod.rs:102 RESPONSE_TYPES`.
 
-Generated, never hand-maintained, and that is structural: the manifest's value to an agent is not
-that it is accurate but that it cannot be wrong (`microvms-cli/src/manifest.rs:4`).
+The manifest is generated and never hand-maintained. Because it is built from the same tables the
+binary runs on, it cannot drift from the binary's actual behavior, and that guarantee is what makes
+it useful to an agent (`microvms-cli/src/manifest.rs:4`).
 
 | Downstream | Type | Touch on change | Citation |
 | --- | --- | --- | --- |
@@ -351,15 +360,15 @@ that it is accurate but that it cannot be wrong (`microvms-cli/src/manifest.rs:4
 
 - **The command count is asserted at 16 in three places, so adding a command is a three-file
   change.** `microvms-cli/src/manifest.rs:280`, `microvms-cli/tests/manifest.rs:51`, and the
-  `RESPONSE_TYPES` array's own length annotation (`microvms-cli/src/commands/mod.rs:102`). That is
-  deliberate: a command added without a `RESPONSE_TYPES` row would ship undescribed, and the
-  cross-check is what keeps the table from being the hand-maintained artifact generation forbids
-  (`microvms-cli/src/manifest.rs:13`).
+  `RESPONSE_TYPES` array's own length annotation (`microvms-cli/src/commands/mod.rs:102`). The
+  triple assertion is deliberate. A command added without a `RESPONSE_TYPES` row would ship
+  undescribed, and the cross-check is what keeps the table from becoming the hand-maintained
+  artifact that generation forbids (`microvms-cli/src/manifest.rs:13`).
 - **`choices: null` and `choices: []` mean different things, and a boolean flag must publish
   neither.** `microvms-cli/src/manifest.rs:401` asserts free text reports `null`; `:468` asserts a
   `SetTrue` flag reports `null` too, even though clap hands it `["true", "false"]`. Publishing those
-  would put a `choices` array on all nineteen flags and make the CLI-5 witness — the field a
-  reviewer scans to find the genuinely closed sets — unreadable (`:135`).
+  would put a `choices` array on all nineteen flags. That would make the CLI-5 witness unreadable,
+  because `choices` is the field a reviewer scans to find the genuinely closed sets (`:135`).
 - **`exec --stream` is the one documented exception to the one-envelope-per-invocation rule, and it
   is published as a machine-readable fact rather than as prose.** `microvms-cli/src/manifest.rs:48`
   emits `alternateResponse` keyed off the flag's mere presence; `:292` asserts no other command

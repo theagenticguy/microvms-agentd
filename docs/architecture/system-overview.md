@@ -4,49 +4,54 @@ AWS Lambda MicroVMs hands you an isolated Firecracker VM and no way to run anyth
 it: the service has no exec API and no file-transfer API (`docs/PLATFORM.md:12`). Every
 harness that wraps the service therefore has to write its own in-VM daemon to supply both.
 This repository is that daemon, plus the client stack that drives it and the verification
-harness that keeps both honest. The daemon is a static binary intended to run as the
-container `CMD` inside the VM (`agentd/src/main.rs:4`); the client is a library that closes
-the measured platform traps once so no caller pays for them again
+harness that checks both. The daemon is a static binary intended to run as the
+container `CMD` inside the VM (`agentd/src/main.rs:4`). The client is a library that
+handles the platform's known failure modes in one place, so callers do not have to handle
+each one themselves. The code calls these failure modes traps
 (`microvms-core/src/lib.rs:5-14`). The audience is whoever builds a sandbox product on
-MicroVMs — an agent harness, a CI runner, a code-execution service.
+MicroVMs, such as an agent harness, a CI runner, or a code-execution service.
 
 The workspace declares seven members (`Cargo.toml:2-10`) plus a live conformance suite.
-`protocol` is the wire contract as Rust types: pure data, serde plus schemars, deliberately
-no tokio, no axum, no base64 — the rule is whether a type is what travels or machinery for
-making it travel (`protocol/src/lib.rs:16-21`, 600 LOC). Both the daemon and the client
+`protocol` is the wire contract expressed as Rust types. It contains pure data and depends
+only on serde and schemars; it deliberately excludes tokio, axum, and base64. The rule for
+membership is that a type belongs here if it is what travels over the wire, while machinery
+for making it travel lives elsewhere (`protocol/src/lib.rs:16-21`, 600 LOC). Both the daemon and the client
 compile against it, so a renamed field breaks the other side's build rather than a
 consumer's runtime (`agentd/Cargo.toml:10-14`).
 
-`agentd` is the daemon: ten modules whose seams follow defect classes rather than the HTTP
-surface — `state` owns the one-shot bootstrap, `auth` decides authorization before a body
-byte is read, `exec` owns idempotent exec, `fs` owns streaming tar, `serve` is generic over
-the listener so faults can be simulated (`agentd/src/lib.rs:31-40`, 11988 LOC). Its router
-is assembled by walking the same endpoint list `/v1/schema` publishes, so a documented route
-with no handler panics at startup (`agentd/src/routes.rs:29-34`). Eighteen routes: six
-platform lifecycle hooks under a fixed prefix, six `/v1/exec/*`, four `/v1/fs/*`, health, and
-schema (`agentd/src/routes.rs:112-137`).
+`agentd` is the daemon. It has ten modules, and their seams follow defect classes rather
+than the HTTP surface (`agentd/src/lib.rs:31-40`, 11988 LOC). `state` owns the one-shot
+bootstrap, `auth` decides authorization before a body byte is read, `exec` owns idempotent
+exec, and `fs` owns streaming tar. `serve` is generic over the listener so that tests can
+simulate faults. The router is assembled by walking the same endpoint list that
+`/v1/schema` publishes, so a documented route with no handler panics at startup
+(`agentd/src/routes.rs:29-34`). There are eighteen routes in total: six platform lifecycle
+hooks under a fixed prefix, six `/v1/exec/*` routes, four `/v1/fs/*` routes, a health
+route, and a schema route (`agentd/src/routes.rs:112-137`).
 
-`microvms-core` is the client library and the largest crate (20608 LOC). Its own doc comment
-splits it: `error`, `region`, `sizing`, `hooks`, `constants` are the foundation; `cost`,
-`control`, `session`, `sandbox` are the product surface (`microvms-core/src/lib.rs:59-63`).
-`control` is hand-signed SigV4 rest-json with each trap closed before the request leaves the
-process (`microvms-core/src/control/mod.rs:13-29`), `session` is the in-VM client with proxy
-auth and a resumable byte cursor (`microvms-core/src/session/mod.rs:1-7`), `sandbox` is the
-lifecycle state machine whose private fields mirror the verified model
-(`microvms-core/src/sandbox.rs:9-17`), and `cost` is decimal money where unpriced is a
-distinct variant rather than zero (`microvms-core/src/cost.rs:22-27`).
+`microvms-core` is the client library and the largest crate (20608 LOC). Its own doc
+comment splits it into two groups: `error`, `region`, `sizing`, `hooks`, and `constants`
+form the foundation, while `cost`, `control`, `session`, and `sandbox` form the product
+surface (`microvms-core/src/lib.rs:59-63`). `control` speaks hand-signed SigV4 rest-json
+and closes each trap before the request leaves the process
+(`microvms-core/src/control/mod.rs:13-29`). `session` is the in-VM client, with proxy auth
+and a resumable byte cursor (`microvms-core/src/session/mod.rs:1-7`). `sandbox` is the
+lifecycle state machine, and its private fields mirror the verified model
+(`microvms-core/src/sandbox.rs:9-17`). `cost` represents money as decimals, and it uses a
+distinct variant rather than zero when a resource is unpriced
+(`microvms-core/src/cost.rs:22-27`).
 
-`microvms-cli` ships the `microvm` binary — 16 subcommands, one JSON envelope per invocation
-on stdout with progress on stderr (`microvms-cli/src/cli.rs:97-215`,
-`microvms-cli/src/envelope.rs:4-11`). It has no lib target, so nothing can depend on it, and
-its direct dependency set is an allowlist of exactly six names asserted by a test that reads
-`cargo metadata` (`microvms-cli/Cargo.toml:9-42`). AWS is reachable only through
-`microvms-core`. `microvms-py` and `microvms-js` wrap that same core through PyO3 and
-napi-rs, never through the CLI (`microvms-py/Cargo.toml:22-26`).
+`microvms-cli` ships the `microvm` binary. It has 16 subcommands, and each invocation
+writes one JSON envelope to stdout with progress on stderr (`microvms-cli/src/cli.rs:97-215`,
+`microvms-cli/src/envelope.rs:4-11`). It has no lib target, so nothing can depend on it.
+Its direct dependency set is an allowlist of exactly six names, and a test that reads
+`cargo metadata` asserts the list (`microvms-cli/Cargo.toml:9-42`). AWS is reachable only
+through `microvms-core`. `microvms-py` and `microvms-js` wrap that same core through PyO3
+and napi-rs rather than through the CLI (`microvms-py/Cargo.toml:22-26`).
 
 Verification lives in two more places. `model` is a stateright model of the bootstrap and
-exec lifecycle with one dependency and no edge to any member — it models the protocol rather
-than importing it (`model/Cargo.toml:8-9`). `conformance/run_rs.py` drives the built CLI
+exec lifecycle. It has one dependency and no edge to any workspace member, because it
+models the protocol rather than importing it (`model/Cargo.toml:8-9`). `conformance/run_rs.py` drives the built CLI
 against real AWS through 75 named checks (`conformance/run_rs.py:8-10`). Start reading at
 `agentd/src/lib.rs` for the trust boundary, then `microvms-core/src/lib.rs` for the trap
 ladder.

@@ -1,8 +1,8 @@
 # microvms-agentd · Dependency graph
 
-The seven workspace crates and the external crates they import most often.
-Solid rectangles are workspace members. Dashed cylinders are third-party
-crates from crates.io.
+This diagram shows the seven workspace crates and the external crates they
+import most often. Solid rectangles are workspace members. Dashed cylinders
+are third-party crates from crates.io.
 
 ```mermaid
 flowchart LR
@@ -63,23 +63,24 @@ dependency that does not exist.
 ## Reading the internal edges
 
 `protocol` is the sink: it depends on no workspace member, and five of the
-other six depend on it. That is the point of extracting it. The daemon and
-every client name the same types, so a field renamed in `protocol` breaks the
-build on both sides of the wire instead of surfacing at runtime
+other six depend on it. The crate was extracted to create exactly this shape.
+The daemon and every client name the same types, so a field renamed in
+`protocol` breaks the build on both sides of the wire instead of surfacing at
+runtime
 (`protocol/Cargo.toml:7`, `microvms-core/Cargo.toml:23-28`).
 
 `microvms-core` is the only crate the three consumers share. The CLI, the
 Python binding, and the Node binding each depend on it and on nothing else in
 the workspace beyond `protocol`.
 
-Three absent edges are load-bearing, and each is asserted by a test rather
-than left to convention:
+Three edges are deliberately absent. Each absence is asserted by a test
+rather than left to convention:
 
 - **Nothing depends on `microvms-cli`.** It declares one `[[bin]]` and no
   `src/lib.rs` (`microvms-cli/Cargo.toml:9-19`), so it exports nothing another
   crate could name. Two tests hold this: `the_cli_exports_no_library_target_at_all`
-  (`microvms-cli/tests/dependency_direction.rs:126`) fails the moment a `lib`
-  target appears — before anyone can use it — and
+  (`microvms-cli/tests/dependency_direction.rs:126`) fails as soon as a `lib`
+  target appears, before any crate can use it, and
   `no_workspace_crate_depends_on_the_cli` (`:219`) covers every member with no
   exception list.
 - **No edge from `agentd` to `microvms-core`.** The daemon ships into the
@@ -87,9 +88,9 @@ than left to convention:
   control-plane stack (`microvms-core/Cargo.toml:56-57`). They share only the
   wire types.
 - **`agentd-model` stands alone.** Its one dependency is `stateright`
-  (`model/Cargo.toml:8-9`). It holds no daemon code — it is an executable
-  specification of the bootstrap and exec lifecycle whose reachable states
-  stateright enumerates exhaustively (`model/src/lib.rs:2-9`). An edge into the
+  (`model/Cargo.toml:8-9`). It is an executable specification of the bootstrap
+  and exec lifecycle whose reachable states stateright enumerates exhaustively
+  (`model/src/lib.rs:2-9`), and it holds no daemon code. An edge into the
   implementation would let a bug in the code define the property the model
   exists to check.
 
@@ -97,16 +98,18 @@ than left to convention:
 `microvms-core` re-exports the crate (`pub use protocol;`,
 `microvms-core/src/lib.rs:77`). The edge is allowlisted by
 `the_direct_dependency_set_is_exactly_the_allowed_one`
-(`microvms-cli/tests/thinness.rs:146`), an equality rather than a denylist, so
-an unlisted dependency fails the build rather than slipping through.
+(`microvms-cli/tests/thinness.rs:146`). That test asserts equality against a
+fixed set instead of checking a denylist, so any unlisted dependency fails the
+build.
 
-One caveat if you read that guard: its prose says "Six normal dependencies"
+The guard's comment says "Six normal dependencies"
 (`microvms-cli/tests/thinness.rs:134`, and the same count at
-`microvms-cli/Cargo.toml:23`, `:38`, `:90-91`), but the `ALLOWED` table it
-asserts against holds seven — `microvms-core`, `protocol`, `clap`, `ratatui`,
-`serde`, `serde_json`, `tokio` (`microvms-cli/tests/thinness.rs:64`).
-`cargo metadata` confirms seven normal dependencies. The count in the prose is
-stale; the equality is correct, which is the half that gates the build.
+`microvms-cli/Cargo.toml:23`, `:38`, `:90-91`). The `ALLOWED` table it asserts
+against holds seven: `microvms-core`, `protocol`, `clap`, `ratatui`, `serde`,
+`serde_json`, `tokio` (`microvms-cli/tests/thinness.rs:64`). `cargo metadata`
+confirms seven normal dependencies, so the count in the comment is stale. The
+equality assertion itself is correct, and the assertion is the part that gates
+the build.
 
 ## Reading the external edges
 
@@ -116,12 +119,12 @@ against `microvms-core`'s 9. `tokio` sources at `microvms-core` (10 files),
 though five of the seven members declare it.
 
 Ranking is by file count, so it measures how widely a crate is spread rather
-than how much the design rests on it. The AWS control-plane stack is the clear
-case: `reqwest`, `aws-config`, `aws-credential-types`, `aws-sigv4`, and
+than how much the design rests on it. The AWS control-plane stack shows the
+difference. `reqwest`, `aws-config`, `aws-credential-types`, `aws-sigv4`, and
 `backon` all sit in one or two files under `microvms-core/src/control/`, so
-they rank near the bottom and fall into the overflow table below while being
-the substance of what the crate does. Read the table as elided, not as
-peripheral.
+they rank near the bottom and fall into the overflow table below, even though
+they carry the substance of what the crate does. A crate in that table was cut
+for space, not because it is peripheral.
 
 Dev-dependencies are excluded. `turmoil`, `proptest`, `hyper`, `hyper-util`,
 `tower`, and `cargo_metadata` are test-only and appear in no edge.

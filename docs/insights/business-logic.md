@@ -2,13 +2,14 @@
 
 ## What counts as business logic here, and why the shape is unusual
 
-This codebase has almost no business domain in the usual sense. There are no users, no
-orders, no billing accounts. What it has instead is a set of **trap closures**: rules that
-exist because someone measured AWS Lambda MicroVMs behaving in a way that points away from
-its own cause, and paid for that measurement once so no caller pays again. Seventeen of
-those measurements are recorded in `docs/PLATFORM.md`; fifteen are actionable by a client.
+The domain rules in this codebase are a set of **trap closures**: rules that exist because
+someone measured AWS Lambda MicroVMs behaving in a way that points away from its own cause,
+and paid for that measurement once so no caller pays again. There is almost no business
+domain in the usual sense, because the system has no users, no orders, and no billing
+accounts. Seventeen of those measurements are recorded in `docs/PLATFORM.md`; fifteen are
+actionable by a client.
 
-So the domain rules in this file are:
+The rules fall into four groups:
 
 - The **13 TRAP requirements** — closures over platform behavior that misleads.
 - The **10 COST requirements** — cost-honesty rules, because the client can time a
@@ -24,39 +25,41 @@ it protects against** (the `docs/PLATFORM.md` finding), and its **strength**.
 
 Every closure is ranked, strongest first, at `microvms-core/src/lib.rs:21-40`:
 
-- **S1, inexpressible** — the mistake cannot be written down. A closed enum, a newtype with
-  no conversion, an absent parameter. Cannot regress without a compile error somewhere.
+- **S1, inexpressible** — the mistake cannot be written down. Examples are a closed enum, a
+  newtype with no conversion, or an absent parameter. An S1 closure cannot regress without a
+  compile error somewhere.
 - **S2, expressible but rejected** — the mistake can be written, and the client refuses it
   locally before any control-plane call, with an error naming the `docs/PLATFORM.md`
-  finding. Weaker because the guard is code that can regress, but it costs seconds rather
-  than a build cycle. Every boundary where a bare integer or string still has to be judged
-  lands here.
-- **S3, correct by default and overridable** — weakest, because it protects the caller who
-  does nothing and abandons the one who overrides. An S3 closure must state what the
-  override costs. There is exactly one in this codebase.
+  finding. S2 is weaker because the guard is code that can regress, but it costs seconds
+  rather than a build cycle. Every boundary where a bare integer or string still has to be
+  judged lands here.
+- **S3, correct by default and overridable** — weakest, because it protects only the caller
+  who accepts the default; a caller who overrides is unprotected. An S3 closure must state
+  what the override costs. There is exactly one in this codebase.
 
-Two conventions follow from the ladder and are worth stating before the tables.
+Two conventions follow from the ladder.
 
 **Every error message names its finding.** A local reject explains itself by citing the
-`docs/PLATFORM.md` section that measured the behavior, because the guards exist precisely so
-a reader can go to the measurement rather than to a constraint
-(`microvms-core/src/lib.rs:42-48`). "region 'eu-central-1' is invalid" sends someone to check
-their spelling; the message that is actually raised sends them to the null-message finding.
+`docs/PLATFORM.md` section that measured the behavior, because the guards exist so a reader
+can go to the measurement rather than to a constraint
+(`microvms-core/src/lib.rs:42-48`). A message like "region 'eu-central-1' is invalid" sends
+someone to check their spelling. The message that is actually raised sends them to the
+null-message finding.
 
-**A guard that cannot fail is worse than no guard.** Every guard has a named falsification —
-a specific plausible edit that must turn a specific test red. "Delete the feature and the
-test fails" does not count (`microvms-core/src/lib.rs:50-57`).
+**Every guard has a demonstrated way to fail.** Each guard carries a named falsification,
+meaning a specific plausible edit that must turn a specific test red. "Delete the feature and
+the test fails" does not count (`microvms-core/src/lib.rs:50-57`).
 
 ### Out of scope
 
 There is no database and no ORM, so there are no DB-side invariants. Wire-level request
 validation performed by AWS is out of scope except where this client duplicates it
-deliberately — and it duplicates a lot, for a reason recorded at
-`microvms-core/src/constants.rs:11-23`: botocore's `VALIDATED_METADATA_ATTRS` is only
+deliberately, which it does in many places. The reason is recorded at
+`microvms-core/src/constants.rs:11-23`. botocore's `VALIDATED_METADATA_ATTRS` covers only
 `{required, min, document, union}`, so `max`, `pattern`, and `enum` violations are
-serialized, sent, and answered with a `ValidationException`. These guards are load-bearing,
-and the obvious future simplification — "the SDK validates the model already, delete these" —
-silently reopens all of them.
+serialized, sent, and answered with a `ValidationException`. Because the SDK does not check
+those constraints, deleting these local guards on the assumption that "the SDK validates the
+model already" would reopen all of them without any visible failure.
 
 ## Validations
 
@@ -79,10 +82,10 @@ silently reopens all of them.
 | `maximumDurationInSeconds` outside 1..=28800 is refused | Launch | `microvms-core/src/control/mod.rs:371-386` | `ERR_INVALID_ARG` saying a longer session needs a second VM, not a larger number |
 | An image name is checked against `[a-zA-Z0-9-_]+` and a 64-character ceiling before the artifact upload | Image build | `microvms-core/src/constants.rs:158-164`, `microvms-core/src/control/mod.rs:390+` | `ERR_INVALID_ARG`, with three separate messages because the pattern message misleads for a 70-character name containing no dots or slashes |
 
-`IdlePolicy.maxIdleDurationSeconds` is the deliberate counter-example: it has **no** local
-guard, because its constraint is `min: 60`, which botocore does enforce locally with a clear
-message (`microvms-core/src/constants.rs:25-27`, `microvms-core/src/control/mod.rs:330-331`).
-The absence is a decision, not a gap.
+`IdlePolicy.maxIdleDurationSeconds` deliberately has **no** local guard. Its constraint is
+`min: 60`, which botocore does enforce locally with a clear message
+(`microvms-core/src/constants.rs:25-27`, `microvms-core/src/control/mod.rs:330-331`).
+Because the SDK already covers this case, the missing guard is a decision rather than a gap.
 
 ### Trap closures — in-VM session
 
@@ -135,13 +138,13 @@ The absence is a decision, not a gap.
 | A write that would take the filesystem below the configured reserve is refused before it starts | Disk | `agentd/src/disk.rs:66-80`, `agentd/src/config.rs:65-71` | 507 naming the actual free space, rather than an ENOSPC surfacing as an indistinguishable 500 |
 | Every buffer, output capture, stdin write, linger, TTL, and stream window is bounded | Resources | `agentd/src/config.rs:11-71` | Truncation with a marker, or a bounded refusal. Every bound exists because its unbounded version was a defect in the Python predecessor |
 
-Note the deliberate **asymmetry** in filesystem confinement, argued with a reviewer rather
-than overlooked (`agentd/src/fs.rs:4-18`). The single-file routes `PUT`/`GET /v1/fs/file` are
-**not** confined to a root: the same bearer token authorizes `POST /v1/exec/start`, which
+Filesystem confinement is deliberately asymmetric, and the reasoning was argued with a
+reviewer (`agentd/src/fs.rs:4-18`). The single-file routes `PUT`/`GET /v1/fs/file` are
+**not** confined to a root. The same bearer token authorizes `POST /v1/exec/start`, which
 runs arbitrary commands as root by design, so a root prefix would add no security while
 breaking real behavior. The confinement that matters is on `PUT /v1/fs/tar`, where member
-paths come out of an uploaded archive rather than from a caller who named them — that gap is
-the entire traversal class.
+paths come out of an uploaded archive rather than from a caller who named them. That gap is
+where the entire traversal class lives.
 
 ### CLI parser closures
 
@@ -175,23 +178,23 @@ the entire traversal class.
 | The model-backed and tolerated image-ready state sets are disjoint | Application, pinned by test | `microvms-core/src/constants.rs:326-333` |
 | A poisoned lock is recovered rather than propagated, because the daemon is the only channel into the VM | Application, `agentd` state | `agentd/src/state.rs:69-83`, reasoning at `:8-54` |
 
-The STATE-* invariants are not only enforced in code — they are the `stateModel` in
-`spec/core.symspec.json`, whose five variables (`vm_state`, `token_installed`,
+The STATE-* invariants are enforced in code and are also the `stateModel` in
+`spec/core.symspec.json`. The model's five variables (`vm_state`, `token_installed`,
 `image_exists`, `was_terminated`, `bootstrap_count` bounded 0..3) are the `Sandbox` struct's
 private fields verbatim. The Z3/stateright proofs over that model (bootstrap at most once,
-suspend from non-RUNNING unreachable, TERMINATED never returns to RUNNING) are proofs about
-*this struct's* reachable states, which is only worth something because the transitions in
-`sandbox.rs` are the only way to move it (`microvms-core/src/sandbox.rs:9-17`).
+suspend from non-RUNNING unreachable, TERMINATED never returns to RUNNING) are therefore
+proofs about *this struct's* reachable states. That correspondence holds only because the
+transitions in `sandbox.rs` are the only way to move the struct
+(`microvms-core/src/sandbox.rs:9-17`).
 
-One design decision worth recording: the lifecycle is **runtime-checked rather than
-typestate**, deliberately (`microvms-core/src/sandbox.rs:19-32`). A `Sandbox<Running>`
-returning a `Suspended` handle would make STATE-5's wrong call a compile error — strictly
-stronger on the ladder — but a type whose Rust identity changes on every transition cannot be
-one `#[pyclass]`, so it would be re-erased into a runtime-checked enum at the binding
-boundary, and the binding's copy is the one most callers actually hit. What is kept from the
-typestate idea is the part that costs nothing: the check happens **before** the wire call, and
-the test asserts the control-plane call count, which is the observable that distinguishes the
-two.
+The lifecycle is deliberately **runtime-checked rather than typestate**
+(`microvms-core/src/sandbox.rs:19-32`). A `Sandbox<Running>` returning a `Suspended` handle
+would make STATE-5's wrong call a compile error, which is strictly stronger on the ladder.
+But a type whose Rust identity changes on every transition cannot be one `#[pyclass]`. It
+would be re-erased into a runtime-checked enum at the binding boundary, and the binding's
+copy is the one most callers actually hit. The part of the typestate idea that costs nothing
+is kept anyway. The check happens **before** the wire call, and the test asserts the
+control-plane call count, which is the observable that distinguishes the two designs.
 
 ## Calculations
 
@@ -219,12 +222,12 @@ Both figures read the **baseline**, never the peak (`microvms-core/src/cost.rs:1
 items rather than one blended GB-second because that is how the pricing page prices them, and
 a blended figure cannot be reconciled against a Cost Explorer breakdown that keeps them apart
 (`microvms-core/src/cost.rs:937-944`). The guest reports the peak and bursts to it, but the
-peak is charged only for the seconds above baseline actually consumed — which this client
-cannot observe, so it is left out rather than guessed at. Reading the peak would overstate the
-memory line exactly 4x, since the 2 GB class reports 8 GB in the guest.
+peak is charged only for the seconds above baseline actually consumed. This client cannot
+observe those seconds, so the peak is left out rather than guessed at. Reading the peak would
+overstate the memory line exactly 4x, since the 2 GB class reports 8 GB in the guest.
 
-A suspended VM gets **no compute line at all** — not a compute line multiplied by zero, which
-would reappear the moment someone changed how a duration is derived
+A suspended VM gets **no compute line at all**, rather than a compute line multiplied by
+zero. A zeroed line would reappear the moment someone changed how a duration is derived
 (`microvms-core/src/cost.rs:1825-1835`).
 
 ### Snapshot storage with the retention floor
@@ -232,65 +235,66 @@ would reappear the moment someone changed how a duration is derived
 `billed_seconds = max(held_seconds, floor_seconds)` where the floor is one week
 (`microvms-core/src/cost.rs:1633-1635`). Then
 `quantity = gb × billed_seconds / SECONDS_PER_MONTH`, priced at `rates.storage_gb_month()`.
-`SECONDS_PER_MONTH` is 2,628,000 — that is `730 × 3600`, AWS's own month, spelled out because
-30-day and calendar-month conventions both give plausible-looking answers that disagree with
-the worked examples by a few percent (`microvms-core/src/cost.rs:74-80`).
+`SECONDS_PER_MONTH` is 2,628,000, which is `730 × 3600`, AWS's own month. It is spelled out
+because 30-day and calendar-month conventions both give plausible-looking answers that
+disagree with the worked examples by a few percent (`microvms-core/src/cost.rs:74-80`).
 
 When the floor applied, the note quotes the day count off the rate row rather than dividing
-by 86,400 beside the message — the field is the only thing that knows how long the window is,
-and a division written beside the message would keep saying "7-day" after a rate row moved to
-a fortnight (`microvms-core/src/cost.rs:1639-1646`, `:916-927`).
+by 86,400 beside the message. The rate-row field is the only thing that knows how long the
+window is, so a division written beside the message would keep saying "7-day" after a rate
+row moved to a fortnight (`microvms-core/src/cost.rs:1639-1646`, `:916-927`).
 
 Not applying the floor would understate the one line item that dominates a
-create-and-destroy suite, by four orders of magnitude: a 2 GB image deleted after sixty
+create-and-destroy suite, by four orders of magnitude. A 2 GB image deleted after sixty
 seconds still bills about four cents (`microvms-core/src/cost.rs:104-109`).
 
 ### Break-even suspended hold
 
-The one genuinely non-trivial formula (`microvms-core/src/cost.rs:2011-2027`).
+This is the least trivial formula in the module (`microvms-core/src/cost.rs:2011-2027`).
 `running_per_sec = baseline_vcpu × vcpu_rate + baseline_gb × gb_rate`.
 `storage_per_sec = baseline_gb × storage_gb_month / SECONDS_PER_MONTH`.
 `churn = baseline_gb × (write_rate + read_rate)`.
 
-It is a **piecewise** solve, and the piecewise-ness is the point. Inside the
-minimum-retention window the storage charge is a constant, so the equation is linear in the
-hold: `candidate = (churn + floor_sec × storage_per_sec) / running_per_sec`. Past the window
-storage grows with the hold and the slope changes, so if the candidate falls outside the
-window the answer is `churn / (running_per_sec − storage_per_sec)` instead. Solving only one
-branch would return a number in the wrong regime.
+The solve is **piecewise** because the storage charge behaves differently on each side of
+the minimum-retention window. Inside the window the storage charge is a constant, so the
+equation is linear in the hold. The candidate is
+`(churn + floor_sec × storage_per_sec) / running_per_sec`. Past the window, storage grows
+with the hold and the slope changes. If the candidate falls outside the window, the answer
+is `churn / (running_per_sec − storage_per_sec)` instead. Solving only one branch would
+return a number in the wrong regime.
 
-This is the figure a pool scheduler actually needs, and the one a bare "100x cheaper"
-headline hides — below it, suspending and resuming costs more than having left the VM running
-(`microvms-core/src/cost.rs:2001-2011`). The conclusion the comparison supports is "avoid
-churn", not "avoid residency" (`microvms-core/src/cost.rs:1936-1945`).
+This is the figure a pool scheduler needs, and a bare "100x cheaper" headline does not show
+it. Below the break-even hold, suspending and resuming costs more than having left the VM
+running (`microvms-core/src/cost.rs:2001-2011`). The conclusion the comparison supports is
+"avoid churn" rather than "avoid residency" (`microvms-core/src/cost.rs:1936-1945`).
 
 ### Why the sizing table is data, not arithmetic (TRAP-13)
 
 Every documented peak is exactly four times its baseline, which makes `baseline × 4` look
-like the obvious simplification. It is the one thing the sizing module must not do: that
-regularity is AWS's and not ours, and a sixth row that broke the pattern would silently get
-the pattern applied to it, reporting a burst ceiling the service does not offer
-(`microvms-core/src/sizing.rs:13-23`).
+like the obvious simplification. The sizing module must not compute it that way. The
+regularity belongs to AWS's current table rather than to the service's contract, so a sixth
+row that broke the pattern would get the pattern applied to it, reporting a burst ceiling
+the service does not offer (`microvms-core/src/sizing.rs:13-23`).
 
 So `SIZE_CLASSES` (`microvms-core/src/sizing.rs:68-99`) is the only place any of the twenty
-numbers appears, and every accessor reads a row out of it through one lookup. The
-falsifiability device is that `row_in` and `class_for_baseline_in` take the table as a
-**parameter** (`microvms-core/src/sizing.rs:247`, `:255`) purely so a test can drive the
-accessors over a table whose peak is *not* 4x its baseline — a test against the shipped table
-could not tell a lookup from an arithmetic derivation, because every shipped peak *is* 4x
+numbers appears, and every accessor reads a row out of it through one lookup. To make this
+testable, `row_in` and `class_for_baseline_in` take the table as a **parameter**
+(`microvms-core/src/sizing.rs:247`, `:255`) so a test can drive the accessors over a table
+whose peak is *not* 4x its baseline. A test against the shipped table could not tell a
+lookup from an arithmetic derivation, because every shipped peak *is* 4x
 (`microvms-core/src/sizing.rs:298-314`).
 
 ### Two float boundaries, and only two (COST-6)
 
-`seconds_of` (`microvms-core/src/cost.rs:120-124`) is exact rather than a conversion: a
-`Duration` is a whole-seconds count plus a nanosecond remainder, both integers, and the
+`seconds_of` (`microvms-core/src/cost.rs:120-124`) is exact rather than a lossy conversion.
+A `Duration` is a whole-seconds count plus a nanosecond remainder, both integers, and the
 nanosecond division is by a power of ten.
 
 `gb_decimal` (`microvms-core/src/cost.rs:138-152`) is the **only** place an `f64` becomes a
 `Decimal`. It goes through the float's decimal *string* rather than its binary value, because
 `Decimal::try_from(0.1f64)` would carry the binary error into every downstream figure. It is
-fallible rather than lossy: `NaN`, an infinity, and a magnitude past 28 digits have no decimal
-reading, and a money figure derived from one of them would be a number nobody could
+fallible rather than lossy. `NaN`, an infinity, and a magnitude past 28 digits have no
+decimal reading, and a money figure derived from one of them would be a number nobody could
 reconcile. `EstimatedUsd::new` deliberately takes a `Decimal` and not an `f64`, so it cannot
 become a third boundary (`microvms-core/src/cost.rs:553-561`).
 
@@ -301,10 +305,10 @@ become a third boundary (`microvms-core/src/cost.rs:553-561`).
   list (TRAP-3), no `SHELL_INGRESS` variant and no `mint_shell_auth_token` method (TRAP-11),
   no conversion between hook-timeout families, no `f64` accessor on a dollar figure (COST-2),
   no unlabelled duration constructor (COST-1), no `Measured` field on a plan (COST-10). Where
-  a requirement is about an impl being *absent*, the check is a program that fails to build —
-  `compile_fail` doctests with pinned error codes, because a bare `compile_fail` passes for
-  any build failure including a typo in the test itself. `microvms-core/src/cost.rs:395-408`,
-  `:519-545`.
+  a requirement is about an impl being *absent*, the check is a program that fails to build.
+  These checks are `compile_fail` doctests with pinned error codes, because a bare
+  `compile_fail` passes for any build failure, including a typo in the test itself.
+  `microvms-core/src/cost.rs:395-408`, `:519-545`.
 
 - **Local refusal before the wire, always.** Every S2 guard fires before the first
   control-plane call, and where the distinction is observable the test asserts the
@@ -316,57 +320,60 @@ become a third boundary (`microvms-core/src/cost.rs:553-561`).
   `docs/PLATFORM.md` section rather than restating the constraint, because the guards exist so
   a reader can reach the measurement. `microvms-core/src/lib.rs:42-48`.
 
-- **The one S3 escape hatch, and what it costs:** `Region::unlisted` accepts a region this
-  client has not seen carry MicroVMs, because AWS adds regions faster than the list is
-  re-read and a client that refuses a region AWS just launched in is its own kind of wrong.
-  The override costs exactly the diagnostic: the first control-plane call answers
-  `AccessDeniedException` with a null message and the caller spends an hour reading a correct
-  IAM policy. It is a visible enum **variant** rather than a hidden flag, so a reader of a
-  call site can see someone opted in, and a supported name handed to it comes back as its
-  proper variant so nothing downstream handles two spellings.
+- **The one S3 escape hatch, and what it costs.** `Region::unlisted` accepts a region this
+  client has not seen carry MicroVMs. AWS adds regions faster than the list is re-read, and
+  a client that refuses a region AWS just launched in is also wrong. The override costs the
+  diagnostic. If the region does not carry MicroVMs, the first control-plane call answers
+  `AccessDeniedException` with a null message, and the caller spends an hour reading a
+  correct IAM policy. The escape hatch is a visible enum **variant** rather than a hidden
+  flag, so a reader of a call site can see someone opted in. A supported name handed to it
+  comes back as its proper variant, so nothing downstream handles two spellings.
   `microvms-core/src/region.rs:51-62`, `:94-113`.
 
-- **The region list's correctness condition runs in both directions, and one direction is
-  worse.** A *missing* region refuses a launch AWS would have accepted — the safer direction,
-  still wrong, and what `unlisted` is for. An *extra* region is worse, because it re-opens the
-  null-message trap for a name nothing will reject. `eu-central-1` was on this list until
-  2026-08-07 and does not carry MicroVMs; it is the named falsification case.
+- **The region list can be wrong in two directions, and one direction is worse.** A
+  *missing* region refuses a launch AWS would have accepted. That is the safer direction,
+  still wrong, and it is what `unlisted` is for. An *extra* region is worse, because it
+  re-opens the null-message trap for a name nothing will reject. `eu-central-1` was on this
+  list until 2026-08-07 and does not carry MicroVMs; it is the named falsification case.
   `microvms-core/src/region.rs:20-31`, `:190-214`.
 
-- **A best-effort probe must not make a claim it cannot support.** TRAP-2's stall probe fires
+- **A best-effort probe only raises when it has the evidence.** TRAP-2's stall probe fires
   once, past the grace, and raises only when builds are listed, the list is non-empty, and
-  **every** build is `PENDING`. A listing failure returns `Ok(())` — the wait continues and
-  the caller gets an honest timeout — rather than either breaking the wait or reporting
-  "everything is fine". Unknown is not empty, and a wedge claim made on a throttled API call
-  sends the reader after the wrong cause. `microvms-core/src/control/image.rs:276-322`.
+  **every** build is `PENDING`. A listing failure returns `Ok(())`, so the wait continues
+  and the caller gets a plain timeout. The probe neither breaks the wait nor reports
+  "everything is fine" on a failed listing, because an unknown build list is not an empty
+  one, and a wedge claim made on a throttled API call sends the reader after the wrong
+  cause. `microvms-core/src/control/image.rs:276-322`.
 
-- **Fail-fast state sets are per-call-site, not global.** `wait_for_state` takes `fail_on` as
-  a parameter because suspend *wants* `SUSPENDED` and tolerates `TERMINATED`, while resume
-  must pass the *dead* states only — failing on `SUSPENDED` would fail every resume, since
-  that is the state the call is made from. This is why `constants.rs` carries both
-  `TERMINAL_STATES` and `DEAD_STATES`. `microvms-core/src/control/microvm.rs:353-361`,
+- **Fail-fast state sets are per-call-site, not global.** `wait_for_state` takes `fail_on`
+  as a parameter because different callers fail on different states. Suspend *wants*
+  `SUSPENDED` and tolerates `TERMINATED`. Resume must pass the *dead* states only, because
+  failing on `SUSPENDED` would fail every resume — that is the state the call is made from.
+  This is why `constants.rs` carries both `TERMINAL_STATES` and `DEAD_STATES`.
+  `microvms-core/src/control/microvm.rs:353-361`,
   `microvms-core/src/constants.rs:137-149`.
 
 - **Token minting lives inside the retry path, and a mint failure is retryable.** A proxy
   token capped at sixty minutes and minted once at construction expires mid-trial, and the
-  rejection is indistinguishable from a dead daemon. Refresh is at **half** the ceiling rather
-  than just under it: refreshing at fifty-nine minutes puts the expiry inside the window
-  between building the headers and the proxy validating them. A control-plane throttle at
-  minute thirty must not kill a trial that is otherwise healthy.
+  rejection is indistinguishable from a dead daemon. Refresh is at **half** the ceiling
+  rather than just under it, because refreshing at fifty-nine minutes puts the expiry inside
+  the window between building the headers and the proxy validating them. A control-plane
+  throttle at minute thirty must not kill a trial that is otherwise healthy.
   `microvms-core/src/session/proxy.rs:21-39`, `:62-67`.
 
 - **Credentials never reach a log line.** `RunHookPayload` and both `ProxyToken` types have
-  hand-written `Debug` impls that print the byte count or the header names, never the value —
-  and because `RunMicrovmRequest` keeps its derive, the safety is inherited by every struct
-  and error chain that formats one. `microvms-core/src/control/microvm.rs:79-83`, `:218-233`.
-  The daemon likewise never logs the token or the payload carrying it
+  hand-written `Debug` impls that print the byte count or the header names instead of the
+  value. Because `RunMicrovmRequest` keeps its derive, every struct and error chain that
+  formats one inherits the same behavior. `microvms-core/src/control/microvm.rs:79-83`,
+  `:218-233`. The daemon likewise omits the token and the payload carrying it from its logs
   (`agentd/src/routes.rs:189`).
 
-- **Unbootstrapped is not unauthorized, and neither is missing.** The daemon answers 503 while
-  no token is installed, 401 for a wrong token, 409 for a bootstrap conflict, and 400 for a
-  malformed hook — never 404, because clients map 404 onto "file not found" and turn a
-  protocol error into a phantom missing artifact. Collapsing 503 and 401 was a real defect
-  class. `agentd/src/auth.rs:70-79`, `agentd/src/state.rs:236-242` (the test that pins it).
+- **Each authorization failure has its own status code.** The daemon answers 503 while no
+  token is installed, 401 for a wrong token, 409 for a bootstrap conflict, and 400 for a
+  malformed hook. It never answers 404, because clients map 404 onto "file not found" and
+  turn a protocol error into a phantom missing artifact. Collapsing 503 and 401 was a real
+  defect class. `agentd/src/auth.rs:70-79`, `agentd/src/state.rs:236-242` (the test that
+  pins it).
 
 - **A retried bootstrap of the identical token is success, not a conflict.** The platform may
   retry its own hook, and answering 409 there would fail a launch that is fine.
@@ -378,46 +385,48 @@ become a third boundary (`microvms-core/src/cost.rs:553-561`).
   place to discover the mistake. `agentd/src/routes.rs:218-234`.
 
 - **Health is reachable before bootstrap.** A client needs the contract before it holds a
-  token: the bootstrap token arrives at the platform's `/run` hook, so between launch and
-  bootstrap there is a window in which a gated health route would answer 503 — which a client
+  token. The bootstrap token arrives at the platform's `/run` hook, so between launch and
+  bootstrap there is a window in which a gated health route would answer 503, which a client
   reads as "the daemon is broken" rather than "not yet bootstrapped".
   `agentd/src/routes.rs:307-316`.
 
-- **A poisoned lock is recovered, not propagated, and the reasoning is per-lock.** The
-  daemon is the only channel into the VM — no SSH, no supervisor, no console — so
-  `.expect()` on a poisoned mutex converts one handler bug into a permanently unreachable VM.
-  The `token` lock is sound in the strong sense (every write is a whole-value assignment, and
-  recovery cannot *install* a token, so poisoning is not a bootstrap bypass). The `execs`
-  lock is sound for a narrower reason: the map is not left internally corrupt, but one exec
-  entry may be semantically inconsistent — a blast radius of one exec id against a dead VM.
-  `agentd/src/state.rs:8-54`, `:69-83`.
+- **A poisoned lock is recovered rather than propagated, and the reasoning is per-lock.**
+  The daemon is the only channel into the VM (there is no SSH, no supervisor, and no
+  console), so `.expect()` on a poisoned mutex converts one handler bug into a permanently
+  unreachable VM. The `token` lock is sound in the strong sense. Every write to it is a
+  whole-value assignment, and recovery cannot *install* a token, so poisoning is not a
+  bootstrap bypass. The `execs` lock is sound for a narrower reason. The map is not left
+  internally corrupt, but one exec entry may be semantically inconsistent, which limits the
+  blast radius to one exec id against a dead VM. `agentd/src/state.rs:8-54`, `:69-83`.
 
 - **Teardown never raises, and order matters.** `Sandbox::terminate` returns a
-  `TeardownReport` rather than a `Result`, because it runs where a caller's `finally` would
-  and an error raised there replaces the real failure — the real one being the one worth
-  reading. Order is VM, then image (retrying twenty times, because an image in `CREATING`
-  refuses deletion), then the log group **last**, because the service can recreate a group
-  deleted before its image. `microvms-core/src/sandbox.rs:45-53`, `:78-86`, `:801+`.
+  `TeardownReport` rather than a `Result`. It runs where a caller's `finally` would, and an
+  error raised there replaces the original failure, which is the one worth reading. Teardown
+  deletes the VM first, then the image (retrying twenty times, because an image in
+  `CREATING` refuses deletion), then the log group **last**, because the service can
+  recreate a group deleted before its image. `microvms-core/src/sandbox.rs:45-53`, `:78-86`,
+  `:801+`.
 
 - **There is no `Drop` that tears down.** Rust has no context manager and `Drop` cannot
-  await: a blocking `Drop` would deadlock inside a runtime and a spawning one would race
+  await. A blocking `Drop` would deadlock inside a runtime, and a spawning one would race
   process exit. So `Drop` only warns, naming the id, and the rule is that a caller calls
   `terminate` explicitly. `microvms-core/src/sandbox.rs:55-60`.
 
-- **Leaked identifiers are recorded before the delete is attempted, not after.** The other
-  order loses the identifier when the process dies inside the call — exactly the interrupt
-  case the ledger exists for. And the ledger file is only removed when nothing is
-  outstanding, because a leftover file is how `microvm ls` knows there is something to tell
-  the operator about. For a wedged image and a service-created log group the identifier **is**
-  the remedy; there is no second way to find them. `microvms-cli/src/ledger.rs:5-21`.
+- **Leaked identifiers are recorded before the delete is attempted, not after.** Recording
+  after the delete loses the identifier when the process dies inside the call, which is
+  exactly the interrupt case the ledger exists for. The ledger file is only removed when
+  nothing is outstanding, because a leftover file is how `microvm ls` knows there is
+  something to tell the operator about. For a wedged image and a service-created log group
+  the identifier **is** the remedy; there is no second way to find them.
+  `microvms-cli/src/ledger.rs:5-21`.
 
-- **Exec idempotency is opt-in, inverting TRAP-1's shape deliberately.** The default is a
-  generated exec id, because `microvm exec` is one shot and an id reused by accident means the
-  second invocation is answered from the first's record. The *stable* id is the flag. What it
-  buys is a retry safe across the caller's own restart: the daemon returns success for a known
-  id without spawning a second child, decided under the registry lock. This is explicitly not
-  a control-plane `clientToken`, whose replay wedges an image permanently and which this CLI
-  therefore does not have at all. `microvms-cli/src/cli.rs:487-509`,
+- **Exec idempotency is opt-in, which deliberately inverts TRAP-1's shape.** The default is
+  a generated exec id, because `microvm exec` is one shot and an id reused by accident means
+  the second invocation is answered from the first's record. The *stable* id is the flag.
+  What it buys is a retry that is safe across the caller's own restart. The daemon returns
+  success for a known id without spawning a second child, decided under the registry lock.
+  This differs from a control-plane `clientToken`, whose replay wedges an image permanently
+  and which this CLI therefore does not have at all. `microvms-cli/src/cli.rs:487-509`,
   `agentd/src/exec.rs:362-375`.
 
 - **The parser is the outermost gate (CLI-5).** `--memory` and `--region` are closed value
@@ -426,33 +435,34 @@ become a third boundary (`microvms-core/src/cost.rs:553-561`).
   build cycle. `microvms-cli/src/cli.rs:216-236`, `:893-905`.
 
 - **Local constants are checked against the pinned service model in the build gate
-  (TRAP-12).** `constants::as_json` publishes every hardcoded constraint keyed with names the
-  drift script reads, and the key set is pinned by a test — because a rename here does not
-  fail compilation, it makes a check silently stop comparing. The two values no model states,
-  `MICROVM_REGIONS` and `SIZE_CLASSES`, are compared against pinned literals in the script
-  instead, since a value compared only against itself passes by construction.
-  `microvms-core/src/constants.rs:29-42`, `:176-208`, `:222-251`.
+  (TRAP-12).** `constants::as_json` publishes every hardcoded constraint keyed with names
+  the drift script reads, and the key set is pinned by a test. The pin exists because a
+  rename here does not fail compilation; it makes a check stop comparing without any visible
+  failure. The two values no model states, `MICROVM_REGIONS` and `SIZE_CLASSES`, are
+  compared against pinned literals in the script instead, since a value compared only
+  against itself passes by construction. `microvms-core/src/constants.rs:29-42`,
+  `:176-208`, `:222-251`.
 
-- **A disk write is refused before it starts rather than after ENOSPC.** ENOSPC arrives after
-  the filesystem is already full, so by then every other writer in the VM is broken too
-  including the ones that cannot report anything — and it arrives as a generic io error, so
-  the caller cannot distinguish "the disk is full" from "the daemon is broken", and retrying
-  (correct for the second) makes the first worse. Grounded in a documented incident,
-  anthropics/claude-code#59856. `agentd/src/disk.rs:4-30`.
+- **A disk write is refused before it starts rather than after ENOSPC.** ENOSPC arrives
+  after the filesystem is already full, so by then every other writer in the VM is broken
+  too, including the ones that cannot report anything. It also arrives as a generic io
+  error, so the caller cannot distinguish "the disk is full" from "the daemon is broken".
+  Retrying is correct for the second case and makes the first worse. The guard is grounded
+  in a documented incident, anthropics/claude-code#59856. `agentd/src/disk.rs:4-30`.
 
-- **A rate table's staleness warning is a fallback, not the defence.** It can only say that
-  nobody has looked; a drift check against the Pricing API is what tells you whether a rate
-  moved. Ninety days is the same order as the interval at which AWS has historically
-  restructured Lambda pricing, and the cost of the warning when nothing changed is one line of
-  output. `microvms-core/src/cost.rs:50-56`, `:90-95`.
+- **A rate table's staleness warning is a fallback rather than the primary defence.** The
+  warning can only say that nobody has looked. A drift check against the Pricing API is what
+  tells you whether a rate moved. Ninety days is the same order as the interval at which AWS
+  has historically restructured Lambda pricing, and the cost of the warning when nothing
+  changed is one line of output. `microvms-core/src/cost.rs:50-56`, `:90-95`.
 
-- **A rate table is all-or-nothing.** A partial table would price a run at less than it costs
-  with no way for the caller to see which field was left stale, so `from_catalog` refuses four
-  ways — a missing ARM compute line whose x86 sibling is present, a missing line with no
-  sibling, a restated unit, and two products where there was one. The ARM case gets its own
-  message naming the rate it refuses and the magnitude of the error substituting it would
-  introduce (~18%), because the tempting fix is to use the sibling and every estimate would
-  inflate while nothing said so. `microvms-core/src/cost.rs:1191-1199`, `:1268-1302`.
+- **A rate table is all-or-nothing.** A partial table would price a run at less than it
+  costs, with no way for the caller to see which field was left stale. So `from_catalog`
+  refuses four ways: a missing ARM compute line whose x86 sibling is present, a missing line
+  with no sibling, a restated unit, and two products where there was one. The ARM case gets
+  its own message naming the rate it refuses and the magnitude of the error substituting it
+  would introduce (~18%). The tempting fix is to use the sibling, which would inflate every
+  estimate without any indication. `microvms-core/src/cost.rs:1191-1199`, `:1268-1302`.
 
 ## See also
 

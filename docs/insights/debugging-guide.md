@@ -1,22 +1,22 @@
 # microvms-agentd · Debugging guide
 
-Something is broken. Where do you look first?
+This guide tells you where to look first when something breaks.
 
-This project has an unusual amount of its debugging knowledge already written down, because
-almost every failure mode here was found the expensive way — against real AWS, after the local
-tiers were green. Four places hold that history, and they are the four this guide draws from:
+Most of this project's debugging knowledge is already written down, because almost every
+failure mode here was found against real AWS after the local tiers were green. That history
+lives in four places, and this guide draws from all of them:
 
 - `docs/PLATFORM.md` — every entry is a measured platform behavior with a date, a region, and
   an API version. Most of them are traps.
-- `EXIT_TABLE` in `microvms-cli/src/exit.rs:171` — fourteen rows, each carrying not just a
-  code but a `meaning` (what to do next) and a `finding` (the `docs/PLATFORM.md` section that
-  measured it). That third column is what turns an exit code into a lookup.
+- `EXIT_TABLE` in `microvms-cli/src/exit.rs:171` — fourteen rows. Each row carries a code, a
+  `meaning` (what to do next), and a `finding` (the `docs/PLATFORM.md` section that measured
+  it). The `finding` column turns an exit code into a documentation lookup.
 - Trap messages in the library. `microvms-core` writes the finding into the error message
-  itself, so the failure explains itself without a doc lookup.
-- Git commit bodies. The live-round commits are postmortems.
+  itself, so the message carries the explanation without a doc lookup.
+- Git commit bodies. The commits from the live rounds double as postmortems.
 
-There are **zero** `TODO`, `FIXME`, `HACK`, `INCIDENT`, or `POSTMORTEM` comments anywhere in
-source. The history is not missing; it lives in the four places above.
+The source contains no `TODO`, `FIXME`, `HACK`, `INCIDENT`, or `POSTMORTEM` comments. The
+history lives in the four places above instead.
 
 ## Failure-mode index
 
@@ -64,8 +64,8 @@ source. The history is not missing; it lives in the four places above.
 
 ## First-checks ladder
 
-Cheapest first. Steps 1 through 3 cost nothing and no AWS call; step 4 onward costs money or
-minutes.
+The steps are ordered cheapest first. Steps 1 through 3 cost nothing and make no AWS call.
+Step 4 onward costs money or minutes.
 
 1. **Read the exit code, then its row.** The integer alone is coarse by design, but the row
    carries a `meaning` (what to do next) and a `finding` (which `docs/PLATFORM.md` section
@@ -77,122 +77,132 @@ minutes.
    collapses: `ERR_PROTOCOL` covers five wire kinds, so `Conflict` and `NotFound` arrive with
    the same integer and different `data.kind`. `microvms-cli/src/exit.rs:268-276`
 3. **Run `microvm doctor`.** It is the only command that must work with nothing configured,
-   and its check order is itself the diagnosis order: region first (a wrong one produces the
-   null-message denial that reads as IAM), then whether the credential chain resolves at all
-   — which spends no API call, so `doctor` cannot fail on a throttle — then the three
-   Terraform outputs by name, then whether the stack is actually applied, then the daemon
-   binary's architecture. `microvms-cli/src/commands/doctor.rs:36-57`
-4. **If you are about to build: pass `--binary` to `doctor`.** Twenty bytes of ELF header
-   against `0xB7` is what separates a named failure from a 45-minute build that ends as a
-   run-hook timeout mentioning nothing about architecture.
+   and its check order matches the diagnosis order. The region check runs first, because a
+   wrong region produces the null-message denial that reads as IAM. Next it checks whether
+   the credential chain resolves at all; that check spends no API call, so `doctor` cannot
+   fail on a throttle. It then checks the three Terraform outputs by name, then whether the
+   stack is actually applied, and finally the daemon binary's architecture.
+   `microvms-cli/src/commands/doctor.rs:36-57`
+4. **If you are about to build: pass `--binary` to `doctor`.** The check reads twenty bytes
+   of ELF header and compares them against `0xB7`. That comparison reports an architecture
+   mismatch as a named failure. Without it, the same mismatch surfaces as a 45-minute build
+   that ends in a run-hook timeout mentioning nothing about architecture.
    `microvms-cli/src/commands/doctor.rs:8-15`
-5. **If a launch died: read `GetMicrovm`'s `stateReason` before anything else.** A VM terminal
-   before `RUNNING` died during startup, which for a hook-serving daemon almost always means a
-   lifecycle hook failed — and the reason is the only evidence that outlives the VM. Polling
-   through the terminal states instead wastes minutes and then reports a connection error that
-   hides the cause. `microvms-core/src/control/microvm.rs:395-413`
+5. **If a launch died: read `GetMicrovm`'s `stateReason` before anything else.** A VM that
+   reached a terminal state before `RUNNING` died during startup, which for a hook-serving
+   daemon almost always means a lifecycle hook failed. The `stateReason` is the only evidence
+   that outlives the VM. Polling through the terminal states instead wastes minutes and then
+   reports a connection error that hides the cause.
+   `microvms-core/src/control/microvm.rs:395-413`
 6. **If a build hangs: list the builds rather than waiting out the timeout.** All builds
-   `PENDING` with `updatedAt` never advancing is the `clientToken` replay signature and waiting
-   will not help. An unreadable build list is *not* evidence of a wedge — take the honest
-   timeout instead of a claim made on a throttled call.
+   `PENDING` with `updatedAt` never advancing is the signature of a `clientToken` replay,
+   and waiting will not help. An unreadable build list is not evidence of a wedge. If the
+   list call was throttled, report the timeout rather than concluding anything from it.
    `microvms-core/src/control/image.rs:291-322`
-7. **If the VM is up: `GET /v1/health`.** Unauthenticated on purpose, so it answers in the
-   pre-bootstrap window where nothing else does. Four signals in one call: `bootstrapped`
-   (503s everywhere means the run hook has not landed), `disk.under_pressure` (writes are
-   about to be refused with 507), `identity_degraded` (repair half-failed and this VM shares
-   its hostname and `boot_id` with every sibling), `identity_repaired`.
-   `agentd/src/routes.rs:278-301`
-8. **Read the daemon's own log in `/aws/lambda-microvms/<image-name>`.** JSON on stdout, level
-   from `AGENTD_LOG`. If that group is *empty* while a build reports `reason=unknown`, the
-   cause is the build role's log prefix, not the service. `agentd/src/main.rs:84-96`
+7. **If the VM is up: `GET /v1/health`.** The route is unauthenticated on purpose, so it
+   answers in the pre-bootstrap window where nothing else does. One call returns four
+   signals: `bootstrapped` (503s everywhere means the run hook has not landed),
+   `disk.under_pressure` (writes are about to be refused with 507), `identity_degraded`
+   (repair half-failed and this VM shares its hostname and `boot_id` with every sibling),
+   and `identity_repaired`. `agentd/src/routes.rs:278-301`
+8. **Read the daemon's own log in `/aws/lambda-microvms/<image-name>`.** The daemon writes
+   JSON to stdout, with the level taken from `AGENTD_LOG`. If that group is empty while a
+   build reports `reason=unknown`, the cause is the build role's log prefix, not the
+   service. `agentd/src/main.rs:84-96`
 9. **The build logs survive the CLI's own teardown, so read them before you clean up.** This
-   crate cannot delete a log group — CloudWatch is not in its dependency set — so asking to
-   delete one *names* it in `TeardownReport.undeleted` rather than removing it, and silently
-   succeeding instead "would report a clean teardown over six accumulated log groups, which is
-   how the leak was found in the first place." That naming is your last chance to read them
-   before `verify-clean --delete` removes them. `microvms-core/src/sandbox.rs:231-236`,
-   `microvms-core/src/sandbox.rs:298-303`
+   crate cannot delete a log group, because CloudWatch is not in its dependency set. Asking
+   it to delete one therefore names the group in `TeardownReport.undeleted` rather than
+   removing it. Reporting success instead "would report a clean teardown over six accumulated
+   log groups, which is how the leak was found in the first place." That naming is your last
+   chance to read the logs before `verify-clean --delete` removes them.
+   `microvms-core/src/sandbox.rs:231-236`, `microvms-core/src/sandbox.rs:298-303`
 10. **Before you walk away: `scripts/verify-clean`.** Teardown reporting success and the
     account being clean are different questions, and the difference has cost this project
-    twice. Expect to run `--delete` more than once: an image refuses deletion while its VM is
-    still terminating. `scripts/verify-clean:6-26`
+    twice. Expect to run `--delete` more than once, because an image refuses deletion while
+    its VM is still terminating. `scripts/verify-clean:6-26`
 
 ## Known incident patterns
 
-No `INCIDENT`, `POSTMORTEM`, `FLAKY`, or `KNOWN BUG` comment tags exist in source — the
+The source contains no `INCIDENT`, `POSTMORTEM`, `FLAKY`, or `KNOWN BUG` comment tags. The
 history is recorded in `docs/PLATFORM.md`, in `EXIT_TABLE`'s `finding` column, in git commit
-bodies, and in `.erpaval/solutions/`. These are the recurring shapes.
+bodies, and in `.erpaval/solutions/`. The patterns below recur across that history.
 
-- **The green run that never exercised the thing.** The single most common pattern in this
-  project's history. The first OOM probe allocated with `python3`, which `amazonlinux:2023-minimal`
-  does not have: it reported `command not found` with exit 127, every downstream check passed,
-  and the probe measured nothing while looking like a clean result. Signal: a suite that passes
-  while a condition you expected to observe never appears. Mitigation: assert on the verdict,
-  not on the absence of failure. `docs/PLATFORM.md:349-362`
+- **The green run that never exercised the thing.** This is the most common pattern in this
+  project's history. The first OOM probe allocated with `python3`, which
+  `amazonlinux:2023-minimal` does not have. The probe reported `command not found` with exit
+  127, every downstream check passed, and the run looked clean while measuring nothing.
+  Signal: a suite that passes while a condition you expected to observe never appears.
+  Mitigation: assert on the verdict, not on the absence of failure. `docs/PLATFORM.md:349-362`
 - **The fake more forgiving than the real server.** 310 fake-backed tests were green over a
   client whose auth-header injection replaced the header vec and stripped the caller's
-  content type; the real axum extractor answered 400 while the fakes parsed bodies without
-  reading content-type at all. Signal: a live tier failing a request every local tier accepts.
-  Mitigation: the stated lesson — a fake that accepts what the real server rejects converts
-  integration bugs into production bugs. `microvms-core/src/session/mod.rs:106-117`,
+  content type. The real axum extractor answered 400. The fakes parsed bodies without
+  reading content-type at all, so they accepted the broken request. Signal: a live tier
+  failing a request every local tier accepts. Mitigation: a fake that accepts what the real
+  server rejects converts integration bugs into production bugs, so tighten the fake to
+  match the real server. `microvms-core/src/session/mod.rs:106-117`,
   `.erpaval/solutions/test-failures/guards-that-passed-against-broken-code.md:38-45`
-- **The guard that was never watched failing.** Five distinct ways a guard passed against
-  deliberately broken code in one session: a bare ` ```compile_fail ` block passes for *any*
-  build error including a typo in the doctest; a fake that models the failure event cannot
-  catch lateness (a client refreshing too late presents a token with no life left, never an
-  expired one); uniform proptest draws essentially never land in the narrow band where a
-  rounding bug lives; and a guard test can *require* the divergence it should catch. Signal: a
-  guard you have never seen red. Mitigation: break the invariant, watch it fail, restore.
+- **The guard that was never watched failing.** In one session, guards passed against
+  deliberately broken code in five distinct ways. A bare ` ```compile_fail ` block passes for
+  any build error, including a typo in the doctest. A fake that models the failure event
+  cannot catch lateness, because a client refreshing too late presents a token with no life
+  left rather than an expired one. Uniform proptest draws essentially never land in the
+  narrow band where a rounding bug lives. And a guard test can require the very divergence
+  it should catch. Signal: a guard you have never seen red. Mitigation: break the invariant,
+  watch the guard fail, then restore the code.
   `.erpaval/solutions/test-failures/guards-that-passed-against-broken-code.md:12-37`
 - **Verified in every tier except the one that mattered.** Identity repair had two of three
-  steps silently failing in every real VM: unit tests inject a tempdir layout and a fake
-  platform, so they are structurally unable to observe a missing kernel capability. Signal: a
-  probe reporting `identity_degraded: true` that the conformance suite could not see because it
-  never asserted on the field. Mitigation: assert the field, and pick the tier that can observe
-  the thing. `docs/PLATFORM.md:186-189`
-- **The wrong-cause report.** A whole family: a null-message `AccessDeniedException` sends
-  someone to audit an IAM policy that is fine; `reason=unknown` on a build reads as the service
-  failing to populate `stateReason` when it is the caller's own log prefix discarding the
-  evidence; an expired proxy token is indistinguishable from a daemon that died; a 404 where a
-  400 belongs reads as a missing file, which is exactly how one defect hid for a review round.
-  Mitigation, applied throughout: the error message names the finding inline, and
-  `WireKind::from_status` has deliberately **no generic 4xx fallback**.
+  steps failing in every real VM without any test noticing. Unit tests inject a tempdir
+  layout and a fake platform, so they cannot observe a missing kernel capability. Signal: a
+  probe reporting `identity_degraded: true` that the conformance suite could not see, because
+  the suite never asserted on the field. Mitigation: assert on the field, and pick the tier
+  that can observe the behavior. `docs/PLATFORM.md:186-189`
+- **The wrong-cause report.** This is a family of failures where the error points at the
+  wrong cause. A null-message `AccessDeniedException` sends someone to audit an IAM policy
+  that is fine. A build's `reason=unknown` reads as the service failing to populate
+  `stateReason` when the caller's own log prefix is discarding the evidence. An expired
+  proxy token is indistinguishable from a daemon that died. A 404 where a 400 belongs reads
+  as a missing file, which is how one defect hid for a review round. Mitigation, applied
+  throughout: the error message names the finding inline, and `WireKind::from_status` has
+  no generic 4xx fallback, so an unexpected status cannot be misread as a known one.
   `microvms-core/src/error.rs:336-356`, `microvms-core/src/error.rs:222-226`
-- **The stated constraint restated by hand and got wrong.** `STRATEGY.md` and `TRUST.md` both
-  claimed a 16 KB `runHookPayload` ceiling. The real figure is 4096 bytes — a quarter — and the
-  error ran in the dangerous direction, telling a reader they could fit four times the secret
-  material they actually can. The number was machine-readable in the botocore service model the
-  whole time. Mitigation: `scripts/check-model-drift`, wired into `mise run check`, so a
-  documented constraint that no longer matches the shipped model fails mechanically.
-  `docs/PLATFORM.md:54-101`
+- **A constraint restated by hand, and restated wrong.** `STRATEGY.md` and `TRUST.md` both
+  claimed a 16 KB `runHookPayload` ceiling. The real figure is 4096 bytes, a quarter of the
+  claim. The error ran in the dangerous direction, telling a reader they could fit four
+  times the secret material they actually can. The number was machine-readable in the
+  botocore service model the whole time. Mitigation: `scripts/check-model-drift`, wired into
+  `mise run check`, fails mechanically when a documented constraint no longer matches the
+  shipped model. `docs/PLATFORM.md:54-101`
 - **Teardown succeeded and the account kept billing.** `terraform destroy` once reported nine
   resources destroyed while six service-created log groups survived, because Terraform never
-  owned them. Separately an image deletion retried past the point where the log-group delete had
-  already run. And `verify-clean` itself once reported clean while a CLI run's log group billed,
-  because the prefix list did not know the `microvm-cli` name — a missing prefix converts an
-  unknown into a false assurance, which is worse than no checker. Mitigation: query the account
-  independently of the code that did the cleanup; keep the prefix list complete.
-  `scripts/verify-clean:6-26`, `scripts/verify-clean:39-50`
-- **Silent until the disk is already full.** anthropics/claude-code#59856, cited by number in
-  source: a sandbox accumulated 121 never-collected session directories, filled two 10 GB disks
-  to 100%, and the first symptom was `useradd: No space left on device` — by which point every
-  writer in the sandbox was broken, including the ones that cannot report anything. Contributors
-  were mundane: a 956 MB cache re-downloaded per run, an unbounded journal. Mitigation: refuse a
-  write *before* it starts if it would cross a reserve, answer 507 with the free bytes, and put
-  the number on `/v1/health` so the curve is visible while there is still time.
-  `agentd/src/disk.rs:4-22`, `protocol/src/health.rs:21-33`
+  owned them. Separately, an image deletion retried past the point where the log-group delete
+  had already run. And `verify-clean` itself once reported clean while a CLI run's log group
+  billed, because the prefix list did not know the `microvm-cli` name. A missing prefix
+  converts an unknown into a false assurance, which is worse than having no checker.
+  Mitigation: query the account independently of the code that did the cleanup, and keep the
+  prefix list complete. `scripts/verify-clean:6-26`, `scripts/verify-clean:39-50`
+- **Silent until the disk is already full.** In anthropics/claude-code#59856, cited by number
+  in source, a sandbox accumulated 121 never-collected session directories and filled two
+  10 GB disks to 100%. The first symptom was `useradd: No space left on device`, and by that
+  point every writer in the sandbox was broken, including the ones that cannot report
+  anything. The contributors were ordinary: a 956 MB cache re-downloaded per run, and an
+  unbounded journal. Mitigation: refuse a write before it starts if it would cross a
+  reserve, answer 507 with the free bytes, and put the number on `/v1/health` so the curve
+  is visible while there is still time. `agentd/src/disk.rs:4-22`,
+  `protocol/src/health.rs:21-33`
 - **A hostile header that killed the handler.** The Python predecessor's `hmac.compare_digest`
   raised `TypeError` on a `str` containing non-ASCII, so `Bearer tökén` took down the handler
-  thread and the client got `RemoteDisconnected` instead of a status it could act on. Any caller
-  controls that header. Mitigation: comparison on raw bytes, never decoded — plus authorization
-  decided before a single body byte is read, since the predecessor buffered first and an
-  unauthorized request could force a 256 MB allocation on a 512 MiB VM. `agentd/src/auth.rs:6-14`
-- **The control that was actively wrong, not merely weak.** Both the platform's lifecycle hooks
-  and the harness's control requests arrive from `127.0.0.1`, because the endpoint proxy
-  terminates outside the VM and forwards over loopback. A source-address rule rejecting loopback
-  callers on the bootstrap route would reject the platform's own legitimate bootstrap and break
-  every launch. An attempt at it broke 39 tests, and those failures were reporting a real defect
-  rather than a harness artifact. `docs/PLATFORM.md:418-441`
+  thread and the client got `RemoteDisconnected` instead of a status it could act on. Any
+  caller controls that header. Mitigation: the comparison now runs on raw bytes and never
+  decodes. Authorization is also decided before a single body byte is read, because the
+  predecessor buffered first, which let an unauthorized request force a 256 MB allocation on
+  a 512 MiB VM. `agentd/src/auth.rs:6-14`
+- **A security control that breaks the platform.** Both the platform's lifecycle hooks and
+  the harness's control requests arrive from `127.0.0.1`, because the endpoint proxy
+  terminates outside the VM and forwards over loopback. A source-address rule rejecting
+  loopback callers on the bootstrap route would therefore reject the platform's own
+  legitimate bootstrap and break every launch. An attempt at such a rule broke 39 tests, and
+  those failures were reporting a real defect rather than a harness artifact.
+  `docs/PLATFORM.md:418-441`
 
 ## See also
 

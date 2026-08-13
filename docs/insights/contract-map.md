@@ -1,22 +1,23 @@
 # microvms-agentd · Contract map
 
-A "contract" here is not the default "type declared in module A, imported by module B". This is a
-single Cargo workspace where `cargo build` already catches that case: rename a field in `protocol/`
-and every crate that reads it stops compiling. The contracts worth mapping are the ones the compiler
-cannot see.
+In this document, **a contract is a shape whose producer and consumer sit in different processes,
+different languages, or different artifacts, so that a change on one side does not fail the build.**
+This definition is narrower than the usual "type declared in module A, imported by module B" because
+this is a single Cargo workspace, and `cargo build` already catches that case: rename a field in
+`protocol/` and every crate that reads it stops compiling. The contracts worth mapping are the ones
+the compiler cannot see.
 
-So: **a contract is a shape whose producer and consumer sit in different processes, different
-languages, or different artifacts — such that a change on one side does not fail the build.** That
-covers seven of the nine sections below. Two same-workspace contracts are included because they are
-the boundary a compiler does check and everything else leans on (the `protocol` crate) or because the
-two definitions are deliberately *not* shared (the proxy header pair).
+That definition covers seven of the nine sections below. Two same-workspace contracts are also
+included. The `protocol` crate is included because it is the compiler-checked boundary that
+everything else leans on. The proxy header pair is included because its two definitions are
+deliberately kept separate.
 
-The repo is unusually explicit about this. Nearly every contract below carries a gate whose job is to
-be the thing that disagrees, and several of those gates carry a comment explaining that a check with
-nothing to disagree with reports clean and is therefore worse than no check. Where such a comment
-exists it is quoted, because it is the assumption a future reader most needs.
+Nearly every contract below carries a gate that compares the two sides and fails when they diverge.
+Several of those gates carry a source comment explaining that a check with nothing to compare
+against always reports clean, and that a clean report produced that way hides drift. Where such a
+comment exists it is quoted, because it records the assumption a future reader needs.
 
-Ordered by consumer count descending.
+The sections are ordered by consumer count, descending.
 
 ## The `protocol` crate — daemon↔client wire types
 
@@ -76,8 +77,8 @@ pub struct ErrorBody {
 
 **Assumptions consumers make:**
 
-- Every type derives *both* halves of serde even where one side needs one, because the missing half
-  is what a client would hand-write — stated as the crate's reason for existing at
+- Every type derives *both* halves of serde even where one side needs one, because if the crate
+  omitted one half, clients would hand-write it themselves. The crate states this as its reason for existing at
   `protocol/src/lib.rs:23-27` and again at `protocol/src/exec.rs:3-8`.
 - The SSE dispatcher assumes the three event names are exactly the three constants and silently
   drops an unrecognized name: `microvms-core/src/session/sse.rs:287-322` matches
@@ -88,20 +89,21 @@ pub struct ErrorBody {
   closes without one means the connection failed rather than the command finishing
   (`protocol/src/exec.rs:156-158`).
 - A client branches on `ErrorBody.error` and the status code, **never** on `detail`
-  (`protocol/src/exec.rs:201-205`) — which is why the ten slugs are `&'static str` consts chosen at
-  each call site rather than formatted strings (`protocol/src/exec.rs:221-247`).
+  (`protocol/src/exec.rs:201-205`). Because clients branch on `error`, the ten slugs are
+  `&'static str` consts chosen at each call site rather than formatted strings
+  (`protocol/src/exec.rs:221-247`).
 - `PollResponse.result` is absent-when-running on the way out and must read back as `None` on the way
   in; a client that treated the missing outcome as an error would fail on every poll before the first
   one that mattered (`protocol/src/exec.rs:302-331`).
-- Version negotiation has no *request*: the daemon serves exactly one protocol version, so a client
-  that has read the doc already knows which (`protocol/src/lib.rs:56-57`). Same
+- There is no version negotiation request. The daemon serves exactly one protocol version, so a
+  client that has read the doc already knows which (`protocol/src/lib.rs:56-57`). The same
   `protocol_version` with a different `daemon_version` means proceed, and must not be treated as an
   error (`protocol/src/lib.rs:42-46`).
-- `Health.disk == null` is not `disk` absent: unmeasurable free space is distinct from zero, and a
-  monitor that conflated them would page on a missing `statvfs`
-  (`protocol/src/health.rs:31-33`, test `protocol/src/health.rs:67-81`).
-- `FsQuery.mode` is a **string**, because `0644` in JSON is either a syntax error or decimal 644
-  depending on the parser (`protocol/src/fs.rs:21-23`).
+- `Health.disk == null` means free space could not be measured, which is distinct from both zero
+  free space and an absent `disk` field. A monitor that conflated them would page on a missing
+  `statvfs` (`protocol/src/health.rs:31-33`, test `protocol/src/health.rs:67-81`).
+- `FsQuery.mode` is a **string**, because a bare `0644` in JSON is either a syntax error or decimal
+  644 depending on the parser (`protocol/src/fs.rs:21-23`).
 
 **Drift risk:** Adding a variant to `Phase` or `StreamKind`, or a fourth SSE event name, compiles on
 both sides and is then silently dropped by the SSE dispatcher's fall-through
@@ -151,24 +153,24 @@ same commit, and let the `docs/schema.json` byte-compare (below) surface the new
 **Assumptions consumers make:**
 
 - The comparison is **byte for byte**, not parsed-JSON equality, because the formatting is part of
-  what is committed: a semantic comparison would pass on a hand-reformatted file and the next
-  regeneration would land a diff nobody asked for (`agentd/src/bin/schema.rs:58-62`).
+  what is committed. A semantic comparison would pass on a hand-reformatted file, and the next
+  regeneration would then land a diff nobody asked for (`agentd/src/bin/schema.rs:58-62`).
 - The document is generated against `Config::default()` rather than `from_env()`, so the artifact is a
   function of the source alone and the check does not fail on whichever machine has `AGENTD_PORT`
   exported (`agentd/src/bin/schema.rs:11-15`).
-- `definition_collisions` is empty. Two generators run — `for_serialize()` and `for_deserialize()`
-  (`agentd/src/schema.rs:241-246`) — because a field with a serde default is optional inbound and
+- `definition_collisions` is empty. Two generators run, `for_serialize()` and `for_deserialize()`
+  (`agentd/src/schema.rs:241-246`), because a field with a serde default is optional inbound and
   present outbound, and one generator cannot say both (`agentd/src/schema.rs:236-240`).
-  `merge_definitions` *reports* rather than resolves a disagreement, since silently preferring one
-  would publish a shape the daemon does not use on one of the two paths
-  (`agentd/src/schema.rs:327-330`).
+  When the two generators disagree about a type, `merge_definitions` reports the disagreement
+  instead of picking one shape, because picking one would publish a shape the daemon does not use
+  on one of the two paths (`agentd/src/schema.rs:327-330`).
 - Consumers must accept **either** rendering of a unit-variant enum. schemars 1.x emits `oneOf` +
   `const` when variants carry doc comments and a flat `enum` array when they do not, so `Phase`
   (documented) and `StreamKind` (not) appear in two forms in one document
   (`agentd/src/schema.rs:792-798`).
 - The router is assembled from the same list the document is (`agentd/src/schema.rs:182-186`), so an
-  undocumented route cannot be served; the tests therefore check the *reverse* direction — a
-  documented route the daemon no longer serves (`agentd/tests/schema_artifact.rs:142-174`) and a
+  undocumented route cannot be served. The tests therefore check the reverse direction: a
+  documented route the daemon no longer serves (`agentd/tests/schema_artifact.rs:142-174`), and a
   status code the document promises that the daemon stopped producing (`:176-200`).
 - The published `limits` are read from the **running** `Config`, so an operator who raised a cap by
   environment variable publishes their own numbers (`agentd/src/schema.rs:204-210`). Two of those
@@ -176,7 +178,7 @@ same commit, and let the `docs/schema.json` byte-compare (below) surface the new
   (`agentd/tests/schema_artifact.rs:326-327`).
 
 **Drift risk:** A doc comment added to a `protocol` field changes the artifact, because schemars
-publishes doc comments as `description` — which is why `Health.version` carries a **line** comment
+publishes doc comments as `description`. Because of that, `Health.version` carries a **line** comment
 rather than a doc comment, stated in as many words at `protocol/src/health.rs:16-18`. Mitigation: run
 `cargo run -p agentd --bin schema` in the same commit as any `protocol` edit; the gate then reports a
 diff rather than a consumer discovering it.
@@ -227,34 +229,34 @@ CONSTANT_NAMES = (
   (`scripts/check-model-drift:256-265`), because "a renamed constant does not fail compilation in
   either language — it makes this comparison stop happening, and a check that stops happening reports
   clean". An *extra* key exits too (`:353-361`), because a constant in the dump with no comparison
-  written for it reads as covered and is not.
-- The API version is checked before anything is compared, as a hard stop rather than one drift line
-  among many: a constraint checked against a different model version is a constraint that was not
-  checked (`scripts/check-model-drift:742-751`).
+  written for it looks covered when it is not.
+- The API version is checked before anything is compared, and a mismatch is a hard stop rather than
+  one drift line among many. Comparing a constraint against a different model version says nothing
+  about the model the client actually targets (`scripts/check-model-drift:742-751`).
 - An absent model is a `SystemExit`, never a skip (`scripts/check-model-drift:114-127`), and there is
   no `--skip-rust` flag any more because skipping the only client would leave the gate comparing
   nothing (`:724-727`).
-- Two values the model states nothing about are compared against **literals in the script itself** —
-  `PINNED_REGIONS` (`:210-216`) and `PINNED_SIZE_CLASSES` (`:222-228`). They were verified only by
-  the Python-vs-Rust cross-comparison, and when that client was deleted the two `c.record` calls
-  degenerated into self-comparisons that could not fail (`:50-59`). Those two comparisons pass their
-  own `sides=` so a failure names "pinned here" rather than "model" and does not send the reader to
-  the wrong file (`:610-627`, mechanism at `:417-423`).
+- Two values the model states nothing about are compared against literals in the script itself:
+  `PINNED_REGIONS` (`:210-216`) and `PINNED_SIZE_CLASSES` (`:222-228`). They were previously
+  verified only by the Python-vs-Rust cross-comparison, and when that client was deleted the two
+  `c.record` calls degenerated into self-comparisons that could not fail (`:50-59`). Those two
+  comparisons pass their own `sides=` so a failure names "pinned here" rather than "model" and does
+  not send the reader to the wrong file (`:610-627`, mechanism at `:417-423`).
 - The six hook-timeout shapes are checked **separately**, not one per family, because they are six
   shapes in the model and AWS can move one without moving its siblings
   (`scripts/check-model-drift:522-539`).
-- `SIZE_CLASSES` is deliberately excluded from the sorted-before-comparison set, because its order
-  *is* meaningful — smallest baseline first — and sorting it would hide a reordering that matters
+- `SIZE_CLASSES` is deliberately excluded from the sorted-before-comparison set. Its order is
+  meaningful (smallest baseline first), so sorting it would hide a reordering that matters
   (`scripts/check-model-drift:180-184`).
-- The uncovered list is not decoration. It named `RunMicrovmRequestClientTokenString` as unbound, and
-  checking it found that `run`'s token — which defaults its scope to a full image ARN — exceeded 128
-  characters for a legal 64-character image name in the longest-named region, and would have failed
-  the launch on a field the caller never set (`scripts/check-model-drift:576-580`).
+- The uncovered list has found a real bug. It named `RunMicrovmRequestClientTokenString` as
+  unbound, and checking it found that `run`'s token exceeded 128 characters for a legal 64-character
+  image name in the longest-named region. The token defaults its scope to a full image ARN, so the
+  launch would have failed on a field the caller never set (`scripts/check-model-drift:576-580`).
 
 **Drift risk:** The gate reports **33 constraints** compared and 37 constrained shapes it binds
 nothing to (measured by running `./scripts/check-model-drift` on 2026-08-09). A new AWS constraint
 lands in that uncovered list, which is printed but is not a failure. Mitigation: read the uncovered
-list — with `--verbose` for the stated value — when bumping botocore, since that list is the answer
+list (with `--verbose` for the stated value) when bumping botocore, since that list is the answer
 to "what did this not check" (`scripts/check-model-drift:679-691`).
 
 ## The CLI envelope — `apiVersion` 1 and `data.kind`
@@ -300,7 +302,7 @@ pub fn error(failure: &CliError) -> Value {
 
 **Assumptions consumers make:**
 
-- `apiVersion` is bumped when a field's *meaning* changes, never when a command is added — an agent
+- `apiVersion` is bumped when a field's *meaning* changes, never when a command is added. An agent
   pinned to `"1"` must keep parsing, and a new command changes the manifest instead
   (`microvms-cli/src/envelope.rs:62-65`).
 - Every failure field is unconditional: `finding` present-and-empty, `suggestions` `[]`, `data` `{}`,
@@ -309,40 +311,40 @@ pub fn error(failure: &CliError) -> Value {
   (`microvms-cli/src/envelope.rs:20-25`). `conformance/run_rs.py:164-167` takes that at its word and
   reads them directly so a vanished field is a `KeyError` rather than a `None` that flows into an
   assertion and passes.
-- The exit code is deliberately **coarser** than the daemon's status discipline: five `WireKind`s
+- The exit code is deliberately **coarser** than the daemon's status discipline. Five `WireKind`s
   collapse onto `ERR_PROTOCOL` — `Conflict`, `NotFound`, `ProtocolError`, `StdinClosed`, `TooLarge`
   (pinned at `microvms-cli/src/exit.rs:532-548`) — because a shell branching on `$?` cannot act
   differently on a 400 than on a 409 (`microvms-cli/src/exit.rs:39-44`). So the conformance oracle
   asserts on `data.kind` instead (`conformance/run_rs.py:220-231`, envelope side
   `microvms-cli/src/envelope.rs:27-31`).
-- The **absence** of `data.kind` is information: it says the CLI refused locally before any call
-  reached the daemon (`conformance/run_rs.py:182-191`, producer side
+- The **absence** of `data.kind` carries information. It means the CLI rejected the request locally
+  before any call reached the daemon (`conformance/run_rs.py:182-191`, producer side
   `microvms-cli/src/envelope.rs:450-453`).
-- Branch on `code`, never on `error` — `error` is human-readable and may be reworded between releases
-  (`microvms-cli/src/manifest.rs:102`, `:113`).
-- Progress is on stderr always, and `--quiet` cannot buy silence about a leak or a stale rate:
+- Consumers branch on `code`, never on `error`, because `error` is human-readable and may be
+  reworded between releases (`microvms-cli/src/manifest.rs:102`, `:113`).
+- Progress is on stderr always, and `--quiet` does not suppress warnings about a leak or a stale rate:
   `warn` ignores `quiet` and `progress` honours it (`microvms-cli/src/envelope.rs:13-18`,
   `:144-155`, both halves tested at `:489-496`). `conformance/run_rs.py:263-265` relies on this to
   pass `--quiet` on every invocation.
 - The process exit code and `envelope.exitCode` are two independent renderings of one decision, and
-  CLI-3 is the claim that they agree — so the driver cross-checks rather than trusting either
+  CLI-3 is the claim that they agree, so the driver cross-checks rather than trusting either
   (`conformance/run_rs.py:281-298`).
 - `exec --stream` is the one exception and carries a **different discriminant**,
   `microvm.exec.stream` rather than `microvm.exec`, so a consumer branching on `type` learns which
   parse applies from the field it reads first (`microvms-cli/src/envelope.rs:33-45`). The envelope is
   written **compact** once a stream has started, because "the last line is the envelope" is only true
   if the envelope is one line (`microvms-cli/src/envelope.rs:46-49`, `:167-175`). The consumer
-  asserts all three properties rather than tolerating them (`conformance/run_rs.py:306-388`), and
-  uses a separate reader because `Cli.call`'s whole assertion is that stdout is *one* document
+  asserts all three properties rather than tolerating them (`conformance/run_rs.py:306-388`). It
+  uses a separate reader because `Cli.call` asserts that stdout is *one* document
   (`conformance/run_rs.py:327-329`).
 
 **Drift risk:** A new field added to `data` on a success envelope is invisible to `Envelope.parse`,
-which reads `data` as an opaque dict (`conformance/run_rs.py:196`) — so a key the CLI stops emitting
+which reads `data` as an opaque dict (`conformance/run_rs.py:196`), so a key the CLI stops emitting
 fails only at the check that reads it, not at parse time. Mitigation: the manifest's `responseKeys`
 per command is the machine-readable list, asserted non-empty for every command
 (`microvms-cli/src/manifest.rs:426-443`).
 
-## The manifest — generated, machine-readable, never hand-maintained
+## The manifest — generated and machine-readable
 
 **Producer:** `microvms-cli/src/manifest.rs:34-130` (`build`)
 
@@ -354,8 +356,8 @@ per command is the machine-readable list, asserted non-empty for every command
 - `microvms-cli/src/manifest.rs:200-253` — `render`, the human and dense views.
 - `conformance/run_rs.py:310-314` — reads `exec`'s `alternateResponse` as the published statement of
   the NDJSON exception.
-- Any agent choosing a command: the manifest is the whole surface, and its stated value is that it
-  **cannot be wrong** (`microvms-cli/src/manifest.rs:4-11`).
+- Any agent choosing a command: the manifest is the whole surface. Because it is generated rather
+  than hand-maintained, it stays in step with the binary (`microvms-cli/src/manifest.rs:4-11`).
 
 **Shape:**
 
@@ -384,27 +386,27 @@ per command is the machine-readable list, asserted non-empty for every command
 - The command list is an **equality** with the registered subcommands, not a subset check: a manifest
   listing a command the parser does not accept is as bad as one omitting a command it does
   (`microvms-cli/src/manifest.rs:259-283`).
-- `choices` is a closed set or `null`, and it is the CLI-5 witness — the field a reviewer or a test
-  reads to see whether an S1 guard was downgraded to a convenience string flag
+- `choices` is a closed set or `null`, and it is the CLI-5 witness. It is the field a reviewer or a
+  test reads to see whether an S1 guard was downgraded to a convenience string flag
   (`microvms-cli/src/manifest.rs:18-23`). A free-text parameter reports `null`, never `[]`, because
-  `[]` says "a closed set with nothing in it", which is not a thing, and a consumer treating it as a
-  domain would refuse every value (`microvms-cli/src/manifest.rs:395-399`).
+  `[]` would claim a closed set with nothing in it, and a consumer treating that as a domain would
+  refuse every value (`microvms-cli/src/manifest.rs:395-399`).
 - A boolean flag publishes **no** domain even though clap reports `["true", "false"]` for `SetTrue`,
   because nineteen false positives would make the CLI-5 witness unreadable
   (`microvms-cli/src/manifest.rs:134-140`, `:461-486`). `is_flag` reads the *action* rather than the
-  absence of possible values, since "has no domain" is not the same question
-  (`microvms-cli/src/manifest.rs:188-197`).
+  absence of possible values, because whether a parameter is a flag and whether it has a domain are
+  different questions (`microvms-cli/src/manifest.rs:188-197`).
 - `alternateResponse` is present-and-null for every command but `exec`, asserted in both directions:
   a `--stream` added elsewhere without a response row would publish an undocumented second NDJSON
   shape, and an `exec` that lost the entry would leave a consumer parsing NDJSON as one document
   (`microvms-cli/src/manifest.rs:285-332`).
-- The streaming exception is stated **twice** — in `exec`'s `alternateResponse` and in the
-  `conventions` list — because the two lists are read by different consumers: an agent choosing a
-  command reads the command entry, one writing a parser reads the conventions
+- The streaming exception is stated **twice**, in `exec`'s `alternateResponse` and in the
+  `conventions` list, because the two lists are read by different consumers. An agent choosing a
+  command reads the command entry, and one writing a parser reads the conventions
   (`microvms-cli/src/manifest.rs:120-123`). The convention must name the discriminant, or a parser
   author is left guessing how to detect it (`microvms-cli/src/manifest.rs:498-513`).
 - Every command's `summary` is the first line of its doc comment, and a deleted doc comment would
-  publish an empty summary rather than fail — which is why the length is asserted
+  publish an empty summary rather than fail. Because of that, the length is asserted
   (`microvms-cli/src/manifest.rs:445-459`).
 
 **Drift risk:** The three count assertions (16 commands, 14 exit rows, 6 conventions) are literals in
@@ -445,29 +447,29 @@ pub fn line_to_json(item: &LineItem) -> Value {
 **Assumptions consumers make:**
 
 - An unpriced line emits **no `usd` key at all**, not a null, because a null gets summed as zero by
-  anything permissive: "That is the one arithmetic this file refuses to enable"
+  anything permissive — "That is the one arithmetic this file refuses to enable"
   (`microvms-cli/src/render.rs:7-13`). Both bindings restate it independently
   (`microvms-py/src/cost.rs:387-391`, `microvms-js/src/cost.rs:308-312`).
 - The Node binding returns the line as a JSON **string** rather than an object, because
   `#[napi(object)]` cannot express an absent key — an `Option` field serializes as `null`, which is
-  the one value that gets summed as zero (`microvms-js/src/cost.rs:291-296`). And it is
-  hand-assembled rather than derived, because a serde derive over an `Option` is exactly what would
-  get the absent key wrong (`microvms-js/src/cost.rs:308-312`).
-- Every **dollar** crosses as a string and every **seconds** figure as a number, and the split is
-  about which consumer is being protected: a caller summing a dollar column must be stopped from
-  doing float arithmetic on money, and a caller comparing a duration against a timeout must not have
-  to discover that one client quotes seconds in quotes (`microvms-cli/src/render.rs:15-25`).
+  the one value that gets summed as zero (`microvms-js/src/cost.rs:291-296`). It is
+  hand-assembled rather than derived, because a serde derive over an `Option` would emit `null` for
+  the absent key (`microvms-js/src/cost.rs:308-312`).
+- Every **dollar** crosses as a string and every **seconds** figure as a number. The split protects
+  two different consumers. A caller summing a dollar column must be stopped from doing float
+  arithmetic on money. A caller comparing a duration against a timeout must not have to discover
+  that one client quotes seconds in quotes (`microvms-cli/src/render.rs:15-25`).
 - A dollar string's **scale** is explicitly not part of the contract. `rust_decimal` normalizes a
   product's scale differently from Python's `decimal`, so `0.0384` and `0.03840000` both occur for
   the same line item; the figures are numerically equal and "comparing the strings byte for byte was
   never a supported operation" (`microvms-cli/src/render.rs:27-46`). The one place scale *is*
-  asserted byte for byte is a **rate**, because a rate is a transcription and a derived figure is not
-  a transcription of anything (`microvms-cli/src/render.rs:48-51`).
+  asserted byte for byte is a **rate**, because a rate is transcribed from a published source and a
+  derived figure is not (`microvms-cli/src/render.rs:48-51`).
 - The total's floor is published under `priced` and never under `total`, because a caller reading a
   field called `total` would have no reason to check `isLowerBound`
   (`microvms-cli/src/render.rs:87-94`, restated at `microvms-py/src/cost.rs:429-433` and
   `microvms-js/src/cost.rs:375-378`). `AtLeast`'s floor and `Exact`'s figure share the field on
-  purpose: a consumer that ignores `isLowerBound` gets a number that is never an over-statement
+  purpose, so a consumer that ignores `isLowerBound` gets a number that is never an over-statement
   (`microvms-cli/src/render.rs:88-90`).
 - Compute figures read `baseline_*` and never the peak. The 2 GB class reports 8 GB in the guest, so
   reading the peak would overstate the memory line exactly 4x
@@ -478,7 +480,7 @@ pub fn line_to_json(item: &LineItem) -> Value {
   (`microvms-py/src/cost.rs:398-401`, `microvms-js/src/cost.rs:323-326`).
 
 **Drift risk:** A third `Amount` variant would need the absent-key rule reimplemented in four places
-and nothing forces that — `microvms-cli/src/render.rs:100-109` is an exhaustive match and would fail
+and nothing forces that. `microvms-cli/src/render.rs:100-109` is an exhaustive match and would fail
 to compile, but the two bindings match on `(estimate(), unpriced_reason())` tuples and would silently
 take the `(None, None)` arm. Mitigation: if a variant is added, add it to the exhaustive CLI match
 first and let the compiler point at the one site, then port to both bindings in the same commit.
@@ -535,47 +537,48 @@ PINNED: dict[str, Decimal] = {
 
 **Assumptions consumers make:**
 
-- The duplication is the point, not an oversight: "a drift check that imported the values it checks
+- The duplication is deliberate: "a drift check that imported the values it checks
   would compare a table against itself and pass by construction. Two independent readers is the same
   pattern this repo's harbor-harvest sibling uses for its tool/library twins — port a change to both,
   never unify them" (`scripts/check-live-rates:111-117`).
-- `verify_twin` reads Rust **as text** rather than shelling out to `microvm cost --json`, and the
-  reason is not laziness: the envelope carries *amounts*, not rates, so the CLI path would have to
-  divide a line item by its quantity — which means a change in the cost arithmetic (baseline swapped
-  for peak, a retention floor applied where it was not) "would surface here as a rate that drifted.
-  That is a true failure reported against the wrong file" (`scripts/check-live-rates:150-159`).
-- The cost of that trade is accepted explicitly: a reformat of `pinned_rates()` breaks the read, and
-  that failure is an exit 1 naming the field it could not find, never a silent pass
+- `verify_twin` reads Rust **as text** rather than shelling out to `microvm cost --json`. The
+  envelope carries *amounts*, not rates, so the CLI path would have to divide a line item by its
+  quantity. Under that arrangement, a change in the cost arithmetic (baseline swapped for peak, a
+  retention floor applied where it was not) "would surface here as a rate that drifted. That is a
+  true failure reported against the wrong file" (`scripts/check-live-rates:150-159`).
+- The cost of that trade is accepted explicitly. A reformat of `pinned_rates()` breaks the read, and
+  that failure is an exit 1 naming the field it could not find rather than a silent pass
   (`scripts/check-live-rates:160-164`).
 - `TWIN_FIELDS` is an explicit map even though the names are identical today, so a Rust-side rename is
   a failure that names the field rather than a comparison that quietly stops happening
   (`scripts/check-live-rates:135-144`).
-- The twin check runs **first on every path**, including `--twin-only`: a pinned figure that disagrees
-  with its twin is already wrong whatever the API says, and finding out before the fetch keeps a
-  two-table problem from reading as a one-table one (`scripts/check-live-rates:605-616`).
-- The drift tolerance is 0.5% and is the rounding in the pinned figures rather than a licence to
-  drift — the pinned snapshot rates are three-significant-figure roundings of ten-digit API figures,
-  so a tighter tolerance would report drift on a table that is correct, and a check that always fires
-  is a check nobody reads (`scripts/check-live-rates:491-495`).
-- `relative` has no zero guard on purpose: a pinned rate of zero would mean the table claims a
+- The twin check runs **first on every path**, including `--twin-only`. A pinned figure that
+  disagrees with its twin is already wrong whatever the API says, and finding out before the fetch
+  keeps a two-table problem from reading as a one-table one (`scripts/check-live-rates:605-616`).
+- The drift tolerance is 0.5%, which matches the rounding in the pinned figures. The pinned snapshot
+  rates are three-significant-figure roundings of ten-digit API figures, so a tighter tolerance
+  would report drift on a table that is correct, and a check that always fires is a check nobody
+  reads (`scripts/check-live-rates:491-495`).
+- `relative` has no zero guard on purpose. A pinned rate of zero would mean the table claims a
   billable line item is free, and a `ZeroDivisionError` is a better outcome than a drift report that
   quietly skipped it (`scripts/check-live-rates:519-522`).
 - Every line is reported, drifted or not, because a check that printed only its findings could not be
   told apart from one whose credentials silently failed over to zero line items
   (`scripts/check-live-rates:502-506`).
-- There is no `--region` flag: one pinned table exists and it is us-east-1, and a flag that fetched
+- There is no `--region` flag. One pinned table exists and it is us-east-1, and a flag that fetched
   some other region and compared it against itself would pass by construction
   (`scripts/check-live-rates:587-589`).
-- A missing ARM rate **raises** rather than substituting the x86 sibling, which is 17.9% higher: the
+- A missing ARM rate **raises** rather than substituting the x86 sibling, which is 17.9% higher. The
   hand-pinned table used the ARM figure "correctly but by luck", and a fallback "would overstate
   every estimate by 17.9% and look entirely healthy doing it"
   (`scripts/check-live-rates:16-21`, enforced at `:408-442`).
 
-**Drift risk:** Five rates, confirmed by running `./scripts/check-live-rates --twin-only`
+**Drift risk:** The check covers five rates, confirmed by running
+`./scripts/check-live-rates --twin-only`
 (`twin ok: 5 pinned rate(s) agree with microvms-core/src/cost.rs`, 2026-08-09). A sixth rate added to
-`RateTable` would not be compared until it is added to `PINNED` and `TWIN_FIELDS` — the gate reports
-the count it checked, so the number is the tell. Mitigation: the gate prints
-`twin ok: N pinned rate(s)`, so an unchanged N after a table grows is visible in the log.
+`RateTable` would not be compared until it is added to `PINNED` and `TWIN_FIELDS`. Mitigation: the
+gate prints `twin ok: N pinned rate(s)`, so an unchanged N after the table grows is visible in the
+log.
 
 ## The endpoint proxy header pair — two lanes, two definitions
 
@@ -608,8 +611,8 @@ pub const PROXY_PORT_HEADER: &str = "X-aws-proxy-port";
 
 **Assumptions consumers make:**
 
-- Both headers go on every request. Omitting the port header is "a rejection that reads like a bad
-  token, which is the worst available diagnostic: the header that is wrong is not the header the
+- Both headers go on every request. Omitting the port header produces "a rejection that reads like a
+  bad token, which is the worst available diagnostic: the header that is wrong is not the header the
   error mentions" (`microvms-core/src/session/proxy.rs:5-12`).
 - `CreateMicrovmAuthToken` answers with `authToken` as a **map** of header name to value, not a bare
   string, because the API is shaped for schemes needing more than one header. Reading that map as a
@@ -617,27 +620,27 @@ pub const PROXY_PORT_HEADER: &str = "X-aws-proxy-port";
   has no `Display`, and the only way out names the header it reads
   (`microvms-core/src/session/proxy.rs:14-19`, type at `:76-79`).
 - Header lookup is case-insensitive, because the map's keys come from a service response rather than
-  from this crate: a client matching `X-aws-proxy-auth` exactly would break on a response spelling it
+  from this crate. A client matching `X-aws-proxy-auth` exactly would break on a response spelling it
   lowercase, and the failure would look like a missing header rather than a missing key
   (`microvms-core/src/session/proxy.rs:102-114`).
 - All the token's headers are forwarded, not just the two this client knows about, because the
   platform's stated reason for a map is that a scheme may need more than one header
   (`microvms-core/src/session/proxy.rs:116-125`).
-- The port header is this client's to send — but if a control-plane response ever includes it, that
+- The port header is this client's to send, but if a control-plane response ever includes it, that
   value **wins**, because the service knows which ports it scoped the token to and this client only
   knows which one it was configured with (`microvms-core/src/session/proxy.rs:408-417`).
-- Minting happens inside `ProxyAuth::headers`, which every request calls, because the service caps a
-  proxy token at sixty minutes — shorter than a long agent run — and the resulting rejection is
-  indistinguishable from a daemon that died (`microvms-core/src/session/proxy.rs:21-27`). Refresh is
-  at *half* the ceiling, not just under it: refreshing at fifty-nine minutes puts the expiry inside
-  the window between building the headers and the proxy validating them
+- Minting happens inside `ProxyAuth::headers`, which every request calls. The service caps a
+  proxy token at sixty minutes, which is shorter than a long agent run, and the resulting rejection
+  is indistinguishable from a daemon that died (`microvms-core/src/session/proxy.rs:21-27`). Refresh
+  is at *half* the ceiling, not just under it, because refreshing at fifty-nine minutes puts the
+  expiry inside the window between building the headers and the proxy validating them
   (`microvms-core/src/session/proxy.rs:29-33`).
 
 **Drift risk:** The two definitions can diverge without a compile error. What makes the duplication
 safe is one conversion test that goes through the *other* module's spelling, so if either lane
-changed a name the port assertion fails (`microvms-core/src/session/proxy.rs:866-887`) — the stated
-trade being "cheaper than merging the constants, which would mean one lane editing the other's file"
-(`:859-865`). Mitigation: keep that conversion test; it is the whole of the coupling.
+changed a name the port assertion fails (`microvms-core/src/session/proxy.rs:866-887`). The stated
+trade is that this is "cheaper than merging the constants, which would mean one lane editing the
+other's file" (`:859-865`). Mitigation: keep that conversion test; it is the whole of the coupling.
 
 ## `spec/core.symspec.json` ↔ `sandbox.rs` ↔ `model/src/client.rs` — a three-way mirror
 
@@ -679,41 +682,42 @@ trade being "cheaper than merging the constants, which would mean one lane editi
 
 - `model/src/client.rs` mirrors `microvms_core::sandbox::Lifecycle` "by convention rather than by
   dependency — this crate has no cargo edge to `microvms-core`, exactly as it has none to `agentd`"
-  (`model/src/client.rs:58-59`). Nothing compiles the mirror; it is a naming discipline.
-- The Z3 proofs are only worth something if the transitions in `sandbox.rs` are the only way to move
-  the state, which is why every one of the five fields is private and every mutation happens in one of
-  five methods (`microvms-core/src/sandbox.rs:13-17`).
+  (`model/src/client.rs:58-59`). No build step checks the mirror; keeping the two in step is a
+  naming discipline.
+- The Z3 proofs only hold if the transitions in `sandbox.rs` are the only way to move
+  the state. Because of that, every one of the five fields is private and every mutation happens in
+  one of five methods (`microvms-core/src/sandbox.rs:13-17`).
 - Lifecycle is an enum, not a `String`, because a `String` would let `"RUNNING "` and `"Running"` both
   exist and every guard would have to decide which it meant
   (`microvms-core/src/sandbox.rs:93-95`).
-- `sandbox.rs` is runtime-checked rather than typestate, and the reason is a binding constraint: a
+- `sandbox.rs` is runtime-checked rather than typestate, because of a binding constraint. A
   type whose Rust identity changes on every transition cannot be one `#[pyclass]`, so a typestate
-  sandbox would be re-erased at the binding boundary and the check would exist twice with the
-  binding's copy being the one most callers hit (`microvms-core/src/sandbox.rs:19-27`). What is kept
-  from the idea is that the check happens **before** the wire call, and the test asserts the call
-  count because that is the observable that distinguishes the two
+  sandbox would be re-erased at the binding boundary. The check would then exist twice, and the
+  binding's copy would be the one most callers hit (`microvms-core/src/sandbox.rs:19-27`). What is
+  kept from the typestate idea is that the check happens **before** the wire call, and the test
+  asserts the call count because that is the observable that distinguishes the two
   (`microvms-core/src/sandbox.rs:29-32`).
 - The model counts **wire calls in the state** (`model/src/client.rs:82-95`), because a state-only
-  property cannot say "this call should never have happened": a client that calls `ResumeMicrovm`,
+  property cannot say "this call should never have happened". A client that calls `ResumeMicrovm`,
   gets an error, and stays put satisfies every state-only property and burns a poll timeout
   (`model/src/client.rs:24-31`).
-- Violations are recorded at the **transition**, where the pre-state is still in hand. Inferring from
-  the post-state was tried and was wrong — a suspend from SUSPENDED and one from RUNNING both land in
-  SUSPENDING, so nothing in the result tells them apart (`model/src/client.rs:175-181`,
-  `:517-526`).
+- Violations are recorded at the **transition**, where the pre-state is still in hand. An earlier
+  version inferred the violation from the post-state, which did not work: a suspend from SUSPENDED
+  and one from RUNNING both land in SUSPENDING, so nothing in the result tells them apart
+  (`model/src/client.rs:175-181`, `:517-526`).
 - Every `always` property is paired with a `sometimes` witness, because a safety property over a
   state space that never reached the interesting state passes while measuring nothing
   (`model/src/client.rs:38-42`, witnesses at `:594-635`).
 - Properties are stated **unconditionally** rather than consulting the config they are meant to
   discriminate, since a property that reads that flag becomes vacuous in the very run where it should
   fail (`model/src/client.rs:508-513`, same idiom at `model/src/lib.rs:433-439`).
-- The resume window is a boolean, not a clock: what the model has to settle is whether the client
+- The resume window is a boolean, not a clock. What the model has to settle is whether the client
   *checks* before calling, and a counter would multiply the state space by the window's width to
   prove the same one bit (`model/src/client.rs:44-52`).
 
 **Drift risk:** A sixth `Lifecycle` state added to `sandbox.rs` compiles, and neither the symspec
-document nor `model/src/client.rs` notices — the mirror has no mechanical enforcement in either
-direction. Mitigation: `mise run spec:core` and the `model` crate's tests are the two readers; run
+document nor `model/src/client.rs` notices, because the mirror has no mechanical enforcement in
+either direction. Mitigation: `mise run spec:core` and the `model` crate's tests are the two readers; run
 both when touching the lifecycle, and note that `spec:core` is deliberately outside `check`'s
 dependency list because it needs a node path in someone's home directory (`mise.toml:150-154`).
 

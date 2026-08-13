@@ -32,8 +32,9 @@ never gets bootstrapped.
 
 ## Rules that exist because a defect proved them necessary
 
-Each of these was bought with a real bug during the Harbor PR #2469 integration.
-They are protocol contract, not implementation preference.
+Each of these rules comes from a real bug found during the Harbor PR #2469
+integration. They are part of the protocol contract, so implementations must
+follow them.
 
 **Bootstrap is one-shot, and a replay of the identical token succeeds.** A first
 `/run` installs the token and returns 200. A later `/run` carrying the same token
@@ -42,30 +43,31 @@ VM is broken. A later `/run` carrying a different token returns 409 and changes
 nothing. The model in `model/` checks this over every interleaving, including a
 racing in-VM caller.
 
-**Control routes answer 503 before bootstrap.** Not 404, and not a connection
-drop.
+**Control routes answer 503 before bootstrap.** They do not answer 404, and
+they do not drop the connection.
 
 **A missing or malformed body key is 400, never 404.** Clients map 404 onto
-"file not found", so the wrong code turns a protocol typo into a phantom absent
-artifact — which is exactly how one defect hid.
+"file not found". Because of that mapping, returning 404 for a protocol typo
+makes the client believe an artifact is absent when it is not. One defect went
+undetected this way.
 
 **Authorization is decided before any body byte is read.** An unauthenticated
 caller must not be able to make the daemon allocate. Rejected requests still
 drain a small body so pooled client connections keep working; larger ones close.
 
 **Token comparison happens on bytes, in constant time.** Comparing `str` values
-raises on non-ASCII input in some languages, and any caller controls the header —
-that was a trivially reachable denial of the connection.
+raises on non-ASCII input in some languages. Any caller controls the header, so
+a non-ASCII header value could crash the connection.
 
 **No exception on the parse, auth, or routing path may drop a connection.** A
 catch-all returns 500. Raw TLS handshake bytes get a 400 and a debug log, since
 something in the platform's path probes the port with TLS first.
 
 **`cwd` is omitted when unset.** When the client sends no working directory, the
-daemon emits no `cd` prefix and the child inherits the daemon's own working
-directory, which is the image `WORKDIR` because the daemon is the container
-`CMD`. Forcing `/` breaks prebuilt-image tasks and defeats any harness that
-discovers the image workdir with `pwd`.
+daemon emits no `cd` prefix, and the child inherits the daemon's own working
+directory. Because the daemon is the container `CMD`, that directory is the
+image `WORKDIR`. Forcing `/` breaks prebuilt-image tasks and defeats any harness
+that discovers the image workdir with `pwd`.
 
 **Exec is idempotent on a caller-minted `exec_id`.** A retried `/exec/start`
 returns success without spawning a second child. Polling is read-only. Output
@@ -73,76 +75,81 @@ lives until the caller acks, and only acked entries are collected. The Python
 predecessor unlinked output files at child exit, which destroyed anything a
 backgrounded grandchild wrote afterward.
 
-**No shell unless asked.** An argv array execs directly. `shell: true` wraps in
+**A shell wraps the command only when the caller asks for one.** An argv array
+execs directly. `shell: true` wraps in
 `sh -c` with the command as a single argument. The predecessor's brace-group
 wrapper turned empty and comment-terminated commands into syntax errors and let
 an unbalanced `}` escape the group.
 
 **Tar extraction mirrors the CPython `data` filter contract.** In-tree symlinks
-are preserved, because harnesses legitimately pack them; absolute link targets
-are refused; relative targets must resolve under the root, resolved with
-`normpath` semantics rather than `realpath` so a symlink written earlier in the
-same archive cannot redirect a later member; symlinks resolve relative to their
-own directory while hard links resolve against the archive root; member count and
-total size are capped; modes are applied after content lands.
+are preserved, because harnesses legitimately pack them. Absolute link targets
+are refused. Relative targets must resolve under the root, using `normpath`
+semantics rather than `realpath`, so a symlink written earlier in the same
+archive cannot redirect a later member. Symlinks resolve relative to their own
+directory, while hard links resolve against the archive root. Member count and
+total size are capped. Modes are applied after content lands.
 
 **Bodies stream to disk, and caps are enforced on the wire.** The predecessor
 buffered whole archives in memory on a VM whose baseline can be 512 MiB, where an
 OOM-killed daemon is unrecoverable. It also measured archive size inside the gzip
-`with` block, where the stream is unflushed: `tell()` reported 10 bytes for a
-327-byte archive, making the guard nearly decorative.
+`with` block, where the stream is unflushed. There, `tell()` reported 10 bytes
+for a 327-byte archive, so the size guard almost never fired.
 
-**Output is bounded with an explicit truncation marker,** and a post-exit linger
+**Output is bounded, and truncation is marked explicitly.** A post-exit linger
 deadline bounds how long the daemon waits on grandchildren still holding the pipe.
 
 ## Streaming and stdin
 
-Both exist for one consumer: an agent harness running inside the VM, which emits
-output for minutes and may need a prompt written to it. Polling re-sends the whole
-buffer each time and truncates at the output cap, which is wrong for both.
+Both features serve one consumer, an agent harness running inside the VM. The
+harness emits output for minutes and may need a prompt written to it. Polling
+serves neither need well, because it re-sends the whole buffer each time and
+truncates at the output cap.
 
-**The stream is a view, never the object.** An exec is a server-side record keyed
-by its caller-minted `exec_id`. Attaching, detaching, or dropping a connection
-must not affect the command, and both views must keep working: poll returns the
-buffer, stream follows it, and neither disturbs the other.
+**The stream is a read-only view of the exec.** An exec is a server-side record
+keyed by its caller-minted `exec_id`. Attaching, detaching, or dropping a
+connection must not affect the command. Both views must keep working, so poll
+returns the buffer, stream follows it, and neither disturbs the other.
 
-**Resume is by byte offset.** `?offset=N` yields exactly the bytes after N. This is
-the difference between a working reconnect and a broken one: E2B's offset-less
-reattach loses everything produced during the gap. A reattach past the retained
-window gets an explicit `gap` event naming the range, because silently skipping
-bytes while appearing to stream is worse than admitting the loss.
+**Resume is by byte offset.** `?offset=N` yields exactly the bytes after N, so a
+client that reconnects can pick up where it left off. For comparison, E2B's
+reattach takes no offset, so a reconnecting E2B client loses everything produced
+during the gap. A reattach past the retained window gets an explicit `gap` event
+naming the missing range. Without that event, the client would keep streaming
+and never learn that bytes were skipped.
 
-**The terminal event is the point of using SSE.** A raw chunked byte stream cannot
-distinguish a finished command from a dropped connection — the bytes are
-identical. So the stream emits a typed `exit` event carrying the status and *then*
-ends. Keep-alive comments fill silences, because an agent harness thinking for two
-minutes must not look like a dead connection.
+**SSE is used because it can carry a typed terminal event.** A raw chunked byte
+stream cannot distinguish a finished command from a dropped connection, because
+the bytes are identical in both cases. The stream therefore emits a typed `exit`
+event carrying the status and *then* ends. Keep-alive comments fill silences, so
+an agent harness thinking for two minutes does not look like a dead connection.
 
 **stdin is opt-in and a separate request.** A command that does not ask for stdin
-gets `Stdio::null()`, so nothing inherits a surprise descriptor; asking for it and
-then writing to a command that did not request it is 409. Writes go to
-`POST /v1/exec/{id}/stdin`, never multiplexed onto the output connection, which is
-what makes a dropped attach harmless. EOF is an explicit signal rather than
-inferred, because a child reading stdin cannot exit until the daemon drops its own
-handle — `Child::wait()` drops the child's copy, not ours.
+gets `Stdio::null()`, so nothing inherits a surprise descriptor. Writing to a
+command that did not request stdin returns 409. Writes go to
+`POST /v1/exec/{id}/stdin` and are never multiplexed onto the output connection.
+Because the two connections are separate, a dropped attach cannot corrupt stdin.
+EOF is an explicit signal rather than inferred, because a child reading stdin
+cannot exit until the daemon drops its own handle. `Child::wait()` drops the
+child's copy of the handle, not the daemon's.
 
 ## Trust boundary
 
 The platform's `/run` hook arrives from `127.0.0.1` and is indistinguishable at
 the socket level from a request sent by a process inside the VM (measured; see
-`PLATFORM.md`). Source-address filtering is therefore wrong rather than merely
-unverified.
+`PLATFORM.md`). Filtering by source address therefore cannot separate the
+platform from an in-VM process, so it provides no protection here.
 
-The defenses that remain, all of them checked in `model/`:
+The remaining defenses, all checked in `model/`, are the following:
 
 1. Bootstrap is one-shot, so a losing racer never replaces the winner's token.
 2. A post-bootstrap hijack attempt is refused at the hook with 409 and at the
    control API with 401.
 3. The agent token never enters an exec'd child's environment.
 
-The residual risk is stated plainly rather than dismissed: the daemon being the
-container `CMD` and the harness issuing its first exec only after readiness is an
-*unenforced* invariant. A base image that starts its own background process
+One risk remains. The design assumes the daemon is the container `CMD` and that
+the harness issues its first exec only after readiness. The daemon does not
+enforce this invariant. A base image that starts its own background process
 before bootstrap breaks it. `model/` includes that configuration and reports the
-counterexample path, so the cost of the invariant is a checked fact rather than a
-paragraph. Enforcing it belongs to whoever builds the image, not to this daemon.
+counterexample path, so the consequence of breaking the invariant is a checked
+result rather than a prediction. Enforcing the invariant is the responsibility
+of whoever builds the image, not of this daemon.

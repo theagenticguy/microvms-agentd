@@ -1,23 +1,23 @@
 # microvms-agentd · Ownership
 
-Per-author ownership analysis does not apply to this repo, so this file answers a different question.
+This file describes knowledge concentration by file rather than by author, because per-author ownership analysis does not apply to this repo.
 
 The whole history is 31 commits over four days, 2026-08-05 through 2026-08-09, under two identities:
 `bgagent` (27) and `Laith Al-Saadoon` (4). `bgagent` is the commit identity of the agent sessions that
 wrote the code, not a person who holds knowledge in their head. A commit-share table would report
 roughly 87% / 13% on every folder and tell a reader nothing about bus factor. There is also no
-`CODEOWNERS` file to validate against. So the usual output — folders ranked by top-contributor share —
-is omitted deliberately rather than fabricated.
+`CODEOWNERS` file to validate against. This file therefore omits the usual output of folders ranked
+by top-contributor share.
 
-What does carry risk here is **knowledge concentration by artifact**: a handful of files encode
-behavior that was *measured against the live AWS service*, not derived from code. Delete or silently
-edit one of them and no amount of reading the source recovers the value. Re-deriving it costs live AWS
-runs, and in some cases a full build-and-run cycle per fact. That is the real single point of failure,
-and it is a file property, not a person property.
+The risk that does exist here is **knowledge concentration by artifact**. A handful of files encode
+behavior that was *measured against the live AWS service* and cannot be derived from the code. If one
+of them is deleted or silently edited, reading the source will not recover its contents. Re-deriving
+those contents costs live AWS runs, and in some cases a full build-and-run cycle per fact. The single
+points of failure in this repo are therefore files rather than people.
 
 ## Knowledge concentration
 
-Ranked by what it would cost to recover the file's contents if it were lost.
+The table ranks each artifact by what it would cost to recover the file's contents if it were lost.
 
 | Artifact | What it encodes | Recoverable from code? | Recovery cost |
 | --- | --- | --- | --- |
@@ -28,35 +28,35 @@ Ranked by what it would cost to recover the file's contents if it were lost.
 | `docs/TRUST.md` | The trust boundary contract, implementable without this project | Partly | Re-argued from PLATFORM.md, not from source |
 | `conformance/` | The live-run harness that produced the measurements | Yes | It is code; but it is how everything above was obtained |
 
-Detail on the three that matter most:
+The three artifacts with the highest recovery cost are described in more detail below.
 
-- **`docs/PLATFORM.md`** states its own measurement context up front — `us-east-1`, API version
+- **`docs/PLATFORM.md`** states its own measurement context up front: `us-east-1`, API version
   `2025-09-09`, `al2023-minimal` aarch64, measured 2026-08-01 through 2026-08-04. Two entries show why
-  the file cannot be regenerated: `runHookPayload` arrives wrapped in an envelope rather than as the
-  request body, and finding that "cost a full build-and-run cycle" because the platform terminates the
-  VM on the resulting 400 before you can look inside it. Separately, the `runHookPayload` ceiling is
-  4096 bytes, not the 16 KB two other docs had asserted — an error that ran in the dangerous direction,
-  telling a reader they could fit four times the secret material they actually can.
+  the file cannot be cheaply regenerated. First, `runHookPayload` arrives wrapped in an envelope rather
+  than as the request body. Establishing that fact "cost a full build-and-run cycle" because the
+  platform terminates the VM on the resulting 400 before the payload can be inspected. Second, the
+  `runHookPayload` ceiling is 4096 bytes. Two other docs had asserted 16 KB, and that overstated
+  ceiling would lead a reader to plan for four times the secret material the platform actually accepts.
 
 - **`scripts/check-model-drift`** holds `PINNED_REGIONS` and `PINNED_SIZE_CLASSES` as deliberate
-  hand-maintained copies. The script's own header explains why: those two values used to be verified by
-  comparing the Python client against the Rust client, the Python client was deleted after the Rust port
-  went green, and no AWS service model states either value. The literals are that lost second reader,
-  restored. Two of the five size-class rows are measured rather than documented, and the rows are *read*
-  rather than computed as 4x the baseline because a formula there would be the exact bug the table
-  exists to prevent.
+  hand-maintained copies. The script's own header explains why. Those two values used to be verified by
+  comparing the Python client against the Rust client. The Python client was deleted after the Rust
+  port went green, and no AWS service model states either value. The pinned literals replace the
+  deleted Python client as the second reader of those values. Two of the five size-class rows are
+  measured rather than documented. The rows are also *read* rather than computed as 4x the baseline,
+  because a formula there would reproduce the exact bug the table exists to prevent.
 
-- **`microvms-core/src/cost.rs`** carries a drift scar inline. `storage_gb_month` reads
-  `dec!(0.0811111030)`; the comment records that it "Was 0.08 — a plausible-looking" figure, 1.37% low,
-  from quoting storage per GB-hour while the table holds per GB-month. Region is not a cosmetic label on
-  this table: eu-west-1 runs 5.3% over us-east-1 on compute and 19% on snapshot storage, so a Tokyo
+- **`microvms-core/src/cost.rs`** records one past drift error inline. `storage_gb_month` reads
+  `dec!(0.0811111030)`, and the comment records that it "Was 0.08 — a plausible-looking" figure, 1.37%
+  low, produced by quoting storage per GB-hour while the table holds per GB-month. The rates also vary
+  by region. eu-west-1 runs 5.3% over us-east-1 on compute and 19% on snapshot storage, so a Tokyo
   caller reading the us-east-1 rates understates their snapshot write bill by 22.6%. Only us-east-1 is
-  pinned, and `scripts/check-live-rates` is the oracle that catches it going stale.
+  pinned, and `scripts/check-live-rates` is the check that catches the table going stale.
 
 ## Read first
 
-A new maintainer should read in this order. The first three are non-negotiable; skipping PLATFORM.md
-means re-learning its traps at the cost of live AWS runs.
+A new maintainer should read these documents in this order. Read the first three before changing any
+code, because skipping PLATFORM.md means re-learning its traps at the cost of live AWS runs.
 
 1. `README.md` — why the project exists: the first daemon was 787 lines of Python inside Harbor
    PR #2469 and took 28 review findings across six rounds, nearly all in the daemon or in the service's
@@ -76,14 +76,16 @@ means re-learning its traps at the cost of live AWS runs.
 
 ## Single points of failure
 
-No per-author bus-factor SPOFs can be computed — see the intro. The equivalent risks are artifact-shaped:
+Per-author bus-factor SPOFs cannot be computed, for the reasons given in the introduction. The
+equivalent risks attach to specific files:
 
-- `docs/PLATFORM.md` — the only record of the project's live-service measurements. Treat edits as
-  measurement changes requiring a new dated run, never as prose cleanup.
+- `docs/PLATFORM.md` — the only record of the project's live-service measurements. Treat every edit
+  as a measurement change that requires a new dated run, not as prose cleanup.
 - `scripts/check-model-drift` — `PINNED_REGIONS` and `PINNED_SIZE_CLASSES` lost their cross-client
-  reader when the Python client was deleted; port any change to both sides in the same commit, as the
+  reader when the Python client was deleted. Port any change to both sides in the same commit, as the
   file instructs.
-- `microvms-core/src/cost.rs` — a hand-pinned us-east-1 rate table that has already drifted once;
-  keep `scripts/check-live-rates` in CI so staleness surfaces as a failure rather than a wrong estimate.
-- `spec/core.symspec.json` — 51 requirements in one file with no second copy; its `TRAP-*` entries are
-  only as good as the PLATFORM.md sections they encode, so change the two together.
+- `microvms-core/src/cost.rs` — a hand-pinned us-east-1 rate table that has already drifted once.
+  Keep `scripts/check-live-rates` in CI so staleness surfaces as a CI failure rather than a wrong
+  cost estimate.
+- `spec/core.symspec.json` — 51 requirements in one file with no second copy. Its `TRAP-*` entries
+  are only as good as the PLATFORM.md sections they encode, so change the two together.
