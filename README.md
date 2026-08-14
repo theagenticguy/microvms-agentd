@@ -122,11 +122,28 @@ not confirm it deleted, so nothing leaks silently.
 
 ## Running coding agents inside a MicroVM
 
-Two open-source harnesses already run coding agents (Claude Code, Codex CLI,
-and others) inside Lambda MicroVMs using this same architecture: a small
-daemon baked into the VM image supplies the exec and file-transfer API the
-platform lacks, and a per-VM token arrives through the `runHookPayload` hook
-so the shared image snapshot never contains a usable secret.
+[examples/coding-agents-on-bedrock](examples/coding-agents-on-bedrock/) runs
+Claude Code and Codex CLI headless inside a MicroVM, against Bedrock, with no
+vendor API key anywhere. One script builds an image carrying both CLIs,
+launches a VM with `--egress`, mints a short-lived Bedrock bearer token from
+your AWS credentials, copies it in over the authenticated channel, and drives
+each agent through `microvm exec`:
+
+```bash
+examples/coding-agents-on-bedrock/run.sh
+```
+
+Claude Code uses its native Bedrock mode (`CLAUDE_CODE_USE_BEDROCK=1`);
+Codex talks to Bedrock's OpenAI-compatible Responses endpoint through a
+five-line provider config. The example's [README](examples/coding-agents-on-bedrock/README.md)
+explains each decision, including the two platform constraints the Dockerfile
+has to respect.
+
+Two open-source harnesses run coding agents inside Lambda MicroVMs the same
+way: a small daemon baked into the VM image supplies the exec and
+file-transfer API the platform lacks, and a per-VM token arrives through the
+`runHookPayload` hook so the shared image snapshot never contains a usable
+secret.
 
 - **Harbor** ([harbor-framework/harbor#2469](https://github.com/harbor-framework/harbor/pull/2469))
   adds Lambda MicroVMs as an agent-evaluation environment: each trial builds
