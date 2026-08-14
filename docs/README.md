@@ -16,6 +16,9 @@ citation that was machine-verified against the source at generation time.
 - [PROTOCOL.md](PROTOCOL.md) — the daemon's wire protocol.
 - [TRUST.md](TRUST.md) — the in-VM trust boundary.
 - [STRATEGY.md](STRATEGY.md) — how the verification stack fits together.
+- [HARNESS-CAPABILITIES.md](HARNESS-CAPABILITIES.md) — what agent harnesses
+  (Harbor, Omnigent, the Vercel Sandbox / eve shape) require of a sandbox
+  platform, mapped onto this one, with the gaps ranked.
 - [CLI-COVERAGE-PLAN.md](CLI-COVERAGE-PLAN.md) — the plan that took live
   conformance from 38 checks to all of them. The plan is implemented; the file
   is kept for its reasoning.
