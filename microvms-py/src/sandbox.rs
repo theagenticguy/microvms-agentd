@@ -566,11 +566,11 @@ impl PySandbox {
         execution_role_arn=None,
         agent_token=None,
         egress=false,
-        max_idle_sec=600,
-        suspended_sec=600,
+        max_idle_sec=None,
+        suspended_sec=None,
         auto_resume=false,
-        max_duration_sec=3600,
-        ready_timeout=300.0,
+        max_duration_sec=None,
+        ready_timeout=None,
         token_scope=None,
     ))]
     #[allow(
@@ -585,23 +585,31 @@ impl PySandbox {
         execution_role_arn: Option<String>,
         agent_token: Option<String>,
         egress: bool,
-        max_idle_sec: u32,
-        suspended_sec: u32,
+        max_idle_sec: Option<u32>,
+        suspended_sec: Option<u32>,
         auto_resume: bool,
-        max_duration_sec: u32,
-        ready_timeout: f64,
+        max_duration_sec: Option<u32>,
+        ready_timeout: Option<f64>,
         token_scope: Option<String>,
     ) -> PyCoreResult<PySession> {
+        // Every unset window falls back to the core's own default rather than to a number
+        // written here: ten-minute idle and suspended windows, a one-hour ceiling, and the
+        // five-minute ready wait are measured figures, and a second copy of them in a
+        // binding is a second thing to keep in step (the JS binding defers the same way).
+        let defaults = RunRequest::new();
         let request = RunRequest {
             image_identifier,
             execution_role_arn,
             agent_token,
             egress,
-            max_idle_sec,
-            suspended_sec,
+            max_idle_sec: max_idle_sec.unwrap_or(defaults.max_idle_sec),
+            suspended_sec: suspended_sec.unwrap_or(defaults.suspended_sec),
             auto_resume,
-            max_duration_sec,
-            ready_timeout: seconds(ready_timeout)?,
+            max_duration_sec: max_duration_sec.unwrap_or(defaults.max_duration_sec),
+            ready_timeout: match ready_timeout {
+                Some(timeout) => seconds(timeout)?,
+                None => defaults.ready_timeout,
+            },
             token_scope,
         };
         // `run` answers `&mut Session`, which cannot cross back into Python — so the

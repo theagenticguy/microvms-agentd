@@ -28,7 +28,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use microvms_core::sandbox::Sandbox as CoreSandbox;
-use microvms_core::session::Session as CoreSession;
+use microvms_core::session::{Session as CoreSession, mint_exec_id};
 use microvms_core::{Error, ErrorKind};
 use napi::bindgen_prelude::Either;
 use napi_derive::napi;
@@ -398,39 +398,34 @@ impl Session {
     }
 }
 
-/// A fresh exec id: `x-` plus 16 hex characters, the Python client's shape.
-///
-/// Not a crate: the id needs to be distinct rather than unguessable — it is an idempotency
-/// key, not a credential, and the daemon rejects an unknown one — so the nanosecond clock
-/// mixed with a counter is enough, and a CSPRNG dependency in a binding crate for it would
-/// not be.
-fn mint_exec_id() -> String {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|since| since.as_nanos() as u64)
-        .unwrap_or_default();
-    let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
-    // The counter folds into the clock's high bits so two ids minted in the same nanosecond
-    // still differ.
-    format!("x-{:016x}", nanos ^ (sequence << 40))
-}
-
 /// The daemon's protocol constants, as a JSON string, for a caller asserting against the
 /// wire contract.
 #[napi]
 pub fn session_constants() -> String {
+    // The closed sets come from the protocol enums rather than being spelled here: a
+    // phase added to `protocol::exec::Phase` appears in this list without an edit.
+    let phases = protocol::exec::Phase::ALL
+        .iter()
+        .map(|phase| format!(r#""{}""#, phase.as_str()))
+        .collect::<Vec<_>>()
+        .join(",");
+    let stream_kinds = protocol::exec::StreamKind::ALL
+        .iter()
+        .map(|kind| format!(r#""{}""#, kind.as_str()))
+        .collect::<Vec<_>>()
+        .join(",");
     format!(
         concat!(
             r#"{{"defaultAgentPort":{},"proxyAuthHeader":"{}","proxyPortHeader":"{}","#,
             r#""maxTokenLifetimeSeconds":{},"defaultRefreshAfterSeconds":{},"#,
-            r#""phases":["running","exited","acked"],"streamKinds":["stdout","stderr"]}}"#,
+            r#""phases":[{}],"streamKinds":[{}]}}"#,
         ),
         microvms_core::session::DEFAULT_AGENT_PORT,
         microvms_core::session::PROXY_AUTH_HEADER,
         microvms_core::session::PROXY_PORT_HEADER,
         microvms_core::session::MAX_TOKEN_LIFETIME.as_secs(),
         microvms_core::session::DEFAULT_REFRESH_AFTER.as_secs(),
+        phases,
+        stream_kinds,
     )
 }

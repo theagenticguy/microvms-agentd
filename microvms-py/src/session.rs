@@ -40,7 +40,7 @@
 use std::sync::Arc;
 
 use microvms_core::sandbox::Sandbox;
-use microvms_core::session::Session;
+use microvms_core::session::{Session, mint_exec_id};
 use microvms_core::{Error, ErrorKind};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict};
@@ -503,25 +503,6 @@ impl Command {
     }
 }
 
-/// A fresh exec id: `x-` plus 16 hex characters, the Python client's shape.
-///
-/// Not a crate: the id needs to be distinct rather than unguessable — it is an
-/// idempotency key, not a credential, and the daemon rejects an unknown one — so the
-/// nanosecond clock mixed with a counter is enough, and adding a CSPRNG dependency to a
-/// binding crate for it would not be.
-fn mint_exec_id() -> String {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|since| since.as_nanos() as u64)
-        .unwrap_or_default();
-    let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
-    // The high bits of the counter fold into the clock so two ids minted in the same
-    // nanosecond still differ.
-    format!("x-{:016x}", nanos ^ (sequence << 40))
-}
-
 /// The daemon's protocol constants, for a caller asserting against the wire contract.
 #[pyfunction]
 pub(crate) fn session_constants<'py>(py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
@@ -540,8 +521,16 @@ pub(crate) fn session_constants<'py>(py: Python<'py>) -> PyResult<Bound<'py, PyD
         "defaultRefreshAfterSeconds",
         microvms_core::session::DEFAULT_REFRESH_AFTER.as_secs(),
     )?;
-    dict.set_item("phases", ["running", "exited", "acked"])?;
-    dict.set_item("streamKinds", ["stdout", "stderr"])?;
+    // The closed sets come from the protocol enums rather than being spelled here: a
+    // phase added to `protocol::exec::Phase` appears in this list without an edit.
+    dict.set_item(
+        "phases",
+        protocol::exec::Phase::ALL.map(protocol::exec::Phase::as_str),
+    )?;
+    dict.set_item(
+        "streamKinds",
+        protocol::exec::StreamKind::ALL.map(protocol::exec::StreamKind::as_str),
+    )?;
     Ok(dict)
 }
 

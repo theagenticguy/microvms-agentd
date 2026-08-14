@@ -89,7 +89,7 @@ pub struct ExecResult {
 impl ExecResult {
     pub(crate) fn wrap(result: CoreResult) -> Self {
         Self {
-            phase: phase_str(result.phase).to_string(),
+            phase: result.phase.as_str().to_string(),
             exit_code: result.exit_code(),
             signal: result.outcome.as_ref().and_then(|outcome| outcome.signal),
             stdout: result.stdout().to_string(),
@@ -177,7 +177,7 @@ impl StreamEvent {
                 let end = offset + data.len() as u64;
                 let text = String::from_utf8_lossy(&data).into_owned();
                 Self {
-                    stream: Some(stream_str(stream).to_string()),
+                    stream: Some(stream.as_str().to_string()),
                     offset: Some(offset as i64),
                     end: Some(end as i64),
                     text: Some(text),
@@ -295,6 +295,7 @@ impl AsyncGenerator for ExecStream {
 }
 
 /// How a stream should behave.
+#[derive(Default)]
 #[napi(object)]
 pub struct StreamOptionsInput {
     /// The byte to start at. Non-zero resumes a stream a previous process was reading.
@@ -362,13 +363,7 @@ impl ExecHandle {
     #[napi]
     pub fn stream(&self, options: Option<StreamOptionsInput>) -> napi::Result<ExecStream, String> {
         let defaults = StreamOptions::default();
-        let options = options.unwrap_or(StreamOptionsInput {
-            offset: None,
-            reconnect: None,
-            max_reconnects: None,
-            error_on_gap: None,
-            idle_timeout: None,
-        });
+        let options = options.unwrap_or_default();
         let resolved = StreamOptions {
             offset: options.offset.unwrap_or(0).max(0) as u64,
             reconnect: options.reconnect.unwrap_or(defaults.reconnect),
@@ -458,19 +453,4 @@ pub(crate) fn seconds(value: f64) -> napi::Result<std::time::Duration, String> {
 /// [`seconds`] for an async function, whose error type must be the local newtype.
 pub(crate) fn seconds_async(value: f64) -> Result<std::time::Duration, AsyncError> {
     microvms_core::cost::duration_of_secs_f64(value).map_err(js_async)
-}
-
-fn phase_str(phase: protocol::exec::Phase) -> &'static str {
-    match phase {
-        protocol::exec::Phase::Running => "running",
-        protocol::exec::Phase::Exited => "exited",
-        protocol::exec::Phase::Acked => "acked",
-    }
-}
-
-fn stream_str(kind: protocol::exec::StreamKind) -> &'static str {
-    match kind {
-        protocol::exec::StreamKind::Stdout => "stdout",
-        protocol::exec::StreamKind::Stderr => "stderr",
-    }
 }

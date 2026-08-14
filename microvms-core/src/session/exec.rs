@@ -183,6 +183,29 @@ impl Default for StreamOptions {
     }
 }
 
+/// A fresh exec id: `x-` plus 16 hex characters, the Python client's shape.
+///
+/// Here rather than in each binding, because both bindings carried a byte-identical
+/// copy of this function — and the id's shape is part of the session story ("the exec
+/// id is caller-minted"), so the crate that tells that story is the crate that mints.
+///
+/// Not a crate: the id needs to be distinct rather than unguessable — it is an
+/// idempotency key, not a credential, and the daemon rejects an unknown one — so the
+/// nanosecond clock mixed with a counter is enough, and a CSPRNG dependency for it
+/// would not be.
+pub fn mint_exec_id() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.as_nanos() as u64)
+        .unwrap_or_default();
+    let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    // The counter folds into the clock's high bits so two ids minted in the same
+    // nanosecond still differ.
+    format!("x-{:016x}", nanos ^ (sequence << 40))
+}
+
 /// One exec, addressed by its caller-minted id.
 ///
 /// The id is the idempotency key, so a handle survives a process restart: rebuild it
