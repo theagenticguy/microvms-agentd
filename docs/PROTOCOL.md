@@ -84,10 +84,20 @@ an unbalanced `}` escape the group.
 **Tar extraction mirrors the CPython `data` filter contract.** In-tree symlinks
 are preserved, because harnesses legitimately pack them. Absolute link targets
 are refused. Relative targets must resolve under the root, using `normpath`
-semantics rather than `realpath`, so a symlink written earlier in the same
-archive cannot redirect a later member. Symlinks resolve relative to their own
+semantics rather than `realpath`. Symlinks resolve relative to their own
 directory, while hard links resolve against the archive root. Member count and
 total size are capped. Modes are applied after content lands.
+
+**A symlink an archive wrote cannot redirect a later member, and the kernel is
+what enforces that.** The `normpath` rule above judges a member at the depth its
+name implies, and that is not the same as the depth the write reaches once a
+symlink is in the path. So the daemon opens the extraction root once and creates
+every member relative to that descriptor with `openat2`, using
+`RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS`. A member whose
+path would traverse a symlink is refused with 400 rather than written somewhere
+else. `openat2` needs Linux 5.6 or newer. On an older kernel the syscall answers
+`ENOSYS` and extraction answers 500, which is a refusal rather than a silent
+fall back to the weaker check.
 
 **Bodies stream to disk, and caps are enforced on the wire.** The predecessor
 buffered whole archives in memory on a VM whose baseline can be 512 MiB, where an

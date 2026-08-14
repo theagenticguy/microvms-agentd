@@ -519,3 +519,15 @@ once that window passes. State the window wherever a resume path is offered.
 Measured 2026-08-05. `al2023-minimal`, `python:3.12-slim`, and `node:20-slim` all
 leave `WorkingDir` empty. Anything that tests WORKDIR inheritance needs a purpose
 -built image with `WORKDIR` set, since there is nothing to inherit otherwise.
+
+## The guest kernel is 6.1, which `openat2` needs
+
+Measured 2026-08-14, us-east-1, `al2023-1` base: `uname -r` inside a running VM
+reports `6.1.166-24.303.amzn2023.aarch64`.
+
+The daemon's tar extraction resolves every member through `openat2` with
+`RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS`, which the kernel has supported since
+5.6. Recording the measured version means that dependency rests on a number
+someone checked rather than on an assumption about what Amazon Linux 2023
+ships. A guest older than 5.6 would answer `ENOSYS` and fail extraction rather
+than fall back to weaker confinement, which is the intended behavior.

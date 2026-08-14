@@ -41,11 +41,42 @@
 //! * Device and FIFO members are refused.
 //! * Member count and total uncompressed size are capped.
 //! * Modes are applied in a deferred second pass, after all content lands.
+//!
+//! # Two layers, and why the lexical one is not enough on its own
+//!
+//! The rules above are the first layer. They read the member's name as text and
+//! refuse a hostile member before any syscall runs, which is what makes the 400
+//! bodies specific enough to debug.
+//!
+//! They are not sufficient by themselves. The lexical layer judges a member at the
+//! depth its *name* implies, while the write goes wherever the *filesystem* says.
+//! Those two can disagree once the archive has created a symlink of its own. Issue
+//! #15 is the case: member `V/a/..` normalizes to `V` at depth 1 and its target `.`
+//! is in tree, so `<root>/V` becomes a symlink pointing at the root. Member
+//! `V/a/a/..` then normalizes to `V/a` at depth 2, and its target `../W/escape` is
+//! judged from depth 1, where it stays in tree. The write of `<root>/V/a` follows
+//! `<root>/V` and lands at `<root>/a` instead, one level shallower, and from there
+//! the same target reaches outside the root.
+//!
+//! So there is a second layer underneath, and it is the kernel's. The extraction
+//! opens the root once and creates every member relative to that descriptor with
+//! `openat2` and `RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS`.
+//! A path component that is a symlink stops resolution with `ELOOP`, and a
+//! resolution that would leave the root stops with `EXDEV`. Both become a 400 that
+//! names the member. The daemon no longer has to reason about whether a redirect is
+//! safe, because a redirected write cannot happen.
 
 use std::collections::HashMap;
+use std::ffi::{OsStr, OsString};
 use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
+
+use nix::errno::Errno;
+use nix::fcntl::{AT_FDCWD, AtFlags, OFlag, OpenHow, ResolveFlag, openat2};
+use nix::sys::stat::{FchmodatFlags, Mode, fchmodat, mkdirat};
+use nix::unistd::{UnlinkatFlags, linkat, symlinkat, unlinkat};
 
 use axum::body::Body;
 use axum::extract::{Request, State};
@@ -215,9 +246,15 @@ fn link_target_is_in_tree(base_depth: usize, target: &Path) -> bool {
 /// Where a vetted member lands.
 #[derive(Debug, Eq, PartialEq)]
 enum Landing {
-    /// A path under the root, with its normalized component depth — which a
-    /// symlink target needs as its resolution base.
-    Under { dest: PathBuf, depth: usize },
+    /// A path under the root, with the normalized components that lead to it.
+    ///
+    /// `dest` is the joined path, and it is used for logging and for keying the
+    /// deferred-mode table. The write itself never uses it. The write walks
+    /// `parts` one component at a time through [`Confined`], so the number of
+    /// components the kernel resolves is the number the daemon judged. The count
+    /// of `parts` is also the member's depth, which a symlink target needs as its
+    /// resolution base.
+    Under { dest: PathBuf, parts: Vec<OsString> },
     /// The member names the root itself, i.e. `.` or `./`.
     ///
     /// Kept distinct rather than folded into a refusal because
@@ -240,10 +277,332 @@ fn resolve_member(root: &Path, path: &Path) -> Landing {
     if parts.is_empty() {
         return Landing::Root;
     }
-    let depth = parts.len();
     let mut dest = root.to_path_buf();
-    dest.extend(parts);
-    Landing::Under { dest, depth }
+    dest.extend(&parts);
+    Landing::Under { dest, parts }
+}
+
+/// The extraction root, held open, with every write going through it.
+///
+/// One descriptor for the whole extraction. Each member is created by walking its
+/// components one at a time from this descriptor, and each step is an `openat2`
+/// with [`Confined::RESOLVE`]. A component that turns out to be a symlink fails
+/// with `ELOOP`; a resolution that would leave the root fails with `EXDEV`.
+///
+/// The descriptor is opened `O_PATH`, which means it can be used as the `dirfd` of
+/// an `*at` call and for nothing else. That is all this type needs, and `O_PATH` is
+/// the narrowest thing that provides it — a directory opened `O_PATH` cannot be
+/// read from or written to even if the descriptor leaks somewhere it should not.
+struct Confined {
+    root: OwnedFd,
+}
+
+impl Confined {
+    /// The resolve flags every component walk uses.
+    ///
+    /// * `RESOLVE_BENEATH` is the one that closes issue #15. It refuses any
+    ///   resolution that reaches a path which is not a descendant of the
+    ///   descriptor, which covers a `..` that climbs out and an absolute path.
+    /// * `RESOLVE_NO_SYMLINKS` refuses a symlink *anywhere* in the path, including
+    ///   the final component. `RESOLVE_BENEATH` alone would follow a symlink and
+    ///   only complain if the result left the root, so `<root>/V -> .` would still
+    ///   redirect `<root>/V/a` to `<root>/a` — in tree, and at the wrong depth,
+    ///   which is exactly the bug. Refusing traversal outright is what makes the
+    ///   path the kernel resolves the same path the lexical layer judged.
+    /// * `RESOLVE_NO_MAGICLINKS` is implied by `RESOLVE_NO_SYMLINKS` and named
+    ///   anyway. Magic links are the `/proc/[pid]/fd/*` style entries that are not
+    ///   symlinks and jump somewhere else when opened. Naming the flag means the
+    ///   guarantee does not quietly depend on the implication holding.
+    ///
+    /// `RESOLVE_IN_ROOT` was considered and rejected. It *rewrites* an escaping
+    /// path to land at the root rather than failing, so a member that tried to
+    /// escape would be silently written somewhere the archive never named. This
+    /// module refuses instead, because a rewrite teaches the caller nothing.
+    ///
+    /// `RESOLVE_NO_XDEV` was also considered and rejected. It refuses to cross a
+    /// mount point, and an extraction root with a legitimate bind mount or a
+    /// separate volume underneath it is a normal thing for a harness to have.
+    /// Crossing a mount does not escape the root, so refusing it would break real
+    /// uploads for no confinement gain.
+    const RESOLVE: ResolveFlag = ResolveFlag::RESOLVE_BENEATH
+        .union(ResolveFlag::RESOLVE_NO_SYMLINKS)
+        .union(ResolveFlag::RESOLVE_NO_MAGICLINKS);
+
+    /// Opens `root`, creating it if it is absent, and holds it.
+    ///
+    /// The root itself is opened by absolute path with only
+    /// `RESOLVE_NO_MAGICLINKS`, not with [`Self::RESOLVE`]. `RESOLVE_BENEATH`
+    /// rejects an absolute pathname outright, and the caller's `?path=` is
+    /// absolute by contract — `write_tar` refuses a relative one. The root is also
+    /// the caller's own choice rather than something out of the archive, and the
+    /// module comment explains why a caller-named path is not confined. Symlinks
+    /// on the way to the root are therefore fine and are followed, the same way
+    /// the previous `create_dir_all` followed them. Everything *inside* the root
+    /// comes from the archive and gets the full flag set.
+    ///
+    /// This is also where an old kernel is discovered. `openat2` landed in Linux 5.6
+    /// and answers `ENOSYS` before that, which becomes a 500 and refuses the whole
+    /// extraction. There is deliberately no fall back to the plain `create_dir_all`
+    /// and `File::create` this replaced: falling back would mean the confinement a
+    /// caller cannot see silently became the weaker one, and issue #15 is what the
+    /// weaker one allows.
+    fn open(root: &Path) -> io::Result<Self> {
+        std::fs::create_dir_all(root)?;
+        let how = OpenHow::new()
+            .flags(OFlag::O_PATH | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC)
+            .resolve(ResolveFlag::RESOLVE_NO_MAGICLINKS);
+        let root = openat2(AT_FDCWD, root, how).map_err(io::Error::from)?;
+        Ok(Self { root })
+    }
+
+    /// Opens the single component `name` under `dir` as a directory.
+    ///
+    /// Single component on purpose. `openat2` would happily resolve `a/b/c` in one
+    /// call under the same flags, but doing it a component at a time is what lets
+    /// the error name which component failed, and a 400 that names the component
+    /// is the difference between an operator fixing their tree and re-reading it.
+    fn open_dir(&self, dir: BorrowedFd<'_>, name: &OsStr) -> Result<OwnedFd, Errno> {
+        let how = OpenHow::new()
+            .flags(OFlag::O_PATH | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC)
+            .resolve(Self::RESOLVE);
+        openat2(dir, name, how)
+    }
+
+    /// Walks `parts` from the root, creating each directory that is missing.
+    ///
+    /// Returns the descriptor for the last component. `EEXIST` from `mkdirat` is
+    /// not an error: an archive may name the same directory twice, and a partial
+    /// extraction that is retried has to converge. The open that follows decides
+    /// whether the existing name is usable, and a symlink there fails with
+    /// `ELOOP` rather than being traversed.
+    fn make_dirs(&self, parts: &[OsString]) -> Result<OwnedFd, WalkError> {
+        let mut current = self.root.try_clone().map_err(|err| WalkError {
+            component: None,
+            errno: Errno::try_from(err).unwrap_or(Errno::EIO),
+        })?;
+        for (index, part) in parts.iter().enumerate() {
+            // 0o777 rather than the archive's mode, because the archive's mode is
+            // replayed by `apply_deferred_modes` after every member has landed.
+            // Applying it here is the defect that pass exists to avoid: a 0o500
+            // directory blocks the writes of its own children.
+            match mkdirat(&current, part.as_os_str(), Mode::from_bits_truncate(0o777)) {
+                Ok(()) | Err(Errno::EEXIST) => {}
+                Err(errno) => return Err(WalkError::at(parts, index, errno)),
+            }
+            current = self
+                .open_dir(current.as_fd(), part)
+                .map_err(|errno| WalkError::at(parts, index, errno))?;
+        }
+        Ok(current)
+    }
+
+    /// Splits `parts` into the parent directory descriptor and the final name.
+    ///
+    /// Every leaf creation needs exactly this: a `dirfd` the kernel has already
+    /// confirmed is inside the root and reached without traversing a symlink, plus
+    /// one name to create in it. `parts` is never empty here, because
+    /// [`resolve_member`] returns [`Landing::Root`] for the empty case and the
+    /// member loop handles that separately.
+    fn parent_of(&self, parts: &[OsString]) -> Result<(OwnedFd, OsString), WalkError> {
+        let (name, ancestors) = parts
+            .split_last()
+            .expect("a member has at least one component");
+        let parent = self.make_dirs(ancestors)?;
+        Ok((parent, name.clone()))
+    }
+
+    /// Creates the directory a `Directory` member names.
+    fn create_dir(&self, parts: &[OsString]) -> Result<(), WalkError> {
+        self.make_dirs(parts).map(drop)
+    }
+
+    /// Creates and opens the file a data member's bytes go into.
+    ///
+    /// `O_TRUNC` rather than `O_EXCL`, and the existing name is unlinked first, for
+    /// the reason the previous `remove_file` plus `File::create` had: an archive may
+    /// legitimately overwrite a name, and a retried partial extraction has to
+    /// converge. The unlink is `unlinkat` without `AT_REMOVEDIR`, so a directory in
+    /// the way survives and the open below reports `EISDIR`, which is the same
+    /// answer `File::create` gave.
+    fn create_file(&self, parts: &[OsString]) -> Result<std::fs::File, WalkError> {
+        let (parent, name) = self.parent_of(parts)?;
+        let last = parts.len() - 1;
+        let how = OpenHow::new()
+            .flags(OFlag::O_WRONLY | OFlag::O_CREAT | OFlag::O_TRUNC | OFlag::O_CLOEXEC)
+            // 0o666 before umask, matching `File::create`. The archive's own mode
+            // is replayed later by `apply_deferred_modes`.
+            .mode(Mode::from_bits_truncate(0o666))
+            .resolve(Self::RESOLVE);
+        let fd = openat2(parent.as_fd(), name.as_os_str(), how)
+            .map_err(|errno| WalkError::at(parts, last, errno))?;
+        Ok(std::fs::File::from(fd))
+    }
+
+    /// Creates a symlink at `parts` with `target` written verbatim.
+    ///
+    /// The target is never resolved here and never checked against the filesystem.
+    /// tar stores the link rather than what it points at, and a tree packed in
+    /// dependency-free order can carry a symlink whose target arrives later or
+    /// never. The lexical layer has already decided the target stays in tree.
+    fn create_symlink(&self, parts: &[OsString], target: &Path) -> Result<(), WalkError> {
+        let (parent, name) = self.parent_of(parts)?;
+        let last = parts.len() - 1;
+        self.replace(parent.as_fd(), &name);
+        symlinkat(target, parent.as_fd(), name.as_os_str())
+            .map_err(|errno| WalkError::at(parts, last, errno))
+    }
+
+    /// Creates a hard link at `parts` pointing at `source`, an archive-root-relative
+    /// member name.
+    ///
+    /// Both ends go through the confined walk. `source` is resolved from the root
+    /// because a hard link's target in a tar archive is a member name rather than a
+    /// path relative to the link, which is the base difference the module comment
+    /// describes. `AtFlags::empty()` rather than `AT_SYMLINK_FOLLOW`, so linking to
+    /// a symlink member links the symlink rather than its target — the same thing
+    /// `std::fs::hard_link` did.
+    fn create_hard_link(
+        &self,
+        parts: &[OsString],
+        source: &[OsString],
+    ) -> Result<(), HardLinkError> {
+        let (parent, name) = self.parent_of(parts).map_err(HardLinkError::Dest)?;
+        let last = parts.len() - 1;
+        self.replace(parent.as_fd(), &name);
+
+        // An empty source is the archive naming the root as a hard-link target.
+        // `linkat` with an empty path is EINVAL rather than "link the directory",
+        // and that is the honest answer: a hard link to a directory is not
+        // creatable on Linux at all.
+        let Some((source_name, source_dirs)) = source.split_last() else {
+            return Err(HardLinkError::Dest(WalkError {
+                component: None,
+                errno: Errno::EINVAL,
+            }));
+        };
+        let source_parent = self
+            .walk_existing(source_dirs)
+            .map_err(HardLinkError::Source)?;
+
+        linkat(
+            source_parent.as_fd(),
+            source_name.as_os_str(),
+            parent.as_fd(),
+            name.as_os_str(),
+            AtFlags::empty(),
+        )
+        .map_err(|errno| HardLinkError::Dest(WalkError::at(parts, last, errno)))
+    }
+
+    /// Walks `parts` from the root without creating anything.
+    ///
+    /// Used for the source side of a hard link, where the member must already exist
+    /// — `link(2)` needs an existing file, and creating the directories on the way
+    /// there would turn "the archive names a member it never included" into an
+    /// empty directory tree plus the same failure one call later.
+    fn walk_existing(&self, parts: &[OsString]) -> Result<OwnedFd, WalkError> {
+        let mut current = self.root.try_clone().map_err(|err| WalkError {
+            component: None,
+            errno: Errno::try_from(err).unwrap_or(Errno::EIO),
+        })?;
+        for (index, part) in parts.iter().enumerate() {
+            current = self
+                .open_dir(current.as_fd(), part)
+                .map_err(|errno| WalkError::at(parts, index, errno))?;
+        }
+        Ok(current)
+    }
+
+    /// Unlinks `name` under `dir`, ignoring every failure.
+    ///
+    /// A link member replaces an existing name rather than failing on it, and
+    /// `symlinkat`/`linkat` have no truncating equivalent of `O_TRUNC`, so the old
+    /// name has to go first. Every error is ignored on purpose: the common one is
+    /// `ENOENT`, which means there was nothing to replace, and any other means the
+    /// create below fails and reports the real reason.
+    fn replace(&self, dir: BorrowedFd<'_>, name: &OsStr) {
+        let _ = unlinkat(dir, name, UnlinkatFlags::NoRemoveDir);
+    }
+
+    /// Applies `mode` to `parts`, without following a symlink at the last component.
+    ///
+    /// `FchmodatFlags::NoFollowSymlink` so a symlink member's own mode is what gets
+    /// chmodded rather than whatever it points at. Linux does not support changing a
+    /// symlink's mode and answers `EOPNOTSUPP`, which is fine — the alternative is
+    /// following the link and changing the permissions of a file the archive did not
+    /// name. [`apply_deferred_modes`] logs the failure and moves on.
+    fn set_mode(&self, parts: &[OsString], mode: u32) -> Result<(), WalkError> {
+        let (parent, name) = self.parent_of(parts)?;
+        let last = parts.len() - 1;
+        fchmodat(
+            parent.as_fd(),
+            name.as_os_str(),
+            Mode::from_bits_truncate(mode),
+            FchmodatFlags::NoFollowSymlink,
+        )
+        .map_err(|errno| WalkError::at(parts, last, errno))
+    }
+}
+
+/// A confined walk that stopped, and where.
+#[derive(Debug)]
+struct WalkError {
+    /// The component the kernel refused, when one is identifiable. `None` covers
+    /// the failures that are not about a component, such as a descriptor that
+    /// could not be duplicated.
+    component: Option<OsString>,
+    errno: Errno,
+}
+
+impl WalkError {
+    fn at(parts: &[OsString], index: usize, errno: Errno) -> Self {
+        Self {
+            component: parts.get(index).cloned(),
+            errno,
+        }
+    }
+
+    /// Turns the stopped walk into the refusal the caller sees, prefixed with
+    /// `context` when there is something to say about which end failed.
+    ///
+    /// Three errnos become a 400 that names the member, because each one is a thing
+    /// the caller's archive did and the caller is the only one who can fix it:
+    ///
+    /// * `ELOOP` is a symlink in the path. Under [`Confined::RESOLVE`] the kernel
+    ///   reports it for *any* symlink component, so this is the issue #15 case: the
+    ///   archive created a symlink and then tried to write through it.
+    /// * `EXDEV` is a resolution that would have left the root.
+    /// * `EACCES` is directory permissions that forbid the write.
+    ///
+    /// Every other errno stays a 500. `ENOSPC`, `EIO` and `ENOENT` are not the
+    /// caller's archive being wrong, and answering 400 for them would tell the
+    /// caller to fix an archive that is fine. This split also keeps the outcomes the
+    /// property tier already documents: a hard link to a member the archive never
+    /// included is `ENOENT` and stays the 500 it has always been.
+    fn into_refusal(self, member: &Path, context: &str) -> Refusal {
+        let cause = match self.errno {
+            Errno::ELOOP => "a symbolic link on the way there, which extraction refuses to follow",
+            Errno::EXDEV => "a path that resolves outside the extraction root",
+            Errno::EACCES => "directory permissions that refuse the write",
+            _ => return Refusal::Io(io::Error::from(self.errno)),
+        };
+        let reason = match &self.component {
+            Some(component) => format!(
+                "{context}cannot create under {}: {cause}",
+                Path::new(component).display(),
+            ),
+            None => format!("{context}cannot create: {cause}"),
+        };
+        Refusal::member(member, reason)
+    }
+}
+
+/// Which end of a hard link failed. The two ends need different sentences, because
+/// a bad destination is the member's own name and a bad source is the link target.
+#[derive(Debug)]
+enum HardLinkError {
+    Dest(WalkError),
+    Source(WalkError),
 }
 
 /// Caps applied to one extraction, carried separately from [`crate::Config`] so
@@ -264,7 +623,11 @@ fn extract_into(
     caps: Caps,
     guard: &disk::Guard,
 ) -> Result<u64, Refusal> {
-    std::fs::create_dir_all(root)?;
+    // The kernel's half of the confinement, held for the whole extraction. Every
+    // member below is created through this rather than by absolute path, so a
+    // component that turns out to be a symlink stops the write instead of
+    // redirecting it. See the module comment.
+    let confined = Confined::open(root)?;
 
     let mut ar = tar::Archive::new(archive);
     // Ownership is dropped for the same reason CPython's `data` filter drops it:
@@ -279,7 +642,12 @@ fn extract_into(
     // recorded and replayed after all content has landed. This was a real defect:
     // extraction failed partway through with a permission error on a tree that tar
     // itself unpacks fine.
-    let mut deferred: HashMap<PathBuf, u32> = HashMap::new();
+    // Keyed by the joined path so the ordering below can count components, and
+    // carrying the components too, because the chmod goes through the confined walk
+    // and needs them. The path is the key rather than the components because two
+    // members can normalize to the same place and the later mode should win, which
+    // is what a map keyed on the destination gives.
+    let mut deferred: HashMap<PathBuf, (Vec<OsString>, u32)> = HashMap::new();
     let mut members = 0u64;
     let mut total = 0u64;
     // `max_tar_bytes` defaults to 8 GiB, which is far more than the default reserve,
@@ -307,8 +675,8 @@ fn extract_into(
         let path = entry.path()?.into_owned();
         let kind = entry.header().entry_type();
 
-        let (dest, depth) = match resolve_member(root, &path) {
-            Landing::Under { dest, depth } => (dest, depth),
+        let (dest, parts) = match resolve_member(root, &path) {
+            Landing::Under { dest, parts } => (dest, parts),
             Landing::Escapes => {
                 return Err(Refusal::member(&path, "path escapes the extraction root"));
             }
@@ -340,9 +708,11 @@ fn extract_into(
             }
 
             EntryType::Directory => {
-                std::fs::create_dir_all(&dest)?;
+                confined
+                    .create_dir(&parts)
+                    .map_err(|err| err.into_refusal(&path, ""))?;
                 if let Ok(mode) = entry.header().mode() {
-                    deferred.insert(dest, mode);
+                    deferred.insert(dest, (parts, mode));
                 }
             }
 
@@ -361,10 +731,10 @@ fn extract_into(
 
                 // The two bases. A symlink is interpreted by the kernel relative
                 // to the directory holding it, so its base is its own parent —
-                // `depth - 1`. A hard link's target is an archive-relative member
-                // name, so its base is the root, depth 0.
+                // one less than the member's own depth. A hard link's target is an
+                // archive-relative member name, so its base is the root, depth 0.
                 let base_depth = if kind == EntryType::Symlink {
-                    depth - 1
+                    parts.len() - 1
                 } else {
                     0
                 };
@@ -375,25 +745,26 @@ fn extract_into(
                     ));
                 }
 
-                if let Some(parent) = dest.parent() {
-                    std::fs::create_dir_all(parent)?;
-                }
-                // Replacing rather than failing on an existing name: an archive
-                // may legitimately overwrite, and a partial extraction that has to
-                // be retried should converge.
-                let _ = std::fs::remove_file(&dest);
-
                 if kind == EntryType::Symlink {
                     // The target is written verbatim, dangling or not. tar stores
                     // the link, not what it points at, and a tree packed in
                     // dependency-free order can carry a symlink whose target
                     // arrives in a later member — or never, which is still what
                     // the source tree looked like.
-                    std::os::unix::fs::symlink(&target, &dest)?;
+                    confined
+                        .create_symlink(&parts, &target)
+                        .map_err(|err| err.into_refusal(&path, ""))?;
                 } else {
-                    let mut source = root.to_path_buf();
-                    source.extend(normalize(&target).into_iter().flatten());
-                    std::fs::hard_link(&source, &dest)?;
+                    let source = normalize(&target).unwrap_or_default();
+                    confined
+                        .create_hard_link(&parts, &source)
+                        .map_err(|err| match err {
+                            HardLinkError::Dest(err) => err.into_refusal(&path, ""),
+                            HardLinkError::Source(err) => err.into_refusal(
+                                &path,
+                                &format!("hard link target {}: ", target.display()),
+                            ),
+                        })?;
                 }
             }
 
@@ -408,10 +779,9 @@ fn extract_into(
                     )));
                 }
 
-                if let Some(parent) = dest.parent() {
-                    std::fs::create_dir_all(parent)?;
-                }
-                let mut file = std::fs::File::create(&dest)?;
+                let mut file = confined
+                    .create_file(&parts)
+                    .map_err(|err| err.into_refusal(&path, ""))?;
                 // Streamed through `Entry`'s `Read` impl. `Entry::unpack` would
                 // apply no confinement at all, and `unpack_in` applies a
                 // link-target policy that differs from ours — it rejects targets
@@ -419,7 +789,7 @@ fn extract_into(
                 let written = io::copy(&mut entry, &mut file)?;
 
                 if let Ok(mode) = entry.header().mode() {
-                    deferred.insert(dest, mode);
+                    deferred.insert(dest, (parts, mode));
                 }
 
                 // Checked after the member landed, so a member that fits is never
@@ -436,7 +806,7 @@ fn extract_into(
         }
     }
 
-    apply_deferred_modes(deferred);
+    apply_deferred_modes(&confined, deferred);
     Ok(members)
 }
 
@@ -446,16 +816,28 @@ fn extract_into(
 /// something beneath it. Modes are masked to `0o755` and a failure is logged
 /// rather than fatal: the bytes are already correct, and the caller would rather
 /// have a tree with a stale mode than a 500 and no tree.
-fn apply_deferred_modes(deferred: HashMap<PathBuf, u32>) {
-    let mut entries: Vec<(PathBuf, u32)> = deferred.into_iter().collect();
-    entries.sort_by_key(|(path, _)| std::cmp::Reverse(path.components().count()));
+///
+/// The chmod goes through the same confined walk the writes did. It is not the
+/// security-relevant step — the member already landed inside the root — but reusing
+/// one path means there is no second way to reach a member, and a symlink appearing
+/// mid-extraction cannot redirect a chmod either.
+fn apply_deferred_modes(confined: &Confined, deferred: HashMap<PathBuf, (Vec<OsString>, u32)>) {
+    let mut entries: Vec<(PathBuf, Vec<OsString>, u32)> = deferred
+        .into_iter()
+        .map(|(path, (parts, mode))| (path, parts, mode))
+        .collect();
+    entries.sort_by_key(|(_, parts, _)| std::cmp::Reverse(parts.len()));
 
-    for (path, mode) in entries {
+    for (path, parts, mode) in entries {
         // Masked like CPython's `data` filter: no setuid/setgid/sticky out of an
         // upload, and no group- or other-writable bits.
         let masked = mode & 0o755;
-        if let Err(err) = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(masked)) {
-            tracing::warn!(path = %path.display(), %err, "could not apply archive mode");
+        if let Err(err) = confined.set_mode(&parts, masked) {
+            tracing::warn!(
+                path = %path.display(),
+                errno = ?err.errno,
+                "could not apply archive mode",
+            );
         }
     }
 }
@@ -995,6 +1377,67 @@ mod tests {
             self
         }
 
+        /// Writes one GNU extension member, which is how a name or a link target
+        /// longer than the 100-byte header field travels in a tar archive.
+        ///
+        /// `kind` is `L` for a long name and `K` for a long link target. The value
+        /// is the member's body, NUL-terminated, with the terminator counted in
+        /// `size`, and the header's own name field carries GNU's marker string.
+        /// `entry.path()` and `entry.link_name()` read these and override the
+        /// inline fields, which is why `fs.rs` uses those accessors rather than the
+        /// `entry.header()` ones.
+        fn append_extension(&mut self, kind: u8, value: &str) {
+            const LONG_LINK: &[u8] = b"././@LongLink";
+            let mut header = Header::new_gnu();
+            header
+                .as_gnu_mut()
+                .expect("new_gnu yields a gnu header")
+                .name[..LONG_LINK.len()]
+                .copy_from_slice(LONG_LINK);
+            header.set_mode(0o644);
+            header.set_entry_type(EntryType::new(kind));
+            header.set_size(value.len() as u64 + 1);
+            header.set_cksum();
+
+            let mut body = value.as_bytes().to_vec();
+            body.push(0);
+            self.0
+                .append(&header, body.as_slice())
+                .expect("append extension member");
+        }
+
+        /// Appends a link whose name or target is longer than the 100-byte header
+        /// field, using the GNU extension members above.
+        ///
+        /// [`Self::link`] cannot express this: `set_raw_path` writes into a 100-byte
+        /// field and `set_link_name_literal` refuses a value that does not fit. The
+        /// reproducer in issue #15 has a 104-byte path component and a 114-byte
+        /// target, so both extensions are needed. The lengths are incidental to the
+        /// escape, which the short-name test below shows, but this is the shape the
+        /// property tier actually found, so this is the shape the guard reproduces.
+        fn long_link(mut self, kind: EntryType, path: &str, target: &str) -> Self {
+            if path.len() >= 100 {
+                self.append_extension(b'L', path);
+            }
+            if target.len() >= 100 {
+                self.append_extension(b'K', target);
+            }
+
+            // Both inline fields still carry a clipped prefix, the way GNU tar
+            // writes them; the extension members above override what is read.
+            let mut header = Header::new_gnu();
+            header.set_entry_type(kind);
+            header.set_size(0);
+            header.set_mode(0o755);
+            header
+                .set_link_name_literal(&target[..target.len().min(99)])
+                .expect("clipped link target fits the field");
+            Self::set_raw_path(&mut header, &path[..path.len().min(99)]);
+            header.set_cksum();
+            self.0.append(&header, io::empty()).expect("append link");
+            self
+        }
+
         fn special(mut self, kind: EntryType, path: &str) -> Self {
             let mut header = Header::new_gnu();
             header.set_entry_type(kind);
@@ -1234,6 +1677,110 @@ mod tests {
             std::fs::read(dir.path().join("root/fine.txt")).expect("lexical landing site"),
             b"ok",
             "landed at root/fine.txt, not root/d/sub/../fine.txt",
+        );
+    }
+
+    #[test]
+    fn a_symlink_the_archive_created_cannot_redirect_a_later_member_to_a_shallower_depth() {
+        // Issue #15, as the property tier shrank it. Both members pass every lexical
+        // check, and before the kernel layer existed the pair still escaped.
+        //
+        // Member 1 is named `V/a/..`, which normalizes to `V` at depth 1. Its target
+        // is `.`, which stays in tree, so the daemon wrote `<root>/V` as a symlink
+        // pointing at the root itself.
+        //
+        // Member 2 is named `V/a/a/..`, which normalizes to `V/a` at depth 2. A
+        // symlink resolves from its own directory, so its target `../W/escape` is
+        // judged from depth 1, where it reaches the root and stops. In tree.
+        //
+        // The escape is in the write rather than the judgement. `<root>/V` is a
+        // symlink now, so writing `<root>/V/a` follows it and lands at `<root>/a`, a
+        // level shallower than the name says. From there the same `../W/escape`
+        // target reaches `<root>/../W/escape`, outside the root.
+        //
+        // Observed against the pre-fix code: extraction answered 204 and left
+        // `<root>/a` as a symlink to `../W/escape`.
+        //
+        // The kernel layer refuses member 2 with ELOOP, because `V` is a symlink and
+        // resolution under RESOLVE_NO_SYMLINKS will not traverse one.
+        let v = "v".repeat(104);
+        let w = "w".repeat(104);
+        let hop = format!("{v}/a/..");
+        let victim = format!("{v}/a/a/..");
+        let archive = Archive::new()
+            .long_link(EntryType::Symlink, &hop, ".")
+            .long_link(EntryType::Symlink, &victim, &format!("../{w}/escape"))
+            .bytes();
+
+        // The extraction root is nested, so a member that escaped by one level lands
+        // inside the TempDir where the assertions below can see it. An escape into
+        // /tmp would leave nothing to find and would read as a pass.
+        let dir = TempDir::new().expect("tempdir");
+        let root = dir.path().join("nested/deeper/root");
+        let result = extract_into(&root, archive.as_slice(), OPEN, &roomy_guard());
+
+        // 400 naming the member, not a 500. The property tier asserts that every
+        // refusal names a member the archive contained, and the member's name here is
+        // the long one the GNU extension carried.
+        let reason = refusal_reason(result);
+        assert!(reason.contains(&victim), "names the member: {reason}");
+        assert!(
+            reason.contains("symbolic link"),
+            "says the write would have followed a symlink: {reason}",
+        );
+
+        // Member 1 is legitimate on its own terms and is still created, because the
+        // fix refuses the redirected *write* rather than retroactively refusing the
+        // symlink that would have redirected it.
+        assert!(
+            std::fs::symlink_metadata(root.join(&v))
+                .expect("the hop symlink was created")
+                .file_type()
+                .is_symlink(),
+        );
+
+        // Nothing landed outside the root. `<root>/a` is where the escape used to
+        // put its symlink, and `<root>/../W/escape` is where that symlink pointed.
+        assert!(
+            !root.join("a").symlink_metadata().is_ok(),
+            "the shallower path the symlink would have redirected to is empty",
+        );
+        for stray in [
+            dir.path().join("nested/deeper").join(&w),
+            dir.path().join("nested").join(&w),
+            dir.path().join(&w),
+        ] {
+            assert!(
+                stray.symlink_metadata().is_err(),
+                "nothing outside the root: {}",
+                stray.display(),
+            );
+        }
+    }
+
+    #[test]
+    fn a_write_through_a_symlink_the_archive_created_is_refused_at_any_name_length() {
+        // The same defect with names short enough for the inline header field, so the
+        // guard does not silently depend on the GNU long-name path. `hop/a/..`
+        // normalizes to `hop`, a symlink to `.`; `hop/a` is then a write through it.
+        //
+        // A file member rather than a symlink one, so the refusal cannot be coming
+        // from any link-target rule. Before the fix this file landed at `<root>/a`,
+        // one level shallower than `hop/a` names.
+        let archive = Archive::new()
+            .link(EntryType::Symlink, "hop/a/..", ".")
+            .raw_file("hop/a", b"redirected")
+            .bytes();
+
+        let (dir, result) = extract(archive, OPEN);
+        let reason = refusal_reason(result);
+        assert!(reason.contains("hop/a"), "names the member: {reason}");
+        assert!(reason.contains("symbolic link"), "{reason}");
+
+        let root = dir.path().join("root");
+        assert!(
+            !root.join("a").exists(),
+            "the redirected write did not land at the shallower path",
         );
     }
 
