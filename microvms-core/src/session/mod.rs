@@ -187,8 +187,6 @@ pub struct Session {
 }
 
 impl Session {
-    /// A session against `endpoint`, minting proxy tokens through `minter`.
-    ///
     /// The bearer this session authenticates with.
     ///
     /// Public because a caller who launched with a minted token needs to read it back
@@ -200,6 +198,8 @@ impl Session {
         &self.transport.agent_token
     }
 
+    /// A session against `endpoint`, minting proxy tokens through `minter`.
+    ///
     /// Does not talk to the VM. Constructing a session is free and re-doable, and a
     /// constructor that probed would make "do I have a session" mean "is the VM up",
     /// which are different questions with different answers during a launch.

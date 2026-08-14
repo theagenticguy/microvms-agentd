@@ -635,9 +635,12 @@ impl Sandbox {
             )));
         }
 
-        // STATE-4: accepted, so the lifecycle moves before the wait.
-        self.lifecycle = Lifecycle::Suspending;
+        // STATE-4: accepted, so the lifecycle moves before the wait. Acceptance is the
+        // wire call succeeding, so the assignment comes after it: moving to SUSPENDING
+        // first would leave a failed call (a throttle, a dead transport) stuck in a state
+        // neither suspend nor resume accepts, bricking the handle over one bad request.
         self.control.suspend(&id).await?;
+        self.lifecycle = Lifecycle::Suspending;
         // Stamped after the call and before the wait, not after the wait: the idlePolicy's
         // window starts when the platform begins suspending, so timing it from SUSPENDED
         // would under-count the transition and call a closed window open.
@@ -1275,6 +1278,60 @@ mod tests {
             sandbox.was_terminated(),
             "STATE-11's precondition is recorded"
         );
+    }
+
+    /// A suspend whose wire call fails leaves the sandbox in RUNNING, and a retry works.
+    ///
+    /// STATE-4's "accepted" is the wire call succeeding. A client that moved to SUSPENDING
+    /// before the call would strand a failed call there — a state neither suspend nor
+    /// resume accepts, so one throttled or dropped request would brick the handle.
+    /// **Falsification** — move `self.lifecycle = Lifecycle::Suspending` back above the
+    /// `control.suspend` call and the first assertion here reads SUSPENDING, and the retry
+    /// is refused by the STATE-5 guard.
+    #[tokio::test]
+    async fn a_suspend_whose_call_fails_stays_running_and_can_be_retried() {
+        let (mut sandbox, recorder, _) = planted();
+        recorder
+            .answer(
+                "RunMicrovm",
+                Answer::ok(fake::microvm_response("PENDING", None)),
+            )
+            .answer(
+                "GetMicrovm",
+                Answer::ok(fake::microvm_response("RUNNING", None)),
+            )
+            .answer(
+                "GetMicrovm",
+                Answer::ok(fake::microvm_response("SUSPENDED", None)),
+            )
+            .answer(
+                "CreateMicrovmAuthToken",
+                Answer::ok(fake::auth_token_response("proxy-token")),
+            )
+            // A 409 rather than a 429 or a transport cut, because those two are retried
+            // inside `send_with_retry` and this test wants the call to fail once, fast.
+            .answer("SuspendMicrovm", Answer::failure(409, "ConflictException"))
+            .answer("SuspendMicrovm", Answer::ok(fake::empty_response()));
+
+        sandbox
+            .run(RunRequest::new().with_image("arn:image"))
+            .await
+            .expect("launches");
+
+        sandbox
+            .suspend()
+            .await
+            .expect_err("the control plane refused the suspend");
+        assert_eq!(
+            sandbox.lifecycle(),
+            Lifecycle::Running,
+            "a refused suspend must not move the lifecycle: SUSPENDING accepts neither a \
+             suspend nor a resume, so recording it here would brick the handle"
+        );
+
+        sandbox.suspend().await.expect("the retry suspends");
+        assert_eq!(sandbox.lifecycle(), Lifecycle::Suspended);
+        assert_eq!(recorder.call_count("SuspendMicrovm"), 2);
     }
 
     /// **STATE-5, the guard proof.** A suspend from anything but RUNNING is refused with

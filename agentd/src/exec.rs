@@ -836,6 +836,23 @@ pub async fn ack(State(state): State<AppState>, Path(id): Path<String>) -> Respo
 
     let mut slot = shared.result.lock().await;
     if slot.is_none() {
+        // An empty slot means one of two things, and `acked_at` tells them
+        // apart: the first ack takes the result, so a duplicate ack also finds
+        // the slot empty. Reading that as "still running" would send the caller
+        // back into a wait loop over an exec that already exited.
+        let already_acked = state.with_execs(|execs| {
+            execs
+                .get(&id)
+                .map(|entry| entry.acked_at.is_some())
+                .unwrap_or(false)
+        });
+        if already_acked {
+            return fail(
+                StatusCode::CONFLICT,
+                ERROR_ALREADY_ACKED,
+                "output was released by an earlier ack",
+            );
+        }
         return fail(
             StatusCode::CONFLICT,
             ERROR_STILL_RUNNING,
@@ -844,8 +861,9 @@ pub async fn ack(State(state): State<AppState>, Path(id): Path<String>) -> Respo
     }
 
     let released = slot.take();
-    drop(slot);
-
+    // Marked while the slot lock is still held, so a concurrent duplicate ack
+    // cannot observe the emptied slot before `acked_at` is set and misreport
+    // an acked exec as still running.
     let marked = state.with_execs(|execs| match execs.get_mut(&id) {
         Some(entry) if entry.acked_at.is_none() => {
             entry.acked_at = Some(Instant::now());
@@ -857,6 +875,7 @@ pub async fn ack(State(state): State<AppState>, Path(id): Path<String>) -> Respo
         Some(_) => false,
         None => false,
     });
+    drop(slot);
 
     if !marked {
         return fail(
@@ -1878,9 +1897,17 @@ mod tests {
         assert!(acked_at.is_some(), "ack did not start the TTL clock");
 
         // A second ack has nothing left to hand back, so it is a conflict rather
-        // than a 200 with empty output that would read as "no output".
+        // than a 200 with empty output that would read as "no output". The slug
+        // matters as much as the status: the first ack emptied the result slot,
+        // and a handler that read the empty slot as "still running" would send
+        // the caller back into a wait loop over an exec that already exited.
         let second = ack(State(state.clone()), Path("ackme".to_string())).await;
         assert_eq!(second.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            body_json(second).await["error"],
+            ERROR_ALREADY_ACKED,
+            "a duplicate ack must say already_acked, not still_running"
+        );
     }
 
     /// Acking a live exec is 409. A silent success would drop output that is
