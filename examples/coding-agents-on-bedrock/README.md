@@ -56,14 +56,15 @@ agents consume the same token:
 - **Claude Code** has a native Bedrock mode: `CLAUDE_CODE_USE_BEDROCK=1`
   plus `AWS_BEARER_TOKEN_BEDROCK`, with the model chosen by
   `ANTHROPIC_MODEL` (an inference-profile id, e.g.
-  `global.anthropic.claude-haiku-4-5-20251001-v1:0`).
+  `global.anthropic.claude-opus-5`).
 - **Codex CLI** has no Bedrock mode, but Bedrock exposes an
   OpenAI-compatible surface. Current Codex speaks only the Responses wire
   API, which lives on the Mantle host
   (`base_url = https://bedrock-mantle.<region>.api.aws/openai/v1`), not on
   `bedrock-runtime` (that host's `/openai/v1` is chat-completions only,
   which Codex dropped). A five-line `config.toml` defines the provider with
-  the bearer token as the API key (default model `openai.gpt-5.6-terra`).
+  the bearer token as the API key (default model `openai.gpt-5.6-sol`,
+  which carries a 1M-token context window on Bedrock).
 
 The token never appears in the image, a command line, or a daemon log; it
 lives in `/workspace/.agent-env` inside one VM, and expires on its own.

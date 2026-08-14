@@ -20,8 +20,11 @@ set -euo pipefail
 
 REGION="${AWS_REGION:-us-east-1}"
 AGENTD="${AGENTD:-target/aarch64-unknown-linux-musl/release/agentd}"
-CLAUDE_MODEL="${CLAUDE_MODEL:-global.anthropic.claude-haiku-4-5-20251001-v1:0}"
-CODEX_MODEL="${CODEX_MODEL:-openai.gpt-5.6-terra}"
+# Opus 5 via the global inference profile; Sol carries a 1M-token context
+# window on Bedrock (context length is a model property, not a model-id
+# variant — there is no separate "-1m" id).
+CLAUDE_MODEL="${CLAUDE_MODEL:-global.anthropic.claude-opus-5}"
+CODEX_MODEL="${CODEX_MODEL:-openai.gpt-5.6-sol}"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 
 jqr() { python3 -c "import json,sys; print(json.load(sys.stdin)['data']$1)"; }
