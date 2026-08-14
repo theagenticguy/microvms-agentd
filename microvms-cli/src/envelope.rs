@@ -182,12 +182,9 @@ impl<O: Write, E: Write> Output<O, E> {
                     serde_json::to_string_pretty(envelope).unwrap_or_else(|_| envelope.to_string());
                 let _ = writeln!(self.stdout, "{rendered}");
             }
-            Format::Dense if envelope.get("status") == Some(&json!("error")) => {
-                // A dense *failure* still carries the code, because the whole point of
-                // dense is a consumer that branches on field one.
-                let _ = writeln!(self.stdout, "{text}");
-            }
             _ => {
+                // A dense *failure* still carries the code in `text` — `main.rs::report`
+                // renders it with `render_error_dense`, so field one is the code.
                 let _ = writeln!(self.stdout, "{text}");
             }
         }

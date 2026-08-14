@@ -217,7 +217,7 @@ async fn handle_for_test<O: std::io::Write, E: std::io::Write>(
         Command::Logs(args) => local::logs(ctx, args),
         Command::Cost(args) => cost::cost(ctx, args),
         Command::Doctor(args) => doctor::doctor(ctx, args).await,
-        Command::Manifest(_) => local::manifest(ctx),
+        Command::Manifest => local::manifest(ctx),
         Command::Constants(_) => local::constants(ctx),
     }
 }
@@ -519,7 +519,7 @@ async fn no_local_command_touches_a_seam_door() {
             cycles: 1,
             hold_sec: 3600.0,
         }),
-        Command::Manifest(crate::cli::ManifestArgs { emit_json: true }),
+        Command::Manifest,
         Command::Constants(crate::cli::ConstantsArgs { emit_json: true }),
     ];
     for command in &commands {

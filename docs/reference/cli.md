@@ -308,9 +308,7 @@ Emits the whole command surface, its exit codes, and its envelope schema, genera
 
 `microvms-cli/src/commands/local.rs:191`
 
-Flags:
-
-- `--emit-json` — emit JSON; on by default here, unlike every other command, because the only consumer that asks for a manifest is one that parses it. `microvms-cli/src/cli.rs:818-819`.
+The command takes no flags and always emits JSON, because the only consumer that asks for a manifest is one that parses it.
 
 ## constants
 

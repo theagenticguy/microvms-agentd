@@ -255,21 +255,6 @@ pub enum ExecEvent {
     Exit(protocol::exec::ExitEvent),
 }
 
-impl ExecEvent {
-    /// The offset one past this event's last byte, i.e. where a cursor moves to.
-    ///
-    /// `None` for [`ExecEvent::Exit`]: the terminal event's offset is a total rather
-    /// than a position to resume at, and treating it as a cursor would ask the daemon
-    /// to replay from the end of a finished stream.
-    pub fn end(&self) -> Option<u64> {
-        match self {
-            ExecEvent::Output { offset, data, .. } => Some(offset + data.len() as u64),
-            ExecEvent::Gap { to, .. } => Some(*to),
-            ExecEvent::Exit(_) => None,
-        }
-    }
-}
-
 /// Maps one frame onto a typed event.
 ///
 /// Three outcomes, and the middle one is the reason this returns a nested `Result`:
@@ -652,30 +637,6 @@ mod tests {
         ).expect("under the pending ceiling");
         let err = decode(&frames[0]).expect_err("bad base64 must be reported");
         assert!(err.to_string().contains('7'), "{err}");
-    }
-
-    /// A cursor moves past delivered bytes and past a gap, and never past an exit.
-    #[test]
-    fn an_events_end_is_where_a_cursor_resumes() {
-        let output = ExecEvent::Output {
-            stream: protocol::exec::StreamKind::Stdout,
-            offset: 10,
-            data: b"abcd".to_vec(),
-        };
-        assert_eq!(output.end(), Some(14));
-        assert_eq!(ExecEvent::Gap { from: 3, to: 9 }.end(), Some(9));
-        assert_eq!(
-            ExecEvent::Exit(protocol::exec::ExitEvent {
-                exit_code: Some(0),
-                signal: None,
-                truncated: false,
-                writers_may_be_alive: false,
-                offset: 99,
-            })
-            .end(),
-            None,
-            "the terminal offset is a total, not a resume point"
-        );
     }
 
     /// A multi-line `data:` payload joins with newlines, as the spec says.

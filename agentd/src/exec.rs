@@ -1073,7 +1073,7 @@ fn spawn(
             id.to_string(),
             ExecEntry {
                 pgid,
-                shared: clone_shared(&shared),
+                shared: Arc::clone(&shared),
                 acked_at: None,
             },
         );
@@ -1118,10 +1118,6 @@ fn spawn(
     });
 
     Ok(())
-}
-
-fn clone_shared(shared: &Arc<Shared>) -> Arc<Shared> {
-    Arc::clone(shared)
 }
 
 fn phase_of(acked: bool, finished: bool) -> Phase {
@@ -1283,13 +1279,16 @@ impl<R: AsyncReadExt + Unpin> Capped<R> {
     /// that still has the other stream open does not spin on this one — the
     /// caller's loop exits on `done()`.
     async fn pump(&mut self, shared: &Shared) {
-        if self.eof {
-            std::future::pending::<()>().await;
-            return;
-        }
-        let Some(reader) = self.reader.as_mut() else {
-            self.eof = true;
-            return;
+        let reader = match (self.eof, self.reader.as_mut()) {
+            (false, Some(reader)) => reader,
+            // `eof` is initialized to `reader.is_none()` and nothing writes
+            // `reader` after construction, so a missing reader *is* EOF: both
+            // resolve to the never-ready future, and the caller's loop exits on
+            // `done()`.
+            _ => {
+                std::future::pending::<()>().await;
+                return;
+            }
         };
         match reader.read(&mut self.scratch).await {
             Ok(0) => self.eof = true,
