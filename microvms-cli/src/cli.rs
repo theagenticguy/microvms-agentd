@@ -508,6 +508,36 @@ pub struct ExecArgs {
     #[arg(long)]
     pub cwd: Option<String>,
 
+    /// Set one environment variable for the command, as KEY=VALUE. Repeatable.
+    ///
+    /// These flags are the child's *whole* environment: the daemon starts every exec from an
+    /// empty one (`env_clear()`, so the agent token never leaks into a child,
+    /// `agentd/src/exec.rs:1003`) and applies exactly this map. There is no inherited PATH to
+    /// append to — a command that needs one must be handed one, which is the failure the
+    /// coding-agents example documents.
+    ///
+    /// Split at the **first** `=`, so a value may itself contain `=` (`--env A=b=c` sets `A`
+    /// to `b=c`). An empty value is legal and explicit (`--env EMPTY=` sets the variable to
+    /// the empty string); a missing `=` and an empty KEY are refused here, before anything is
+    /// sent, because the daemon would accept either and the child would carry a variable no
+    /// shell can read back.
+    #[arg(long, value_name = "KEY=VALUE", value_parser = parse_env_pair)]
+    pub env: Vec<(String, String)>,
+
+    /// Numeric uid to run the command as. Omitted runs as the daemon's own user.
+    ///
+    /// Numeric because that is the protocol's type (`StartRequest.user: Option<u32>`) and the
+    /// daemon's mechanism (`Command::uid`, between fork and exec) — a *name* would need an
+    /// `/etc/passwd` lookup inside a guest whose base image may not have one. The number is
+    /// not validated here: the guest's uid space is the daemon's to know, and the spawn
+    /// failure it answers for a uid it cannot assume is the real check.
+    #[arg(long, value_name = "UID")]
+    pub user: Option<u32>,
+
+    /// Numeric gid to run the command as. Omitted keeps the daemon's own group.
+    #[arg(long, value_name = "GID")]
+    pub group: Option<u32>,
+
     /// Use this exec id instead of a fresh one, making a retry idempotent.
     ///
     /// # This is TRAP-1's shape, inverted, and the inversion is the point
@@ -534,7 +564,7 @@ pub struct ExecArgs {
     /// OK with `phase: running` — polling is not a failure, and an exit code of `null` with that
     /// phase is the honest report of "not finished yet". Does not ack, so the output stays
     /// readable; `microvm ack` is what releases it.
-    #[arg(long, value_name = "ID", conflicts_with_all = ["exec_id", "stream", "stdin", "cwd", "detach"])]
+    #[arg(long, value_name = "ID", conflicts_with_all = ["exec_id", "stream", "stdin", "cwd", "detach", "env", "user", "group"])]
     pub poll: Option<String>,
 
     /// Start the command and return immediately, without waiting and **without acking**.
@@ -839,6 +869,39 @@ pub struct ConstantsArgs {
     pub emit_json: bool,
 }
 
+/// One `--env KEY=VALUE` pair, split at the first `=`.
+///
+/// A parser rather than a raw `Vec<String>` the handler splits later, for the CLI-5 reason:
+/// the parse failure names the flag and costs nothing, where a handler failure happens after
+/// the session attach — a network round trip spent discovering a typo.
+///
+/// The three decisions, each the opposite of a silent misread:
+///
+/// - **Split at the first `=`**, so `A=b=c` sets `A` to `b=c`. Splitting at the last would
+///   read the same input as `A=b` set to `c`, and connection strings are full of `=`.
+/// - **An empty VALUE is legal** (`EMPTY=`): setting a variable to the empty string is a real
+///   thing callers do (emptying `PYTHONPATH`), and it is not the same as unsetting — the
+///   child's environment starts empty anyway, so *unset* is spelled by omission.
+/// - **A missing `=` and an empty KEY are refused.** The daemon accepts both — `env` is a
+///   free map on the wire — but a variable named `""` is one no shell can read back, and a
+///   bare `--env DEBUG` is more likely a caller who meant `DEBUG=1` than one who meant the
+///   empty string under a key.
+fn parse_env_pair(pair: &str) -> Result<(String, String), String> {
+    let Some((key, value)) = pair.split_once('=') else {
+        return Err(format!(
+            "no `=` in {pair:?}: --env takes KEY=VALUE. To set an empty value write \
+             `--env {pair}=`; the child's environment starts empty, so leaving a variable \
+             unset is spelled by not passing it."
+        ));
+    };
+    if key.is_empty() {
+        return Err(format!(
+            "empty KEY in {pair:?}: a variable named \"\" is one no shell can read back"
+        ));
+    }
+    Ok((key.to_string(), value.to_string()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1057,6 +1120,9 @@ mod tests {
             vec!["--stdin"],
             vec!["--exec-id", "x-2"],
             vec!["--cwd", "/tmp"],
+            vec!["--env", "A=1"],
+            vec!["--user", "1000"],
+            vec!["--group", "1000"],
         ] {
             let mut argv = vec!["microvm", "exec", "--poll", "x-1"];
             argv.extend(attach);
@@ -1112,6 +1178,115 @@ mod tests {
         ];
         alone.extend(attach);
         Cli::try_parse_from(&alone).expect("--detach pairs with --exec-id and tolerates --timeout");
+    }
+
+    /// `--env` splits at the first `=`, keeps an empty VALUE, and refuses the two misreads.
+    ///
+    /// Each failure mode is asserted on its message rather than only on `is_err()`, because the
+    /// message is the flag's whole interface at the moment of the typo: a refusal that does not
+    /// say "no `=`" sends the caller to the docs for a mistake the error could have named.
+    #[test]
+    fn an_env_pair_splits_at_the_first_equals_and_refuses_the_misreads() {
+        // The first `=`, so a value may itself contain `=` — connection strings do.
+        assert_eq!(
+            parse_env_pair("DSN=postgres://u:p@h/db?sslmode=require"),
+            Ok((
+                "DSN".to_string(),
+                "postgres://u:p@h/db?sslmode=require".to_string()
+            ))
+        );
+        assert_eq!(
+            parse_env_pair("PATH=/usr/bin:/bin"),
+            Ok(("PATH".to_string(), "/usr/bin:/bin".to_string()))
+        );
+        // An empty VALUE is legal and explicit: setting to "" is not unsetting, and unset is
+        // spelled by omission because the child's environment starts empty anyway.
+        assert_eq!(
+            parse_env_pair("EMPTY="),
+            Ok(("EMPTY".to_string(), String::new()))
+        );
+
+        // A missing `=` is more likely `DEBUG=1` forgotten than "" wanted under a key.
+        let missing = parse_env_pair("DEBUG").expect_err("a bare word is not a pair");
+        assert!(missing.contains("no `=`"), "{missing}");
+        assert!(
+            missing.contains("--env DEBUG="),
+            "the refusal must show the spelling for an empty value: {missing}"
+        );
+
+        // An empty KEY is a variable no shell can read back.
+        let empty_key = parse_env_pair("=value").expect_err("a nameless variable");
+        assert!(empty_key.contains("empty KEY"), "{empty_key}");
+    }
+
+    /// `--env` is repeatable and each occurrence is validated by the parser, not the handler.
+    ///
+    /// The parse failure costs nothing; a handler failure happens after the session attach — a
+    /// network round trip spent discovering a typo.
+    #[test]
+    fn env_is_repeatable_and_a_bad_pair_fails_at_parse_time() {
+        let attach = [
+            "--endpoint",
+            "https://vm.example",
+            "--agent-token",
+            "t",
+            "--microvm-id",
+            "mvm-1",
+        ];
+        let mut argv = vec![
+            "microvm", "exec", "env", "--env", "A=1", "--env", "B=", "--env", "C=x=y",
+        ];
+        argv.extend(attach);
+        let cli = Cli::try_parse_from(&argv).expect("three pairs parse");
+        let Command::Exec(args) = cli.command else {
+            panic!("an exec parses as an exec");
+        };
+        assert_eq!(
+            args.env,
+            [
+                ("A".to_string(), "1".to_string()),
+                ("B".to_string(), String::new()),
+                ("C".to_string(), "x=y".to_string()),
+            ]
+        );
+
+        let mut bad = vec!["microvm", "exec", "env", "--env", "NOEQUALS"];
+        bad.extend(attach);
+        assert!(
+            Cli::try_parse_from(&bad).is_err(),
+            "a pair with no `=` must fail before any handler runs"
+        );
+    }
+
+    /// `--user` and `--group` are numeric, because that is the protocol's type.
+    ///
+    /// A name would need an `/etc/passwd` lookup inside a guest whose base image may not have
+    /// one; the daemon's `Command::uid`/`gid` take numbers and so does the wire.
+    #[test]
+    fn user_and_group_are_numeric_and_a_name_is_refused_at_parse_time() {
+        let attach = [
+            "--endpoint",
+            "https://vm.example",
+            "--agent-token",
+            "t",
+            "--microvm-id",
+            "mvm-1",
+        ];
+        let mut argv = vec!["microvm", "exec", "id", "--user", "1000", "--group", "1000"];
+        argv.extend(attach);
+        let cli = Cli::try_parse_from(&argv).expect("numeric ids parse");
+        let Command::Exec(args) = cli.command else {
+            panic!("an exec parses as an exec");
+        };
+        assert_eq!(args.user, Some(1000));
+        assert_eq!(args.group, Some(1000));
+
+        let mut named = vec!["microvm", "exec", "id", "--user", "nobody"];
+        named.extend(attach);
+        assert!(
+            Cli::try_parse_from(&named).is_err(),
+            "a user *name* has no meaning on the wire; the protocol carries a u32"
+        );
     }
 
     /// `--from-offset` cannot be asked for without the stream it is a cursor into.

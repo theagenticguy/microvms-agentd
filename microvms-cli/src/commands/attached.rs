@@ -137,6 +137,14 @@ pub async fn exec<O: std::io::Write, E: std::io::Write>(
             cwd: args.cwd.clone(),
             exec_id: args.exec_id.clone(),
             stdin: args.stdin,
+            // Collected here rather than in the parser, because clap's `Vec<(String, String)>`
+            // is the repeatable flag's natural shape and the wire's `HashMap` is not: a map
+            // built in the parser would silently deduplicate before anyone chose to. Later
+            // flags win on a repeated KEY, which is the shell convention (`FOO=a FOO=b cmd`
+            // runs with `b`).
+            env: args.env.iter().cloned().collect(),
+            user: args.user,
+            group: args.group,
         });
     let exec_id = request.exec_id.clone();
     ctx.out.progress(&format!("exec {exec_id}: {command}"));
