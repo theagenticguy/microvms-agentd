@@ -319,3 +319,10 @@ run = "terraform -chdir=conformance/infra destroy -auto-approve"
 [tasks.install]
 description = "Install git hooks"
 run = "lefthook install"
+
+[tasks."install:cli"]
+description = "Install the `microvm` binary into ~/.cargo/bin, so it runs bare"
+# `--locked` so the installed binary is built against Cargo.lock, the same
+# resolution every gate tested; a floating install could resolve newer
+# dependency versions than anything in CI ever compiled.
+run = "cargo install --path microvms-cli --locked"

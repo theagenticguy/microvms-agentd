@@ -33,11 +33,17 @@ git clone https://github.com/theagenticguy/microvms-agentd
 cd microvms-agentd
 mise install                # toolchains: Rust with the aarch64-musl target, Terraform
 mise run build              # agentd, cross-compiled for the VM (aarch64-musl)
-mise run build:cli          # the microvm CLI, for your machine
+mise run install:cli        # installs `microvm` into ~/.cargo/bin
 ```
 
 The daemon cross-compiles to `aarch64-unknown-linux-musl` because Lambda
-MicroVMs are ARM64-only; the CLI builds for whatever machine you are on.
+MicroVMs are ARM64-only; the CLI installs into `~/.cargo/bin`, which rustup
+puts on your PATH, so `microvm` runs bare from here on. The daemon binary
+lands at a long path, so give it a name:
+
+```bash
+export AGENTD=target/aarch64-unknown-linux-musl/release/agentd
+```
 
 **2. Create the AWS prerequisites.**
 
@@ -65,7 +71,7 @@ convenience, not a requirement.
 **3. Check the machine.**
 
 ```bash
-target/release/microvm doctor --binary target/aarch64-unknown-linux-musl/release/agentd
+microvm doctor --binary $AGENTD
 ```
 
 `doctor` checks your credentials, the region, the three environment values,
@@ -75,9 +81,7 @@ broken prerequisite and suggests the fix.
 **4. Run your first command in a MicroVM.**
 
 ```bash
-target/release/microvm run \
-  target/aarch64-unknown-linux-musl/release/agentd \
-  --exec "uname -a && echo hello from inside"
+microvm run $AGENTD --exec "uname -a && echo hello from inside"
 ```
 
 This builds an image with `agentd` as its entrypoint, launches a VM from it,
@@ -93,8 +97,7 @@ Pass `--keep` to leave the VM running. The output includes three values every
 attached command needs: the endpoint, the agent token, and the MicroVM id.
 
 ```bash
-target/release/microvm run --keep \
-  target/aarch64-unknown-linux-musl/release/agentd
+microvm run --keep $AGENTD
 
 # capture endpoint, agentToken, and microvmId from the output, then:
 
