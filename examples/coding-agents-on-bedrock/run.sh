@@ -29,28 +29,23 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 
 jqr() { python3 -c "import json,sys; print(json.load(sys.stdin)['data']$1)"; }
 
-# ── 1. the image: build once per Dockerfile, reuse by content hash ──────────
+# ── 1. the image: build once per content hash, reuse otherwise ──────────────
 # The image snapshot has a one-week minimum retention, so rebuilding on every
 # run costs money for nothing. Reusing a FIXED name is the trap: deleting
 # and recreating an image under the same name can serve a stale snapshot
 # (measured; it is the same class of hazard as the clientToken replay in
-# docs/PLATFORM.md). Keying the name to the Dockerfile's hash gives both
-# properties: an unchanged Dockerfile reuses its image, a changed one gets a
-# fresh name and a fresh build.
-# `run --image` wants the image ARN (RunMicrovm rejects a bare name), so
-# resolve it from the listing either way.
-IMAGE_NAME="${IMAGE_NAME:-coding-agents-$(sha256sum "$HERE/Dockerfile" | cut -c1-12)}"
-IMAGE_ARN=$(aws lambda-microvms list-microvm-images --region "$REGION" \
-  --query "items[?name=='$IMAGE_NAME'].imageArn" --output text)
-if [ -z "$IMAGE_ARN" ] || [ "$IMAGE_ARN" = "None" ]; then
-  echo "building image $IMAGE_NAME (server-side, several minutes)..." >&2
-  microvm build "$AGENTD" --json \
-    --name "$IMAGE_NAME" \
-    --dockerfile "$HERE/Dockerfile" \
-    --region "$REGION" >/dev/null
-  IMAGE_ARN=$(aws lambda-microvms list-microvm-images --region "$REGION" \
-    --query "items[?name=='$IMAGE_NAME'].imageArn" --output text)
-fi
+# docs/PLATFORM.md). `build --reuse` closes both at once: it keys the image
+# name to a hash of the build inputs (the agentd binary AND the Dockerfile —
+# strictly better than the Dockerfile-only hash this script used to compute),
+# skips the build when that name already exists, and reports the image ARN
+# either way. On a hit the envelope carries `reused: true` and returns in
+# seconds; on a miss the server-side build takes several minutes.
+echo "resolving image (builds server-side on first run, several minutes)..." >&2
+BUILT=$(microvm build "$AGENTD" --json --reuse \
+  --name coding-agents \
+  --dockerfile "$HERE/Dockerfile" \
+  --region "$REGION")
+IMAGE_ARN=$(echo "$BUILT" | jqr "['imageIdentifier']")
 
 # ── 2. launch, keep, with egress ────────────────────────────────────────────
 # --egress is what lets the guest reach bedrock-runtime; without it the VM has

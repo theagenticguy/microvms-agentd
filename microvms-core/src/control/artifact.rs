@@ -75,6 +75,37 @@ pub fn build_artifact(binary: &[u8], dockerfile: &str) -> Result<Vec<u8>, Error>
     Ok(bytes)
 }
 
+/// The sha256 of the artifact's two inputs, as lowercase hex.
+///
+/// # What is hashed, and why not the zip
+///
+/// The **inputs** — the daemon binary's bytes and the Dockerfile text — rather than the
+/// bytes [`build_artifact`] produces. The zip is a container: its byte identity depends on
+/// the `zip` crate's version, its compression level, and its header defaults, so an
+/// upgraded dependency would silently change every image name and orphan every reuse. The
+/// inputs are what a build actually consumes, and two builds with equal inputs produce
+/// interchangeable images — which is the property content-addressed reuse rests on.
+///
+/// Each input is length-prefixed before hashing, so `(binary="ab", dockerfile="c")` and
+/// `(binary="a", dockerfile="bc")` are different hashes rather than one concatenation.
+pub fn artifact_content_hash(binary: &[u8], dockerfile: &str) -> String {
+    use sha2::{Digest as _, Sha256};
+
+    let mut hasher = Sha256::new();
+    hasher.update((binary.len() as u64).to_be_bytes());
+    hasher.update(binary);
+    hasher.update((dockerfile.len() as u64).to_be_bytes());
+    hasher.update(dockerfile.as_bytes());
+    let digest = hasher.finalize();
+
+    let mut hex = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        use std::fmt::Write as _;
+        let _ = write!(hex, "{byte:02x}");
+    }
+    hex
+}
+
 /// A base image: the platform ARN, the Dockerfile `FROM` that pairs with it, and whether
 /// it declares a `WORKDIR`.
 ///
@@ -360,6 +391,42 @@ mod tests {
                  launched from it, so a token here is a token shared with every VM"
             );
         }
+    }
+
+    /// The content hash is a pure function of the two inputs: equal inputs agree, either
+    /// input changing changes it, and the boundary between the two inputs is part of the
+    /// identity.
+    ///
+    /// The boundary case is the one worth spelling out: without length prefixes,
+    /// `("ab", "c")` and `("a", "bc")` hash the same concatenation — and a Dockerfile
+    /// edit could then collide with a binary edit, serving a stale image for changed
+    /// inputs, which is the exact hazard the hash exists to close.
+    #[test]
+    fn the_content_hash_follows_the_inputs_and_only_the_inputs() {
+        let hash = artifact_content_hash(b"binary-bytes", "FROM scratch\n");
+        assert_eq!(
+            hash,
+            artifact_content_hash(b"binary-bytes", "FROM scratch\n")
+        );
+        assert_eq!(hash.len(), 64, "sha256 as lowercase hex");
+        assert!(
+            hash.chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+        );
+
+        assert_ne!(
+            hash,
+            artifact_content_hash(b"other-bytes", "FROM scratch\n")
+        );
+        assert_ne!(
+            hash,
+            artifact_content_hash(b"binary-bytes", "FROM scratch\nRUN true\n")
+        );
+        assert_ne!(
+            artifact_content_hash(b"ab", "c"),
+            artifact_content_hash(b"a", "bc"),
+            "the input boundary is part of the identity"
+        );
     }
 
     /// The Dockerfile's `FROM` comes from the base image, so the two cannot disagree.

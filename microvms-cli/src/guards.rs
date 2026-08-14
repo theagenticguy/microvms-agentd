@@ -234,6 +234,7 @@ fn aws_commands(binary: &std::path::Path) -> Vec<(&'static str, Command, Door)> 
                 memory: MemoryMib::Mib2048,
                 dockerfile: None,
                 repair_identity: false,
+                reuse: false,
                 port: None,
                 region: region_flags(),
                 infra: InfraFlags::default(),
@@ -528,7 +529,7 @@ async fn no_local_command_touches_a_seam_door() {
 /// **literal** written from the service model, so a member this crate misreads cannot be
 /// misread identically by the fake.
 struct ScriptedTransport {
-    calls: Mutex<Vec<String>>,
+    calls: Mutex<Vec<Call>>,
     /// Answers per operation, front to back; the last repeats.
     answers: Mutex<std::collections::HashMap<String, std::collections::VecDeque<(u16, String)>>>,
     /// Fired the first time this operation is seen. The interrupt's trigger.
@@ -561,7 +562,12 @@ impl ScriptedTransport {
     }
 
     fn calls(&self) -> Vec<String> {
-        self.calls.lock().expect("not poisoned").clone()
+        self.calls
+            .lock()
+            .expect("not poisoned")
+            .iter()
+            .map(|call| call.operation.to_string())
+            .collect()
     }
 
     fn called(&self, operation: &str) -> usize {
@@ -570,15 +576,39 @@ impl ScriptedTransport {
             .filter(|call| *call == operation)
             .count()
     }
+
+    /// The paths requested for `operation`, in order — where the resolution guards read
+    /// the `nameFilter` and `nextToken` query members.
+    fn paths_of(&self, operation: &str) -> Vec<String> {
+        self.calls
+            .lock()
+            .expect("not poisoned")
+            .iter()
+            .filter(|call| call.operation == operation)
+            .map(|call| call.path.clone())
+            .collect()
+    }
+
+    /// The first body sent to `operation`, as generic JSON — the recorder shape core's own
+    /// fake uses, so an assertion reads the wire member rather than a struct's opinion of it.
+    fn first_body(&self, operation: &str) -> serde_json::Value {
+        let calls = self.calls.lock().expect("not poisoned");
+        let call = calls
+            .iter()
+            .find(|call| call.operation == operation)
+            .unwrap_or_else(|| panic!("no call to {operation}"));
+        let body = call
+            .body
+            .as_deref()
+            .unwrap_or_else(|| panic!("{operation} sent no body"));
+        serde_json::from_slice(body).expect("a JSON body")
+    }
 }
 
 impl Transport for ScriptedTransport {
     fn send(&self, call: Call) -> BoxFuture<'_, Result<Reply, Error>> {
         let operation = call.operation.to_string();
-        self.calls
-            .lock()
-            .expect("not poisoned")
-            .push(operation.clone());
+        self.calls.lock().expect("not poisoned").push(call);
 
         // The interrupt fires *when the launch is accepted*, which is the instant CLI-6 is about:
         // a VM exists, its identifier is recorded, and the RUNNING wait has not finished.
@@ -701,9 +731,17 @@ fn microvm_body(state: &str) -> String {
 
 /// `run --image`, so the launch reaches the wire without a build or an upload.
 fn interrupt_run_args(state_dir: std::path::PathBuf) -> RunArgs {
+    run_args_for_image(
+        "arn:aws:lambda:us-east-1:123456789012:microvm-image/img",
+        state_dir,
+    )
+}
+
+/// `run --image <identifier>` with everything else defaulted, for the resolution guards.
+fn run_args_for_image(identifier: &str, state_dir: std::path::PathBuf) -> RunArgs {
     RunArgs {
         binary: None,
-        image: Some("arn:aws:lambda:us-east-1:123456789012:microvm-image/img".into()),
+        image: Some(identifier.into()),
         artifact_uri: None,
         exec: None,
         name: Some("img".into()),
@@ -901,6 +939,409 @@ async fn an_interrupt_whose_teardown_succeeds_reports_no_leak_and_still_exits_in
         crate::ledger::read_all(&dir.0).is_empty(),
         "a clean teardown leaves no ledger"
     );
+}
+
+// ── image name resolution and `build --reuse`, against the scripted transport ─
+
+/// `ListMicrovmImagesResponse`, in the model's own spelling, with an optional `nextToken`.
+///
+/// A literal for the reason every body in this file is one: a response produced by the
+/// same serializer the client deserializes with cannot catch a misspelled member.
+fn list_images_body(names: &[&str], next_token: Option<&str>) -> String {
+    let items: Vec<String> = names
+        .iter()
+        .map(|name| {
+            format!(
+                r#"{{"imageArn": "arn:aws:lambda:us-east-1:123456789012:microvm-image/{name}",
+                     "name": "{name}", "state": "ACTIVE", "createdAt": 1754524800}}"#
+            )
+        })
+        .collect();
+    let token = match next_token {
+        Some(token) => format!(r#", "nextToken": "{token}""#),
+        None => String::new(),
+    };
+    format!(r#"{{"items": [{}]{token}}}"#, items.join(", "))
+}
+
+/// **`run --image <bare-name>` resolves the name to its ARN before the launch.**
+///
+/// The measured defect this closes: the identifier used to pass verbatim into
+/// `RunMicrovm.imageIdentifier`, and a bare name was answered with HTTP 400 "Malformed
+/// ARN" — a message that says nothing about names. The assertions are on the wire: the
+/// listing was asked with the model's `nameFilter`, and the launch body's
+/// `imageIdentifier` is the resolved ARN rather than the name.
+///
+/// `RunMicrovm` is scripted to fail with a 400 so the test ends at the launch rather than
+/// entering the RUNNING wait — resolution has already happened by then, which is what is
+/// under test.
+///
+/// **Guard proof.** Revert the resolution (pass `identifier.clone()` through as before)
+/// and the `imageIdentifier` assertion reads the bare name. Run 2026-08-14 against the
+/// pre-change handler shape; failed exactly there.
+#[tokio::test]
+async fn a_bare_image_name_is_resolved_to_its_arn_before_the_launch() {
+    let dir = TempDir::new("resolve-name");
+    let transport = Arc::new(ScriptedTransport::new());
+    transport
+        .answer(
+            "ListMicrovmImages",
+            200,
+            &list_images_body(&["coding-agents"], None),
+        )
+        .answer("RunMicrovm", 400, r#"{"message": "scripted stop"}"#);
+
+    let seam = ScriptedSeam {
+        transport: Arc::clone(&transport),
+        clock: Arc::new(YieldingClock::default()),
+    };
+    let command = Command::Run(run_args_for_image("coding-agents", dir.0.clone()));
+    let (result, stderr) = dispatch_with(&seam, &command, full_infra()).await;
+    result.expect_err("the scripted RunMicrovm failure ends the run after resolution");
+
+    assert_eq!(transport.called("ListMicrovmImages"), 1);
+    let listing = transport.paths_of("ListMicrovmImages");
+    assert!(
+        listing[0].contains("nameFilter=coding-agents"),
+        "the listing narrows by the model's nameFilter member: {}",
+        listing[0]
+    );
+
+    let body = transport.first_body("RunMicrovm");
+    assert_eq!(
+        body["imageIdentifier"],
+        "arn:aws:lambda:us-east-1:123456789012:microvm-image/coding-agents",
+        "the launch must carry the resolved ARN, never the bare name — a name here is the \
+         Malformed-ARN 400 this exists to close: {body}"
+    );
+
+    // The progress line names the resolved ARN, so an operator reading a stalled launch
+    // knows which image the name landed on.
+    assert!(
+        stderr.contains("resolved image name coding-agents to arn:aws:lambda"),
+        "{stderr}"
+    );
+}
+
+/// **An identifier already shaped like an ARN passes through with zero listing calls.**
+///
+/// The caller who holds the ARN — every existing script — pays nothing for the
+/// resolution existing. Asserted on the call count, which is the observable that
+/// distinguishes "resolved to itself" from "never looked".
+#[tokio::test]
+async fn an_arn_image_identifier_launches_with_no_listing_call() {
+    let dir = TempDir::new("resolve-arn-passthrough");
+    let transport = Arc::new(ScriptedTransport::new());
+    transport.answer("RunMicrovm", 400, r#"{"message": "scripted stop"}"#);
+
+    let seam = ScriptedSeam {
+        transport: Arc::clone(&transport),
+        clock: Arc::new(YieldingClock::default()),
+    };
+    let arn = "arn:aws:lambda:us-east-1:123456789012:microvm-image/img";
+    let command = Command::Run(run_args_for_image(arn, dir.0.clone()));
+    let (result, stderr) = dispatch_with(&seam, &command, full_infra()).await;
+    result.expect_err("the scripted RunMicrovm failure ends the run");
+
+    assert_eq!(
+        transport.called("ListMicrovmImages"),
+        0,
+        "an ARN must cost zero extra calls: {:?}",
+        transport.calls()
+    );
+    assert_eq!(transport.first_body("RunMicrovm")["imageIdentifier"], arn);
+    assert!(
+        !stderr.contains("resolved image name"),
+        "nothing was resolved, so nothing says so: {stderr}"
+    );
+}
+
+/// **A name no image carries is a local `ERR_PRECONDITION` naming the name and the
+/// remedy — and no launch goes out.**
+///
+/// The alternative was the service's 400 "Malformed ARN", which sends the reader to
+/// check their ARN syntax rather than to build the image.
+#[tokio::test]
+async fn an_unknown_image_name_fails_precondition_before_any_launch() {
+    let dir = TempDir::new("resolve-miss");
+    let transport = Arc::new(ScriptedTransport::new());
+    transport.answer("ListMicrovmImages", 200, &list_images_body(&[], None));
+
+    let seam = ScriptedSeam {
+        transport: Arc::clone(&transport),
+        clock: Arc::new(YieldingClock::default()),
+    };
+    let command = Command::Run(run_args_for_image("no-such-image", dir.0.clone()));
+    let (result, _) = dispatch_with(&seam, &command, full_infra()).await;
+
+    let failure = result.expect_err("nothing to launch from");
+    assert_eq!(failure.exit, Exit::Precondition);
+    assert_eq!(failure.code(), "ERR_PRECONDITION");
+    assert!(
+        failure.message.contains("no-such-image"),
+        "{}",
+        failure.message
+    );
+    assert!(
+        failure.message.contains("microvm build"),
+        "the remedy is a build, and the message has to say so: {}",
+        failure.message
+    );
+    assert_eq!(
+        transport.called("RunMicrovm"),
+        0,
+        "no launch may go out for a name that resolved to nothing"
+    );
+}
+
+/// **Resolution follows `nextToken`**, at this level too: an image on page two of the
+/// account's listing is found and launched from.
+///
+/// Core has the same test against its own fake; this one exists because the CLI is the
+/// consumer the packet names, and a delegation that dropped the token would pass core's
+/// test while every CLI resolution stopped at page one.
+#[tokio::test]
+async fn resolution_reads_past_the_first_page_of_the_listing() {
+    let dir = TempDir::new("resolve-paged");
+    let transport = Arc::new(ScriptedTransport::new());
+    transport
+        .answer(
+            "ListMicrovmImages",
+            200,
+            &list_images_body(&["unrelated"], Some("page-2")),
+        )
+        .answer(
+            "ListMicrovmImages",
+            200,
+            &list_images_body(&["coding-agents"], None),
+        )
+        .answer("RunMicrovm", 400, r#"{"message": "scripted stop"}"#);
+
+    let seam = ScriptedSeam {
+        transport: Arc::clone(&transport),
+        clock: Arc::new(YieldingClock::default()),
+    };
+    let command = Command::Run(run_args_for_image("coding-agents", dir.0.clone()));
+    let (result, _) = dispatch_with(&seam, &command, full_infra()).await;
+    result.expect_err("the scripted RunMicrovm failure ends the run after resolution");
+
+    assert_eq!(transport.called("ListMicrovmImages"), 2, "both pages read");
+    let listing = transport.paths_of("ListMicrovmImages");
+    assert!(
+        listing[1].contains("nextToken=page-2"),
+        "the second request carries the first page's token: {}",
+        listing[1]
+    );
+    assert_eq!(
+        transport.first_body("RunMicrovm")["imageIdentifier"],
+        "arn:aws:lambda:us-east-1:123456789012:microvm-image/coding-agents"
+    );
+}
+
+/// The name `build --reuse` derives for `binary`, computed the way the handler computes
+/// it — through core's public hash over the same inputs — so the test knows the name
+/// without copying the derivation logic.
+fn expected_reuse_name(prefix: &str, binary: &std::path::Path) -> String {
+    let bytes = std::fs::read(binary).expect("the fake binary is readable");
+    let dockerfile = microvms_core::control::default_dockerfile(
+        9000,
+        None,
+        &microvms_core::control::BaseImage::al2023(),
+    );
+    let hash = microvms_core::control::artifact_content_hash(&bytes, &dockerfile);
+    format!("{prefix}-{}", &hash[..12])
+}
+
+/// **`build --reuse`, the hit: an image whose content-hash name already exists means no
+/// build at all.**
+///
+/// The load-bearing assertion is the `CreateMicrovmImage` count: a reuse that "worked"
+/// while still creating an image would bill a build and — worse — replay the
+/// stale-snapshot hazard the flag exists to close. The envelope carries `reused: true`
+/// and the existing image's identifier, which is what a script keys on.
+///
+/// **Guard proof.** Make the hit path fall through to the build (delete the early
+/// `return` on `find_image_by_name`'s `Some`) and the count assertion goes red with a
+/// `CreateMicrovmImage` the fake then also fails for lack of an answer.
+#[tokio::test]
+async fn a_reuse_build_whose_hash_name_exists_skips_the_build_entirely() {
+    let binary = FakeBinary::new("reuse-hit");
+    let expected = expected_reuse_name("coding-agents", &binary.0);
+
+    let transport = Arc::new(ScriptedTransport::new());
+    transport.answer(
+        "ListMicrovmImages",
+        200,
+        &list_images_body(&[&expected], None),
+    );
+
+    let seam = ScriptedSeam {
+        transport: Arc::clone(&transport),
+        clock: Arc::new(YieldingClock::default()),
+    };
+    let command = Command::Build(BuildArgs {
+        binary: binary.0.clone(),
+        artifact_uri: None,
+        name: Some("coding-agents".into()),
+        memory: MemoryMib::Mib2048,
+        dockerfile: None,
+        repair_identity: false,
+        reuse: true,
+        port: None,
+        region: region_flags(),
+        infra: InfraFlags::default(),
+    });
+    let (result, stderr) = dispatch_with(&seam, &command, full_infra()).await;
+    let rendered = result.expect("a hit is a success");
+
+    assert_eq!(
+        transport.called("CreateMicrovmImage"),
+        0,
+        "a reuse hit must build nothing: {:?}",
+        transport.calls()
+    );
+    assert_eq!(transport.called("ListMicrovmImages"), 1);
+    let listing = transport.paths_of("ListMicrovmImages");
+    assert!(
+        listing[0].contains(&format!("nameFilter={expected}")),
+        "the listing is asked for the derived name: {}",
+        listing[0]
+    );
+
+    assert_eq!(rendered.data["reused"], true);
+    assert_eq!(rendered.data["imageName"], expected.as_str());
+    assert_eq!(
+        rendered.data["imageIdentifier"],
+        format!("arn:aws:lambda:us-east-1:123456789012:microvm-image/{expected}"),
+        "the existing image's identifier is the envelope's answer"
+    );
+    assert!(stderr.contains("reusing"), "{stderr}");
+}
+
+/// **`build --reuse`, the miss: the build runs, under the derived name.**
+///
+/// Two claims. The build happened — `CreateMicrovmImage` went out — and the name it went
+/// out under carries the content hash, which is what makes the *next* invocation with
+/// the same inputs a hit. A miss that built under the bare prefix would create an image
+/// reuse can never find, and the flag would rebuild forever while reporting success.
+///
+/// **Guard proof.** Keep the seed as the request name on the miss path (drop the
+/// `request.name = name.clone()` assignment) and the `body["name"]` assertion reads
+/// `coding-agents` with no hash suffix.
+#[tokio::test]
+async fn a_reuse_build_whose_hash_name_is_absent_builds_under_the_derived_name() {
+    let binary = FakeBinary::new("reuse-miss");
+    let expected = expected_reuse_name("coding-agents", &binary.0);
+
+    let transport = Arc::new(ScriptedTransport::new());
+    transport
+        .answer("ListMicrovmImages", 200, &list_images_body(&[], None))
+        .answer(
+            "CreateMicrovmImage",
+            201,
+            &format!(
+                r#"{{"imageArn": "arn:aws:lambda:us-east-1:123456789012:microvm-image/{expected}",
+                     "name": "{expected}", "state": "CREATING", "createdAt": 1754524800,
+                     "baseImageArn": "arn:aws:lambda:us-east-1:aws:microvm-image:al2023-1",
+                     "buildRoleArn": "arn:aws:iam::123456789012:role/build",
+                     "codeArtifact": {{"uri": "s3://a-bucket/{expected}.zip"}},
+                     "imageVersion": "1"}}"#
+            ),
+        )
+        .answer(
+            "GetMicrovmImage",
+            200,
+            &format!(
+                r#"{{"imageArn": "arn:aws:lambda:us-east-1:123456789012:microvm-image/{expected}",
+                     "name": "{expected}", "state": "CREATED", "createdAt": 1754524800}}"#
+            ),
+        );
+
+    let seam = ScriptedSeam {
+        transport: Arc::clone(&transport),
+        clock: Arc::new(YieldingClock::default()),
+    };
+    let command = Command::Build(BuildArgs {
+        binary: binary.0.clone(),
+        artifact_uri: None,
+        name: Some("coding-agents".into()),
+        memory: MemoryMib::Mib2048,
+        dockerfile: None,
+        repair_identity: false,
+        reuse: true,
+        port: None,
+        region: region_flags(),
+        infra: InfraFlags::default(),
+    });
+    let (result, _) = dispatch_with(&seam, &command, full_infra()).await;
+    let rendered = result.expect("a miss builds and succeeds");
+
+    assert_eq!(transport.called("CreateMicrovmImage"), 1, "the miss builds");
+    let body = transport.first_body("CreateMicrovmImage");
+    assert_eq!(
+        body["name"],
+        expected.as_str(),
+        "the build goes out under the derived name, hash included — the bare prefix would \
+         create an image reuse can never find: {body}"
+    );
+    assert_eq!(
+        body["codeArtifact"]["uri"],
+        format!("s3://a-bucket/{expected}.zip"),
+        "the derived artifact key follows the derived name"
+    );
+    assert_eq!(rendered.data["reused"], false);
+    assert_eq!(rendered.data["imageName"], expected.as_str());
+}
+
+/// A plain `build` (no `--reuse`) never touches the listing, and its envelope still
+/// carries `reused: false` — the key is always present, so no consumer guards for it.
+#[tokio::test]
+async fn a_plain_build_never_lists_and_reports_reused_false() {
+    let binary = FakeBinary::new("plain-build");
+    let transport = Arc::new(ScriptedTransport::new());
+    transport
+        .answer(
+            "CreateMicrovmImage",
+            201,
+            r#"{"imageArn": "arn:aws:lambda:us-east-1:123456789012:microvm-image/img",
+                 "name": "img", "state": "CREATING", "createdAt": 1754524800,
+                 "baseImageArn": "arn:aws:lambda:us-east-1:aws:microvm-image:al2023-1",
+                 "buildRoleArn": "arn:aws:iam::123456789012:role/build",
+                 "codeArtifact": {"uri": "s3://a-bucket/img.zip"},
+                 "imageVersion": "1"}"#,
+        )
+        .answer(
+            "GetMicrovmImage",
+            200,
+            r#"{"imageArn": "arn:aws:lambda:us-east-1:123456789012:microvm-image/img",
+                 "name": "img", "state": "CREATED", "createdAt": 1754524800}"#,
+        );
+
+    let seam = ScriptedSeam {
+        transport: Arc::clone(&transport),
+        clock: Arc::new(YieldingClock::default()),
+    };
+    let command = Command::Build(BuildArgs {
+        binary: binary.0.clone(),
+        artifact_uri: None,
+        name: Some("img".into()),
+        memory: MemoryMib::Mib2048,
+        dockerfile: None,
+        repair_identity: false,
+        reuse: false,
+        port: None,
+        region: region_flags(),
+        infra: InfraFlags::default(),
+    });
+    let (result, _) = dispatch_with(&seam, &command, full_infra()).await;
+    let rendered = result.expect("builds");
+    assert_eq!(
+        transport.called("ListMicrovmImages"),
+        0,
+        "no --reuse, no listing"
+    );
+    assert_eq!(rendered.data["reused"], false);
+    assert_eq!(rendered.data["imageName"], "img");
 }
 
 // ── the attached surfaces, against a scripted daemon ─────────────────────────

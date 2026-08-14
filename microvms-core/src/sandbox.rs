@@ -500,6 +500,31 @@ impl Sandbox {
         self.control.build_artifact_for(request)
     }
 
+    /// The ARN for `identifier`: an ARN passes through with zero calls, a bare name is
+    /// resolved through the image listing by exact match.
+    ///
+    /// A read-only delegation to [`ControlPlane::resolve_image_arn`], on this type so the
+    /// CLI's launch path reaches it through the one sandbox it already holds. It touches
+    /// none of the five state-machine variables — resolution is a question about the
+    /// account, not about this VM's lifecycle.
+    pub async fn resolve_image_arn(&self, identifier: &str) -> Result<String, Error> {
+        self.control.resolve_image_arn(identifier).await
+    }
+
+    /// The image with exactly `name`, or `None`. Read-only; see
+    /// [`ControlPlane::find_image_by_name`] for the pagination and exact-match rules.
+    pub async fn find_image_by_name(
+        &self,
+        name: &str,
+    ) -> Result<Option<crate::control::ops::MicrovmImageSummaryWire>, Error> {
+        self.control.find_image_by_name(name).await
+    }
+
+    /// The content hash `build --reuse` keys an image name to. Local; zero calls.
+    pub fn artifact_content_hash_for(&self, request: &CreateImageRequest) -> String {
+        self.control.artifact_content_hash_for(request)
+    }
+
     // ── run (STATE-1, STATE-2, STATE-3) ──────────────────────────────────────
 
     /// Launches a MicroVM, waits for RUNNING, and returns its session.

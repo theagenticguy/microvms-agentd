@@ -55,7 +55,7 @@ pub mod transport;
 use std::sync::Arc;
 use std::time::Duration;
 
-pub use artifact::{BaseImage, build_artifact, default_dockerfile};
+pub use artifact::{BaseImage, artifact_content_hash, build_artifact, default_dockerfile};
 pub use connector::ConnectorIntent;
 pub use image::{Image, WaitOpts};
 pub use microvm::{Microvm, ProxyToken, RunHookPayload};
