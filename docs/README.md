@@ -14,6 +14,9 @@ citation that was machine-verified against the source at generation time.
 - [PLATFORM.md](PLATFORM.md) — every measured claim about AWS Lambda MicroVMs,
   dated and scoped. The trap findings recorded here motivated building the client.
 - [PROTOCOL.md](PROTOCOL.md) — the daemon's wire protocol.
+- [EMBEDDING.md](EMBEDDING.md) — embedding agentd in your own image with
+  `microvm dockerfile` and driving it from your own harness: the wire contract
+  a client implements, the proxy-token reality, and the `AGENTD_*` knobs.
 - [TRUST.md](TRUST.md) — the in-VM trust boundary.
 - [STRATEGY.md](STRATEGY.md) — how the verification stack fits together.
 - [HARNESS-CAPABILITIES.md](HARNESS-CAPABILITIES.md) — what agent harnesses
@@ -36,7 +39,7 @@ citation that was machine-verified against the source at generation time.
 
 - [Public API](reference/public-api.md) — microvms-core and protocol exports,
   binding surfaces, and the daemon's 18 HTTP routes.
-- [CLI](reference/cli.md) — all 16 `microvm` commands, the JSON envelope, the
+- [CLI](reference/cli.md) — all 17 `microvm` commands, the JSON envelope, the
   NDJSON stream exception, and the 14-row exit-code catalog.
 
 ## Behavior

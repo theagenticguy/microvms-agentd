@@ -48,8 +48,8 @@ fn every_command_the_manifest_lists_is_one_the_binary_routes() {
     let commands = manifest["commands"].as_array().expect("an array");
     assert_eq!(
         commands.len(),
-        16,
-        "the lifecycle six, the attached five, and the local five"
+        17,
+        "the lifecycle six, the attached five, and the local six"
     );
 
     for command in commands {

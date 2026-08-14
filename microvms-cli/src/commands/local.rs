@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-//! `ls`, `logs`, `manifest`, `constants` — the commands that touch no account.
+//! `ls`, `logs`, `manifest`, `constants`, `dockerfile` — the commands that touch no account.
 //!
 //! Grouped by that property rather than by shape, because it is the property the behavioral
 //! thinness guard cares about: `tests/thinness.rs` asserts that every command *not* in this
@@ -13,7 +13,7 @@
 
 use serde_json::{Map, Value, json};
 
-use crate::cli::{LogsArgs, LsArgs};
+use crate::cli::{DockerfileArgs, LogsArgs, LsArgs};
 use crate::commands::{Ctx, Rendered, response_type};
 use crate::exit::{CliError, Exit};
 use crate::ledger;
@@ -226,6 +226,79 @@ pub fn constants<O: std::io::Write, E: std::io::Write>(
     Ok(Rendered::ok(kind, data, text, emitted.to_string()))
 }
 
+/// Prints the Dockerfile stanza that wraps a base image with agentd.
+///
+/// # Reused, never duplicated
+///
+/// The stanza comes from [`microvms_core::control::default_dockerfile`] — the same function
+/// `microvm build` bakes when no `--dockerfile` is given (`microvms-core/src/control/image.rs`,
+/// `build_artifact_for`). A copy here would be a second Dockerfile that could drift from the
+/// one the default build produces, and the whole point of this command is that appending your
+/// own `RUN` layers to its output *is* the default build plus your layers.
+///
+/// # The two traps ride along as comments
+///
+/// Both are platform constraints microvms-core enforces, and both bite one build cycle after
+/// the mistake is made, so the stanza itself says them where an editor will read them:
+///
+/// - The `FROM` must be the ref that pairs with the create call's `baseImageArn`;
+///   `require_matching_from` refuses a Dockerfile whose FROM disagrees.
+/// - A `WORKDIR` is required when the base declares none — the managed al2023 base does not,
+///   and `require_workdir` refuses inheriting a working directory that does not exist.
+///
+/// `--from` overrides only the docker ref, for a caller pairing a different managed base; the
+/// emitted comment then reminds them the `baseImageArn` has to change with it.
+pub fn dockerfile<O: std::io::Write, E: std::io::Write>(
+    _ctx: &mut Ctx<'_, O, E>,
+    args: &DockerfileArgs,
+) -> Result<Rendered, CliError> {
+    let mut base = microvms_core::control::BaseImage::al2023();
+    if let Some(from) = args.from.as_deref() {
+        base.docker_ref = from.to_string();
+    }
+    let stanza =
+        microvms_core::control::default_dockerfile(args.port, args.workdir.as_deref(), &base);
+
+    let mut header = vec![
+        "# agentd wrapper stanza — append your own RUN layers below the chmod line.".to_string(),
+        format!(
+            "# The FROM must match the managed base's docker_ref: baseImageArn ({}) and the",
+            base.name
+        ),
+        "# FROM select the same base, and microvms-core refuses a Dockerfile whose FROM"
+            .to_string(),
+        "# disagrees (require_matching_from).".to_string(),
+    ];
+    if args.workdir.is_none() {
+        header.push(
+            "# No --workdir was given. The managed base declares no WorkingDir, so a WORKDIR"
+                .to_string(),
+        );
+        header.push(
+            "# is required here: without one every relative path resolves against `/`, and"
+                .to_string(),
+        );
+        header.push(
+            "# microvms-core refuses inherit_workdir when nothing declares one \
+             (require_workdir)."
+                .to_string(),
+        );
+    }
+    let text = format!("{}\n{stanza}", header.join("\n"));
+
+    let mut data = Map::new();
+    data.insert("stanza".into(), json!(text));
+    data.insert("baseImageName".into(), json!(base.name));
+    data.insert("baseImageDockerRef".into(), json!(base.docker_ref));
+    data.insert("port".into(), json!(args.port));
+    data.insert("workdir".into(), json!(args.workdir));
+    let (kind, _) = response_type("dockerfile");
+
+    // Dense drops the header: the constraints are for a human editing the file, and a
+    // token-paying consumer asked for the stanza itself.
+    Ok(Rendered::ok(kind, data, text, stanza))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -329,5 +402,127 @@ mod tests {
         assert!(parsed["MICROVM_REGIONS"].is_array());
         // And the envelope form carries the identical object under `constants`.
         assert_eq!(rendered.data["constants"], parsed);
+    }
+
+    /// A `dockerfile` invocation with `args`, rendered.
+    fn render_dockerfile(args: &DockerfileArgs) -> Rendered {
+        let mut out = Output::new(Format::Plain, false, Vec::new(), Vec::new());
+        let env = |_: &str| None;
+        let seam = crate::seam::PanickingSeam;
+        let mut context = ctx(&mut out, &seam, &env);
+        dockerfile(&mut context, args).expect("dockerfile never fails")
+    }
+
+    /// **The stanza is the default build's Dockerfile, with the daemon lines intact.**
+    ///
+    /// Asserted on the load-bearing lines rather than on the whole text, because the claim
+    /// is about what an image built from this stanza *does*: `FROM` the managed base's pair,
+    /// `COPY agentd` so the binary is in the image, `ENTRYPOINT []` plus `CMD ["/agentd"]` so
+    /// the daemon is the container CMD — the deployment invariant the trust boundary rests on
+    /// (`docs/PROTOCOL.md`, "Trust boundary") — and the requested port in both the env knob
+    /// and the EXPOSE.
+    ///
+    /// **Falsification** — drop the `CMD ["/agentd"]` line from
+    /// `microvms_core::control::default_dockerfile` and the CMD assertion goes red: an image
+    /// built from the stanza would boot the base's own entrypoint and the run hook would
+    /// time out. Broken and confirmed red on 2026-08-14, then restored.
+    #[test]
+    fn the_stanza_carries_the_daemon_lines_the_default_build_bakes() {
+        let rendered = render_dockerfile(&DockerfileArgs {
+            from: None,
+            port: 9000,
+            workdir: None,
+        });
+
+        let base = microvms_core::control::BaseImage::al2023();
+        let stanza = &rendered.dense_text;
+        assert!(
+            stanza.contains(&format!("FROM {}", base.docker_ref)),
+            "the default FROM is the managed base's pair: {stanza}"
+        );
+        assert!(stanza.contains("COPY agentd /agentd"), "{stanza}");
+        assert!(stanza.contains("RUN chmod 0755 /agentd"), "{stanza}");
+        assert!(
+            stanza.contains("ENTRYPOINT []"),
+            "the trust boundary rests on the daemon being the container CMD: {stanza}"
+        );
+        assert!(stanza.contains(r#"CMD ["/agentd"]"#), "{stanza}");
+        assert!(stanza.contains("ENV AGENTD_PORT=9000"), "{stanza}");
+        assert!(stanza.contains("EXPOSE 9000"), "{stanza}");
+
+        // The envelope names the base *pair*, because a consumer needs both halves: the
+        // docker_ref for the FROM and the name the baseImageArn is derived from.
+        assert_eq!(rendered.data["baseImageName"], json!(base.name));
+        assert_eq!(rendered.data["baseImageDockerRef"], json!(base.docker_ref));
+        assert_eq!(rendered.data["port"], json!(9000));
+        assert_eq!(rendered.data["workdir"], Value::Null);
+        // And the human text is the stanza plus the header naming both platform traps.
+        assert!(
+            rendered.text.contains("require_matching_from"),
+            "{}",
+            rendered.text
+        );
+        assert!(
+            rendered.text.contains("require_workdir"),
+            "{}",
+            rendered.text
+        );
+        assert!(rendered.text.ends_with(&rendered.dense_text));
+        assert_eq!(rendered.data["stanza"], json!(rendered.text));
+    }
+
+    /// A `--workdir` lands as both the `mkdir` and the `WORKDIR`, and a `--port` reaches
+    /// every port-bearing line.
+    #[test]
+    fn a_workdir_and_a_port_reach_the_stanza() {
+        let rendered = render_dockerfile(&DockerfileArgs {
+            from: None,
+            port: 8125,
+            workdir: Some("/workspace".into()),
+        });
+        let stanza = &rendered.dense_text;
+        assert!(stanza.contains("RUN mkdir -p /workspace"), "{stanza}");
+        assert!(stanza.contains("WORKDIR /workspace"), "{stanza}");
+        assert!(stanza.contains("ENV AGENTD_PORT=8125"), "{stanza}");
+        assert!(stanza.contains("EXPOSE 8125"), "{stanza}");
+        assert_eq!(rendered.data["workdir"], json!("/workspace"));
+        // With a workdir given, the header's workdir warning has nothing to warn about.
+        assert!(
+            !rendered.text.contains("No --workdir was given"),
+            "{}",
+            rendered.text
+        );
+    }
+
+    /// `--from` replaces the FROM ref and nothing else, and the header still names the
+    /// agreement constraint — because a caller who changed the ref is exactly the caller
+    /// about to hit `require_matching_from`.
+    #[test]
+    fn a_from_override_replaces_the_ref_and_keeps_the_constraint_comment() {
+        let rendered = render_dockerfile(&DockerfileArgs {
+            from: Some("public.ecr.aws/example/other:2024".into()),
+            port: 9000,
+            workdir: Some("/srv".into()),
+        });
+        let stanza = &rendered.dense_text;
+        assert!(
+            stanza.contains("FROM public.ecr.aws/example/other:2024"),
+            "{stanza}"
+        );
+        assert!(
+            !stanza.contains("amazonlinux:2023-minimal"),
+            "the default ref must not survive an override: {stanza}"
+        );
+        // The daemon lines are unchanged by the override.
+        assert!(stanza.contains(r#"CMD ["/agentd"]"#), "{stanza}");
+        assert!(
+            rendered.text.contains("require_matching_from"),
+            "{}",
+            rendered.text
+        );
+        assert_eq!(
+            rendered.data["baseImageDockerRef"],
+            json!("public.ecr.aws/example/other:2024")
+        );
     }
 }

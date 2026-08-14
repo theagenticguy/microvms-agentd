@@ -101,7 +101,7 @@ pub struct Ctx<'a, O: Write, E: Write> {
 /// command added without an entry fails rather than shipping undescribed. That check is the
 /// only thing that keeps this table from being the hand-maintained artifact the manifest is
 /// forbidden to be.
-pub const RESPONSE_TYPES: [(&str, &str, &[&str]); 16] = [
+pub const RESPONSE_TYPES: [(&str, &str, &[&str]); 17] = [
     (
         "run",
         "microvm.run",
@@ -204,6 +204,17 @@ pub const RESPONSE_TYPES: [(&str, &str, &[&str]); 16] = [
         ],
     ),
     ("constants", "microvm.constants", &["constants"]),
+    (
+        "dockerfile",
+        "microvm.dockerfile",
+        &[
+            "stanza",
+            "baseImageName",
+            "baseImageDockerRef",
+            "port",
+            "workdir",
+        ],
+    ),
 ];
 
 /// The discriminant `exec --stream` emits instead of `microvm.exec`, and the keys it carries.
