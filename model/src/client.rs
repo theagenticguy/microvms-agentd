@@ -118,6 +118,11 @@ pub enum Action {
     LaunchAccepted,
     /// The platform reporting the run hook answered with a success status (STATE-2).
     HookSucceeded,
+    /// The caller sending a request through the endpoint proxy, which is what mints —
+    /// and caches — a proxy token when none is held. The warm half of STATE-8: without
+    /// this action nothing ever fills the cache, and "the completion drops the token"
+    /// is a claim about a cache that is empty in every reachable state.
+    ExecRequested,
     /// The caller asking for a suspend (STATE-4, STATE-5).
     SuspendRequested,
     /// The platform reporting suspension complete (STATE-6).
@@ -149,7 +154,9 @@ pub struct State {
     // ── what the client did and holds ────────────────────────────────────────
     /// Every control-plane call, counted. See [`Wire`].
     pub wire: Wire,
-    /// Whether a proxy token is cached. Dropped on every resume completion (STATE-8).
+    /// Whether a proxy token is cached. Filled by the first proxied request
+    /// ([`Action::ExecRequested`]) that finds it cold, dropped on every resume
+    /// completion (STATE-8).
     pub proxy_token_cached: bool,
     /// How many proxy tokens have been minted, which is the only externally visible
     /// evidence that an invalidation happened at all: a token cached forever and one
@@ -158,8 +165,12 @@ pub struct State {
     /// The identity of the installed token, so a property can say it is the *same* token
     /// across a suspend/resume rather than merely that one is installed.
     ///
-    /// Symbolic: `Some(0)` is the token the launch delivered. What matters is only whether
-    /// two readings are equal, never the value.
+    /// Symbolic: `Some(0)` is the token the first launch's payload delivered, `Some(1)`
+    /// a planted second launch's. Identities are distinguishable per launch precisely so
+    /// the replacement detector has two values that *can* differ — an install that
+    /// always wrote `Some(0)` would make `token_replacements` a comparison of a value
+    /// against itself. What matters is only whether two readings are equal, never the
+    /// value.
     pub installed_token: Option<u8>,
     /// Whether a resume the client issued has not yet been reported complete.
     ///
@@ -320,6 +331,14 @@ impl Model for ClientLifecycle {
         // capped, and they are capped one above the cycle bound so a legal cycle is never
         // the thing that runs out.
         if state.wire.launches > 0 {
+            // A proxied request, when the cache is cold and the VM can serve it. Offered
+            // narrowly rather than from every state: no STATE-n guard governs the exec
+            // path, so the illegal-request verdicts the lifecycle calls need have
+            // nothing to say here — the action exists so the cache is fillable and the
+            // STATE-8 drop has something to drop.
+            if state.vm_state == VmState::Running && !state.proxy_token_cached {
+                actions.push(Action::ExecRequested);
+            }
             if state.wire.suspends <= self.cfg.max_cycles {
                 actions.push(Action::SuspendRequested);
             }
@@ -378,7 +397,28 @@ impl Model for ClientLifecycle {
                     next.vm_state = VmState::Running;
                     next.token_installed = true;
                     next.bootstrap_count += 1;
-                    next.installed_token = Some(0);
+                    // The identity rides the launch payload, so each launch delivers a
+                    // distinguishable token: `Some(0)` from the first, `Some(1)` from a
+                    // planted second. That is what gives the replacement detector below
+                    // two values that can differ — a fixed `Some(0)` here would make
+                    // `token_replacements` a comparison of a value against itself, and
+                    // the "never replaced" property a claim nothing could break.
+                    next.installed_token = Some(last.wire.launches - 1);
+                    Verdict::Issued
+                }
+            }
+
+            // STATE-8's warm half. A proxied request that finds the cache cold caches
+            // the token it minted, and what it cached stays until a resume completion
+            // drops it. Not a wire call in the control-plane sense — the request rides
+            // the endpoint proxy — so no `Wire` counter moves. Without this arm the
+            // cache is empty in every reachable state and the STATE-8 drop below drops
+            // nothing.
+            Action::ExecRequested => {
+                if last.vm_state != VmState::Running || last.proxy_token_cached {
+                    Verdict::Ignored
+                } else {
+                    next.proxy_token_cached = true;
                     Verdict::Issued
                 }
             }
@@ -527,6 +567,19 @@ impl Model for ClientLifecycle {
             Property::<Self>::always("a terminated VM never reaches RUNNING", |_, state| {
                 !(state.was_terminated && state.vm_state == VmState::Running)
             }),
+            Property::<Self>::always(
+                "the image exists exactly when a launch was accepted",
+                |_, state| {
+                    // The symspec's `image_exists` is written by STATE-1 alone ("record
+                    // the image as existing") and read by STATE-2's precondition, so the
+                    // coherence claim is an equality: no launch, no image; a launch, an
+                    // image — and a bootstrapped token therefore implies one. Stated so
+                    // the variable is read at all; a symspec variable the properties
+                    // never consult is dead weight the module docs promise not to carry.
+                    state.image_exists == (state.wire.launches > 0)
+                        && (!state.token_installed || state.image_exists)
+                },
+            ),
             // ── the wire-call properties, which is why calls are in the state ──
             Property::<Self>::always("no resume call after a terminate", |_, state| {
                 // The packet's headline: the rejection must cost **zero** wire calls, not
@@ -630,6 +683,15 @@ impl Model for ClientLifecycle {
             Property::<Self>::sometimes("a proxy token is minted after a resume", |_, state| {
                 state.mints >= 1
             }),
+            Property::<Self>::sometimes(
+                "a cached proxy token survives into SUSPENDED",
+                |_, state| {
+                    // The witness that makes the STATE-8 drop non-vacuous: the checker
+                    // reached a SUSPENDED state still holding a cached token, so the
+                    // resume completion offered from here really has something to drop.
+                    state.vm_state == VmState::Suspended && state.proxy_token_cached
+                },
+            ),
             Property::<Self>::sometimes("a suspend completes", |_, state| {
                 state.vm_state == VmState::Suspended
             }),
@@ -791,8 +853,16 @@ mod tests {
         assert_eq!(running.bootstrap_count, 1);
         assert_eq!(running.installed_token, Some(0));
 
+        // A proxied request warms the cache, so the drop below has a token to drop —
+        // without this step the final assertion holds on an always-empty cache and
+        // measures nothing.
+        let warmed = model
+            .next_state(&running, Action::ExecRequested)
+            .expect("a proxied request caches a token");
+        assert!(warmed.proxy_token_cached, "the request must warm the cache");
+
         let suspending = model
-            .next_state(&running, Action::SuspendRequested)
+            .next_state(&warmed, Action::SuspendRequested)
             .expect("a suspend from RUNNING is issued");
         assert_eq!(suspending.wire.suspends, 1);
         let suspended = model

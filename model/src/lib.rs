@@ -382,15 +382,18 @@ impl Model for Agentd {
                             // anything else destroys output the caller never
                             // read, which is the defect the Python daemon
                             // shipped by unlinking on exit.
-                            if next
-                                .execs
-                                .iter()
-                                .any(|e| e.phase != ExecPhase::Acked && e.output_held)
-                                && next.execs.iter().all(|e| e.phase == ExecPhase::Acked)
-                            {
+                            //
+                            // Stated once and audited against itself: the
+                            // detector below flags any entry this predicate
+                            // collects while its output is still held. Acking
+                            // is the only thing that releases output, so a
+                            // collected entry with `output_held` is exactly an
+                            // exec destroyed without its caller's ack.
+                            let collectable = |e: &Exec| e.phase == ExecPhase::Acked;
+                            if next.execs.iter().any(|e| collectable(e) && e.output_held) {
                                 next.released_without_ack = true;
                             }
-                            next.execs.retain(|e| e.phase != ExecPhase::Acked);
+                            next.execs.retain(|e| !collectable(e));
                             Response::Ok
                         }
                     }
