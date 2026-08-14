@@ -158,51 +158,6 @@ mod tests {
     use crate::seam::Infra;
     use microvms_core::SizeClass;
 
-    struct NoAws;
-
-    impl crate::seam::CoreSeam for NoAws {
-        fn control_plane(
-            &self,
-            _region: microvms_core::Region,
-        ) -> crate::seam::futures_util_shim::BoxFuture<
-            '_,
-            Result<microvms_core::control::ControlPlane, microvms_core::Error>,
-        > {
-            panic!("cost reached the control plane")
-        }
-
-        fn open_sandbox(
-            &self,
-            _region: microvms_core::Region,
-            _port: Option<u16>,
-        ) -> crate::seam::futures_util_shim::BoxFuture<
-            '_,
-            Result<microvms_core::sandbox::Sandbox, microvms_core::Error>,
-        > {
-            panic!("cost opened a sandbox")
-        }
-
-        fn attach_session(
-            &self,
-            _region: microvms_core::Region,
-            _attach: crate::seam::Attach,
-        ) -> crate::seam::futures_util_shim::BoxFuture<
-            '_,
-            Result<microvms_core::session::Session, microvms_core::Error>,
-        > {
-            panic!("cost attached a session")
-        }
-
-        fn put_artifact(
-            &self,
-            _uri: &str,
-            _bytes: Vec<u8>,
-        ) -> crate::seam::futures_util_shim::BoxFuture<'_, Result<(), microvms_core::Error>>
-        {
-            panic!("cost uploaded an artifact")
-        }
-    }
-
     fn run_cost(args: CostArgs) -> (Rendered, String) {
         let (result, stderr) = try_cost(args);
         (result.expect("the arithmetic holds"), stderr)
@@ -212,7 +167,7 @@ mod tests {
     fn try_cost(args: CostArgs) -> (Result<Rendered, CliError>, String) {
         let mut out = Output::new(Format::Json, false, Vec::new(), Vec::new());
         let env = |_: &str| None;
-        let seam = NoAws;
+        let seam = crate::seam::PanickingSeam;
         let result = {
             let mut ctx = Ctx {
                 seam: &seam,

@@ -43,7 +43,7 @@ use serde_json::{Map, Value, json};
 use crate::cli::{AckArgs, AttachFlags, CpArgs, ExecArgs, HealthArgs, RegionFlags, StdinArgs};
 use crate::commands::{Ctx, Rendered, STREAM_RESPONSE, response_type};
 use crate::exit::{CliError, Exit};
-use crate::seam::{Attach, resolve_region};
+use crate::seam::Attach;
 
 /// The prefix that means "this side of the copy is in the VM".
 ///
@@ -75,11 +75,7 @@ async fn attach<O: std::io::Write, E: std::io::Write>(
     region: &RegionFlags,
     flags: &AttachFlags,
 ) -> Result<Session, CliError> {
-    let region = resolve_region(
-        region.region.map(|r| r.region()),
-        region.unlisted_region.as_deref(),
-        ctx.env,
-    )?;
+    let region = region.resolve(ctx.env)?;
     let session = ctx
         .seam
         .attach_session(

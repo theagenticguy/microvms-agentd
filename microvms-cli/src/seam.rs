@@ -79,6 +79,42 @@ impl Door {
     }
 }
 
+/// A seam that panics if any door is entered, for tests of commands that must not touch AWS.
+///
+/// One shared fake rather than a copy per test module: the four panicking bodies are the
+/// whole implementation, and three private copies of them is three places for a fifth seam
+/// method to be stubbed differently. `cfg(test)` for the reason [`Door`] gives — nothing in
+/// the shipped binary refuses AWS on purpose.
+#[cfg(test)]
+pub struct PanickingSeam;
+
+#[cfg(test)]
+impl CoreSeam for PanickingSeam {
+    fn control_plane(&self, _region: Region) -> BoxFuture<'_, Result<ControlPlane, Error>> {
+        panic!("this command must not reach the control plane")
+    }
+
+    fn open_sandbox(
+        &self,
+        _region: Region,
+        _port: Option<u16>,
+    ) -> BoxFuture<'_, Result<Sandbox, Error>> {
+        panic!("this command must not open a sandbox")
+    }
+
+    fn attach_session(
+        &self,
+        _region: Region,
+        _attach: Attach,
+    ) -> BoxFuture<'_, Result<Session, Error>> {
+        panic!("this command must not attach a session")
+    }
+
+    fn put_artifact(&self, _uri: &str, _bytes: Vec<u8>) -> BoxFuture<'_, Result<(), Error>> {
+        panic!("this command must not upload an artifact")
+    }
+}
+
 /// What a command needs to attach to a VM it did not launch.
 ///
 /// A struct rather than four parameters because three of the four are opaque identifiers of

@@ -246,58 +246,12 @@ mod tests {
         }
     }
 
-    /// A seam that panics if entered, since none of these commands may touch AWS.
-    struct NoAws;
-
-    impl crate::seam::CoreSeam for NoAws {
-        fn control_plane(
-            &self,
-            _region: microvms_core::Region,
-        ) -> crate::seam::futures_util_shim::BoxFuture<
-            '_,
-            Result<microvms_core::control::ControlPlane, microvms_core::Error>,
-        > {
-            panic!("a local command reached the control plane")
-        }
-
-        fn open_sandbox(
-            &self,
-            _region: microvms_core::Region,
-            _port: Option<u16>,
-        ) -> crate::seam::futures_util_shim::BoxFuture<
-            '_,
-            Result<microvms_core::sandbox::Sandbox, microvms_core::Error>,
-        > {
-            panic!("a local command opened a sandbox")
-        }
-
-        fn attach_session(
-            &self,
-            _region: microvms_core::Region,
-            _attach: crate::seam::Attach,
-        ) -> crate::seam::futures_util_shim::BoxFuture<
-            '_,
-            Result<microvms_core::session::Session, microvms_core::Error>,
-        > {
-            panic!("a local command attached a session")
-        }
-
-        fn put_artifact(
-            &self,
-            _uri: &str,
-            _bytes: Vec<u8>,
-        ) -> crate::seam::futures_util_shim::BoxFuture<'_, Result<(), microvms_core::Error>>
-        {
-            panic!("a local command uploaded an artifact")
-        }
-    }
-
     /// `ls` with nothing outstanding says so rather than printing an empty line.
     #[test]
     fn ls_with_an_empty_state_directory_says_nothing_outstanding() {
         let mut out = Output::new(Format::Plain, false, Vec::new(), Vec::new());
         let env = |_: &str| Some("/nonexistent-microvm-state".to_string());
-        let seam = NoAws;
+        let seam = crate::seam::PanickingSeam;
         let mut context = ctx(&mut out, &seam, &env);
         let rendered = ls(
             &mut context,
@@ -320,7 +274,7 @@ mod tests {
     fn logs_names_the_group_and_refuses_to_imply_it_is_empty() {
         let mut out = Output::new(Format::Plain, false, Vec::new(), Vec::new());
         let env = |_: &str| None;
-        let seam = NoAws;
+        let seam = crate::seam::PanickingSeam;
         let mut context = ctx(&mut out, &seam, &env);
         let failure = logs(
             &mut context,
@@ -363,7 +317,7 @@ mod tests {
     fn constants_emits_the_object_the_drift_gate_reads() {
         let mut out = Output::new(Format::Plain, false, Vec::new(), Vec::new());
         let env = |_: &str| None;
-        let seam = NoAws;
+        let seam = crate::seam::PanickingSeam;
         let mut context = ctx(&mut out, &seam, &env);
         let rendered = constants(&mut context).expect("constants never fails");
 
