@@ -12,14 +12,15 @@ during the Harbor PR #2469 integration.
 ## The service provides no exec and no file transfer
 
 There is no API to run a command in a MicroVM and no API to move a file into or
-out of one. This absence is the entire reason this project exists.
+out of one. This project exists to provide those two operations.
 
-`CreateMicrovmShellAuthToken` exists in the API and is not a substitute. It
-requires a `SHELL_INGRESS` connector, the documented flow is
+`CreateMicrovmShellAuthToken` exists in the API, but it is an interactive
+debugging tool rather than a substitute. It requires a `SHELL_INGRESS`
+connector. The documented flow is
 `ctr task exec -t --exec-id shell <id> /bin/sh` through a console terminal or
-WebSocket, and the documentation scopes it to debugging while recommending it be
-disabled in production. The name suggests a programmatic exec path that it is
-not.
+WebSocket. The documentation scopes it to debugging and recommends disabling it
+in production. Despite what the name suggests, it does not provide a
+programmatic exec path.
 
 ## Hooks are served under a fixed prefix, and two of them are build-time
 
@@ -36,9 +37,9 @@ run, which is a confusing place to discover the mistake.
 
 ## `runHookPayload` arrives wrapped, not as the body
 
-Measured 2026-08-05, and it cost a full build-and-run cycle to find. The string
-passed to `RunMicrovm` as `runHookPayload` is not delivered as the request body.
-The platform wraps it, so the body is:
+Measured 2026-08-05. Finding this cost a full build-and-run cycle. The platform
+wraps the string passed to `RunMicrovm` as `runHookPayload` inside an outer JSON
+object rather than delivering it as the request body, so the body is:
 
 ```json
 {"runHookPayload": "{\"agent_token\": \"...\"}"}
@@ -47,17 +48,19 @@ The platform wraps it, so the body is:
 The caller's own JSON is one `serde_json`/`json.loads` deeper. A daemon that reads
 its fields from the top level answers 400, and the platform then terminates the VM
 with `Run lifecycle hook returned HTTP status 400. Please check your hook endpoint
-and application logs for more details.` before forwarding any traffic — so the
-failure is invisible from outside the VM, and the VM is gone before you can look
-inside it. Read `GetMicrovm`'s `stateReason` first when a launch dies young.
+and application logs for more details.` before forwarding any traffic. Because no
+traffic was ever forwarded, the failure is invisible from outside the VM, and the
+VM is gone before you can look inside it. Read `GetMicrovm`'s `stateReason` first
+when a launch dies young.
 
 ## The `runHookPayload` ceiling is 4096 bytes, and the service model states it
 
-Measured 2026-08-07, us-east-1, API version `2025-09-09`. `STRATEGY.md` asserted a
-16 KB `runHookPayload` and `TRUST.md` repeated it while flagging it as unmeasured. The
-real ceiling is 4096 bytes, a quarter of the claimed figure, and the error ran in the
-dangerous direction: it told a reader they could fit four times the secret material they
-actually can. Corrected 2026-08-07 in both files.
+Measured 2026-08-07, us-east-1, API version `2025-09-09`. The real ceiling is 4096
+bytes. `STRATEGY.md` asserted a 16 KB `runHookPayload` and `TRUST.md` repeated it
+while flagging it as unmeasured, so the documented figure was four times the real
+one. Because the error overstated the limit, a reader planning from it would try to
+fit four times the secret material that actually fits. Both files were corrected
+2026-08-07.
 
 The boundary was bracketed from both sides by calling `RunMicrovm` with a deliberately
 bogus `imageIdentifier`, so nothing could be created and nothing was billed:
@@ -67,20 +70,21 @@ bogus `imageIdentifier`, so nothing could be created and nothing was billed:
 | 4096 bytes | passes the length check, fails only on the bogus ARN (`Malformed ARN - doesn't start with 'arn:'`) |
 | 4097 bytes | `1 validation error detected: Value at 'runHookPayload' failed to satisfy constraint: Member must have length less than or equal to 4096` |
 
-So 4096 is inclusive. The bogus-ARN technique generalizes: to probe a request-validation
-boundary without creating a billable resource, make one other field invalid in a way that
-fails later than the constraint under test, then read which error comes back.
+So 4096 is inclusive. The bogus-ARN technique generalizes to other request-validation
+boundaries. To probe one without creating a billable resource, make one other field
+invalid in a way that fails later than the constraint under test, then read which
+error comes back.
 
 botocore does not enforce this client-side. The oversized request goes to the wire and
 the server rejects it, so a caller building a payload gets no local signal that it is too
 large. A length check before the call is worth having.
 
-The figure was there to be read the whole time. The botocore service model for
+The figure was also available without measuring. The botocore service model for
 `lambda-microvms` version `2025-09-09` declares
 `RunMicrovmRequestRunHookPayloadString` with `max: 4096`. That model is a
-machine-readable statement of the service's constraints, and this project had been
-restating those constraints in prose by hand and getting one of them wrong by 4x. Other
-constraints it states, useful and none of them measured by us:
+machine-readable statement of the service's constraints. This project had been
+restating those constraints in prose by hand, and one of them was wrong by 4x. The
+model states other useful constraints, none of them measured by us:
 
 | Constraint | Value |
 | --- | --- |
@@ -91,14 +95,15 @@ constraints it states, useful and none of them measured by us:
 | `maximumDurationInSeconds` | max 28800 (8 hours) |
 | `ImageName` | max 64 chars, pattern `[a-zA-Z0-9-_]+` |
 
-The 60x gap between the two hook families follows from what they are for: a build hook
-waits on a Dockerfile, a run hook waits on a daemon that is already booted. A daemon that
-takes more than 60 seconds to answer `/run` fails the launch with no way to ask for more
-time.
+The 60x gap between the two hook families follows from what they are for. A build hook
+waits on a Dockerfile, while a run hook waits on a daemon that is already booted. A
+daemon that takes more than 60 seconds to answer `/run` fails the launch, and there is
+no way to ask for more time.
 
 A drift checker is being added at `scripts/check-model-drift` and wired into
-`mise run check`, so a documented constraint that no longer matches the shipped model
-fails mechanically instead of waiting for someone to notice the prose.
+`mise run check`. With it in place, a documented constraint that no longer matches
+the shipped model fails the check mechanically instead of waiting for someone to
+notice the prose.
 
 ## Calling an unpriced region returns `AccessDeniedException` with a null message
 
@@ -107,9 +112,9 @@ price MicroVMs all answered successfully: us-east-1, us-east-2, us-west-2, eu-we
 ap-northeast-1. eu-central-1, ap-southeast-2, and sa-east-1 each returned
 `AccessDeniedException` with the message field `None`.
 
-That is indistinguishable from a genuine IAM denial, so someone who typos a region
-audits a policy that is fine. The tell is the null message: a real denial names the
-principal and the action.
+That response is indistinguishable from a genuine IAM denial, so someone who typos a
+region ends up auditing a policy that is fine. The null message is the way to tell
+them apart, because a real denial names the principal and the action.
 
 Nothing earlier in the call path catches it either. `boto3.client("lambda-microvms",
 region_name=...)` constructs successfully for any region and resolves to
@@ -117,9 +122,9 @@ region_name=...)` constructs successfully for any region and resolves to
 `lambda`. So the first API call is the only thing that reports the problem, and it
 reports the wrong cause.
 
-One resolver detail, stated precisely because the two calls disagree.
-`endpoint_resolver.get_available_endpoints("lambda-microvms")` returns an empty list,
-while `session.get_available_regions("lambda-microvms")` returns 34 regions, the full
+Two resolver calls disagree with each other, so both results are recorded here.
+`endpoint_resolver.get_available_endpoints("lambda-microvms")` returns an empty list.
+`session.get_available_regions("lambda-microvms")` returns 34 regions, the full
 Lambda set, since resolution keys off the shared `lambda` prefix. Neither answer is the
 five-region truth, so do not use either as a support check. Keep the supported list
 explicitly and validate the caller's region against it before the first call.
@@ -136,25 +141,25 @@ outbound network.
 ## `CreateMicrovmAuthToken` returns a header map
 
 Measured 2026-08-05. The `authToken` field is a map of header name to value, not a
-string: the API is shaped for schemes needing more than one header. Read
-`authToken["X-aws-proxy-auth"]`. Requests also need `X-aws-proxy-port` naming
+string. The API is shaped this way to allow schemes that need more than one header.
+Read `authToken["X-aws-proxy-auth"]`. Requests also need `X-aws-proxy-port` naming
 which of the token's allowed ports the request targets.
 
-## MicroVM states, and the one that matters
+## MicroVM states, and terminal states reached before `RUNNING`
 
 `PENDING → RUNNING → SUSPENDING/SUSPENDED → TERMINATING → TERMINATED`. A VM that
 reaches any terminal state *before* `RUNNING` died during startup, which for a
 hook-serving daemon almost always means a lifecycle hook failed. Poll for
-`RUNNING` and fail fast on the terminal states with `stateReason` attached;
-polling through them wastes minutes and then reports a connection error that hides
+`RUNNING` and fail fast on the terminal states with `stateReason` attached.
+Polling through them wastes minutes and then reports a connection error that hides
 the cause.
 
 ## The build log group survives Terraform
 
 Measured 2026-08-05. The service creates `/aws/lambda-microvms/<image-name>`
 itself, so a Terraform stack never owns it and `terraform destroy` leaves it
-behind. It is storage-only cost, but "the stack destroyed cleanly" is not the same
-as "the account is clean" — query for the log group separately, or delete it in
+behind. The leftover group costs only storage, but it means a clean stack destroy
+does not leave a clean account. Query for the log group separately, or delete it in
 teardown.
 
 ## Root in the guest is not enough: `sethostname` and bind mounts need `additionalOsCapabilities`
@@ -173,20 +178,22 @@ Passing `additionalOsCapabilities=["ALL"]` at image creation makes all three
 succeed, confirmed by the same probe reporting `identity_degraded: false` where it
 previously reported `true`.
 
-Two things make this easy to miss. The filesystem write succeeds, so identity
+Two things make this easy to miss. First, the filesystem write succeeds, so identity
 repair looks like it works until you check the two steps that need the kernel's
-permission rather than the filesystem's. And a daemon that logs the failure and
-keeps serving — which is the right behavior, since refusing to serve would strand
-the VM — produces a healthy-looking VM whose hostname and `boot_id` are shared
-with every sibling from the same snapshot.
+permission rather than the filesystem's. Second, the daemon logs the failure and
+keeps serving, which produces a healthy-looking VM whose hostname and `boot_id` are
+shared with every sibling from the same snapshot. Logging and continuing is still
+the right behavior, because a daemon that stopped serving on this failure would
+strand the VM.
 
 `ALL` is the only accepted value in the `2025-09-09` API; there is no way to
 request `CAP_SYS_ADMIN` alone. A caller who does not need hostname or `boot_id`
 repair should leave it unset rather than widen the guest for nothing.
 
 This was found by a live run after the unit tests passed, because those tests
-inject a fake layout and a fake platform. It is the clearest case in this project
-of a guard that was verified in every tier except the one that mattered.
+inject a fake layout and a fake platform. The guard had been verified against
+fakes at every tier but never against the real platform, and the real platform
+was where it failed.
 
 ## `minimumMemoryInMiB` selects a *baseline*, and the guest reports the *peak*
 
@@ -215,11 +222,11 @@ documents the table but not the `MemTotal` mapping.
 AWS: "You pay the baseline rate while your MicroVM is running and only pay for what
 you actively use above the baseline, billed per second." An earlier version of this
 section said a caller "should not assume they are billed for the request", which was
-exactly backwards — the request is what you are billed for, and the extra memory is
+exactly backwards. The request is what you are billed for, and the extra memory is
 burst headroom charged only for the seconds it is actually consumed. Corrected
 2026-08-07 after reading the pricing page rather than inferring from the size.
 
-Consequences for a caller. You cannot use this field to *constrain* a VM, so a
+Three consequences follow for a caller. You cannot use this field to *constrain* a VM, so a
 memory-pressure test must generate pressure against what the guest reports rather
 than what was requested. Guest swap is absent (`SwapTotal: 0 kB`), so pressure goes
 straight to the OOM killer with no paging phase. And picking a small baseline is a
@@ -266,12 +273,12 @@ high), and both compute rates matched to the digit.
 **There are two compute rates 17.9% apart, and only the ARM one can ever apply.** The
 service model's `Architecture` enum has exactly one member, `ARM_64`, so a MicroVM
 cannot be x86 and the non-ARM line items are unreachable for this service. The old table
-used the ARM figures and was correct by luck rather than by construction. This is worth
-recording because the Pricing API returns both and the Lambda pricing page gives a reader
-no obvious signal about which applies, so someone pricing a fleet by hand can land on the
-non-ARM column and overstate compute by 17.9%.
+used the ARM figures and was correct by luck rather than by construction. The Pricing API
+returns both rates, and the Lambda pricing page gives a reader no obvious signal about
+which applies, so someone pricing a fleet by hand can land on the non-ARM column and
+overstate compute by 17.9%.
 
-**Only five regions price MicroVMs, and us-east-1 rates do not travel.** us-east-1,
+**Only five regions price MicroVMs, and rates vary by region.** us-east-1,
 us-east-2, us-west-2, eu-west-1, and ap-northeast-1 return the seven line items;
 eu-central-1, ap-southeast-2, and sa-east-1 return none. us-east-2 and us-west-2 are
 identical to us-east-1 on every line item. The other two are not:
@@ -286,8 +293,8 @@ So a Tokyo caller who estimates from us-east-1 rates understates their bill by u
 22%, and the largest gaps are on the snapshot dimensions rather than on compute, which
 matters most for a design that leans on a suspended pool.
 
-One measurement trap worth recording, because it produces a confident wrong answer.
-us-east-1 usage types are unprefixed while every other region carries a location prefix,
+One measurement trap produces a confident wrong answer. us-east-1 usage types are
+unprefixed while every other region carries a location prefix,
 `USW2-Lambda-MicroVM-Snapshot-Read-GB` and so on. Comparing raw `usagetype` strings
 across regions therefore matches nothing outside us-east-1. The first pass at this table
 came out as NaNs, which reads as "no regional variation" rather than as a join bug. Strip
@@ -298,8 +305,7 @@ GB-second, and there is no per-request charge: instances bill per second. No
 MicroVMs free tier is published; the Lambda free tier is Functions-only. No
 minimum billing increment is published.
 
-Three things worth knowing before running a create-and-destroy test suite like this
-repo's:
+Three cost behaviors affect a create-and-destroy test suite like this repo's:
 
 **Image storage has a one-week minimum.** A 2 GB image deleted sixty seconds after
 creation still bills about a week of storage, roughly four cents. Our conformance
@@ -311,12 +317,13 @@ Runtime, which charges no CPU during I/O wait. On raw MicroVMs, wall-clock time 
 `RUNNING` costs baseline whether or not anything is executing, so suspension is the
 only way to stop paying.
 
-**Suspension is the cheap state, and churn is the cost.** A suspended 2 GB VM pays
-only snapshot storage, about $0.16 a month, against roughly $100 a month to leave
-the same VM running at baseline — a difference of two orders of magnitude, which is
-what makes a warm suspended pool viable. But each cycle pays a write plus a read,
-about $0.011 for a 2 GB VM, so the thing to avoid is suspending and resuming
-constantly rather than suspending for a long time.
+**A suspended VM is cheap to keep, but each suspend/resume cycle has a fixed
+cost.** A suspended 2 GB VM pays
+only snapshot storage, about $0.16 a month. Leaving the same VM running at baseline
+costs roughly $100 a month. That difference of two orders of magnitude is what makes
+a warm suspended pool viable. But each suspend/resume cycle pays a snapshot write
+plus a read, about $0.011 for a 2 GB VM, so the thing to avoid is suspending and
+resuming constantly rather than suspending for a long time.
 
 **Not published:** whether the server-side image build is billed as compute. The
 build starts a real MicroVM to run the Dockerfile, so it plausibly is, but AWS does
@@ -334,8 +341,8 @@ Python client after the Rust port went live-green; the probe is in git history a
 this entry is its result). The customer
 question is "is there a `dmesg`?" and it splits in two.
 
-**A process killed inside a living VM should be visible twice over, and the
-plumbing for it is confirmed present.** What was actually measured: `dmesg` runs in
+**A process killed inside a living VM should be visible in two places, and the
+plumbing for both is confirmed present.** What was actually measured: `dmesg` runs in
 the guest and is readable with no extra privileges (it returned successfully, empty,
 because no OOM occurred), and `/sys/fs/cgroup/memory.events` exists and exposes
 `oom`, `oom_kill`, and `oom_group_kill` counters — all reading 0 on an unpressured
@@ -348,14 +355,13 @@ been exercised by a real OOM. Treat "you will see signal 9 and a dmesg line" as
 sound reasoning from confirmed plumbing rather than as an observation.
 
 **Whether a guest-wide OOM populates `stateReason` remains unmeasured, because we
-could not make one happen.** Two attempts failed for reasons worth recording rather
-than hiding:
+could not make one happen.** Two attempts failed, for the following reasons:
 
 1. The first probe allocated with `python3`, which the `amazonlinux:2023-minimal`
    base image does not have. It reported `command not found` with exit code 127 and
-   every downstream check passed — the probe measured nothing while looking like a
-   clean result. This is the failure mode this project keeps hitting: a green run
-   that never exercised the thing.
+   every downstream check passed. The probe measured nothing while looking like a
+   clean result. This project has hit the same failure mode repeatedly, where a
+   run reports green without ever exercising the behavior under test.
 2. The second allocated with `dd` into `/dev/shm`, which is tmpfs and therefore
    capped near half of RAM. `dd` stopped at 64 MiB against a 1 GiB request and
    exited 0, so again no memory pressure. tmpfs limits are a filesystem ceiling,
@@ -363,7 +369,7 @@ than hiding:
 
 So `stateReason` was `null` and the state `RUNNING` throughout, which says only
 that we never applied real pressure. A future probe needs an allocator that touches
-anonymous memory the kernel must back and cannot silently cap — a small static
+anonymous memory the kernel must back and cannot silently cap. A small static
 binary shipped in the image is the obvious answer, since the guest has no
 interpreter and no compiler.
 
@@ -374,8 +380,8 @@ under pressure, and `/v1/health` stayed reachable and bootstrapped throughout.
 ## Suspend/resume is a freeze and restore, not a stop and start
 
 Measured 2026-08-05, us-east-1, `al2023-1` base, 1024 MiB baseline, via
-`conformance/probe_suspend_resume.py` — deleted with the Python client after the Rust
-port went live-green, so the probe is in git history and this entry is its result.
+`conformance/probe_suspend_resume.py` (deleted with the Python client after the Rust
+port went live-green, so the probe is in git history and this entry is its result).
 The same assertions now run inside `conformance/run_rs.py`'s suspend/resume section.
 `SuspendMicrovm`, held 45 seconds, then `ResumeMicrovm`. Everything survived:
 
@@ -387,22 +393,23 @@ The same assertions now run inside `conformance/run_rs.py`'s suspend/resume sect
 | A backgrounded process | survived and kept running after resume |
 | Endpoint URL | unchanged |
 
-The decisive evidence is a ticker writing `date +%s` once a second: the largest gap
-between consecutive ticks was 51 seconds, matching the suspension plus transition
-time, and the tick file grew by 6 lines over 6 seconds after resume. So the guest
-is frozen rather than killed, and it resumes mid-stride.
+A ticker writing `date +%s` once a second provided the direct evidence. The
+largest gap between consecutive ticks was 51 seconds, which matches the suspension
+plus transition time, and the tick file grew by 6 lines over 6 seconds after resume.
+The guest is frozen rather than killed, and its processes continue from the point
+where they stopped.
 
-Two consequences. Pause/resume needs no token re-delivery and no re-bootstrap,
-which makes a warm suspended sandbox pool viable: suspend an idle VM instead of
-terminating it and the next task lands in a VM that still has its filesystem, its
-installed tools, and its credentials. And a guest process that measures wall time
-sees the suspension as a single jump — anything holding a timeout, a lease, or a
-TLS session across a suspend will observe it expire at once.
+Two consequences follow. Pause/resume needs no token re-delivery and no
+re-bootstrap, which makes a warm suspended sandbox pool viable. Suspend an idle VM
+instead of terminating it, and the next task lands in a VM that still has its
+filesystem, its installed tools, and its credentials. Separately, a guest process
+that measures wall time sees the suspension as a single jump, so anything holding a
+timeout, a lease, or a TLS session across a suspend will observe it expire at once.
 
 This corrects an earlier claim in the daemon's own resume-hook docstring, which
 asserted that bootstrap state being in memory made a resumed VM unable to serve the
-control API. That was reasoning from where the state lives rather than from a
-measurement, and it was wrong.
+control API. That claim was inferred from where the state lives rather than
+measured, and the measurement showed it was wrong.
 
 ## Traffic ordering around the `/run` hook
 
@@ -429,16 +436,15 @@ The endpoint proxy terminates outside the VM and forwards over loopback. Both th
 platform's lifecycle hooks and the harness's control requests arrive from
 `127.0.0.1`.
 
-Consequence, and it inverts the intuition: a source-address rule that rejects
-loopback callers on the bootstrap route is not a weak control resting on an
-unverified assumption. It is actively wrong. It would reject the platform's own
-legitimate bootstrap and break every launch. Do not implement it. An earlier
-attempt broke 39 tests, and those failures were reporting a real defect rather
-than a harness artifact.
+A source-address rule that rejects loopback callers on the bootstrap route would
+reject the platform's own legitimate bootstrap and break every launch. Do not
+implement it. This inverts the usual intuition, in which a loopback filter looks
+like a safe extra control. An earlier attempt broke 39 tests, and those failures
+were reporting a real defect rather than a harness artifact.
 
 Because in-VM traffic is indistinguishable from platform traffic at the socket
 level, the one-shot bootstrap is the only available defense on that route. Its
-sufficiency is checked in `model/` rather than argued in prose.
+sufficiency is checked mechanically in `model/`.
 
 ## Something probes the port with TLS before bootstrap
 
@@ -450,9 +456,9 @@ code 400, message Bad request version ("\x13\x01\x13\x02...")
 ```
 
 That is a TLS ClientHello reaching a plaintext HTTP server. Something in the
-platform's path probes the port with TLS first. It is harmless, the correct
+platform's path probes the port with TLS first. The probe is harmless. The correct
 response is a 400 and a debug-level log, and it must not take the listener down.
-It looks like an attack in logs, which is why it is documented here.
+It is documented here because it looks like an attack in logs.
 
 ## Endpoint authentication
 
@@ -465,14 +471,13 @@ There is no unauthenticated internet path to the daemon's port. Port scoping is
 the useful part: a token minted for port 9000 cannot reach port 8080, so a task
 workload and a control plane can share a VM with access handed out to only one.
 
-Operational consequence for clients: the 60-minute ceiling means a long-running
-trial will mint a fresh token mid-flight, so token minting sits inside the retry
-path and boto/HTTP errors from minting must be handled wherever a request can be
-retried.
+The 60-minute ceiling means a long-running trial will mint a fresh token
+mid-flight. Token minting therefore sits inside the retry path, and boto/HTTP
+errors from minting must be handled wherever a request can be retried.
 
 ## `clientToken` is a permanent idempotency key
 
-Measured 2026-08-02, us-east-1, the expensive way. A `clientToken` derived from a
+Measured 2026-08-02, us-east-1. A `clientToken` derived from a
 stable resource identity replays forever: after an image is deleted and recreated
 under the same name, the service replays the original create as a no-op. The
 image sits in `CREATING` with its builds never scheduled
@@ -490,7 +495,7 @@ than burning the full build timeout in silence.
 
 ## Build logs go to `/aws/lambda-microvms/<image-name>`
 
-Measured 2026-08-05. Not `/aws/lambda/microvms/*`. An IAM policy granting the
+Measured 2026-08-05. The prefix is not `/aws/lambda/microvms/*`. An IAM policy granting the
 wrong prefix produces server-side builds with no logs at all, and every failure
 then reports `reason=unknown` — which reads as the service failing to populate
 `stateReason` when it is really the caller's own policy discarding the logs.
@@ -504,7 +509,7 @@ Documented, and confirmed useful in practice. Idle time is measured by inbound
 traffic through the proxy, so an abandoned VM auto-suspends and then terminates
 rather than billing to the 8-hour `maximumDurationInSeconds` ceiling.
 
-Sharp edge for clients that suspend deliberately to preserve state: the
+Clients that suspend deliberately to preserve state hit a sharp edge. The
 launch-time `idlePolicy` terminates a suspended VM after
 `suspended_timeout_sec`, so a "resume later" affordance silently stops working
 once that window passes. State the window wherever a resume path is offered.
