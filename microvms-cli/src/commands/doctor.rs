@@ -485,7 +485,7 @@ mod tests {
             Vec::new(),
         );
         let env = |_: &str| None;
-        let seam = NoAws;
+        let seam = crate::seam::PanickingSeam;
         let ctx = Ctx {
             seam: &seam,
             out: &mut out,
@@ -506,50 +506,5 @@ mod tests {
             "{by_name:?}"
         );
         assert!(checks.iter().all(|check| check.fatal && !check.ok));
-    }
-
-    struct NoAws;
-
-    impl crate::seam::CoreSeam for NoAws {
-        fn control_plane(
-            &self,
-            _region: Region,
-        ) -> crate::seam::futures_util_shim::BoxFuture<
-            '_,
-            Result<microvms_core::control::ControlPlane, microvms_core::Error>,
-        > {
-            panic!("this test reaches no seam")
-        }
-
-        fn open_sandbox(
-            &self,
-            _region: Region,
-            _port: Option<u16>,
-        ) -> crate::seam::futures_util_shim::BoxFuture<
-            '_,
-            Result<microvms_core::sandbox::Sandbox, microvms_core::Error>,
-        > {
-            panic!("this test reaches no seam")
-        }
-
-        fn attach_session(
-            &self,
-            _region: Region,
-            _attach: crate::seam::Attach,
-        ) -> crate::seam::futures_util_shim::BoxFuture<
-            '_,
-            Result<microvms_core::session::Session, microvms_core::Error>,
-        > {
-            panic!("this test reaches no seam")
-        }
-
-        fn put_artifact(
-            &self,
-            _uri: &str,
-            _bytes: Vec<u8>,
-        ) -> crate::seam::futures_util_shim::BoxFuture<'_, Result<(), microvms_core::Error>>
-        {
-            panic!("this test reaches no seam")
-        }
     }
 }

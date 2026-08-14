@@ -150,7 +150,7 @@ async fn run<O: std::io::Write, E: std::io::Write>(
             infra,
             env: &process_env,
         };
-        handle(&mut ctx, &parsed.command).await
+        handle(&mut ctx, &parsed.command, commands::lifecycle::on_ctrl_c()).await
     };
 
     match result {
@@ -368,16 +368,21 @@ fn infra_for(command: &Command) -> Infra {
 ///
 /// Exhaustive matters: a thirteenth command added to [`Command`] fails to compile here rather
 /// than silently doing nothing, which is the failure mode a `HashMap<&str, fn>` dispatcher has.
+///
+/// The interrupt is a parameter rather than built in the `run` arm, so the behavioral guard
+/// dispatches through this exact function with [`commands::lifecycle::never`] instead of
+/// maintaining a sixteen-arm copy that only differs there. `main` passes
+/// [`commands::lifecycle::on_ctrl_c`]; nothing is installed until the future is polled, so the
+/// fifteen commands that never poll it pay nothing.
 async fn handle<O: std::io::Write, E: std::io::Write>(
     ctx: &mut Ctx<'_, O, E>,
     command: &Command,
+    interrupt: commands::lifecycle::Interrupt<'_>,
 ) -> Result<commands::Rendered, CliError> {
     match command {
         // The only command that races the interrupt, because it is the only one that launches
-        // (CLI-6). `on_ctrl_c` rather than a global handler, so the guard can inject its own.
-        Command::Run(args) => {
-            commands::lifecycle::run(ctx, args, commands::lifecycle::on_ctrl_c()).await
-        }
+        // (CLI-6). Injected rather than a global handler, so the guard can pass its own.
+        Command::Run(args) => commands::lifecycle::run(ctx, args, interrupt).await,
         Command::Build(args) => commands::lifecycle::build(ctx, args).await,
         // The attached block: five commands, one door. See `commands/attached.rs`.
         Command::Exec(args) => commands::attached::exec(ctx, args).await,

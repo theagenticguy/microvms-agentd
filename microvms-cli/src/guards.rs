@@ -186,40 +186,13 @@ async fn dispatch_with(
             infra,
             env: &env,
         };
-        handle_for_test(&mut ctx, command).await
+        // The *shipped* dispatcher, with the one substitution the guard needs: the interrupt for
+        // `run` is [`crate::commands::lifecycle::never`], so this measures the seam rather than
+        // racing a signal.
+        crate::handle(&mut ctx, command, crate::commands::lifecycle::never()).await
     };
     let stderr = String::from_utf8(out.into_streams().1).expect("utf8");
     (result, stderr)
-}
-
-/// The dispatcher, as the guard calls it.
-///
-/// Mirrors `main`'s `handle` and is deliberately a second copy of nothing: it forwards to the same
-/// handler functions, and the interrupt for `run` is [`crate::commands::lifecycle::never`] so this
-/// guard measures the seam rather than racing a signal.
-async fn handle_for_test<O: std::io::Write, E: std::io::Write>(
-    ctx: &mut Ctx<'_, O, E>,
-    command: &Command,
-) -> Result<Rendered, CliError> {
-    use crate::commands::{attached, cost, doctor, lifecycle, local};
-    match command {
-        Command::Run(args) => lifecycle::run(ctx, args, lifecycle::never()).await,
-        Command::Build(args) => lifecycle::build(ctx, args).await,
-        Command::Exec(args) => attached::exec(ctx, args).await,
-        Command::Health(args) => attached::health(ctx, args).await,
-        Command::Ack(args) => attached::ack(ctx, args).await,
-        Command::Stdin(args) => attached::stdin(ctx, args).await,
-        Command::Cp(args) => attached::cp(ctx, args).await,
-        Command::Suspend(args) => lifecycle::suspend(ctx, args).await,
-        Command::Resume(args) => lifecycle::resume(ctx, args).await,
-        Command::Terminate(args) => lifecycle::terminate(ctx, args).await,
-        Command::Ls(args) => local::ls(ctx, args),
-        Command::Logs(args) => local::logs(ctx, args),
-        Command::Cost(args) => cost::cost(ctx, args),
-        Command::Doctor(args) => doctor::doctor(ctx, args).await,
-        Command::Manifest => local::manifest(ctx),
-        Command::Constants(_) => local::constants(ctx),
-    }
 }
 
 /// Every AWS-touching command, its arguments, and the door it must enter.
@@ -1117,7 +1090,7 @@ async fn against_daemon(
             infra: full_infra(),
             env: &env,
         };
-        handle_for_test(&mut ctx, command).await
+        crate::handle(&mut ctx, command, crate::commands::lifecycle::never()).await
     };
     let (stdout, stderr) = out.into_streams();
     (

@@ -77,7 +77,7 @@ use crate::commands::{Ctx, Rendered, response_type};
 use crate::exit::Exit;
 use crate::ledger::Ledger;
 use crate::render::RunOutcome;
-use crate::seam::{resolve_region, state_dir};
+use crate::seam::state_dir;
 
 /// The future a launch races against. See the module docs.
 ///
@@ -123,11 +123,7 @@ pub async fn run<O: std::io::Write, E: std::io::Write>(
     args: &RunArgs,
     interrupt: Interrupt<'_>,
 ) -> Result<Rendered, crate::exit::CliError> {
-    let region = resolve_region(
-        args.region.region.map(|r| r.region()),
-        args.region.unlisted_region.as_deref(),
-        ctx.env,
-    )?;
+    let region = args.region.resolve(ctx.env)?;
     let size = args.memory.size_class();
     let name = args
         .name
@@ -472,11 +468,7 @@ pub async fn build<O: std::io::Write, E: std::io::Write>(
     ctx: &mut Ctx<'_, O, E>,
     args: &BuildArgs,
 ) -> Result<Rendered, crate::exit::CliError> {
-    let region = resolve_region(
-        args.region.region.map(|r| r.region()),
-        args.region.unlisted_region.as_deref(),
-        ctx.env,
-    )?;
+    let region = args.region.resolve(ctx.env)?;
     ctx.infra.require(&["build_role_arn"])?;
     if !args.binary.exists() {
         return Err(crate::exit::CliError::new(
@@ -733,11 +725,7 @@ pub async fn suspend<O: std::io::Write, E: std::io::Write>(
     ctx: &mut Ctx<'_, O, E>,
     args: &SuspendArgs,
 ) -> Result<Rendered, crate::exit::CliError> {
-    let region = resolve_region(
-        args.region.region.map(|r| r.region()),
-        args.region.unlisted_region.as_deref(),
-        ctx.env,
-    )?;
+    let region = args.region.resolve(ctx.env)?;
     let plane = ctx.seam.control_plane(region).await?;
     let current = plane.get_microvm(&args.microvm_id).await?;
     if current.state != "RUNNING" {
@@ -798,11 +786,7 @@ pub async fn resume<O: std::io::Write, E: std::io::Write>(
     ctx: &mut Ctx<'_, O, E>,
     args: &ResumeArgs,
 ) -> Result<Rendered, crate::exit::CliError> {
-    let region = resolve_region(
-        args.region.region.map(|r| r.region()),
-        args.region.unlisted_region.as_deref(),
-        ctx.env,
-    )?;
+    let region = args.region.resolve(ctx.env)?;
     let plane = ctx.seam.control_plane(region).await?;
     ctx.out.progress(&format!("resuming {}", args.microvm_id));
     plane.resume(&args.microvm_id).await?;
@@ -843,11 +827,7 @@ pub async fn terminate<O: std::io::Write, E: std::io::Write>(
     ctx: &mut Ctx<'_, O, E>,
     args: &TerminateArgs,
 ) -> Result<Rendered, crate::exit::CliError> {
-    let region = resolve_region(
-        args.region.region.map(|r| r.region()),
-        args.region.unlisted_region.as_deref(),
-        ctx.env,
-    )?;
+    let region = args.region.resolve(ctx.env)?;
     let plane = ctx.seam.control_plane(region).await?;
 
     ctx.out

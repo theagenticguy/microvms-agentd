@@ -41,7 +41,7 @@
 use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use microvms_core::{Region, SizeClass};
+use microvms_core::{Error, Region, SizeClass};
 
 /// `microvm`: a working sandbox in one command, and nothing microvms-core does not do.
 #[derive(Debug, Parser)]
@@ -300,6 +300,22 @@ pub struct RegionFlags {
     /// as an IAM denial. Use this when AWS has launched MicroVMs somewhere new.
     #[arg(long, value_name = "NAME", conflicts_with = "region")]
     pub unlisted_region: Option<String>,
+}
+
+impl RegionFlags {
+    /// The region every ARN in this invocation is derived for.
+    ///
+    /// One method rather than the same three-line unpacking of these flags at every AWS
+    /// command's first line — six copies of one expression is six chances for the flag order
+    /// to drift. The resolution itself, and why its order must agree with the SDK's, lives at
+    /// [`crate::seam::resolve_region`].
+    pub fn resolve(&self, env: &dyn Fn(&str) -> Option<String>) -> Result<Region, Error> {
+        crate::seam::resolve_region(
+            self.region.map(|r| r.region()),
+            self.unlisted_region.as_deref(),
+            env,
+        )
+    }
 }
 
 /// The three identifiers, plus the port, that address a VM this invocation did not launch.
