@@ -246,6 +246,9 @@ fn aws_commands(binary: &std::path::Path) -> Vec<(&'static str, Command, Door)> 
                 command: Some("true".into()),
                 timeout: 30.0,
                 cwd: None,
+                env: Vec::new(),
+                user: None,
+                group: None,
                 exec_id: None,
                 poll: None,
                 detach: false,
@@ -1106,6 +1109,9 @@ fn exec_command(shape: impl FnOnce(&mut ExecArgs)) -> Command {
         command: Some("true".into()),
         timeout: 30.0,
         cwd: None,
+        env: Vec::new(),
+        user: None,
+        group: None,
         exec_id: None,
         poll: None,
         detach: false,
@@ -1247,6 +1253,83 @@ async fn two_invocations_without_an_exec_id_send_different_keys() {
         sent[0], sent[1],
         "a constant generated id makes every exec after the first read the first one's output"
     );
+}
+
+/// **`exec --env`, `--user`, and `--group` reach the start body verbatim, and their absence is
+/// an absence.**
+///
+/// Asserted on the recorded request body, because that is the only place the claim lives: the
+/// daemon `env_clear()`s and applies exactly this map (`agentd/src/exec.rs:1003`), so a key
+/// mangled between the flag and the wire is a variable the child silently does not have — the
+/// PATH failure the coding-agents example documents, reintroduced through the fix. The second
+/// invocation asserts the defaults stay defaults: `env` empty and `user`/`group` **null**, since
+/// `Some(0)` where `None` belonged would ask the daemon to demote every exec to root.
+///
+/// **Guard proof.** Swap the tuple in `attached::exec`'s collection — `args.env.iter().map(|(k,
+/// v)| (v.clone(), k.clone()))` — and the body carries `{"/usr/bin:/bin": "PATH"}`: the `env`
+/// assertion goes red naming the missing key. Change `user: args.user` to `None` and the uid
+/// assertion goes red. Both breaks were made on 2026-08-14, both failed exactly there, and both
+/// were restored.
+#[tokio::test]
+async fn env_user_and_group_reach_the_wire_verbatim_and_default_to_absent() {
+    let script = DaemonScript::new();
+    script
+        .reply(200, STARTED_BODY)
+        .reply(200, &poll_body("exited", "0", "", false))
+        .reply(200, &poll_body("acked", "0", "", false));
+
+    let command = exec_command(|args| {
+        args.env = vec![
+            ("PATH".into(), "/usr/bin:/bin".into()),
+            ("EMPTY".into(), String::new()),
+        ];
+        args.user = Some(1000);
+        args.group = Some(2000);
+    });
+    let (result, _, _) = against_daemon(&script, &command).await;
+    result.expect("the exec succeeds");
+
+    let start = script
+        .requests()
+        .into_iter()
+        .find(|request| request.path == "/v1/exec/start")
+        .expect("a start went out");
+    let body: serde_json::Value =
+        serde_json::from_slice(&start.body).expect("the start body is JSON");
+    assert_eq!(
+        body["env"]["PATH"], "/usr/bin:/bin",
+        "the key must stay the key and the value the value; a swap is a variable the child \
+         silently lacks: {body}"
+    );
+    assert_eq!(
+        body["env"]["EMPTY"], "",
+        "an empty value is set-to-empty, not unset: {body}"
+    );
+    assert_eq!(body["user"], 1000, "{body}");
+    assert_eq!(body["group"], 2000, "{body}");
+
+    // And without the flags, the wire says nothing: an empty map and nulls. `Some(0)` here
+    // would demote every exec to root, which is the opposite of a default.
+    let script = DaemonScript::new();
+    script
+        .reply(200, STARTED_BODY)
+        .reply(200, &poll_body("exited", "0", "", false))
+        .reply(200, &poll_body("acked", "0", "", false));
+    let (result, _, _) = against_daemon(&script, &exec_command(|_| {})).await;
+    result.expect("the exec succeeds");
+    let start = script
+        .requests()
+        .into_iter()
+        .find(|request| request.path == "/v1/exec/start")
+        .expect("a start went out");
+    let body: serde_json::Value = serde_json::from_slice(&start.body).expect("JSON");
+    assert_eq!(
+        body["env"],
+        serde_json::json!({}),
+        "no --env means an empty environment on the wire: {body}"
+    );
+    assert_eq!(body["user"], serde_json::Value::Null, "{body}");
+    assert_eq!(body["group"], serde_json::Value::Null, "{body}");
 }
 
 /// **`exec --detach` starts and stops: one POST, no wait, and above all no ack.**

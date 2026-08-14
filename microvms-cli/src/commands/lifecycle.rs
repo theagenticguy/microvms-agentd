@@ -645,6 +645,14 @@ pub struct StartSpec<'a> {
     pub exec_id: Option<String>,
     /// Whether the child gets a writable stdin pipe.
     pub stdin: bool,
+    /// The child's whole environment. The daemon starts every exec from `env_clear()` — the
+    /// agent token must never leak into a child — so this map is not merged into anything:
+    /// what is here is everything the child sees.
+    pub env: std::collections::HashMap<String, String>,
+    /// Numeric uid to demote to. `None` runs as the daemon's own user.
+    pub user: Option<u32>,
+    /// Numeric gid to demote to. `None` keeps the daemon's own group.
+    pub group: Option<u32>,
 }
 
 impl<'a> StartSpec<'a> {
@@ -655,6 +663,9 @@ impl<'a> StartSpec<'a> {
             cwd: None,
             exec_id: None,
             stdin: false,
+            env: std::collections::HashMap::new(),
+            user: None,
+            group: None,
         }
     }
 }
@@ -671,9 +682,9 @@ impl<'a> StartSpec<'a> {
 /// dependency in `Cargo.toml` says why the direct edge stays: it resolves identically either
 /// way, it is ARCH-2's own contract, and `tests/thinness.rs` allowlists it by name.
 ///
-/// Shared with [`crate::commands::attached`] rather than duplicated, because the fields this
-/// deliberately leaves unset — `user`, `group`, `timeout_sec` — are decisions with reasons, and a
-/// second constructor is where one of them silently acquires a different answer.
+/// Shared with [`crate::commands::attached`] rather than duplicated, because the field this
+/// deliberately leaves unset — `timeout_sec` — is a decision with a reason, and a second
+/// constructor is where it silently acquires a different answer.
 pub fn start_request(spec: StartSpec<'_>) -> microvms_core::protocol::exec::StartRequest {
     // Every field written out rather than `..Default::default()`, and not only because
     // `StartRequest` has no `Default`: this struct is the wire contract, so a field added on the
@@ -691,11 +702,20 @@ pub fn start_request(spec: StartSpec<'_>) -> microvms_core::protocol::exec::Star
         command: vec![spec.command.to_string()],
         shell: true,
         cwd: spec.cwd,
-        env: std::collections::HashMap::new(),
-        // No demotion: the daemon's own user is what the image chose, and a uid flag on this
-        // surface would be a number with no way to check it means anything in that guest.
-        user: None,
-        group: None,
+        // Verbatim, not merged: the daemon `env_clear()`s before applying this map
+        // (`agentd/src/exec.rs:1003`), so the caller's `--env` flags are the child's whole
+        // environment and there is nothing on this side to merge them into.
+        env: spec.env,
+        // Forwarded as the numbers the caller gave, unvalidated. The earlier reason for
+        // leaving these `None` — "a uid flag on this surface would be a number with no way to
+        // check it means anything in that guest" — still holds as far as it goes, but it
+        // holds equally against the Python and Node bindings, which do expose them; the guest's
+        // uid space is unknowable from *any* client, and the daemon's spawn failure for a uid
+        // it cannot assume is the real check. What the reason bought was parity-breaking
+        // caution, not a guard: `--user`/`--group` now forward, and omission stays the
+        // default, which is "run as the daemon's own user".
+        user: spec.user,
+        group: spec.group,
         // The client-side deadline is the caller's `--timeout`, applied by `run_sync`. Sending it
         // as the *daemon's* budget too would kill the child at a deadline the caller cannot see
         // in the exit code.
@@ -987,10 +1007,8 @@ mod tests {
     #[test]
     fn a_shell_command_is_one_element_with_the_shell_flag_set() {
         let request = start_request(StartSpec {
-            command: "pytest -q && echo done",
             cwd: Some("/workspace".into()),
-            exec_id: None,
-            stdin: false,
+            ..StartSpec::command("pytest -q && echo done")
         });
         assert!(request.shell, "a shell line needs the shell flag");
         assert_eq!(request.command, ["pytest -q && echo done"]);
@@ -1017,10 +1035,8 @@ mod tests {
         assert!(first.starts_with("x-"), "{first}");
 
         let stable = start_request(StartSpec {
-            command: "a",
-            cwd: None,
             exec_id: Some("conformance-retry-1".into()),
-            stdin: false,
+            ..StartSpec::command("a")
         });
         assert_eq!(
             stable.exec_id, "conformance-retry-1",
@@ -1030,10 +1046,10 @@ mod tests {
         // And twice, so the forwarding is not merely a pass-through of the first call.
         assert_eq!(
             start_request(StartSpec {
-                command: "different command entirely",
                 cwd: Some("/elsewhere".into()),
                 exec_id: Some("conformance-retry-1".into()),
                 stdin: true,
+                ..StartSpec::command("different command entirely")
             })
             .exec_id,
             "conformance-retry-1"
@@ -1050,13 +1066,57 @@ mod tests {
         assert!(!start_request(StartSpec::command("cat")).stdin);
         assert!(
             start_request(StartSpec {
-                command: "cat",
-                cwd: None,
-                exec_id: None,
                 stdin: true,
+                ..StartSpec::command("cat")
             })
             .stdin
         );
+    }
+
+    /// The parsed `--env` map and the `--user`/`--group` numbers reach the request verbatim.
+    ///
+    /// Verbatim is the property: keys and values must not be swapped, decorated, or merged
+    /// into anything, because the daemon `env_clear()`s and applies exactly this map — a
+    /// mangled key here is a variable the child silently does not have. Keys and values are
+    /// deliberately distinguishable strings, so a swap fails on both assertions rather than
+    /// passing by symmetry.
+    ///
+    /// **Guard proof.** Swap key and value in the collection feeding `spec.env` (build the map
+    /// as `(v, k)`) and the `PATH` lookup below reads `None`; drop `user: spec.user` back to
+    /// `None` and the uid assertion goes red. Both were done on 2026-08-14 and both failed as
+    /// stated, then were restored.
+    #[test]
+    fn env_user_and_group_reach_the_start_request_verbatim() {
+        let request = start_request(StartSpec {
+            env: std::collections::HashMap::from([
+                ("PATH".to_string(), "/usr/bin:/bin".to_string()),
+                ("EMPTY".to_string(), String::new()),
+            ]),
+            user: Some(1000),
+            group: Some(2000),
+            ..StartSpec::command("env")
+        });
+        assert_eq!(request.env.len(), 2);
+        assert_eq!(
+            request.env.get("PATH").map(String::as_str),
+            Some("/usr/bin:/bin"),
+            "the key must stay the key: a swap makes a variable the child silently lacks"
+        );
+        assert_eq!(
+            request.env.get("EMPTY").map(String::as_str),
+            Some(""),
+            "an empty value survives to the wire; it is not the same as unset"
+        );
+        assert_eq!(request.user, Some(1000));
+        assert_eq!(request.group, Some(2000));
+
+        // And the defaults stay the defaults: no demotion, empty environment. The one-shot
+        // constructor is what `run --exec` uses, so a stray value here would give every run's
+        // exec an environment nobody asked for.
+        let bare = start_request(StartSpec::command("true"));
+        assert!(bare.env.is_empty());
+        assert_eq!(bare.user, None);
+        assert_eq!(bare.group, None);
     }
 
     /// The wait carries the caller's deadline and never a negative one.

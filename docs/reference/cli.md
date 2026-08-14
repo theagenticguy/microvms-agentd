@@ -105,16 +105,19 @@ Runs one command in a MicroVM that is already running. The single subcommand cov
 
 Flags:
 
-- `[COMMAND]` — a shell command to run in the VM; omitted only with `--poll`. `microvms-cli/src/cli.rs:479-480`.
-- `--timeout <TIMEOUT>` — how long to wait for the command, in seconds; default `300`. `microvms-cli/src/cli.rs:483-484`.
-- `--cwd <CWD>` — working directory. When omitted, the command inherits the image WORKDIR, which is not the same as passing `/`. `microvms-cli/src/cli.rs:490-491`.
-- `--exec-id <ID>` — use this exec id instead of a fresh one, making a retry idempotent; the daemon returns success for a known id without spawning a second child. `microvms-cli/src/cli.rs:510-511`.
-- `--poll <ID>` — read an existing exec's status and output instead of starting anything; read-only server-side, does not ack. Conflicts with `--exec-id`, `--stream`, `--stdin`, `--cwd`, `--detach`. `microvms-cli/src/cli.rs:519-520`.
-- `--detach` — start the command and return immediately, without waiting and without acking; prints the exec id and `phase: running`. Conflicts with `--stream` and `--stdin`. `microvms-cli/src/cli.rs:539-540`.
-- `--stream` — stream output as it arrives rather than waiting for the whole thing; under `--json` or into a pipe this writes NDJSON. `microvms-cli/src/cli.rs:549-550`.
-- `--from-offset <BYTES>` — resume a stream at this byte offset; requires `--stream`. `microvms-cli/src/cli.rs:557-558`.
-- `--stdin` — give the command a stdin pipe, feed it this process's stdin, then close it. `microvms-cli/src/cli.rs:565-566`.
-- Plus `AttachFlags` and `RegionFlags`. `microvms-cli/src/cli.rs:568-572`.
+- `[COMMAND]` — a shell command to run in the VM; omitted only with `--poll`. `microvms-cli/src/cli.rs:497-498`.
+- `--timeout <TIMEOUT>` — how long to wait for the command, in seconds; default `300`. `microvms-cli/src/cli.rs:501-502`.
+- `--cwd <CWD>` — working directory. When omitted, the command inherits the image WORKDIR, which is not the same as passing `/`. `microvms-cli/src/cli.rs:508-509`.
+- `--env <KEY=VALUE>` — set one environment variable for the command; repeatable. These flags are the child's whole environment: the daemon starts every exec from an empty one and applies exactly this map, so there is no inherited PATH to append to. Split at the first `=`, so a value may itself contain `=`; an empty VALUE is legal (`--env EMPTY=`), and a missing `=` or an empty KEY is refused at parse time. `microvms-cli/src/cli.rs:524-525`.
+- `--user <UID>` — numeric uid to run the command as; omitted runs as the daemon's own user. Numeric because that is the protocol's type and the daemon's mechanism (`Command::uid`, between fork and exec) — a name would need an `/etc/passwd` lookup inside a guest whose base image may not have one. `microvms-cli/src/cli.rs:534-535`.
+- `--group <GID>` — numeric gid to run the command as; omitted keeps the daemon's own group. `microvms-cli/src/cli.rs:538-539`.
+- `--exec-id <ID>` — use this exec id instead of a fresh one, making a retry idempotent; the daemon returns success for a known id without spawning a second child. `microvms-cli/src/cli.rs:558-559`.
+- `--poll <ID>` — read an existing exec's status and output instead of starting anything; read-only server-side, does not ack. Conflicts with `--exec-id`, `--stream`, `--stdin`, `--cwd`, `--detach`, `--env`, `--user`, `--group`. `microvms-cli/src/cli.rs:567-568`.
+- `--detach` — start the command and return immediately, without waiting and without acking; prints the exec id and `phase: running`. Conflicts with `--stream` and `--stdin`. `microvms-cli/src/cli.rs:587-588`.
+- `--stream` — stream output as it arrives rather than waiting for the whole thing; under `--json` or into a pipe this writes NDJSON. `microvms-cli/src/cli.rs:597-598`.
+- `--from-offset <BYTES>` — resume a stream at this byte offset; requires `--stream`. `microvms-cli/src/cli.rs:605-606`.
+- `--stdin` — give the command a stdin pipe, feed it this process's stdin, then close it. `microvms-cli/src/cli.rs:613-614`.
+- Plus `AttachFlags` and `RegionFlags`. `microvms-cli/src/cli.rs:616-620`.
 
 ## health
 
