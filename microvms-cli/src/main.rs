@@ -371,9 +371,9 @@ fn infra_for(command: &Command) -> Infra {
 ///
 /// The interrupt is a parameter rather than built in the `run` arm, so the behavioral guard
 /// dispatches through this exact function with [`commands::lifecycle::never`] instead of
-/// maintaining a sixteen-arm copy that only differs there. `main` passes
+/// maintaining a seventeen-arm copy that only differs there. `main` passes
 /// [`commands::lifecycle::on_ctrl_c`]; nothing is installed until the future is polled, so the
-/// fifteen commands that never poll it pay nothing.
+/// sixteen commands that never poll it pay nothing.
 async fn handle<O: std::io::Write, E: std::io::Write>(
     ctx: &mut Ctx<'_, O, E>,
     command: &Command,
@@ -399,6 +399,7 @@ async fn handle<O: std::io::Write, E: std::io::Write>(
         Command::Doctor(args) => commands::doctor::doctor(ctx, args).await,
         Command::Manifest => commands::local::manifest(ctx),
         Command::Constants(_) => commands::local::constants(ctx),
+        Command::Dockerfile(args) => commands::local::dockerfile(ctx, args),
     }
 }
 

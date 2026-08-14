@@ -1,6 +1,6 @@
 # microvms-agentd · CLI
 
-The `microvm` binary has sixteen subcommands, declared as one `clap` `Subcommand` enum in `microvms-cli/src/cli.rs:90-215` and built from `microvms-cli/Cargo.toml:20-22`.
+The `microvm` binary has seventeen subcommands, declared as one `clap` `Subcommand` enum in `microvms-cli/src/cli.rs:90-227` and built from `microvms-cli/Cargo.toml:20-22`.
 
 ## Global flags
 
@@ -327,6 +327,28 @@ Flags:
 
 - `--emit-json` — emit the raw constants object without an envelope. This is the one stdout write in this binary that is not an envelope. `microvms-cli/src/cli.rs:830-831`.
 
+## dockerfile
+
+```
+microvm dockerfile [OPTIONS]
+```
+
+Prints the Dockerfile stanza that wraps any base image with agentd. The stanza is what `microvm build` bakes when no `--dockerfile` is given, so appending your own `RUN` layers to this output and passing the result to `build --dockerfile` is the default build plus your layers. The text comes from `microvms-core`'s own generator rather than a copy, so it cannot drift from what a default build produces. `microvms-cli/src/commands/local.rs:251`, reusing `microvms-core/src/control/artifact.rs:145`.
+
+The output's comments name the two platform constraints a hand-written wrapper hits. The `FROM` must match the managed base's `docker_ref`, because the build runs the Dockerfile on top of the base that `baseImageArn` names and `microvms-core` refuses a Dockerfile whose `FROM` disagrees. And a `WORKDIR` is required when the base declares none — the managed al2023 base does not, so without one every relative path resolves against `/`. `microvms-core/src/control/artifact.rs:228-244`, `microvms-core/src/control/artifact.rs:196-220`.
+
+This is a local command: no account is involved, and the stanza is built from compile-time constants.
+
+Flags:
+
+- `--from <IMAGE_REF>` — the image ref for the `FROM` line; defaults to the managed al2023 base's pair, `public.ecr.aws/amazonlinux/amazonlinux:2023-minimal`. Only change this when you are also changing `baseImageArn`. `microvms-cli/src/cli.rs:884-891`.
+- `--port <PORT>` — the port agentd listens on inside the guest; default `9000`. Reaches both `ENV AGENTD_PORT` and `EXPOSE`. `microvms-cli/src/cli.rs:893-895`.
+- `--workdir <DIR>` — a working directory to create and set, as both a `RUN mkdir -p` and a `WORKDIR`. Strongly recommended, because the managed base declares no WorkingDir. `microvms-cli/src/cli.rs:897-903`.
+
+The JSON envelope carries the stanza text plus the base image pair — `baseImageName` for deriving `baseImageArn` and `baseImageDockerRef` for the `FROM` — so a consumer holds both halves of the agreement the platform enforces. `microvms-cli/src/commands/mod.rs:207-217`.
+
+For the full recipe — appending tool layers, building, and driving the daemon from your own harness — see [docs/EMBEDDING.md](../EMBEDDING.md).
+
 ## The JSON envelope
 
 Each invocation writes exactly one JSON object on stdout. Progress always goes to stderr. `--quiet` suppresses progress but not warnings, so a leaked resource is still reported even in quiet mode. `microvms-cli/src/envelope.rs:1-18`. `apiVersion` is `"1"`; it is bumped when a field's meaning changes, not when a command is added. `microvms-cli/src/envelope.rs:66`.
@@ -367,7 +389,7 @@ A request rejected locally reports no `data.kind`, because nothing reached the d
 
 ### Response types
 
-Each command declares its `type` discriminant and the `data` keys its success envelope carries. `microvms-cli/src/commands/mod.rs:102-205`.
+Each command declares its `type` discriminant and the `data` keys its success envelope carries. `microvms-cli/src/commands/mod.rs:102-218`.
 
 | Command | `type` |
 | --- | --- |
@@ -387,6 +409,7 @@ Each command declares its `type` discriminant and the `data` keys its success en
 | `doctor` | `microvm.doctor` |
 | `manifest` | `microvm.manifest` |
 | `constants` | `microvm.constants` |
+| `dockerfile` | `microvm.dockerfile` |
 
 ## The NDJSON stream exception
 

@@ -354,7 +354,7 @@ fn aws_commands(binary: &std::path::Path) -> Vec<(&'static str, Command, Door)> 
 ///
 /// Listed with a reason rather than skipped by a naming rule, so a *new* AWS-touching command is
 /// covered by the guard by default and can only leave the net by someone writing its name here.
-const LOCAL_ONLY: [(&str, &str); 5] = [
+const LOCAL_ONLY: [(&str, &str); 6] = [
     (
         "ls",
         "reads the local ledger; the whole point is that AWS cannot attribute a dead run",
@@ -375,6 +375,11 @@ const LOCAL_ONLY: [(&str, &str); 5] = [
     (
         "constants",
         "emits microvms_core::constants::as_json for the drift gate",
+    ),
+    (
+        "dockerfile",
+        "renders microvms_core::control::default_dockerfile to stdout; the stanza is a string \
+         built from compile-time constants and no account is involved",
     ),
 ];
 
@@ -497,6 +502,11 @@ async fn no_local_command_touches_a_seam_door() {
         }),
         Command::Manifest,
         Command::Constants(crate::cli::ConstantsArgs { emit_json: true }),
+        Command::Dockerfile(crate::cli::DockerfileArgs {
+            from: None,
+            port: 9000,
+            workdir: Some("/workspace".into()),
+        }),
     ];
     for command in &commands {
         let seam = RefusingSeam::new();

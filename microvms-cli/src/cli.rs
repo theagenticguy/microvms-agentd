@@ -80,7 +80,7 @@ pub struct Cli {
     pub quiet: bool,
 }
 
-/// The sixteen commands.
+/// The seventeen commands.
 ///
 /// Variant order is the order `microvm --help` and the manifest list them in, which is
 /// lifecycle order rather than alphabetical: a reader meeting this surface for the first time
@@ -214,6 +214,16 @@ pub enum Command {
     /// botocore model and against the Python client's own constants, which is the only check
     /// available for a value no API answers.
     Constants(ConstantsArgs),
+
+    /// Print the Dockerfile stanza that wraps any base image with agentd.
+    ///
+    /// The stanza is what `microvm build` bakes when no `--dockerfile` is given, emitted so
+    /// you can append your own layers and hand the result back to `build --dockerfile`. It
+    /// comes from `microvms-core`'s own generator, so it cannot drift from what a default
+    /// build produces — and its comments name the two platform traps a hand-written wrapper
+    /// hits: the FROM must match the managed base's `docker_ref`, and a WORKDIR is required
+    /// when the base declares none. Local: no account is involved.
+    Dockerfile(DockerfileArgs),
 }
 
 // ── the closed sets (CLI-5) ─────────────────────────────────────────────────
@@ -869,6 +879,30 @@ pub struct ConstantsArgs {
     pub emit_json: bool,
 }
 
+#[derive(Args, Debug)]
+pub struct DockerfileArgs {
+    /// The image ref for the FROM line. Defaults to the managed al2023 base's pair.
+    ///
+    /// Only change this when you are also changing `baseImageArn`: the build runs the
+    /// Dockerfile *on top of* the base that ARN names, and microvms-core refuses a
+    /// Dockerfile whose FROM disagrees with it (`require_matching_from`). Passing a ref
+    /// here does not select a base — it only writes the line that has to match one.
+    #[arg(long = "from", value_name = "IMAGE_REF")]
+    pub from: Option<String>,
+
+    /// The port agentd listens on inside the guest.
+    #[arg(long, default_value_t = 9000)]
+    pub port: u16,
+
+    /// A working directory to create and set. Strongly recommended.
+    ///
+    /// Most public ARM64 base images, the managed al2023 base included, declare no
+    /// WorkingDir — so without a WORKDIR every relative path in your commands resolves
+    /// against `/`, and microvms-core refuses `inherit_workdir` when nothing declares one.
+    #[arg(long, value_name = "DIR")]
+    pub workdir: Option<String>,
+}
+
 /// One `--env KEY=VALUE` pair, split at the first `=`.
 ///
 /// A parser rather than a raw `Vec<String>` the handler splits later, for the CLI-5 reason:
@@ -1026,7 +1060,7 @@ mod tests {
         Cli::command().debug_assert();
     }
 
-    /// Sixteen subcommands, named as the manifest and the response table name them.
+    /// Seventeen subcommands, named as the manifest and the response table name them.
     ///
     /// The five after `exec` are the attached block — `health`, `ack`, `stdin`, `cp` beside it —
     /// and their position is asserted rather than incidental, because `--help`'s reading order is
@@ -1056,6 +1090,7 @@ mod tests {
                 "doctor",
                 "manifest",
                 "constants",
+                "dockerfile",
             ]
         );
     }
