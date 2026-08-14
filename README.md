@@ -120,6 +120,36 @@ one.
 If a run is interrupted, `microvm ls` lists what this CLI created and could
 not confirm it deleted, so nothing leaks silently.
 
+## Running coding agents inside a MicroVM
+
+Two open-source harnesses already run coding agents (Claude Code, Codex CLI,
+and others) inside Lambda MicroVMs using this same architecture: a small
+daemon baked into the VM image supplies the exec and file-transfer API the
+platform lacks, and a per-VM token arrives through the `runHookPayload` hook
+so the shared image snapshot never contains a usable secret.
+
+- **Harbor** ([harbor-framework/harbor#2469](https://github.com/harbor-framework/harbor/pull/2469))
+  adds Lambda MicroVMs as an agent-evaluation environment: each trial builds
+  the task's Dockerfile into a MicroVM image server-side, launches a VM from
+  the snapshot, and drives the agent through a stdlib-only in-VM daemon with
+  detached start/poll/ack exec, so a command can outrun the 60-minute
+  MicroVM auth-token ceiling. Harbor's Claude Code agent runs against
+  Bedrock (`CLAUDE_CODE_USE_BEDROCK=1`), and its Codex CLI agent takes an
+  `OPENAI_BASE_URL` override, so both run inside the VM with no vendor API
+  key when the execution role carries `bedrock:InvokeModel`.
+- **Omnigent** ([omnigent-ai/omnigent#2217](https://github.com/omnigent-ai/omnigent/pull/2217))
+  adds Lambda MicroVMs as a server-managed sandbox provider: sessions
+  suspend to a snapshot between turns and resume with the running host,
+  its processes, and its live token intact, so an idle session stops
+  billing compute. Its credential guidance is the key pattern: grant the
+  execution role `bedrock:InvokeModel` and point the agent at Bedrock, and
+  no model key ever enters the sandbox.
+
+Both integrations predate this repo's daemon and carry their own; this
+project is the same architecture built out fully, with the daemon, the
+verified client, and the platform findings shared across any harness
+instead of rediscovered per integration.
+
 ## Calling it from code
 
 The same lifecycle is available as a library, with the same defaults and the
