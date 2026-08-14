@@ -1,133 +1,199 @@
 # microvms-agentd
 
-A verified client stack and in-VM daemon for AWS Lambda MicroVMs, written in
-Rust. The workspace contains an exec-and-file-transfer daemon (`agentd`), a
-client library (`microvms-core`) whose types make the platform's measured
-failure modes impossible to express, a CLI (`microvm`), Python and Node
-bindings, and a live conformance suite that verifies all of it against the real
-service.
+Run commands and move files in and out of AWS Lambda MicroVMs.
 
-The service gives you an isolated Firecracker VM but no way to run anything in
-it. There is no exec API and no file-transfer API. Every harness that wraps
-Lambda MicroVMs therefore writes an in-VM daemon to supply both. Those
-harnesses then discover, through billable failures, that the platform's error
-responses often do not indicate the real cause. An unsupported region answers
-`AccessDeniedException` with a null message. A reused `clientToken` wedges an
-image in `CREATING` for fifteen hours with no error at all. A
-`minimumMemoryInMiB` of 512 produces a guest that reports 2 GB. This project
-ran those measurements once and recorded each finding in
-[docs/PLATFORM.md](docs/PLATFORM.md) with its date and region. The client's
-type system encodes those findings, so callers cannot repeat the mistakes.
+The service gives you an isolated Firecracker VM but no exec API and no
+file-transfer API. This project supplies both: `agentd` is a small daemon baked
+into your VM image, and the `microvm` CLI (plus Rust, Python, and Node
+libraries) talks to it. One command builds an image, launches a VM, runs your
+command inside it, reports the cost, and tears everything down.
 
-**Status: every conformance check runs live and green.** The most recent
-`mise run live` built an image, launched a real MicroVM in us-east-1, and drove
-75 checks through the `microvm` CLI. The checks cover the full lifecycle, tar
-round trips through the daemon's confined packer, rejection of hostile
-archives, SSE ordering with mid-stream reconnect at a byte cursor, the stdin
-lifecycle, start/poll/ack decomposition, and suspend/resume preserving the
-token, filesystem, and a running process. All 75 checks passed, none failed,
-and none were skipped. Teardown left the account clean, and the pinned rate
-table matched the AWS Pricing API on all five rates.
-
-## The shape of the workspace
-
-```text
-protocol/        the daemon↔client wire types; drift is a compile error
-agentd/          the in-VM daemon: exec, file transfer, one-shot bootstrap
-model/           stateright models of the daemon and the client lifecycle
-microvms-core/   the client: control plane, session, cost engine, sandbox
-microvms-cli/    the microvm binary — 16 commands, JSON envelopes, a manifest
-microvms-py/     PyO3 binding (thin; every trap closure inherited from core)
-microvms-js/     napi-rs binding (same contract)
-conformance/     run_rs.py — the live suite; every check expressible via the CLI
-spec/            51 formal requirements; three lifecycle invariants proved in Z3
+```bash
+microvm run ./agentd --exec "echo hello from a microvm"
 ```
 
-Dependencies flow in one direction: `cli → core → protocol`, bindings → core,
-and `agentd → protocol`. The CLI has no lib target and an allowlisted
-dependency set. Tests assert both properties, so the CLI cannot reach AWS
-except through the library.
+## What you need
 
-## How strongly a mistake is closed
+- An AWS account with Lambda MicroVMs access, in one of the regions that carry
+  the service: `us-east-1`, `us-east-2`, `us-west-2`, `eu-west-1`,
+  `ap-northeast-1`.
+- [mise](https://mise.jdx.dev/), which provides the Rust toolchain, Terraform,
+  and every task below.
+- AWS credentials in your environment (any form the SDK understands).
 
-The spec ranks every guard ([docs/insights/business-logic.md](docs/insights/business-logic.md)
-catalogs all 41):
+Everything is source-only; nothing is published to crates.io, PyPI, or npm.
+You build the two binaries yourself, and the build is one task.
 
-- **S1 — inexpressible.** `Region` is a closed enum over the five regions that
-  carry MicroVMs. `SizeClass` is the five documented baselines. Run-hook and
-  build-hook timeouts are two types with no conversion (their ceilings differ
-  60x). There is no conversion from a dollar figure to a bare float. No create
-  path accepts a caller-supplied idempotency token.
-- **S2 — rejected locally**, before any billable call, with an error naming the
-  `docs/PLATFORM.md` finding that measured the behavior.
-- **S3 — correct by default, overridable**, with the override's cost stated.
+## Getting started
 
-Every guard carries a falsification: a specific plausible regression that turns
-a specific test red. Before that rule was enforced, four guards in this repo's
-history passed against deliberately broken code.
+**1. Clone and build.**
 
-## Cost honesty
+```bash
+git clone https://github.com/theagenticguy/microvms-agentd
+cd microvms-agentd
+mise install                # toolchains: Rust with the aarch64-musl target, Terraform
+mise run build              # agentd, cross-compiled for the VM (aarch64-musl)
+mise run build:cli          # the microvm CLI, for your machine
+```
 
-The cost engine produces estimates and has no billing path. Durations carry
-provenance (measured vs projected) as an enum variant, so an unlabeled duration
-does not construct. An unbilled phase is represented as `Unpriced { reason }`
-rather than as zero. A total containing any unpriced line renders as a lower
-bound naming its phases. Rates are pinned with their retrieval date and are
-ARM-only; the Architecture enum has one member because the x86 column the
-Pricing API also returns overstates compute by 17.9%. `mise run live:rates`
-compares the pinned table against the live Pricing API. A twin copy of that
-check in `scripts/check-live-rates` serves as an independent oracle.
+The daemon cross-compiles to `aarch64-unknown-linux-musl` because Lambda
+MicroVMs are ARM64-only; the CLI builds for whatever machine you are on.
 
-## Quick start
+**2. Create the AWS prerequisites.**
+
+A MicroVM image build needs an S3 bucket for the code artifact, a build role,
+and an execution role. The repo ships a small Terraform stack that creates
+exactly those three things:
+
+```bash
+mise run live:infra
+```
+
+Then export its outputs where the CLI looks for them:
+
+```bash
+cd conformance/infra
+export MICROVM_BUCKET=$(terraform output -raw s3_bucket)
+export MICROVM_BUILD_ROLE_ARN=$(terraform output -raw build_role_arn)
+export MICROVM_EXECUTION_ROLE_ARN=$(terraform output -raw execution_role_arn)
+cd ../..
+```
+
+If you already have a bucket and roles, export those instead; the stack is a
+convenience, not a requirement.
+
+**3. Check the machine.**
+
+```bash
+target/release/microvm doctor --binary target/aarch64-unknown-linux-musl/release/agentd
+```
+
+`doctor` checks your credentials, the region, the three environment values,
+and that the daemon binary is aarch64. When something is wrong it names the
+broken prerequisite and suggests the fix.
+
+**4. Run your first command in a MicroVM.**
+
+```bash
+target/release/microvm run \
+  target/aarch64-unknown-linux-musl/release/agentd \
+  --exec "uname -a && echo hello from inside"
+```
+
+This builds an image with `agentd` as its entrypoint, launches a VM from it,
+runs the command, prints its output and the run's cost, and tears the VM down.
+Teardown is the default so an interrupted session does not leave a billable VM
+behind. Expect the first run to take a few minutes; most of it is the image
+build, and the image snapshot has a one-week minimum retention, so keep and
+reuse it (`--image`) rather than rebuilding.
+
+## Working with a long-lived VM
+
+Pass `--keep` to leave the VM running. The output includes three values every
+attached command needs: the endpoint, the agent token, and the MicroVM id.
+
+```bash
+target/release/microvm run --keep \
+  target/aarch64-unknown-linux-musl/release/agentd
+
+# capture endpoint, agentToken, and microvmId from the output, then:
+
+microvm exec --endpoint $EP --agent-token $TOK --microvm-id $ID "python3 -V"
+microvm cp ./data.csv vm:/tmp/data.csv \
+  --endpoint $EP --agent-token $TOK --microvm-id $ID
+microvm cp --tar ./project.tar vm:/workspace \
+  --endpoint $EP --agent-token $TOK --microvm-id $ID
+microvm suspend $ID          # freeze: memory, filesystem, and token survive
+microvm resume $ID           # thaw; a running process resumes mid-flight
+microvm terminate $ID        # stop paying
+```
+
+`exec` also streams (`--stream`), feeds stdin (`--stdin`), starts a command
+and returns immediately (`--detach`), and reads an existing exec back
+(`--poll <id>`). Suspend and resume preserve memory, the filesystem, and
+running processes, and a suspended VM bills at a small fraction of a running
+one.
+
+If a run is interrupted, `microvm ls` lists what this CLI created and could
+not confirm it deleted, so nothing leaks silently.
+
+## Calling it from code
+
+The same lifecycle is available as a library, with the same defaults and the
+same guardrails:
+
+- **Rust**: `microvms-core`; the CLI is a thin layer over it.
+- **Python**: `microvms-py`, built with maturin.
+- **Node**: `microvms-js`, built with napi-rs.
+
+See [docs/reference/public-api.md](docs/reference/public-api.md) for the
+surface.
+
+## Using it from scripts and agents
+
+Every command takes `--json` and then emits exactly one JSON envelope on
+stdout; progress goes to stderr. Success carries `type` and `data`; failure
+carries a stable `code`, a mapped `exitCode`, and `suggestions`. The one
+exception is `exec --stream`, which emits NDJSON events and the envelope last.
+`microvm manifest` prints the whole command surface as JSON, generated from
+the CLI's own argument tree, so a tool can discover the surface without
+parsing help text. Details in [docs/reference/cli.md](docs/reference/cli.md).
+
+## What it costs
+
+Every run reports a cost estimate built from pinned, dated, per-region ARM
+rates; `mise run live:rates` checks the pinned table against the AWS Pricing
+API. Anything the engine cannot price is reported as unpriced with a reason
+rather than as zero, and a total containing an unpriced line renders as a
+lower bound. Note the image snapshot's one-week minimum retention: deleting an
+image early saves nothing, so reuse is the economical habit.
+
+## The workspace
+
+```text
+protocol/        daemon↔client wire types; drift is a compile error
+agentd/          the in-VM daemon: exec, file transfer, one-shot bootstrap
+model/           stateright models of the daemon and client lifecycle
+microvms-core/   the client library: control plane, session, cost, sandbox
+microvms-cli/    the microvm binary: 16 commands, JSON envelopes, a manifest
+microvms-py/     Python binding (PyO3)
+microvms-js/     Node binding (napi-rs)
+conformance/     the live suite: 75 checks against real AWS, via the CLI
+spec/            51 formal requirements; 3 lifecycle invariants proved in Z3
+```
+
+The platform has sharp edges: error responses that point away from their
+causes, a `clientToken` replay that wedges an image in `CREATING` for fifteen
+hours, and a memory floor that silently doubles. Each one was measured once,
+recorded in [docs/PLATFORM.md](docs/PLATFORM.md) with its date and region, and
+then closed in the client: illegal states either do not construct (regions and
+sizes are closed enums) or are rejected locally with an error that names the
+finding, before any billable call.
+
+## Developing
 
 ```bash
 mise run install         # git hooks
 mise run check           # the definition of done: lint, security, all test
                          # tiers, schema freshness, model drift, cross-compile
-cargo build --release -p microvms-cli
-target/release/microvm manifest        # the machine-readable command surface
-target/release/microvm doctor          # is this machine ready to launch?
 ```
 
-The live tier is deliberately separate because it creates real MicroVMs and
-costs money:
+The live tier is separate because it creates real MicroVMs and costs money:
 
 ```bash
-mise run live            # conformance + rates + leak check, ~5 minutes
+mise run live            # conformance (75 checks) + rates + leak check, ~5 min
+mise run live:destroy    # tear the Terraform stack back down
 ```
 
-`microvm --json` emits exactly one envelope object per invocation on stdout.
-Agents and scripts parse that envelope, and `data.kind` carries the
-fine-grained error taxonomy. `exec --stream` is the documented exception; it
-emits NDJSON events and then the envelope last. See
-[docs/reference/cli.md](docs/reference/cli.md).
-
-## Verification stack
-
-| Tier | What it proves | Where |
-| --- | --- | --- |
-| symspec + Z3 | 51 requirements consistent; bootstrap-once, no suspend outside RUNNING, terminated never RUNNING — proved over unbounded runs | `spec/core.symspec.json`, `mise run spec:core` |
-| stateright | The daemon model and the client lifecycle model, including a real interleaving bug the checker found | `model/` |
-| proptest | Token collision-freedom, payload boundaries, decimal arithmetic | in-crate |
-| turmoil | Reconnect-at-cursor and proxy-token expiry under simulated network faults | `microvms-core/tests/` |
-| drift gate | 33 hardcoded service constraints against the pinned botocore model | `scripts/check-model-drift`, in `mise run check` |
-| live conformance | All 75 checks against real AWS through the CLI | `conformance/run_rs.py`, `mise run live` |
-
-Security gates run in `mise run check` and CI: semgrep, betterleaks over full
-git history, SPDX license headers, plus SBOM generation (CycloneDX + SPDX) with
-grype/trivy/osv-scanner in their own CI job.
-
-## Documentation
-
-[docs/README.md](docs/README.md) is the index. The hand-written, authoritative
-documents are [PLATFORM.md](docs/PLATFORM.md) (the measured findings),
-[PROTOCOL.md](docs/PROTOCOL.md), and [TRUST.md](docs/TRUST.md). The generated
-tree (architecture, reference, behavior, analysis, diagrams, insights) carries
-machine-verified `path:line` citations throughout. Start with the
-[system overview](docs/architecture/system-overview.md) or the
+Verification runs at six tiers: Z3 proofs over the spec, stateright models,
+property tests, network-fault simulation (turmoil), a drift gate comparing 33
+hardcoded service constraints against the pinned botocore model, and the live
+conformance suite. [CONTRIBUTING.md](CONTRIBUTING.md) has the workflow;
+[docs/README.md](docs/README.md) indexes the rest of the documentation,
+starting with the
+[system overview](docs/architecture/system-overview.md) and the
 [debugging guide](docs/insights/debugging-guide.md).
 
 ## License
 
-Apache-2.0. The project is source-only; nothing here is published to
-crates.io, PyPI, or npm.
+Apache-2.0.
