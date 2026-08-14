@@ -77,7 +77,7 @@ pub struct PyExecResult {
 impl PyExecResult {
     pub(crate) fn wrap(result: ExecResult) -> Self {
         Self {
-            phase: phase_str(result.phase),
+            phase: result.phase.as_str(),
             exit_code: result.exit_code(),
             signal: result.outcome.as_ref().and_then(|outcome| outcome.signal),
             stdout: result.stdout().to_string(),
@@ -363,7 +363,7 @@ fn event_to_py(py: Python<'_>, event: ExecEvent) -> PyResult<Py<PyAny>> {
         } => Ok(Py::new(
             py,
             PyOutputChunk {
-                stream: stream_str(stream),
+                stream: stream.as_str(),
                 offset,
                 data,
             },
@@ -534,24 +534,32 @@ impl PyExecHandle {
         *,
         offset=0,
         reconnect=true,
-        max_reconnects=20,
+        max_reconnects=None,
         error_on_gap=false,
-        idle_timeout=60.0,
+        idle_timeout=None,
     ))]
     fn stream(
         &self,
         offset: u64,
         reconnect: bool,
-        max_reconnects: u32,
+        max_reconnects: Option<u32>,
         error_on_gap: bool,
-        idle_timeout: f64,
+        idle_timeout: Option<f64>,
     ) -> PyCoreResult<ExecStream> {
+        // Unset knobs fall back to the core's `StreamOptions::default()` rather than to
+        // numbers written here: the reconnect budget and the keepalive-derived idle window
+        // are the core's measurements, and a second copy of them in a binding is a second
+        // thing to keep in step (the JS binding defers the same way).
+        let defaults = StreamOptions::default();
         let options = StreamOptions {
             offset,
             reconnect,
-            max_reconnects,
+            max_reconnects: max_reconnects.unwrap_or(defaults.max_reconnects),
             error_on_gap,
-            idle_timeout: seconds(idle_timeout)?,
+            idle_timeout: match idle_timeout {
+                Some(idle) => seconds(idle)?,
+                None => defaults.idle_timeout,
+            },
         };
         Ok(ExecStream::new(Arc::clone(&self.inner), options))
     }
@@ -620,21 +628,6 @@ impl PyExecHandle {
 /// stay in one place.
 pub(crate) fn seconds(value: f64) -> Result<Duration, microvms_core::Error> {
     microvms_core::cost::duration_of_secs_f64(value)
-}
-
-fn phase_str(phase: protocol::exec::Phase) -> &'static str {
-    match phase {
-        protocol::exec::Phase::Running => "running",
-        protocol::exec::Phase::Exited => "exited",
-        protocol::exec::Phase::Acked => "acked",
-    }
-}
-
-fn stream_str(kind: protocol::exec::StreamKind) -> &'static str {
-    match kind {
-        protocol::exec::StreamKind::Stdout => "stdout",
-        protocol::exec::StreamKind::Stderr => "stderr",
-    }
 }
 
 /// Registers the exec surface on the module.

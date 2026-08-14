@@ -858,6 +858,7 @@ impl ResidencyComparison {
 /// real `Duration` instance, so `{ running: 3600 }` and `{ running: { seconds: 3600 } }` are
 /// both rejected by napi's conversion before any Rust runs. What the object buys is optional
 /// fields with JS's own `undefined`, which is how "this phase did not happen" is said.
+#[derive(Default)]
 #[napi(object)]
 pub struct RunUsageOptions<'a> {
     /// Wall-clock time in RUNNING. Bills at baseline whether or not anything is executing —
@@ -893,17 +894,7 @@ pub fn run_report(
     options: Option<RunUsageOptions<'_>>,
     rates: Option<&RateTable>,
 ) -> napi::Result<CostReport, String> {
-    let options = options.unwrap_or(RunUsageOptions {
-        running: None,
-        suspended: None,
-        image_build: None,
-        image_gb: None,
-        image_retained: None,
-        suspend_resume_cycles: None,
-        snapshot_gb: None,
-        launched: None,
-        label: None,
-    });
+    let options = options.unwrap_or_default();
     let usage = RunUsage {
         running: options.running.map(|duration| duration.inner),
         suspended: options.suspended.map(|duration| duration.inner),
@@ -932,6 +923,7 @@ pub fn run_report(
 /// Separate from [`RunUsageOptions`] on purpose (COST-10): every field is a number, so there
 /// is no field an accidentally-measured duration could be written into. The wrapping into
 /// projected durations happens in the core, in one place.
+#[derive(Default)]
 #[napi(object)]
 pub struct PlanUsageOptions {
     pub running_seconds: Option<f64>,
@@ -955,16 +947,7 @@ pub fn estimate_run(
     options: Option<PlanUsageOptions>,
     rates: Option<&RateTable>,
 ) -> napi::Result<CostReport, String> {
-    let options = options.unwrap_or(PlanUsageOptions {
-        running_seconds: None,
-        suspended_seconds: None,
-        image_gb: None,
-        image_retained_seconds: None,
-        suspend_resume_cycles: None,
-        snapshot_gb: None,
-        launched: None,
-        label: None,
-    });
+    let options = options.unwrap_or_default();
     let plan = PlanUsage {
         running_seconds: options.running_seconds.unwrap_or(0.0),
         suspended_seconds: options.suspended_seconds.unwrap_or(0.0),
@@ -1027,19 +1010,11 @@ pub fn cost_constants() -> String {
         .map(|provenance| quote(provenance.as_str()))
         .collect::<Vec<_>>()
         .join(",");
-    let phases = [
-        CostPhase::ImageBuild,
-        CostPhase::ImageStorage,
-        CostPhase::Launch,
-        CostPhase::Running,
-        CostPhase::Suspended,
-        CostPhase::Suspend,
-        CostPhase::Resume,
-    ]
-    .iter()
-    .map(|phase| quote(phase.as_str()))
-    .collect::<Vec<_>>()
-    .join(",");
+    let phases = CostPhase::ALL
+        .iter()
+        .map(|phase| quote(phase.as_str()))
+        .collect::<Vec<_>>()
+        .join(",");
     let lines = [
         BillingLine::Vcpu,
         BillingLine::Memory,

@@ -275,6 +275,7 @@ impl BuildImageOptions {
 }
 
 /// Everything a launch needs.
+#[derive(Default)]
 #[napi(object)]
 pub struct RunOptions {
     /// The image to launch, or omitted for the one `buildImage` built.
@@ -307,6 +308,7 @@ pub struct RunOptions {
 /// Both deletions are opt-in, because both destroy something a caller may still want: the
 /// image is reusable across runs, and the log group is where a failed build's only evidence
 /// lives.
+#[derive(Default)]
 #[napi(object)]
 pub struct TeardownOptions {
     pub delete_image: Option<bool>,
@@ -495,18 +497,7 @@ impl Sandbox {
     #[napi]
     pub async fn run(&self, options: Option<RunOptions>) -> Result<Session, AsyncError> {
         let defaults = RunRequest::new();
-        let options = options.unwrap_or(RunOptions {
-            image_identifier: None,
-            execution_role_arn: None,
-            agent_token: None,
-            egress: None,
-            max_idle_sec: None,
-            suspended_sec: None,
-            auto_resume: None,
-            max_duration_sec: None,
-            ready_timeout: None,
-            token_scope: None,
-        });
+        let options = options.unwrap_or_default();
         // Every unset field falls back to the core's own default rather than to a number
         // written here: ten-minute idle and suspended windows and a one-hour ceiling are
         // measured figures, and a second copy of them in a binding is a second thing to keep
@@ -594,13 +585,7 @@ impl Sandbox {
         // account and a billed leak, and restating them would put a second copy of that
         // measurement in a binding.
         let defaults = TeardownOpts::default();
-        let options = options.unwrap_or(TeardownOptions {
-            delete_image: None,
-            delete_log_group: None,
-            delete_attempts: None,
-            delete_backoff: None,
-            wait_for_terminated: None,
-        });
+        let options = options.unwrap_or_default();
         let mut opts = TeardownOpts {
             delete_image: options.delete_image.unwrap_or(false),
             delete_log_group: options.delete_log_group.unwrap_or(false),

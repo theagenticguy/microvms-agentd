@@ -1103,18 +1103,7 @@ pub(crate) fn cost_constants<'py>(py: Python<'py>) -> PyResult<Bound<'py, PyDict
             Provenance::Projected.as_str(),
         ],
     )?;
-    dict.set_item(
-        "phases",
-        [
-            CostPhase::ImageBuild.as_str(),
-            CostPhase::ImageStorage.as_str(),
-            CostPhase::Launch.as_str(),
-            CostPhase::Running.as_str(),
-            CostPhase::Suspended.as_str(),
-            CostPhase::Suspend.as_str(),
-            CostPhase::Resume.as_str(),
-        ],
-    )?;
+    dict.set_item("phases", CostPhase::ALL.map(CostPhase::as_str))?;
     dict.set_item(
         "billingLines",
         [

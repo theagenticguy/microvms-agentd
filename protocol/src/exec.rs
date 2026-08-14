@@ -30,6 +30,29 @@ pub enum Phase {
     Acked,
 }
 
+impl Phase {
+    /// Every phase, in lifecycle order.
+    ///
+    /// Public because a client that publishes the closed set — both bindings do, in
+    /// their `session_constants` — needs the list from the type rather than a spelled-out
+    /// copy that goes stale the first time a phase is added. The round-trip test below
+    /// holds `ALL` complete by exhaustive match.
+    pub const ALL: [Phase; 3] = [Phase::Running, Phase::Exited, Phase::Acked];
+
+    /// The wire spelling — the exact string serde writes under `rename_all` above.
+    ///
+    /// Here rather than in each client because two bindings each grew their own
+    /// three-arm match over this enum; a variant renamed on the wire must change
+    /// exactly one table, and the test below is what keeps this one equal to serde's.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Phase::Running => "running",
+            Phase::Exited => "exited",
+            Phase::Acked => "acked",
+        }
+    }
+}
+
 /// Captured output and exit status of a finished exec.
 #[derive(Clone, Debug, Default, Deserialize, JsonSchema, Serialize)]
 pub struct Outcome {
@@ -57,6 +80,22 @@ pub struct Outcome {
 pub enum StreamKind {
     Stdout,
     Stderr,
+}
+
+impl StreamKind {
+    /// Both kinds, in the order the daemon documents them.
+    ///
+    /// Same reason as [`Phase::ALL`]: the bindings publish this closed set, and a
+    /// list they spell themselves is a list the enum can outgrow.
+    pub const ALL: [StreamKind; 2] = [StreamKind::Stdout, StreamKind::Stderr];
+
+    /// The wire spelling — the exact string serde writes under `rename_all` above.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            StreamKind::Stdout => "stdout",
+            StreamKind::Stderr => "stderr",
+        }
+    }
 }
 
 /// A start request. `command` is either an argv array or, with `shell: true`, a
@@ -267,6 +306,36 @@ mod tests {
             serde_json::to_string(&StreamKind::Stderr).expect("serializes"),
             "\"stderr\""
         );
+    }
+
+    /// `as_str` is a second spelling of what serde already writes, so the two must be
+    /// equal for every variant or the bindings publish names the wire never carries.
+    ///
+    /// `ALL` is held complete by exhaustion rather than by a length check: the matches
+    /// below have no wildcard arm, so a variant added to either enum fails to compile
+    /// here until it is added to its `ALL` too.
+    #[test]
+    fn as_str_agrees_with_serde_for_every_phase_and_stream_kind() {
+        for phase in Phase::ALL {
+            assert_eq!(
+                serde_json::to_string(&phase).expect("serializes"),
+                format!("\"{}\"", phase.as_str()),
+                "{phase:?} spells differently through as_str and serde"
+            );
+            match phase {
+                Phase::Running | Phase::Exited | Phase::Acked => {}
+            }
+        }
+        for kind in StreamKind::ALL {
+            assert_eq!(
+                serde_json::to_string(&kind).expect("serializes"),
+                format!("\"{}\"", kind.as_str()),
+                "{kind:?} spells differently through as_str and serde"
+            );
+            match kind {
+                StreamKind::Stdout | StreamKind::Stderr => {}
+            }
+        }
     }
 
     /// Both halves of serde on one type is the whole point of the crate: what the
