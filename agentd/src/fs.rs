@@ -467,19 +467,9 @@ fn apply_deferred_modes(deferred: HashMap<PathBuf, u32>) {
 /// because the predecessor validated after writing and left a file on disk with
 /// the wrong permissions after answering an error.
 fn parse_mode(raw: &str) -> Option<u32> {
-    let digits = raw
-        .trim()
-        .trim_start_matches("0o")
-        .trim_start_matches("0O")
-        .trim_start_matches('0');
-    // An all-zeros input trims to empty and genuinely means mode 0.
-    if digits.is_empty() {
-        return if raw.trim().chars().all(|c| c == '0') && !raw.trim().is_empty() {
-            Some(0)
-        } else {
-            None
-        };
-    }
+    // Only the `0o`/`0O` prefix needs stripping: `from_str_radix` already accepts
+    // leading zeros in base 8, so `0644` and `000` parse without special-casing.
+    let digits = raw.trim().trim_start_matches("0o").trim_start_matches("0O");
     let mode = u32::from_str_radix(digits, 8).ok()?;
     // Refuse anything above the permission and setuid/setgid/sticky bits: a
     // caller passing a whole `st_mode` including the file-type bits is confused,
@@ -537,10 +527,29 @@ impl From<io::Error> for SpoolError {
     }
 }
 
+/// Extracts the query every fs route takes, or the 400 all of them answer when
+/// `path` is missing.
+///
+/// A helper rather than a `Query<FsQuery>` extractor in the handler signatures:
+/// the extractor's default rejection body ("Failed to deserialize query string:
+/// missing field `path`") is not the body this surface has always answered, so
+/// keeping the wire contract through the extractor route would mean a custom
+/// rejection type — more machinery than the three lines it would replace. This
+/// also leaves the handler signatures alone, which the proptest harness calls
+/// directly. The `Err` is the un-built refusal rather than a `Response` so the
+/// variant stays small (clippy's `result_large_err`).
+fn fs_query(request: &Request) -> Result<FsQuery, (StatusCode, &'static str)> {
+    match axum::extract::Query::<FsQuery>::try_from_uri(request.uri()) {
+        Ok(query) => Ok(query.0),
+        Err(_) => Err((StatusCode::BAD_REQUEST, "path query parameter is required")),
+    }
+}
+
 /// Reads one file. 404 only when the path is genuinely absent.
 pub async fn read_file(request: Request) -> Response {
-    let Ok(query) = axum::extract::Query::<FsQuery>::try_from_uri(request.uri()) else {
-        return (StatusCode::BAD_REQUEST, "path query parameter is required").into_response();
+    let query = match fs_query(&request) {
+        Ok(query) => query,
+        Err(refusal) => return refusal.into_response(),
     };
     let path = PathBuf::from(&query.path);
 
@@ -586,8 +595,9 @@ pub async fn read_file(request: Request) -> Response {
 
 /// Writes one file. Not confined to a root; see the module comment.
 pub async fn write_file(State(state): State<AppState>, request: Request) -> Response {
-    let Ok(query) = axum::extract::Query::<FsQuery>::try_from_uri(request.uri()) else {
-        return (StatusCode::BAD_REQUEST, "path query parameter is required").into_response();
+    let query = match fs_query(&request) {
+        Ok(query) => query,
+        Err(refusal) => return refusal.into_response(),
     };
     let path = PathBuf::from(&query.path);
     let guard = state.disk_guard();
@@ -773,8 +783,9 @@ fn pack_tree(root: &Path, spool: std::fs::File) -> Result<std::fs::File, Refusal
 
 /// Streams a tar of the tree at `?path=`.
 pub async fn read_tar(State(state): State<AppState>, request: Request) -> Response {
-    let Ok(query) = axum::extract::Query::<FsQuery>::try_from_uri(request.uri()) else {
-        return (StatusCode::BAD_REQUEST, "path query parameter is required").into_response();
+    let query = match fs_query(&request) {
+        Ok(query) => query,
+        Err(refusal) => return refusal.into_response(),
     };
     let root = PathBuf::from(&query.path);
     let caps = Caps {
@@ -835,8 +846,9 @@ pub async fn read_tar(State(state): State<AppState>, request: Request) -> Respon
 /// This is the one write path in the module that *is* confined, because the member
 /// paths come from the archive rather than from the caller. See the module comment.
 pub async fn write_tar(State(state): State<AppState>, request: Request) -> Response {
-    let Ok(query) = axum::extract::Query::<FsQuery>::try_from_uri(request.uri()) else {
-        return (StatusCode::BAD_REQUEST, "path query parameter is required").into_response();
+    let query = match fs_query(&request) {
+        Ok(query) => query,
+        Err(refusal) => return refusal.into_response(),
     };
     let root = PathBuf::from(&query.path);
     if !root.is_absolute() {
@@ -1391,6 +1403,39 @@ mod tests {
             None,
             "a whole st_mode including file-type bits is a caller error",
         );
+    }
+
+    #[tokio::test]
+    async fn a_request_without_a_path_answers_the_same_400_on_every_fs_route() {
+        // The four routes share one query helper; this pins the wire shape it must
+        // preserve — 400 with this exact body, not the extractor's default
+        // "Failed to deserialize query string" rejection.
+        let state = AppState::with_probe(
+            Config::default(),
+            roomy_probe,
+            crate::identity::Report::skipped(),
+        );
+        let request = |method: &str, uri: &str| {
+            axum::http::Request::builder()
+                .method(method)
+                .uri(uri)
+                .body(Body::empty())
+                .expect("request")
+        };
+
+        let responses = [
+            read_file(request("GET", "/v1/fs/file")).await,
+            write_file(State(state.clone()), request("PUT", "/v1/fs/file")).await,
+            read_tar(State(state.clone()), request("GET", "/v1/fs/tar")).await,
+            write_tar(State(state), request("PUT", "/v1/fs/tar")).await,
+        ];
+        for response in responses {
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let body = axum::body::to_bytes(response.into_body(), 1024)
+                .await
+                .expect("body");
+            assert_eq!(&body[..], b"path query parameter is required");
+        }
     }
 
     #[test]
