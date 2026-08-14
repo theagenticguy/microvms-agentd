@@ -392,6 +392,96 @@ impl ControlPlane {
         )
     }
 
+    /// The image with exactly `name`, or `None` when no page of the listing has one.
+    ///
+    /// # `nameFilter` narrows, it does not answer
+    ///
+    /// The model's `nameFilter` is a server-side **substring** filter ("images whose name
+    /// contains the specified string"), so `coding-agents` also matches
+    /// `coding-agents-old`. The filter is sent — it keeps a large account's listing to one
+    /// page in practice — and the exact-match comparison happens here, on the client,
+    /// because "contains" and "is" are different questions and only the second one is
+    /// safe to launch from.
+    ///
+    /// # The listing paginates, and every page is read
+    ///
+    /// An image on page two is still an image. A resolver that read only the first page
+    /// would answer "no image named X" for a name that exists — the confident wrong
+    /// answer, which then sends the caller to rebuild an image they already paid for.
+    pub async fn find_image_by_name(
+        &self,
+        name: &str,
+    ) -> Result<Option<ops::MicrovmImageSummaryWire>, Error> {
+        let mut next_token: Option<String> = None;
+        loop {
+            let call = Call::get(
+                "ListMicrovmImages",
+                paths::microvm_images_list(Some(name), next_token.as_deref()),
+            );
+            let reply = send_with_retry(self.transport(), call).await?;
+            let listed: ops::ListImagesResponseWire = reply.json("ListMicrovmImages")?;
+
+            if let Some(hit) = listed.items.into_iter().find(|item| item.name == name) {
+                return Ok(Some(hit));
+            }
+            match listed.next_token {
+                Some(token) => next_token = Some(token),
+                None => return Ok(None),
+            }
+        }
+    }
+
+    /// The ARN for `identifier`: an ARN passes through untouched, a bare name is
+    /// resolved through the image listing by exact name.
+    ///
+    /// # Why this exists
+    ///
+    /// `RunMicrovm.imageIdentifier` takes an ARN, and a bare name sent verbatim is
+    /// answered with HTTP 400 "Malformed ARN" — after a credential resolution and a
+    /// signed call, and with a message that says nothing about names. Every consumer was
+    /// scripting this resolution with the AWS CLI (the coding-agents example did); this
+    /// is that script, once, with the pagination handled.
+    ///
+    /// # An ARN costs zero calls
+    ///
+    /// The passthrough is checked first, so a caller who already holds the ARN pays
+    /// nothing for the convenience existing. The prefix test is `arn:` exactly — the one
+    /// spelling every AWS ARN starts with, and a string the `ImageName` pattern
+    /// (`[a-zA-Z0-9-_]+`) cannot produce, so no legal image name is mistaken for one.
+    pub async fn resolve_image_arn(&self, identifier: &str) -> Result<String, Error> {
+        if identifier.starts_with("arn:") {
+            return Ok(identifier.to_string());
+        }
+        match self.find_image_by_name(identifier).await? {
+            Some(image) => Ok(image.image_arn),
+            None => Err(Error::new(
+                ErrorKind::Precondition,
+                format!(
+                    "no image named {identifier:?} exists in {} (the listing was read to its \
+                     last page and resolution requires an exact name match). Build one first — \
+                     `microvm build <binary> --name {identifier}` — or pass the image ARN \
+                     directly.",
+                    self.region.as_str(),
+                ),
+            )),
+        }
+    }
+
+    /// The content hash of the artifact `request` would build, for content-addressed
+    /// image reuse.
+    ///
+    /// Derives the Dockerfile exactly as [`ControlPlane::build_artifact_for`] does —
+    /// same default, same port — so the name a reuse check computes is the name a build
+    /// of the same request would carry. See [`artifact::artifact_content_hash`] for what
+    /// is hashed and why it is the inputs rather than the zip.
+    pub fn artifact_content_hash_for(&self, request: &CreateImageRequest) -> String {
+        let dockerfile = match request.dockerfile.as_deref() {
+            Some(dockerfile) => dockerfile.to_string(),
+            None => artifact::default_dockerfile(self.port, None, &request.base_image),
+        };
+        artifact::artifact_content_hash(&request.binary, &dockerfile)
+    }
+
     /// Deletes every version but the first, then the image, retrying.
     ///
     /// # Why it retries
@@ -1022,5 +1112,161 @@ mod tests {
             .expect("builds the zip");
         assert!(!bytes.is_empty());
         assert_eq!(fake.calls().len(), 0);
+    }
+
+    // ── name resolution ──────────────────────────────────────────────────────
+
+    /// A bare name resolves to its image's ARN through the listing, and the request
+    /// carries the model's `nameFilter` query member.
+    ///
+    /// The listing here answers with a *substring* superset — `agentd-conformance-old`
+    /// beside the exact name — because that is what `nameFilter` really returns, and the
+    /// exact-match rule is what this test is for: `contains` and `is` are different
+    /// questions, and only `is` is safe to launch from.
+    ///
+    /// **Falsification** — return the first item regardless of name match (replace the
+    /// `item.name == name` comparison with `true`) and this resolves to `...-old`'s ARN:
+    /// the equality below goes red. Run 2026-08-14; it failed exactly there and was
+    /// restored.
+    #[tokio::test]
+    async fn a_bare_name_resolves_to_the_exactly_matching_images_arn() {
+        let (plane, fake, _) = planted();
+        fake.answer(
+            "ListMicrovmImages",
+            Answer::ok(fake::list_images_response(
+                &["agentd-conformance-old", "agentd-conformance"],
+                None,
+            )),
+        );
+
+        let arn = plane
+            .resolve_image_arn("agentd-conformance")
+            .await
+            .expect("resolves");
+        assert_eq!(
+            arn, "arn:aws:lambda:us-east-1:123456789012:microvm-image/agentd-conformance",
+            "the exact match wins, not the first substring hit"
+        );
+
+        let calls = fake.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].method, super::super::transport::Method::Get);
+        assert_eq!(
+            calls[0].path,
+            "/2025-09-09/microvm-images?nameFilter=agentd-conformance"
+        );
+    }
+
+    /// An identifier already shaped like an ARN passes through untouched, with **zero**
+    /// listing calls — the caller who holds the ARN pays nothing.
+    #[tokio::test]
+    async fn an_arn_identifier_passes_through_with_no_listing_call() {
+        let (plane, fake, _) = planted();
+        let arn = "arn:aws:lambda:us-east-1:123456789012:microvm-image/img";
+        let resolved = plane.resolve_image_arn(arn).await.expect("passes through");
+        assert_eq!(resolved, arn);
+        assert_eq!(
+            fake.call_count("ListMicrovmImages"),
+            0,
+            "an ARN must cost zero extra calls"
+        );
+        assert_eq!(fake.calls().len(), 0);
+    }
+
+    /// Zero matches is a local `Precondition` error naming the name and the remedy —
+    /// not the service's "Malformed ARN", which says nothing about names.
+    #[tokio::test]
+    async fn an_unknown_name_is_a_precondition_error_naming_the_name_and_the_remedy() {
+        let (plane, fake, _) = planted();
+        fake.answer(
+            "ListMicrovmImages",
+            Answer::ok(fake::list_images_response(&[], None)),
+        );
+
+        let error = plane
+            .resolve_image_arn("no-such-image")
+            .await
+            .expect_err("nothing to resolve");
+        assert_eq!(error.kind(), ErrorKind::Precondition);
+        assert_eq!(error.code(), "ERR_PRECONDITION");
+        let message = error.to_string();
+        assert!(message.contains("no-such-image"), "{message}");
+        assert!(message.contains("microvm build"), "{message}");
+        assert!(
+            message.contains("last page"),
+            "the message must say the whole listing was read: {message}"
+        );
+    }
+
+    /// Resolution follows `nextToken` across pages: an image on page two is found, and
+    /// the second request carries the first page's token.
+    ///
+    /// **Falsification** — stop the loop after the first page (replace the
+    /// `Some(token)` arm with `return Ok(None)`) and this reports the name missing.
+    /// Run 2026-08-14; it failed exactly there and was restored.
+    #[tokio::test]
+    async fn resolution_follows_next_token_to_an_image_on_the_second_page() {
+        let (plane, fake, _) = planted();
+        fake.answer(
+            "ListMicrovmImages",
+            Answer::ok(fake::list_images_response(
+                &["some-other-image"],
+                Some("page-2-token"),
+            )),
+        )
+        .answer(
+            "ListMicrovmImages",
+            Answer::ok(fake::list_images_response(&["wanted-image"], None)),
+        );
+
+        let arn = plane
+            .resolve_image_arn("wanted-image")
+            .await
+            .expect("found on page two");
+        assert_eq!(
+            arn,
+            "arn:aws:lambda:us-east-1:123456789012:microvm-image/wanted-image"
+        );
+        assert_eq!(fake.call_count("ListMicrovmImages"), 2, "both pages read");
+
+        let paths = fake.paths();
+        assert!(
+            paths[1].contains("nextToken=page-2-token"),
+            "the second request must carry the first page's token: {}",
+            paths[1]
+        );
+        assert!(
+            paths[0].contains("nameFilter=wanted-image") && !paths[0].contains("nextToken"),
+            "the first request has the filter and no token: {}",
+            paths[0]
+        );
+    }
+
+    /// The reuse hash derives the same Dockerfile a build of the request would, so the
+    /// two agree — and a request whose Dockerfile differs hashes differently.
+    #[test]
+    fn the_reuse_hash_matches_the_build_paths_own_dockerfile_derivation() {
+        let (plane, fake, _) = planted();
+        let request = a_request();
+        let hash = plane.artifact_content_hash_for(&request);
+        assert_eq!(hash.len(), 64);
+        assert_eq!(
+            hash,
+            plane.artifact_content_hash_for(&request),
+            "deterministic"
+        );
+
+        let mut custom = a_request();
+        custom.dockerfile = Some(artifact::default_dockerfile(
+            9000,
+            Some("/workspace"),
+            &custom.base_image,
+        ));
+        assert_ne!(
+            hash,
+            plane.artifact_content_hash_for(&custom),
+            "a different Dockerfile is a different image identity"
+        );
+        assert_eq!(fake.calls().len(), 0, "hashing is local");
     }
 }

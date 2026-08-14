@@ -429,6 +429,33 @@ pub fn auth_token_response(token: &str) -> String {
     )
 }
 
+/// `ListMicrovmImagesResponse` with one page of named images and an optional `nextToken`.
+///
+/// The member names are the model's: `imageArn`, `name`, `state`, `createdAt`, and a
+/// top-level `nextToken` that is **absent** on the last page rather than null — which is
+/// what a real final page looks like, and what the pagination loop's exit reads.
+pub fn list_images_response(names: &[&str], next_token: Option<&str>) -> String {
+    let items: Vec<String> = names
+        .iter()
+        .map(|name| {
+            format!(
+                r#"{{
+                    "imageArn": "arn:aws:lambda:us-east-1:123456789012:microvm-image/{name}",
+                    "name": "{name}",
+                    "state": "ACTIVE",
+                    "latestActiveImageVersion": "1",
+                    "createdAt": 1754524800
+                }}"#
+            )
+        })
+        .collect();
+    let token = match next_token {
+        Some(token) => format!(r#", "nextToken": {}"#, json_string(token)),
+        None => String::new(),
+    };
+    format!(r#"{{"items": [{}]{token}}}"#, items.join(", "))
+}
+
 /// `DeleteMicrovmImageOutput`.
 pub fn delete_image_response() -> String {
     r#"{"imageIdentifier": "arn:aws:lambda:us-east-1:123456789012:microvm-image/img",

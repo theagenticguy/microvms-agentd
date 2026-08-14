@@ -55,7 +55,7 @@ Builds an image, launches a VM, runs a command, reports the cost, and tears the 
 Flags:
 
 - `[BINARY]` — the aarch64 agentd binary to bake in as the image CMD; ignored when `--image` names an image to launch instead. `microvms-cli/src/cli.rs:353-354`.
-- `--image <IDENTIFIER>` — launch this existing image instead of building one. `microvms-cli/src/cli.rs:360-361`.
+- `--image <IDENTIFIER>` — launch this existing image instead of building one. Takes an ARN or a bare image name: a name is resolved to its ARN through the account's image listing (exact match, every page read) before the launch, with a progress line naming the resolved ARN. An identifier already shaped like an ARN passes through with zero extra calls. A name that resolves to nothing fails locally with `ERR_PRECONDITION` naming the name and suggesting `microvm build` — the service's own answer to a bare name is HTTP 400 "Malformed ARN", which says nothing about names. `microvms-cli/src/commands/lifecycle.rs:283-300`, resolution in `microvms-core/src/control/image.rs:411-475`.
 - `--artifact-uri <S3_URI>` — where the build artifact already is; `microvms-core` builds the artifact bytes and takes the URI but does not upload. `microvms-cli/src/cli.rs:368-369`.
 - `--exec <COMMAND>` — a shell command to run in the VM. When it is omitted, the run only launches and tears down, which is how you check that an image boots. `microvms-cli/src/cli.rs:374-375`.
 - `--name <NAME>` — image name; defaults to a per-invocation name, because reusing a name can trigger a `clientToken` replay that wedges the image. `microvms-cli/src/cli.rs:379-380`.
@@ -90,8 +90,11 @@ Flags:
 - `--memory <MEMORY>` — baseline MiB, selecting a documented size class; default `2048`. `microvms-cli/src/cli.rs:454-455`.
 - `--dockerfile <DOCKERFILE>` — a Dockerfile to use instead of the library's default. `microvms-cli/src/cli.rs:458-459`.
 - `--repair-identity` — widen the guest so `sethostname` and the `boot_id` bind mount work. `microvms-cli/src/cli.rs:462-463`.
+- `--reuse` — reuse an existing image whose build inputs match, instead of building. Computes a sha256 over the build inputs (the daemon binary's bytes and the Dockerfile), derives the image name `<name>-<hash12>` — where the prefix is `--name` or the stable stem `microvm-cli` — and checks the listing for that exact name. A hit skips the build entirely and reports the existing image with `reused: true` in the envelope; a miss builds under the derived name, so the next invocation with the same inputs hits. The hash is in the name because recreating an image under a previously-used fixed name can serve a stale snapshot (measured; the same hazard class as the clientToken replay in `docs/PLATFORM.md`) — content-keying gives both properties at once: unchanged inputs reuse their image, changed inputs get a fresh name and a fresh build. `--memory` is not part of the identity, so a reused image keeps the size class it was created with; the envelope's `size` is the requested class and the text says so. `microvms-cli/src/commands/lifecycle.rs:501`, the hash at `microvms-core/src/control/artifact.rs:91`.
 - `--port <PORT>` — the daemon's port inside the guest. `microvms-cli/src/cli.rs:466-467`.
 - Plus `RegionFlags` and `InfraFlags`. `microvms-cli/src/cli.rs:469-473`.
+
+The success envelope always carries `reused` (`false` for a plain build), so a consumer never guards for the key. `microvms-cli/src/commands/mod.rs`.
 
 ## exec
 

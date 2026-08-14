@@ -90,6 +90,11 @@ backon = { version = "1.6", features = ["tokio-sleep"] }
 # so aes/bzip2/lzma/ppmd/xz/zstd are compressors this crate will never select and
 # C libraries it would otherwise have to build for the musl target.
 zip = { version = "8.6", default-features = false, features = ["deflate"] }
+# `build --reuse` keys an image name to a content hash of the artifact bytes, so an
+# unchanged binary+Dockerfile reuses its image and a changed one gets a fresh name —
+# which is the fix for the stale-snapshot-on-name-reuse hazard. sha2 is already in
+# the tree transitively through aws-sigv4; this makes the edge direct and versioned.
+sha2 = "0.11"
 
 # ── the in-VM session (T-W2-5) ──────────────────────────────────────────────
 # Same pin as the daemon carries. `time` for the poll and deadline paths, `sync`

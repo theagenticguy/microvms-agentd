@@ -642,6 +642,28 @@ pub mod paths {
         format!("/{API_PATH_VERSION}/microvm-images")
     }
 
+    /// `GET /2025-09-09/microvm-images`, with the listing's query members.
+    ///
+    /// `nameFilter` is the model's server-side **substring** filter — it narrows the
+    /// listing, it does not answer "the image named X", so an exact-match comparison
+    /// still happens in the caller. `nextToken` is the pagination cursor and is opaque,
+    /// which is why both values go through [`encode_segment`]: an opaque token may carry
+    /// `+` or `=`, and an unencoded one desynchronises the SigV4 canonical query from
+    /// the query actually sent.
+    pub fn microvm_images_list(name_filter: Option<&str>, next_token: Option<&str>) -> String {
+        let mut query: Vec<String> = Vec::new();
+        if let Some(filter) = name_filter {
+            query.push(format!("nameFilter={}", encode_segment(filter)));
+        }
+        if let Some(token) = next_token {
+            query.push(format!("nextToken={}", encode_segment(token)));
+        }
+        if query.is_empty() {
+            return microvm_images();
+        }
+        format!("{}?{}", microvm_images(), query.join("&"))
+    }
+
     /// `GET|DELETE /2025-09-09/microvm-images/{imageIdentifier}`
     pub fn microvm_image(image: &str) -> String {
         format!(
@@ -758,6 +780,32 @@ mod tests {
         assert_eq!(
             paths::auth_token("mvm-1"),
             "/2025-09-09/microvms/mvm-1/auth-token"
+        );
+    }
+
+    /// The listing path carries its query members in the model's spelling, percent-encoded,
+    /// and a bare listing is the plain collection path with no `?`.
+    ///
+    /// An opaque `nextToken` may carry `+`, `/`, or `=`; unencoded, those desynchronise the
+    /// SigV4 canonical query from the query actually sent, and the rejection reads like bad
+    /// credentials.
+    #[test]
+    fn the_image_listing_path_encodes_its_query_members() {
+        assert_eq!(
+            paths::microvm_images_list(None, None),
+            "/2025-09-09/microvm-images"
+        );
+        assert_eq!(
+            paths::microvm_images_list(Some("my-image"), None),
+            "/2025-09-09/microvm-images?nameFilter=my-image"
+        );
+        assert_eq!(
+            paths::microvm_images_list(Some("my-image"), Some("a+b/c=")),
+            "/2025-09-09/microvm-images?nameFilter=my-image&nextToken=a%2Bb%2Fc%3D"
+        );
+        assert_eq!(
+            paths::microvm_images_list(None, Some("token")),
+            "/2025-09-09/microvm-images?nextToken=token"
         );
     }
 

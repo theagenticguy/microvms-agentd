@@ -323,6 +323,31 @@ pub struct DeleteImageResponseWire {
     pub state: String,
 }
 
+/// `ListMicrovmImagesResponse`.
+///
+/// `nextToken` is how the account's listing paginates, and the name resolver **must**
+/// follow it: an image on page two of a paginated listing is still an image, and a
+/// resolver that read only the first page would report "no image named X" for a name
+/// that exists — the confident wrong answer, which is worse than a failure.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ListImagesResponseWire {
+    pub items: Vec<MicrovmImageSummaryWire>,
+    pub next_token: Option<String>,
+}
+
+/// `MicrovmImageSummary`, narrowed to the members name resolution reads.
+///
+/// The model marks `imageArn`, `name`, `state`, and `createdAt` required; the first
+/// three are the ones anything downstream uses.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MicrovmImageSummaryWire {
+    pub image_arn: String,
+    pub name: String,
+    pub state: String,
+}
+
 /// The modeled error shapes, which all carry a `message` and several add fields.
 ///
 /// One type for all seven because every one has `message` as its only member this client
@@ -423,6 +448,41 @@ mod tests {
             serde_json::from_str(json).expect("the version summary's member is state");
         assert_eq!(parsed.state, "SUCCESSFUL");
         assert_eq!(parsed.status.as_deref(), Some("ACTIVE"));
+    }
+
+    /// `ListMicrovmImagesResponse` from the model's own spelling, `nextToken` included.
+    ///
+    /// The honest-fake rule again: this JSON is text transcribed from `service-2.json`,
+    /// not a round trip through this module's serializer, so a misspelled member here
+    /// cannot agree with a misspelled member in the struct.
+    #[test]
+    fn an_image_listing_deserialises_from_the_models_own_spelling() {
+        let json = r#"{
+            "items": [{
+                "imageArn": "arn:aws:lambda:us-east-1:123456789012:microvm-image/img",
+                "name": "img",
+                "state": "ACTIVE",
+                "latestActiveImageVersion": "1",
+                "createdAt": 1754524800
+            }],
+            "nextToken": "opaque-page-2-token"
+        }"#;
+        let parsed: ListImagesResponseWire =
+            serde_json::from_str(json).expect("the model's own spelling parses");
+        assert_eq!(parsed.items.len(), 1);
+        assert_eq!(parsed.items[0].name, "img");
+        assert_eq!(
+            parsed.items[0].image_arn,
+            "arn:aws:lambda:us-east-1:123456789012:microvm-image/img"
+        );
+        assert_eq!(parsed.items[0].state, "ACTIVE");
+        assert_eq!(parsed.next_token.as_deref(), Some("opaque-page-2-token"));
+
+        // The final page: nextToken absent means None, which is what stops the loop.
+        let last: ListImagesResponseWire =
+            serde_json::from_str(r#"{"items": []}"#).expect("an absent nextToken parses");
+        assert!(last.items.is_empty());
+        assert_eq!(last.next_token, None);
     }
 
     /// `RunMicrovmResponse` from the model's spelling, including the optional

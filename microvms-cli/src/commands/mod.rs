@@ -125,7 +125,15 @@ pub const RESPONSE_TYPES: [(&str, &str, &[&str]); 17] = [
     (
         "build",
         "microvm.image",
-        &["imageIdentifier", "imageName", "buildLogGroup", "size"],
+        &[
+            "imageIdentifier",
+            "imageName",
+            "buildLogGroup",
+            "size",
+            // Always present, `false` for a plain build: `true` means `--reuse` matched
+            // an existing image by content-hash name and nothing was built.
+            "reused",
+        ],
     ),
     (
         "exec",

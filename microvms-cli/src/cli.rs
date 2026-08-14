@@ -381,10 +381,17 @@ pub struct RunArgs {
     #[arg(value_name = "BINARY")]
     pub binary: Option<PathBuf>,
 
-    /// Launch this existing image instead of building one.
+    /// Launch this existing image instead of building one. Takes an ARN or a name.
     ///
     /// The loop shape once a build is 45 minutes: `microvm build` once, then `run --image`
     /// as often as you like.
+    ///
+    /// A bare name is resolved to its ARN through the account's image listing before the
+    /// launch (exact match, every page read), with a progress line naming the resolved
+    /// ARN; an identifier already shaped like an ARN passes through with zero extra
+    /// calls. A name no image carries fails locally with ERR_PRECONDITION — the service's
+    /// own answer to a bare name is HTTP 400 "Malformed ARN", which says nothing about
+    /// names.
     #[arg(long, value_name = "IDENTIFIER")]
     pub image: Option<String>,
 
@@ -489,6 +496,23 @@ pub struct BuildArgs {
     /// Widen the guest so `sethostname` and the boot_id bind mount work.
     #[arg(long)]
     pub repair_identity: bool,
+
+    /// Reuse an existing image whose build inputs match, instead of building.
+    ///
+    /// Computes a sha256 over the build inputs (the daemon binary's bytes and the
+    /// Dockerfile), derives the image name `<name>-<hash12>`, and checks the account's
+    /// image listing for that exact name: a hit skips the build entirely and reports the
+    /// existing image with `reused: true`; a miss builds under the derived name.
+    ///
+    /// Why the hash is in the name: recreating an image under a previously-used fixed
+    /// name can serve a stale snapshot (measured — the same hazard class as the
+    /// clientToken replay in docs/PLATFORM.md). Keying the name to the content hash gives
+    /// both properties at once: unchanged inputs reuse their image, changed inputs get a
+    /// fresh name and therefore a fresh build. The match is on binary+Dockerfile only —
+    /// `--memory` is not part of the identity, so a reused image keeps the size class it
+    /// was created with.
+    #[arg(long)]
+    pub reuse: bool,
 
     /// The daemon's port inside the guest.
     #[arg(long)]

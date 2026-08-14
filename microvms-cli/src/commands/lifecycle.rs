@@ -281,9 +281,20 @@ async fn launch_and_exec<O: std::io::Write, E: std::io::Write>(
 
     let image_identifier = match &args.image {
         Some(identifier) => {
+            // A bare name is resolved to its ARN through the image listing before the
+            // launch: `RunMicrovm.imageIdentifier` takes an ARN, and a name sent verbatim
+            // is answered with HTTP 400 "Malformed ARN" — a message that says nothing
+            // about names. An identifier already shaped like an ARN passes through with
+            // zero extra calls (core checks the prefix first), so a caller who holds the
+            // ARN pays nothing for the convenience existing.
+            let resolved = sandbox.resolve_image_arn(identifier).await?;
+            if resolved != *identifier {
+                ctx.out
+                    .progress(&format!("resolved image name {identifier} to {resolved}"));
+            }
             ctx.out
-                .progress(&format!("launching from the existing image {identifier}"));
-            identifier.clone()
+                .progress(&format!("launching from the existing image {resolved}"));
+            resolved
         }
         None => {
             let binary = args.binary.as_ref().expect("checked by the caller");
@@ -463,7 +474,30 @@ fn attach_cost<O: std::io::Write, E: std::io::Write>(
 
 // ── build ───────────────────────────────────────────────────────────────────
 
-/// Builds an image and waits for it to be usable.
+/// Builds an image and waits for it to be usable — or, under `--reuse`, finds the one
+/// whose content hash already built.
+///
+/// # How `--reuse` decides
+///
+/// The name is derived, not chosen: `<prefix>-<hash12>`, where the prefix is `--name` (or
+/// the stable stem `microvm-cli`) and the hash is a sha256 over the build inputs — the
+/// binary's bytes and the Dockerfile. The listing is then checked for that **exact** name:
+/// a hit skips the build and the upload entirely, and the envelope reports the existing
+/// image with `reused: true`; a miss builds under the derived name, so the *next*
+/// invocation with the same inputs hits.
+///
+/// The prefix default is `microvm-cli` rather than the per-invocation
+/// `microvm-cli-<epoch>` the plain path uses, deliberately: a name containing a timestamp
+/// never matches across invocations, which would make `--reuse` a flag that always
+/// misses. The hash supplies the uniqueness the timestamp supplied — and unlike a
+/// timestamp it collides exactly when reuse is correct.
+///
+/// # Why the hash is in the name at all
+///
+/// Recreating an image under a previously-used fixed name can serve a stale snapshot
+/// (measured; the same hazard class as the clientToken replay in docs/PLATFORM.md).
+/// Content-keying the name closes that: unchanged inputs reuse, changed inputs get a
+/// fresh name and therefore a fresh build under it.
 pub async fn build<O: std::io::Write, E: std::io::Write>(
     ctx: &mut Ctx<'_, O, E>,
     args: &BuildArgs,
@@ -478,51 +512,126 @@ pub async fn build<O: std::io::Write, E: std::io::Write>(
         .suggest("cargo build --release -p agentd --target aarch64-unknown-linux-musl"));
     }
     let size = args.memory.size_class();
-    let name = args
-        .name
-        .clone()
-        .unwrap_or_else(|| format!("microvm-cli-{}", epoch_secs()));
+    let seed = if args.reuse {
+        // A stable stem: see the function docs on why the epoch default would make
+        // `--reuse` a flag that always misses.
+        args.name
+            .clone()
+            .unwrap_or_else(|| "microvm-cli".to_string())
+    } else {
+        args.name
+            .clone()
+            .unwrap_or_else(|| format!("microvm-cli-{}", epoch_secs()))
+    };
 
-    let mut sandbox = ctx.seam.open_sandbox(region, args.port).await?;
-    ctx.out.progress(&format!("building image {name} ({size})"));
-    let request = build_request_from(
+    let sandbox = ctx.seam.open_sandbox(region, args.port).await?;
+    let mut request = build_request_from(
         ctx,
-        &name,
+        &seed,
         size,
         &args.binary,
         args.dockerfile.as_deref(),
         args.repair_identity,
         args.artifact_uri.as_deref(),
     )?;
+
+    let name;
+    if args.reuse {
+        let hash = sandbox.artifact_content_hash_for(&request);
+        name = format!("{seed}-{}", &hash[..12]);
+        // The request was built under the seed; the derived name replaces it everywhere
+        // the seed landed — the name, the token label, and the derived artifact key (but
+        // not a caller-supplied --artifact-uri, which is theirs).
+        request.name = name.clone();
+        request.token_scope = Some(name.clone());
+        if args.artifact_uri.is_none()
+            && let Some(bucket) = ctx.infra.bucket.as_deref()
+        {
+            request.code_artifact_uri = format!("s3://{bucket}/{name}.zip");
+        }
+        ctx.out.progress(&format!(
+            "checking for an existing image named {name} (content hash {})",
+            &hash[..12]
+        ));
+        if let Some(existing) = sandbox.find_image_by_name(&name).await? {
+            ctx.out.progress(&format!(
+                "reusing {} — the build inputs are unchanged, so no build was started",
+                existing.image_arn
+            ));
+            return Ok(render_build(
+                &existing.image_arn,
+                &name,
+                size,
+                true,
+                &format!(
+                    "{}/{name}",
+                    microvms_core::control::image::BUILD_LOG_GROUP_PREFIX
+                ),
+            ));
+        }
+        ctx.out
+            .progress(&format!("no image named {name}; building it"));
+    } else {
+        name = seed;
+    }
+
+    let mut sandbox = sandbox;
+    ctx.out.progress(&format!("building image {name} ({size})"));
     upload_artifact(ctx, &sandbox, &request).await?;
     let image = sandbox.build_image(request).await?;
+    Ok(render_build(
+        &image.identifier,
+        &image.name,
+        size,
+        false,
+        &image.build_log_group(),
+    ))
+}
 
+/// The `build` envelope, shared by the built and the reused outcomes so the two cannot
+/// carry different keys.
+///
+/// `reused` is always present — `false` for a plain build — so a consumer never has to
+/// guard against a missing key. `size` on a reused image is the *requested* class, and
+/// the text says so: the class an existing image was created with is not observable from
+/// the listing, and `--memory` is deliberately not part of the reuse identity.
+fn render_build(
+    identifier: &str,
+    name: &str,
+    size: microvms_core::SizeClass,
+    reused: bool,
+    build_log_group: &str,
+) -> Rendered {
     let mut data = Map::new();
-    data.insert("imageIdentifier".into(), json!(image.identifier));
-    data.insert("imageName".into(), json!(image.name));
+    data.insert("imageIdentifier".into(), json!(identifier));
+    data.insert("imageName".into(), json!(name));
     // Named in the payload because the *service* creates it, Terraform never owns it, and
     // `terraform destroy` leaves it behind — so the caller who built this image is the only
     // one who will ever know to delete it.
-    data.insert("buildLogGroup".into(), json!(image.build_log_group()));
+    data.insert("buildLogGroup".into(), json!(build_log_group));
     data.insert("size".into(), json!(size.to_string()));
+    data.insert("reused".into(), json!(reused));
 
     let (kind, _) = response_type("build");
-    let dense = format!(
-        "{}\t{}\t{}",
-        image.identifier,
-        image.name,
-        image.build_log_group()
-    );
-    let text = [
-        format!("image: {}", image.identifier),
-        format!("name: {}", image.name),
-        format!("size: {size}"),
-        format!("build log group: {}", image.build_log_group()),
+    let dense = format!("{identifier}\t{name}\t{build_log_group}");
+    let mut lines = vec![format!("image: {identifier}"), format!("name: {name}")];
+    if reused {
+        lines.push(
+            "reused: yes — the content hash matched an existing image; nothing was built"
+                .to_string(),
+        );
+        lines.push(format!(
+            "size: {size} (requested; a reused image keeps the class it was created with)"
+        ));
+    } else {
+        lines.push(format!("size: {size}"));
+    }
+    lines.push(format!("build log group: {build_log_group}"));
+    lines.push(
         "note: the service created that log group; terraform destroy will not remove it"
             .to_string(),
-    ]
-    .join("\n");
-    Ok(Rendered::ok(kind, data, text, dense))
+    );
+    Rendered::ok(kind, data, lines.join("\n"), dense)
 }
 
 /// The create request for `run`'s arguments.
