@@ -223,7 +223,7 @@ def test_the_exit_event_carries_a_total_rather_than_a_resume_position(
 ) -> None:
     """`offset` on an exit is a **total**, and treating it as a cursor would replay from the end.
 
-    The core's `ExecEvent::end()` answers `None` here for exactly that reason, and this is the
+    A cursor never moves past an exit for exactly that reason, and this is the
     binding-side statement of it: `Exit` has `offset` and no `end`.
     """
     server = sse_server([[output_frame(0, b"done\n"), exit_frame(5)]])  # type: ignore[operator]

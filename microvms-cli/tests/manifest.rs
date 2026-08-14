@@ -195,7 +195,7 @@ fn the_published_exit_table_agrees_with_what_the_binary_exits() {
 fn a_bare_manifest_invocation_emits_json() {
     let outcome = run(&["manifest"], &[]);
     assert_eq!(outcome.exit_code(), 0);
-    // The default `--emit-json` is on, so this parses without the global flag.
+    // `manifest` is always JSON, so this parses without the global flag.
     let parsed: serde_json::Value = serde_json::from_str(&outcome.stdout).unwrap_or_else(|error| {
         panic!(
             "a bare manifest must be parseable ({error}): {}",

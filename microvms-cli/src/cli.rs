@@ -204,9 +204,9 @@ pub enum Command {
     /// Emit the whole command surface, its exit codes, and its envelope schema.
     ///
     /// Derived from the registered command tree rather than written down, so it cannot drift
-    /// from what this binary actually accepts. Defaults to JSON: the only consumer that asks
+    /// from what this binary actually accepts. Always JSON: the only consumer that asks
     /// for a manifest is one that parses it.
-    Manifest(ManifestArgs),
+    Manifest,
 
     /// Emit every service constraint this client believes, for the drift gate.
     ///
@@ -809,16 +809,6 @@ pub struct DoctorArgs {
 
     #[command(flatten)]
     pub infra: InfraFlags,
-}
-
-#[derive(Args, Debug)]
-pub struct ManifestArgs {
-    /// Emit JSON. On by default here, unlike every other command.
-    ///
-    /// The global --json also works; this exists so a bare `microvm manifest` is already
-    /// what its only consumer wants.
-    #[arg(long, default_value_t = true)]
-    pub emit_json: bool,
 }
 
 #[derive(Args, Debug)]

@@ -158,21 +158,6 @@ pub struct Microvm {
 }
 
 impl Microvm {
-    /// Whether this state is terminal — reached before RUNNING, it means the VM died during
-    /// startup (TRAP-8).
-    pub fn is_terminal(state: &str) -> bool {
-        crate::constants::TERMINAL_STATES.contains(&state)
-    }
-
-    /// Whether nothing comes back from this state.
-    ///
-    /// Separate from [`Microvm::is_terminal`] because SUSPENDED is a death *before* RUNNING
-    /// and an ordinary waypoint on the resume path — a resume that failed fast on SUSPENDED
-    /// would fail on every resume, since that is the state the call is made from.
-    pub fn is_dead(state: &str) -> bool {
-        crate::constants::DEAD_STATES.contains(&state)
-    }
-
     /// The reason the service gave, or a phrase saying it gave none.
     ///
     /// A phrase rather than an empty string, because "the service said nothing" and "the
@@ -464,11 +449,6 @@ impl ControlPlane {
         let reply = send_with_retry(self.transport(), call).await?;
         let minted: ops::CreateAuthTokenResponseWire = reply.json("CreateMicrovmAuthToken")?;
         ProxyToken::from_map(&minted.auth_token, self.port())
-    }
-
-    /// Options for a lifecycle wait: five minutes, five-second polls.
-    pub fn lifecycle_wait_opts(&self) -> WaitOpts {
-        WaitOpts::for_launch()
     }
 }
 
@@ -1079,17 +1059,6 @@ mod tests {
             fake.first_body("CreateMicrovmAuthToken")["allowedPorts"][0]["port"],
             8080
         );
-    }
-
-    /// The terminal and dead sets, and the asymmetry between them.
-    #[test]
-    fn suspended_is_terminal_but_not_dead() {
-        assert!(Microvm::is_terminal("SUSPENDED"));
-        assert!(!Microvm::is_dead("SUSPENDED"));
-        assert!(Microvm::is_terminal("TERMINATED"));
-        assert!(Microvm::is_dead("TERMINATED"));
-        assert!(!Microvm::is_terminal("RUNNING"));
-        assert!(!Microvm::is_terminal("PENDING"));
     }
 
     /// **TRAP-11, across a full lifecycle.** Drive create, wait, launch, wait, mint, suspend,

@@ -339,7 +339,7 @@ impl PyExit {
     }
 
     /// Total bytes published. A total rather than a position to resume at, which is why
-    /// the core's `ExecEvent::end()` answers `None` here.
+    /// `Exit` has no `end` getter while `Output` and `Gap` both do.
     #[getter]
     fn offset(&self) -> u64 {
         self.offset

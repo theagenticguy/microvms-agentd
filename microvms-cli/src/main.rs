@@ -95,14 +95,13 @@ fn main() -> ExitCode {
     // arrived after the subcommand, and the raw scan above only exists for the failure path that
     // never gets here.
     //
-    // `manifest` is the one command whose *own* flag defaults JSON on. The only consumer that asks
-    // for a manifest is one that parses it, so a bare `microvm manifest` is already what it wants —
+    // `manifest` is the one command that is always JSON. The only consumer that asks for a
+    // manifest is one that parses it, so a bare `microvm manifest` is already what it wants —
     // `cli.py:2278` makes the same choice with `json: bool = True`. Folded in here rather than read
     // inside the handler, because the format is what decides which stream and which rendering the
     // dispatcher uses, and a handler that could change it after the fact would be a second answer
     // to one question.
-    let wants_json =
-        parsed.json || matches!(&parsed.command, Command::Manifest(args) if args.emit_json);
+    let wants_json = parsed.json || matches!(&parsed.command, Command::Manifest);
     let format = envelope::resolve_format(
         wants_json,
         parsed.dense,
@@ -393,7 +392,7 @@ async fn handle<O: std::io::Write, E: std::io::Write>(
         Command::Logs(args) => commands::local::logs(ctx, args),
         Command::Cost(args) => commands::cost::cost(ctx, args),
         Command::Doctor(args) => commands::doctor::doctor(ctx, args).await,
-        Command::Manifest(_) => commands::local::manifest(ctx),
+        Command::Manifest => commands::local::manifest(ctx),
         Command::Constants(_) => commands::local::constants(ctx),
     }
 }
