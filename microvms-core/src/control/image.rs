@@ -250,7 +250,7 @@ impl ControlPlane {
                 });
             }
             if Image::is_failed(&got.state) {
-                return Err(self.build_failure(&got.name, &got.state));
+                return Err(self.build_failure(&got).await);
             }
 
             let elapsed = self.clock().elapsed().saturating_sub(started);
@@ -289,18 +289,20 @@ impl ControlPlane {
     /// build failures: unknown is not empty, and a claim made on a throttled API call sends
     /// the reader after the wrong cause.
     async fn probe_stalled_build(&self, identifier: &str, elapsed: Duration) -> Result<(), Error> {
-        let Some(states) = self.build_states(identifier).await else {
+        let Some(builds) = self.builds_of_first_version(identifier).await else {
             // Could not see the build list. Say nothing rather than guess.
             return Ok(());
         };
 
-        if states.is_empty() {
+        if builds.is_empty() {
             // No builds listed at all is not the signature: the replay case lists builds
             // and leaves them PENDING. An empty list is a version whose builds have not
             // been enumerated yet.
             return Ok(());
         }
-        if !states.iter().all(|state| state == "PENDING") {
+        // `buildState`, not `state`. The deserializer refuses the other spelling, so this
+        // read cannot silently produce nothing the way `b.get("state")` did.
+        if !builds.iter().all(|build| build.build_state == "PENDING") {
             return Ok(());
         }
 
@@ -315,81 +317,209 @@ impl ControlPlane {
                  one. Two images were wedged this way for ~15 hours (docs/PLATFORM.md, \
                  '`clientToken` is a permanent idempotency key'). Waiting will not help.",
                 elapsed.as_secs_f64(),
-                states.len(),
-                states.join(", "),
+                builds.len(),
+                builds
+                    .iter()
+                    .map(ops::MicrovmImageBuildSummaryWire::describe)
+                    .collect::<Vec<_>>()
+                    .join(", "),
             ),
         ))
     }
 
-    /// The `buildState` of every build of the image's first version, or `None` when the
-    /// listing could not be read.
+    /// Every build of the image's first version, or `None` when the listing could not be
+    /// read.
     ///
     /// Two calls — versions, then builds — because `ListMicrovmImageBuilds` requires an
     /// `imageVersion` in its path.
-    async fn build_states(&self, identifier: &str) -> Option<Vec<String>> {
-        let versions_call = Call::get(
-            "ListMicrovmImageVersions",
-            paths::image_versions(identifier),
-        );
-        let versions: ops::ListImageVersionsResponseWire =
-            send_with_retry(self.transport(), versions_call)
-                .await
-                .ok()?
-                .json("ListMicrovmImageVersions")
-                .ok()?;
-        let version = versions.items.first()?.image_version.clone();
+    ///
+    /// # Every page, because the verdict is over *all* builds
+    ///
+    /// `ListMicrovmImageBuilds` caps `maxResults` at 50, and [`Self::probe_stalled_build`]
+    /// asserts **all** builds are `PENDING`. Over a truncated page that quantifier is a
+    /// claim about a subset presented as a claim about the set, and it is wrong in both
+    /// directions: 50 pending builds on page one with a scheduled build on page two reads
+    /// as a wedge on a healthy image, and one page of scheduled builds hides a real wedge.
+    /// Since the verdict is a universal, the loop reads to the last page before deciding.
+    async fn builds_of_first_version(
+        &self,
+        identifier: &str,
+    ) -> Option<Vec<ops::MicrovmImageBuildSummaryWire>> {
+        let version = self.first_version(identifier).await?.image_version;
+        self.builds_of_version(identifier, &version).await
+    }
 
-        let builds_call = Call::get(
-            "ListMicrovmImageBuilds",
-            paths::image_builds(identifier, &version),
-        );
-        let builds: ops::ListImageBuildsResponseWire =
-            send_with_retry(self.transport(), builds_call)
+    /// Every build of `version`, or `None` when the listing could not be read.
+    async fn builds_of_version(
+        &self,
+        identifier: &str,
+        version: &str,
+    ) -> Option<Vec<ops::MicrovmImageBuildSummaryWire>> {
+        let mut builds = Vec::new();
+        let mut next_token: Option<String> = None;
+        loop {
+            let call = Call::get(
+                "ListMicrovmImageBuilds",
+                paths::image_builds(identifier, version, next_token.as_deref()),
+            );
+            let page: ops::ListImageBuildsResponseWire = send_with_retry(self.transport(), call)
                 .await
                 .ok()?
                 .json("ListMicrovmImageBuilds")
                 .ok()?;
+            builds.extend(page.items);
+            match page.next_token {
+                Some(token) => next_token = Some(token),
+                None => return Some(builds),
+            }
+        }
+    }
 
-        // `buildState`, not `state`. The deserializer refuses the other spelling, so this
-        // read cannot silently produce nothing the way `b.get("state")` did.
-        Some(
-            builds
-                .items
-                .into_iter()
-                .map(|build| build.build_state)
-                .collect(),
+    /// The first version listed, or `None` when the listing could not be read or the image
+    /// has none.
+    ///
+    /// Only the first page is fetched, and that is correct rather than a second instance
+    /// of the same bug: this reads `items.first()`, so a later page cannot change the
+    /// answer. Fetching the rest would be calls whose results are discarded.
+    async fn first_version(&self, identifier: &str) -> Option<ops::MicrovmImageVersionSummaryWire> {
+        let call = Call::get(
+            "ListMicrovmImageVersions",
+            paths::image_versions(identifier, None),
+        );
+        let versions: ops::ListImageVersionsResponseWire = send_with_retry(self.transport(), call)
+            .await
+            .ok()?
+            .json("ListMicrovmImageVersions")
+            .ok()?;
+        versions.items.into_iter().next()
+    }
+
+    /// The message for a build the service reported as failed, with whatever reason the
+    /// service already stated.
+    ///
+    /// # The reasons come first, because the service usually has one
+    ///
+    /// `GetMicrovmImage` has no `stateReason` member — the shape structurally cannot carry
+    /// one — so for a while this message could only name the log group and guess. It does
+    /// not have to guess: `MicrovmImageVersionSummary` and `MicrovmImageBuildSummary` both
+    /// carry a `stateReason`, and `GetMicrovmImage` names the failed version in
+    /// `latestFailedImageVersion`. So two listings the client already knows how to make
+    /// turn "the build failed, here is where the logs would be" into "the build failed
+    /// because X".
+    ///
+    /// The lookup is **best effort**: a listing that cannot be read leaves the reasons out
+    /// and the message keeps its log-group remedy, for the reason
+    /// [`Self::probe_stalled_build`] gives at length — a diagnosis made on a throttled call
+    /// sends the reader after the wrong cause. What it must never do is turn a real build
+    /// failure into a listing error, so nothing here returns `Err`.
+    ///
+    /// # The log-group paragraph stays
+    ///
+    /// It names the required prefix, because a failure that reads as "unknown" is most often
+    /// a build role granted the *plausible* prefix rather than the measured one. This client
+    /// cannot check the log group — CloudWatch is not in its dependency set — so the prefix
+    /// is named whenever no reason was found, rather than unconditionally. That conditional
+    /// is what the reasons above buy back: this used to be "a deliberate weakening" of the
+    /// Python diagnostic precisely because the client had no reason in hand, and now it does.
+    /// The full assessment of why no log *read* happens here is in
+    /// `microvms-cli/src/commands/local.rs`'s `logs`, beside the command a caller reaches
+    /// for instead.
+    async fn build_failure(&self, got: &ops::GetMicrovmImageResponseWire) -> Error {
+        let name = &got.name;
+        let state = &got.state;
+        let reasons = self.failure_reasons(got).await;
+
+        let said = if reasons.is_empty() {
+            format!(
+                "Neither the failed version nor any of its builds carried a stateReason, so the \
+                 service stated no cause. If the build log group {BUILD_LOG_GROUP_PREFIX}/{name} \
+                 also contains no events, the cause is most likely the build role's log \
+                 permissions rather than a silent service: the role must grant logs on the \
+                 {BUILD_LOG_GROUP_PREFIX}/* prefix, and a policy granting /aws/lambda/microvms/* \
+                 instead — the plausible spelling, and the wrong one — produces builds with no \
+                 logs at all (docs/PLATFORM.md, 'Build logs go to \
+                 {BUILD_LOG_GROUP_PREFIX}/<image-name>')."
+            )
+        } else {
+            format!(
+                "The service stated the cause: {}. Full build logs are in \
+                 {BUILD_LOG_GROUP_PREFIX}/{name}.",
+                reasons.join("; "),
+            )
+        };
+
+        Error::new(
+            ErrorKind::Platform,
+            format!("the image build for {name:?} failed: {state}. {said}"),
         )
     }
 
-    /// The message for a build the service reported as failed.
+    /// Every `stateReason` the service already stated about this image's failure: the
+    /// version's, then each failed build's.
     ///
-    /// Names the required log-group prefix, because the failure that reads as "unknown" is
-    /// most often a build role granted the *plausible* prefix rather than the measured one.
-    /// This client cannot check the log group — CloudWatch is not in its dependency set —
-    /// so the prefix is named unconditionally rather than only when the group is empty,
-    /// which is a deliberate weakening of the Python diagnostic.
-    ///
-    /// Weakening rather than gap, and it stays weakened deliberately: the *remedy sentence*
-    /// is what a reader acts on and it is the same either way, so what the conditional
-    /// bought was one bit. Adding a log reader to get that bit back would mean a second
-    /// signing name and a second host in a transport whose single-service-ness is four
-    /// readable constants, and it would answer `AccessDeniedException` in an account set up
-    /// as this project documents — no role here is granted a log *read*. The full assessment
-    /// is in `microvms-cli/src/commands/local.rs`'s `logs`, beside the command a caller
-    /// reaches for instead.
-    fn build_failure(&self, name: &str, state: &str) -> Error {
-        Error::new(
-            ErrorKind::Platform,
-            format!(
-                "the image build for {name:?} failed: {state}. If the reason reads as unknown and \
-                 the build log group {BUILD_LOG_GROUP_PREFIX}/{name} contains no events, the cause \
-                 is most likely the build role's log permissions rather than a silent service: \
-                 the role must grant logs on the {BUILD_LOG_GROUP_PREFIX}/* prefix, and a policy \
-                 granting /aws/lambda/microvms/* instead — the plausible spelling, and the wrong \
-                 one — produces builds with no logs at all (docs/PLATFORM.md, 'Build logs go to \
-                 {BUILD_LOG_GROUP_PREFIX}/<image-name>')."
-            ),
-        )
+    /// Empty when nothing could be read or nothing carried a reason, which the caller
+    /// reports as the service having stated no cause rather than as an absent lookup.
+    async fn failure_reasons(&self, got: &ops::GetMicrovmImageResponseWire) -> Vec<String> {
+        // The version the service itself named as the failed one, falling back to the first
+        // listed — which is what an image whose only version failed looks like.
+        let Some(version) = self.failed_version(got).await else {
+            return Vec::new();
+        };
+
+        let mut reasons = Vec::new();
+        if let Some(reason) = version.state_reason.as_deref() {
+            reasons.push(format!(
+                "version {} is {} because {reason}",
+                version.image_version, version.state
+            ));
+        }
+
+        // The build-level reasons are the specific ones: a version's reason is often "one
+        // or more builds failed", which names the shape of the problem and not the problem.
+        if let Some(builds) = self
+            .builds_of_version(&got.image_arn, &version.image_version)
+            .await
+        {
+            reasons.extend(
+                builds
+                    .iter()
+                    .filter(|build| build.state_reason.is_some() && build.build_state != "PENDING")
+                    .map(|build| format!("build {}", build.describe())),
+            );
+        }
+        reasons
+    }
+
+    /// The version `latestFailedImageVersion` names, or the first version listed when the
+    /// service named none.
+    async fn failed_version(
+        &self,
+        got: &ops::GetMicrovmImageResponseWire,
+    ) -> Option<ops::MicrovmImageVersionSummaryWire> {
+        let Some(wanted) = got.latest_failed_image_version.as_deref() else {
+            return self.first_version(&got.image_arn).await;
+        };
+
+        let mut next_token: Option<String> = None;
+        loop {
+            let call = Call::get(
+                "ListMicrovmImageVersions",
+                paths::image_versions(&got.image_arn, next_token.as_deref()),
+            );
+            let page: ops::ListImageVersionsResponseWire = send_with_retry(self.transport(), call)
+                .await
+                .ok()?
+                .json("ListMicrovmImageVersions")
+                .ok()?;
+            if let Some(hit) = page
+                .items
+                .into_iter()
+                .find(|item| item.image_version == wanted)
+            {
+                return Some(hit);
+            }
+            next_token = Some(page.next_token?);
+        }
     }
 
     /// The image with exactly `name`, or `None` when no page of the listing has one.
@@ -511,27 +641,67 @@ impl ControlPlane {
     }
 
     /// One deletion attempt: drop the extra versions, then the image.
+    ///
+    /// # Every page of versions, or the image cannot be deleted at all
+    ///
+    /// `ListMicrovmImageVersions` caps `maxResults` at 50. Reading one page and then
+    /// deleting the image is not a partial cleanup, it is a **permanent** one: the versions
+    /// on page two still exist, so the final `DeleteMicrovmImage` answers
+    /// `ConflictException`, [`Self::delete_image`]'s retry loop re-reads the same first
+    /// page every attempt, and the call returns `false` forever. The outcome is a billing
+    /// image nothing can delete through this client, which is the exact outcome the retry
+    /// loop exists to prevent.
+    ///
+    /// The whole listing is collected before the first delete rather than deleted
+    /// page-by-page, because deleting from under a cursor is how a paginated traversal
+    /// skips items: the service's page boundaries move as the collection shrinks.
     async fn try_delete_image(&self, identifier: &str) -> Result<(), Error> {
-        let versions_call = Call::get(
-            "ListMicrovmImageVersions",
-            paths::image_versions(identifier),
-        );
-        let versions: ops::ListImageVersionsResponseWire =
-            send_with_retry(self.transport(), versions_call)
+        let mut versions: Vec<String> = Vec::new();
+        let mut next_token: Option<String> = None;
+        loop {
+            let call = Call::get(
+                "ListMicrovmImageVersions",
+                paths::image_versions(identifier, next_token.as_deref()),
+            );
+            let page: ops::ListImageVersionsResponseWire = send_with_retry(self.transport(), call)
                 .await?
                 .json("ListMicrovmImageVersions")?;
+            versions.extend(page.items.into_iter().map(|item| item.image_version));
+            match page.next_token {
+                Some(token) => next_token = Some(token),
+                None => break,
+            }
+        }
 
         // Skip the first: the last remaining version goes with the image.
-        for version in versions.items.iter().skip(1) {
+        for version in versions.iter().skip(1) {
             let call = Call::delete(
                 "DeleteMicrovmImageVersion",
-                paths::image_version(identifier, &version.image_version),
+                paths::image_version(identifier, version),
             );
             send_with_retry(self.transport(), call).await?;
         }
 
         let call = Call::delete("DeleteMicrovmImage", paths::microvm_image(identifier));
-        send_with_retry(self.transport(), call).await?;
+        let reply = send_with_retry(self.transport(), call).await?;
+
+        // The readback is parsed rather than discarded, so `DeleteImageResponseWire` is a
+        // live shape. See [`ops::DeleteImageResponseWire`] for why the state is checked
+        // for a *failure* spelling only: DELETING and DELETED are both the call having
+        // worked, and treating DELETING as incomplete would retry a deletion in progress.
+        let deleted: ops::DeleteImageResponseWire = reply.json("DeleteMicrovmImage")?;
+        if Image::is_failed(&deleted.state) {
+            return Err(Error::new(
+                ErrorKind::Platform,
+                format!(
+                    "DeleteMicrovmImage answered 2xx for {} but reported state {}, so the image \
+                     still exists and still bills. A DELETE_FAILED readback is the service \
+                     accepting the request and refusing the work, which is not something a retry \
+                     of the identical request fixes.",
+                    deleted.image_identifier, deleted.state,
+                ),
+            ));
+        }
         Ok(())
     }
 }
@@ -900,6 +1070,138 @@ mod tests {
         );
     }
 
+    /// **Issue #23.** One scheduled build on page **two** of the build listing is enough to
+    /// clear a healthy image, so a truncated page cannot produce a false wedge verdict.
+    ///
+    /// `probe_stalled_build` asserts **all** builds are PENDING. Over one page that
+    /// quantifier is a claim about a subset presented as a claim about the set: fifty pending
+    /// builds on page one plus one `IN_PROGRESS` build on page two is a healthy image that
+    /// the old code would have called wedged, and `ERR_BUILD_WEDGED` is an exit code a caller
+    /// is told to trust.
+    ///
+    /// **Falsification** — run 2026-08-15. Stop the loop after the first page in
+    /// `builds_of_version` and this fails with `ErrorKind::BuildWedged`, which is exactly the
+    /// false verdict issue #23 describes. Restored.
+    #[tokio::test]
+    async fn a_scheduled_build_on_page_two_prevents_a_false_wedge_verdict() {
+        let (plane, fake, _) = planted();
+        fake.answer(
+            "GetMicrovmImage",
+            Answer::ok(fake::get_image_response("img", "CREATING")),
+        )
+        .answer(
+            "GetMicrovmImage",
+            Answer::ok(fake::get_image_response("img", "CREATING")),
+        )
+        .answer(
+            "GetMicrovmImage",
+            Answer::ok(fake::get_image_response("img", "CREATED")),
+        )
+        .answer(
+            "ListMicrovmImageVersions",
+            Answer::ok(fake::list_versions_response("1")),
+        )
+        // Page one is entirely PENDING, which is the wedge signature over a partial list.
+        .answer(
+            "ListMicrovmImageBuilds",
+            Answer::ok(fake::list_builds_page(
+                &[("build-1", "PENDING"), ("build-2", "PENDING")],
+                Some("builds-page-2"),
+            )),
+        )
+        // Page two says the service scheduled something, so nothing is wedged.
+        .answer(
+            "ListMicrovmImageBuilds",
+            Answer::ok(fake::list_builds_page(&[("build-3", "IN_PROGRESS")], None)),
+        );
+
+        let image = plane
+            .wait_for_image(
+                "arn:image",
+                SizeClass::DEFAULT,
+                WaitOpts {
+                    stall_grace: Duration::from_secs(240),
+                    poll_interval: Duration::from_secs(300),
+                    timeout: Duration::from_secs(2700),
+                },
+            )
+            .await
+            .expect("a build scheduled on page two is a scheduled build");
+        assert_eq!(image.state, "CREATED");
+        assert_eq!(
+            fake.call_count("ListMicrovmImageBuilds"),
+            2,
+            "the probe read both pages before deciding"
+        );
+
+        let listings: Vec<String> = fake
+            .calls()
+            .into_iter()
+            .filter(|call| call.operation == "ListMicrovmImageBuilds")
+            .map(|call| call.path)
+            .collect();
+        assert!(
+            listings[1].contains("nextToken=builds-page-2"),
+            "the second request must carry the first page's token: {}",
+            listings[1]
+        );
+    }
+
+    /// The other direction: a wedge that is only visible on page two is still caught. All
+    /// builds PENDING **across every page** is the signature, and the page-two builds are
+    /// named in the message.
+    ///
+    /// Without this, a paginating probe that read every page but formed its verdict from the
+    /// last one would pass the test above while missing a real wedge.
+    #[tokio::test]
+    async fn a_wedge_is_still_named_when_the_builds_span_two_pages() {
+        let (plane, fake, _) = planted();
+        fake.answer(
+            "GetMicrovmImage",
+            Answer::ok(fake::get_image_response("img", "CREATING")),
+        )
+        .answer(
+            "ListMicrovmImageVersions",
+            Answer::ok(fake::list_versions_response("1")),
+        )
+        .answer(
+            "ListMicrovmImageBuilds",
+            Answer::ok(fake::list_builds_page(
+                &[("build-1", "PENDING")],
+                Some("builds-page-2"),
+            )),
+        )
+        .answer(
+            "ListMicrovmImageBuilds",
+            Answer::ok(fake::list_builds_page(&[("build-2", "PENDING")], None)),
+        );
+
+        let error = plane
+            .wait_for_image(
+                "arn:image",
+                SizeClass::DEFAULT,
+                WaitOpts {
+                    stall_grace: Duration::from_secs(240),
+                    poll_interval: Duration::from_secs(120),
+                    timeout: Duration::from_secs(2700),
+                },
+            )
+            .await
+            .expect_err("a wedged image must not be waited out");
+
+        assert_eq!(error.kind(), ErrorKind::BuildWedged);
+        let message = error.to_string();
+        assert!(
+            message.contains("all 2 builds"),
+            "the count must be over every page, not one: {message}"
+        );
+        assert!(
+            message.contains("build-2"),
+            "the page-two build must be in the verdict: {message}"
+        );
+        assert!(message.contains("build-1"), "{message}");
+    }
+
     /// A build list that cannot be read produces **no** wedge claim. Unknown is not
     /// wedged, and a claim made on a throttled call sends the reader after the wrong cause.
     #[tokio::test]
@@ -935,15 +1237,26 @@ mod tests {
         assert!(!error.to_string().contains("replay signature"), "{error}");
     }
 
-    /// A reported build failure names the required log-group prefix, because the failure
-    /// that reads as "unknown" is most often the wrong IAM prefix rather than a silent
-    /// service.
+    /// A reported build failure with **no** reason anywhere names the required log-group
+    /// prefix, because a failure that reads as "unknown" is most often the wrong IAM prefix
+    /// rather than a silent service.
+    ///
+    /// The listings answer, and answer with no `stateReason`, which is the case that
+    /// distinguishes "the service stated no cause" from "we did not look".
     #[tokio::test]
-    async fn a_failed_build_names_the_required_log_group_prefix() {
+    async fn a_failed_build_with_no_stated_reason_names_the_required_log_group_prefix() {
         let (plane, fake, _) = planted();
         fake.answer(
             "GetMicrovmImage",
             Answer::ok(fake::get_image_response("img", "CREATE_FAILED")),
+        )
+        .answer(
+            "ListMicrovmImageVersions",
+            Answer::ok(fake::list_versions_response("1")),
+        )
+        .answer(
+            "ListMicrovmImageBuilds",
+            Answer::ok(fake::list_builds_response("FAILED")),
         );
 
         let error = plane
@@ -952,12 +1265,142 @@ mod tests {
             .expect_err("a failed build is a failure");
         assert_eq!(error.kind(), ErrorKind::Platform);
         let message = error.to_string();
+        assert!(
+            message.contains("stated no cause"),
+            "the absence has to be stated as an absence: {message}"
+        );
         assert!(message.contains("/aws/lambda-microvms/img"), "{message}");
         assert!(
             message.contains("/aws/lambda/microvms/*"),
             "the wrong prefix has to be named as wrong: {message}"
         );
         assert!(message.contains("the plausible spelling"), "{message}");
+    }
+
+    /// **Issue #25.** A build failure reports the `stateReason` the service already stated,
+    /// at both levels: the version's and the failed build's.
+    ///
+    /// `GetMicrovmImage` structurally cannot carry a reason — the shape has no such member —
+    /// so before this the message could only name a log group and guess. The version reason
+    /// is the general one ("one or more builds failed") and the build reason is the specific
+    /// one, which is why both are surfaced rather than just the nearest.
+    ///
+    /// The failed build is on **page two** of the build listing, so this doubles as a
+    /// pagination guard on the diagnosis path.
+    ///
+    /// **Falsification** — three, all run 2026-08-15. (a) Drop the `failure_reasons` call
+    /// from `build_failure` and the message loses both reasons: the first two assertions go
+    /// red. (b) Stop following `nextToken` in `builds_of_version` (return `Some(builds)` in
+    /// the `Some(token)` arm) and only the version reason survives: the `no space left`
+    /// assertion goes red. (c) Drop `state_reason` from `MicrovmImageBuildSummaryWire` and
+    /// it does not compile.
+    #[tokio::test]
+    async fn a_failed_build_reports_the_reason_the_service_already_stated() {
+        let (plane, fake, _) = planted();
+        fake.answer(
+            "GetMicrovmImage",
+            Answer::ok(fake::get_image_response_failed("img", "CREATE_FAILED", "2")),
+        )
+        // Version "2" is on page two of the version listing, and it is the one
+        // `latestFailedImageVersion` names — so a resolver reading one page finds the wrong
+        // version, or none.
+        .answer(
+            "ListMicrovmImageVersions",
+            Answer::ok(fake::list_versions_page(&["1"], Some("versions-page-2"))),
+        )
+        .answer(
+            "ListMicrovmImageVersions",
+            Answer::ok(fake::list_versions_response_failed(
+                "2",
+                "FAILED",
+                Some("one or more builds failed"),
+            )),
+        )
+        // The build that carries the specific reason is on page two of the build listing.
+        .answer(
+            "ListMicrovmImageBuilds",
+            Answer::ok(fake::list_builds_page_with_reasons(
+                &[("build-1", "SUCCESSFUL", None)],
+                Some("builds-page-2"),
+            )),
+        )
+        .answer(
+            "ListMicrovmImageBuilds",
+            Answer::ok(fake::list_builds_page_with_reasons(
+                &[("build-2", "FAILED", Some("no space left on device"))],
+                None,
+            )),
+        );
+
+        let error = plane
+            .wait_for_image("arn:image", SizeClass::DEFAULT, WaitOpts::default())
+            .await
+            .expect_err("a failed build is a failure");
+        assert_eq!(error.kind(), ErrorKind::Platform);
+        let message = error.to_string();
+
+        assert!(
+            message.contains("one or more builds failed"),
+            "the version-level reason must reach the message: {message}"
+        );
+        assert!(
+            message.contains("no space left on device"),
+            "the build-level reason is the specific one, and it was on page two: {message}"
+        );
+        assert!(
+            message.contains("build-2"),
+            "the buildId is what GetMicrovmImageBuild takes, so it has to be named: {message}"
+        );
+        assert!(
+            message.contains("The service stated the cause"),
+            "{message}"
+        );
+        assert!(
+            !message.contains("stated no cause"),
+            "a message with reasons must not also claim there were none: {message}"
+        );
+
+        assert_eq!(
+            fake.call_count("ListMicrovmImageVersions"),
+            2,
+            "both version pages were read to find the version the service named"
+        );
+        assert_eq!(
+            fake.call_count("ListMicrovmImageBuilds"),
+            2,
+            "both build pages were read"
+        );
+    }
+
+    /// A build failure whose listings cannot be read at all still reports the failure, and
+    /// still names the log group. A diagnosis lookup must never turn a real build failure
+    /// into a listing error.
+    #[tokio::test]
+    async fn an_unreadable_listing_still_reports_the_build_failure() {
+        let (plane, fake, _) = planted();
+        fake.answer(
+            "GetMicrovmImage",
+            Answer::ok(fake::get_image_response("img", "CREATE_FAILED")),
+        )
+        .answer(
+            "ListMicrovmImageVersions",
+            Answer::failure(429, "Rate exceeded"),
+        );
+
+        let error = plane
+            .wait_for_image("arn:image", SizeClass::DEFAULT, WaitOpts::default())
+            .await
+            .expect_err("the build still failed");
+        assert_eq!(
+            error.kind(),
+            ErrorKind::Platform,
+            "a build failure, not a throttle: {error}"
+        );
+        assert!(error.to_string().contains("CREATE_FAILED"), "{error}");
+        assert!(
+            error.to_string().contains("/aws/lambda-microvms/img"),
+            "{error}"
+        );
     }
 
     /// Every model failure spelling is recognised, so a build that failed is never polled
@@ -1047,6 +1490,172 @@ mod tests {
             "one version means nothing to delete separately"
         );
         assert_eq!(fake.call_count("DeleteMicrovmImage"), 1);
+    }
+
+    /// **Issue #23, the worst of the three.** Deletion follows `nextToken` and drops the
+    /// versions on page **two**, so an image with more versions than one page can hold is
+    /// still deletable.
+    ///
+    /// Reading one page and then deleting the image is not a partial cleanup, it is a
+    /// permanent one: page-two versions still exist, the final `DeleteMicrovmImage` conflicts,
+    /// the retry loop re-reads the same first page every attempt, and `delete_image` returns
+    /// `false` forever — a billing image nothing can delete through this client.
+    ///
+    /// The assertion is the **delete count**, not the call count: five versions across two
+    /// pages means four `DeleteMicrovmImageVersion` calls, and the two on page two are named
+    /// individually so a loop that read the second page but deleted from the first would
+    /// still fail.
+    ///
+    /// **Falsification** — run 2026-08-15. Replace the `Some(token) => next_token = ...` arm
+    /// with `Some(_) => break` and this fails with 1 deletion instead of 4, and the
+    /// `v-4`/`v-5` path assertions go red. Restored.
+    #[tokio::test]
+    async fn deletion_follows_next_token_and_drops_the_versions_on_page_two() {
+        let (plane, fake, _) = planted();
+        fake.answer(
+            "ListMicrovmImageVersions",
+            Answer::ok(fake::list_versions_page(
+                &["v-1", "v-2", "v-3"],
+                Some("versions-page-2"),
+            )),
+        )
+        .answer(
+            "ListMicrovmImageVersions",
+            Answer::ok(fake::list_versions_page(&["v-4", "v-5"], None)),
+        )
+        .answer(
+            "DeleteMicrovmImageVersion",
+            Answer::ok(fake::empty_response()),
+        )
+        .answer(
+            "DeleteMicrovmImage",
+            Answer::ok(fake::delete_image_response()),
+        );
+
+        assert!(
+            plane
+                .delete_image("arn:image", 20, Duration::from_secs(15))
+                .await,
+            "an image whose versions span two pages must still be deletable"
+        );
+
+        // The delete count first, because it is the outcome the bug produced: reading one
+        // page deletes one version and leaves two billing. A call count would report the
+        // same breakage as "one listing" and bury what that cost.
+        assert_eq!(
+            fake.call_count("DeleteMicrovmImageVersion"),
+            4,
+            "five versions, keeping the first: four deletions, two of them from page two"
+        );
+
+        // Named individually, because a loop that reads page two and then deletes from page
+        // one would still make four calls.
+        let deleted: Vec<String> = fake
+            .calls()
+            .into_iter()
+            .filter(|call| call.operation == "DeleteMicrovmImageVersion")
+            .map(|call| call.path)
+            .collect();
+        for version in ["v-2", "v-3", "v-4", "v-5"] {
+            assert!(
+                deleted.iter().any(|path| path.ends_with(version)),
+                "version {version} was never deleted, so it still bills: {deleted:?}"
+            );
+        }
+        assert!(
+            !deleted.iter().any(|path| path.ends_with("v-1")),
+            "the first version goes with the image: {deleted:?}"
+        );
+        assert_eq!(fake.call_count("DeleteMicrovmImage"), 1);
+        assert_eq!(
+            fake.call_count("ListMicrovmImageVersions"),
+            2,
+            "both pages were read"
+        );
+
+        // The second listing request carries the first page's cursor. Without this the loop
+        // could re-read page one forever and still satisfy a count of two.
+        let listings: Vec<String> = fake
+            .calls()
+            .into_iter()
+            .filter(|call| call.operation == "ListMicrovmImageVersions")
+            .map(|call| call.path)
+            .collect();
+        assert!(
+            listings[1].contains("nextToken=versions-page-2"),
+            "the second request must carry the first page's token: {}",
+            listings[1]
+        );
+        assert!(
+            !listings[0].contains("nextToken"),
+            "the first request carries no cursor: {}",
+            listings[0]
+        );
+    }
+
+    /// **Issue #25.** A `DeleteMicrovmImage` that answers 2xx while reporting a `*_FAILED`
+    /// state is a failure, not a success.
+    ///
+    /// That readback is why `DeleteImageResponseWire` is kept rather than deleted as dead:
+    /// without it the service can accept the delete request, refuse the work, and have
+    /// `delete_image` answer `true` — teardown reports clean and the image keeps billing.
+    ///
+    /// **Falsification** — run 2026-08-15. Drop the `Image::is_failed` check from
+    /// `try_delete_image` and this reports `true` after one attempt: both assertions go red.
+    /// Restored.
+    #[tokio::test]
+    async fn a_delete_that_reads_back_failed_is_not_reported_as_deleted() {
+        let (plane, fake, _) = planted();
+        fake.answer(
+            "ListMicrovmImageVersions",
+            Answer::ok(fake::list_versions_response("1")),
+        )
+        .answer(
+            "DeleteMicrovmImage",
+            Answer::ok(fake::delete_image_response_in("DELETE_FAILED")),
+        );
+
+        assert!(
+            !plane
+                .delete_image("arn:image", 2, Duration::from_secs(15))
+                .await,
+            "a DELETE_FAILED readback means the image still exists and still bills"
+        );
+        assert_eq!(
+            fake.call_count("DeleteMicrovmImage"),
+            2,
+            "every attempt ran rather than the first being taken as success"
+        );
+    }
+
+    /// `DELETING` and `DELETED` are **both** success. The deletion is asynchronous, so
+    /// `DELETING` is the ordinary answer, and treating it as incomplete would re-issue a
+    /// delete already in progress and then report failure on the conflict that comes back.
+    #[tokio::test]
+    async fn both_deleting_and_deleted_read_back_as_success() {
+        for state in ["DELETING", "DELETED"] {
+            let (plane, fake, _) = planted();
+            fake.answer(
+                "ListMicrovmImageVersions",
+                Answer::ok(fake::list_versions_response("1")),
+            )
+            .answer(
+                "DeleteMicrovmImage",
+                Answer::ok(fake::delete_image_response_in(state)),
+            );
+
+            assert!(
+                plane
+                    .delete_image("arn:image", 20, Duration::from_secs(15))
+                    .await,
+                "{state} is the delete having worked"
+            );
+            assert_eq!(
+                fake.call_count("DeleteMicrovmImage"),
+                1,
+                "{state} must not be retried"
+            );
+        }
     }
 
     /// Deletion retries a conflict — an image in `CREATING` refuses deletion, and a VM

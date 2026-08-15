@@ -161,12 +161,25 @@ pub struct RunMicrovmWire {
     pub(crate) client_token: String,
 }
 
-/// `IdlePolicy`. All three members are required by the model.
+/// `IdlePolicy`. All three members are required by the model, in **both** directions.
 ///
-/// `suspendedDurationSeconds` exists **only in the request** — `GetMicrovm` returns an
-/// `idlePolicy` but the client is still the only party that can name the window it asked
-/// for at launch, which is what STATE-12 rests on.
-#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+/// # `suspendedDurationSeconds` comes back, measured
+///
+/// This comment used to say the member "exists only in the request". That was wrong twice
+/// over. The model has one `IdlePolicy` shape, used by `RunMicrovmRequest`,
+/// `RunMicrovmResponse`, and `GetMicrovmResponse` alike, and it marks all three members
+/// required — so the model says the opposite. And the service agrees with the model:
+/// `GetMicrovm` on a RUNNING VM answers
+/// `"idlePolicy": {"maxIdleDurationSeconds": 1800, "suspendedDurationSeconds": 600,
+/// "autoResumeEnabled": false}` (measured 2026-08-15, us-east-1, one read-only
+/// `GetMicrovm`).
+///
+/// The claim mattered because STATE-12 was resting on it: if only the client could name the
+/// suspended window, the client's own record is the only authority on it. The readback
+/// means there is a second one, and [`crate::control::Microvm::idle_policy`] carries it —
+/// so a suspended window that disagrees with what was asked for is now observable rather
+/// than assumed.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct IdlePolicy {
     /// `min: 60`, one of the few constraints botocore enforces locally, so there is
@@ -210,6 +223,11 @@ pub struct CreateMicrovmImageResponseWire {
 }
 
 /// `GetMicrovmImageOutput`.
+///
+/// `tags` is here rather than left to a `ListTags` this client does not implement: the
+/// service already sends the map on every `GetMicrovmImage`, so reading it costs nothing
+/// and a separate operation would cost a call. `createdAt` is one of the model's four
+/// required members and was the only one missing.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GetMicrovmImageResponseWire {
@@ -218,6 +236,15 @@ pub struct GetMicrovmImageResponseWire {
     pub state: String,
     pub latest_active_image_version: Option<String>,
     pub latest_failed_image_version: Option<String>,
+    /// Required by the model. Epoch seconds, possibly fractional.
+    pub created_at: f64,
+    /// Optional: the model marks only `createdAt` required, so an image never updated
+    /// carries no `updatedAt` and the absence is not a parse failure.
+    pub updated_at: Option<f64>,
+    /// `Tags`, absent rather than empty when the image carries none — measured 2026-08-15
+    /// as `"tags": {}` on a real `GetMicrovmImage`, but `Option` because the model does not
+    /// require the member and an absent map must not fail the parse.
+    pub tags: Option<std::collections::BTreeMap<String, String>>,
 }
 
 /// `ListMicrovmImageVersionsOutput`.
@@ -255,13 +282,49 @@ pub struct ListImageBuildsResponseWire {
 /// reads `None` from every real response and TRAP-2 becomes unfalsifiable. The
 /// deserializer test for this shape uses literal model-spelled JSON for that reason,
 /// and asserts that `{"state": ...}` **fails** to deserialize.
+/// Every member the model marks required is a bare field here, plus the optional
+/// `stateReason`. All eight required ones rather than the four this crate reads today,
+/// because the model requiring a member is the strongest promise it makes about a
+/// response, and a required member absent from the struct is a member no drift check can
+/// notice going missing.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MicrovmImageBuildSummaryWire {
+    pub image_arn: String,
+    pub image_version: String,
     pub build_id: String,
     pub build_state: String,
-    pub image_version: String,
+    /// `ARM_64`, the enum's only value — carried as `String` rather than narrowed, because
+    /// a response is not a request and a second value AWS adds must parse rather than fail.
+    pub architecture: String,
+    pub chipset: String,
+    pub chipset_generation: String,
+    /// A `Timestamp`, which rest-json sends as epoch seconds — possibly fractional, hence
+    /// `f64` rather than `i64`.
+    pub created_at: f64,
     pub state_reason: Option<String>,
+}
+
+impl MicrovmImageBuildSummaryWire {
+    /// The build, as a stall diagnosis wants to read it: the state, the build id, and the
+    /// reason when the service gave one.
+    ///
+    /// The `buildId` is in here because it is the identifier `GetMicrovmImageBuild` takes,
+    /// so a reader handed a wedge verdict can go ask about a named build rather than about
+    /// "one of the builds". The reason is included because the model documents it as "the
+    /// reason for the build state, **if applicable**" — so it is populated on states other
+    /// than a failure, and a probe that dropped it would be discarding the service's own
+    /// account of why nothing was scheduled.
+    ///
+    /// An absent reason renders nothing at all rather than an empty parenthesis, for the
+    /// reason [`MicrovmResponseWire::state_reason`] gives: "the service said nothing" and
+    /// "the service said nothing useful" are different diagnoses.
+    pub fn describe(&self) -> String {
+        match self.state_reason.as_deref() {
+            Some(reason) => format!("{} {} ({reason})", self.build_id, self.build_state),
+            None => format!("{} {}", self.build_id, self.build_state),
+        }
+    }
 }
 
 /// `RunMicrovmResponse` and `GetMicrovmResponse` — identical in every member this client
@@ -316,6 +379,22 @@ pub struct MicrovmItemWire {
 }
 
 /// `DeleteMicrovmImageOutput`.
+///
+/// # Kept and read, rather than deleted as dead
+///
+/// This struct was parsed nowhere: `try_delete_image` discarded the reply, so the shape
+/// existed and no code could observe drift in it. The choice was to delete it or to read
+/// it, and reading it wins on one specific case — a 2xx whose `state` is a `*_FAILED`
+/// spelling. That is the service accepting the delete request and refusing the work, and
+/// without the readback it is indistinguishable from a successful delete: `delete_image`
+/// answers `true`, teardown reports clean, and an image keeps billing. This project has
+/// had exactly that failure once already, in `scripts/verify-clean`, which is why the
+/// account is now asked what leaked rather than trusted to have been cleaned.
+///
+/// **`DELETING` and `DELETED` are both success** and the call site treats them alike. The
+/// deletion is asynchronous, so `DELETING` is the ordinary answer; treating it as
+/// incomplete would make the retry loop re-issue a delete that is already in progress and
+/// then report failure on the `ConflictException` that comes back.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DeleteImageResponseWire {
@@ -398,6 +477,114 @@ mod tests {
         assert_eq!(parsed.build_id, "build-abc");
         assert_eq!(parsed.image_version, "1");
         assert_eq!(parsed.state_reason, None);
+
+        // The five members the struct used to drop, all of them model-required. A required
+        // member absent from the struct is a member no drift check can notice going missing.
+        assert_eq!(
+            parsed.image_arn,
+            "arn:aws:lambda:us-east-1:123456789012:microvm-image:img"
+        );
+        assert_eq!(parsed.architecture, "ARM_64");
+        assert_eq!(parsed.chipset, "GRAVITON");
+        assert_eq!(parsed.chipset_generation, "1");
+        assert_eq!(parsed.created_at, 1_754_524_800.0);
+    }
+
+    /// A summary missing a member the model marks **required** fails to deserialize, which
+    /// is what makes the five added members load-bearing rather than decorative.
+    ///
+    /// One case per member, because a single omission would prove only that *some* member is
+    /// required. `stateReason` is checked in the other direction: it is the one optional
+    /// member, so omitting it must still parse.
+    #[test]
+    fn a_build_summary_missing_a_required_member_fails_to_deserialise() {
+        let members = [
+            (
+                "imageArn",
+                r#""arn:aws:lambda:us-east-1:1:microvm-image:i""#,
+            ),
+            ("imageVersion", r#""1""#),
+            ("buildId", r#""build-abc""#),
+            ("buildState", r#""PENDING""#),
+            ("architecture", r#""ARM_64""#),
+            ("chipset", r#""GRAVITON""#),
+            ("chipsetGeneration", r#""1""#),
+            ("createdAt", "1754524800"),
+        ];
+
+        for omitted in members.iter().map(|(name, _)| *name) {
+            let body: Vec<String> = members
+                .iter()
+                .filter(|(name, _)| *name != omitted)
+                .map(|(name, value)| format!(r#""{name}": {value}"#))
+                .collect();
+            let json = format!("{{{}}}", body.join(", "));
+            let error = serde_json::from_str::<MicrovmImageBuildSummaryWire>(&json)
+                .expect_err(&format!("{omitted} is required by the model"));
+            assert!(
+                error.to_string().contains(omitted),
+                "the error must name the member that is missing ({omitted}): {error}"
+            );
+        }
+
+        // The one optional member: omitting `stateReason` parses, and the absence is `None`
+        // rather than an empty string.
+        let all: Vec<String> = members
+            .iter()
+            .map(|(name, value)| format!(r#""{name}": {value}"#))
+            .collect();
+        let parsed: MicrovmImageBuildSummaryWire =
+            serde_json::from_str(&format!("{{{}}}", all.join(", ")))
+                .expect("stateReason is optional");
+        assert_eq!(parsed.state_reason, None);
+    }
+
+    /// `describe` names the build id, the state, and the reason when there is one — and
+    /// renders **nothing** rather than an empty parenthesis when there is not.
+    ///
+    /// The build id is in there because it is what `GetMicrovmImageBuild` takes, so a reader
+    /// handed a wedge verdict can ask about a named build rather than about "one of the
+    /// builds".
+    #[test]
+    fn a_build_describes_itself_with_its_id_and_only_a_reason_it_has() {
+        let with_reason: MicrovmImageBuildSummaryWire = serde_json::from_str(
+            r#"{
+                "imageArn": "arn:aws:lambda:us-east-1:1:microvm-image:i",
+                "imageVersion": "1",
+                "buildId": "build-abc",
+                "buildState": "FAILED",
+                "architecture": "ARM_64",
+                "chipset": "GRAVITON",
+                "chipsetGeneration": "1",
+                "createdAt": 1754524800,
+                "stateReason": "no space left on device"
+            }"#,
+        )
+        .expect("parses");
+        assert_eq!(
+            with_reason.describe(),
+            "build-abc FAILED (no space left on device)"
+        );
+
+        let without: MicrovmImageBuildSummaryWire = serde_json::from_str(
+            r#"{
+                "imageArn": "arn:aws:lambda:us-east-1:1:microvm-image:i",
+                "imageVersion": "1",
+                "buildId": "build-abc",
+                "buildState": "PENDING",
+                "architecture": "ARM_64",
+                "chipset": "GRAVITON",
+                "chipsetGeneration": "1",
+                "createdAt": 1754524800
+            }"#,
+        )
+        .expect("parses");
+        assert_eq!(without.describe(), "build-abc PENDING");
+        assert!(
+            !without.describe().contains("()"),
+            "an absent reason renders nothing, not an empty parenthesis: {}",
+            without.describe()
+        );
     }
 
     /// The bug, made a compile-and-test-time fact: a response carrying `state` instead of
@@ -448,6 +635,146 @@ mod tests {
             serde_json::from_str(json).expect("the version summary's member is state");
         assert_eq!(parsed.state, "SUCCESSFUL");
         assert_eq!(parsed.status.as_deref(), Some("ACTIVE"));
+    }
+
+    /// The version summary's `stateReason`, which is the **version-level** failure reason
+    /// `GetMicrovmImage` structurally cannot provide — that shape has no such member.
+    ///
+    /// It was parsed and never read, so a build failure could only be reported with a log
+    /// group and a guess while the service's own account of the cause sat in hand.
+    #[test]
+    fn a_version_summary_carries_the_state_reason_get_image_cannot() {
+        let json = r#"{
+            "baseImageArn": "arn:aws:lambda:us-east-1:aws:microvm-image:al2023-1",
+            "buildRoleArn": "arn:aws:iam::123456789012:role/build",
+            "codeArtifact": {"uri": "s3://bucket/img.zip"},
+            "imageArn": "arn:aws:lambda:us-east-1:123456789012:microvm-image:img",
+            "imageVersion": "2",
+            "state": "FAILED",
+            "status": "INACTIVE",
+            "createdAt": 1754524800,
+            "stateReason": "one or more builds failed"
+        }"#;
+        let parsed: MicrovmImageVersionSummaryWire = serde_json::from_str(json).expect("parses");
+        assert_eq!(parsed.state, "FAILED");
+        assert_eq!(
+            parsed.state_reason.as_deref(),
+            Some("one or more builds failed")
+        );
+
+        // `GetMicrovmImageOutput` has no `stateReason` member at all, which is the whole
+        // reason the version-level one is worth reading. A response carrying one parses and
+        // the member is simply dropped, so this is asserted by there being no field to read
+        // rather than by a failure.
+        let image: GetMicrovmImageResponseWire = serde_json::from_str(
+            r#"{"imageArn": "a", "name": "n", "state": "CREATE_FAILED",
+                "createdAt": 1754524800, "stateReason": "ignored"}"#,
+        )
+        .expect("an unknown member is dropped");
+        assert_eq!(image.state, "CREATE_FAILED");
+    }
+
+    /// `GetMicrovmImageOutput` carries `tags`, `createdAt`, and `updatedAt`.
+    ///
+    /// Reading `tags` here is a cheaper answer to "what are this image's tags" than
+    /// implementing `ListTags`: the service already sends the map on every call. The literal
+    /// below is the shape a real response has — measured 2026-08-15 against a live
+    /// `GetMicrovmImage`, which answered `"tags": {}` and an `updatedAt` on an untagged image.
+    #[test]
+    fn a_get_image_response_carries_its_tags_and_timestamps() {
+        let json = r#"{
+            "imageArn": "arn:aws:lambda:us-east-1:123456789012:microvm-image:img",
+            "name": "img",
+            "state": "CREATED",
+            "latestActiveImageVersion": "1.0",
+            "createdAt": 1754524800,
+            "updatedAt": 1754528400,
+            "tags": {"owner": "conformance", "cost-centre": "agents"}
+        }"#;
+        let parsed: GetMicrovmImageResponseWire = serde_json::from_str(json).expect("parses");
+        assert_eq!(parsed.created_at, 1_754_524_800.0);
+        assert_eq!(parsed.updated_at, Some(1_754_528_400.0));
+        let tags = parsed.tags.expect("the map was sent");
+        assert_eq!(tags.get("owner").map(String::as_str), Some("conformance"));
+        assert_eq!(tags.len(), 2);
+
+        // An untagged image answers with an empty map, which is different from an absent
+        // one: `Some({})` says the service answered and the image has no tags.
+        let empty: GetMicrovmImageResponseWire = serde_json::from_str(
+            r#"{"imageArn": "a", "name": "n", "state": "CREATED",
+                "createdAt": 1754524800, "updatedAt": 1754528400, "tags": {}}"#,
+        )
+        .expect("parses");
+        assert_eq!(empty.tags, Some(std::collections::BTreeMap::new()));
+
+        // And an absent map is `None` rather than a parse failure, since the model does not
+        // mark `tags` required.
+        let absent: GetMicrovmImageResponseWire = serde_json::from_str(
+            r#"{"imageArn": "a", "name": "n", "state": "CREATED", "createdAt": 1754524800}"#,
+        )
+        .expect("tags is optional");
+        assert_eq!(absent.tags, None);
+        assert_eq!(absent.updated_at, None);
+    }
+
+    /// `createdAt` is required by the model, so a `GetMicrovmImage` response without it
+    /// fails rather than yielding an image whose creation time is silently zero.
+    #[test]
+    fn a_get_image_response_without_created_at_fails_to_deserialise() {
+        let error = serde_json::from_str::<GetMicrovmImageResponseWire>(
+            r#"{"imageArn": "a", "name": "n", "state": "CREATED"}"#,
+        )
+        .expect_err("createdAt is one of the model's four required members");
+        assert!(error.to_string().contains("createdAt"), "{error}");
+    }
+
+    /// `IdlePolicy` round-trips through a **response** body, all three members present.
+    ///
+    /// The comment on the shape used to say `suspendedDurationSeconds` "exists only in the
+    /// request". The JSON below is what a live `GetMicrovm` answered on 2026-08-15, so this
+    /// test is the measurement rather than a restatement of the model.
+    #[test]
+    fn an_idle_policy_comes_back_on_a_response_with_all_three_members() {
+        let json = r#"{
+            "microvmId": "mvm-1",
+            "state": "RUNNING",
+            "endpoint": "https://e",
+            "imageArn": "arn:aws:lambda:us-east-1:123456789012:microvm-image:img",
+            "imageVersion": "1.0",
+            "idlePolicy": {
+                "maxIdleDurationSeconds": 1800,
+                "suspendedDurationSeconds": 600,
+                "autoResumeEnabled": false
+            },
+            "maximumDurationInSeconds": 10800
+        }"#;
+        let parsed: MicrovmResponseWire = serde_json::from_str(json).expect("parses");
+        let policy = parsed.idle_policy.expect("the service sent one");
+        assert_eq!(policy.max_idle_duration_seconds, 1800);
+        assert_eq!(
+            policy.suspended_duration_seconds, 600,
+            "the member the comment claimed the response omits"
+        );
+        assert!(!policy.auto_resume_enabled);
+    }
+
+    /// A `DeleteMicrovmImage` readback parses, and the failure spelling is distinguishable
+    /// from the two success ones — which is the whole reason this shape is read rather than
+    /// deleted as dead.
+    #[test]
+    fn a_delete_readback_distinguishes_failure_from_deleting_and_deleted() {
+        for state in ["DELETING", "DELETED", "DELETE_FAILED"] {
+            let json = format!(
+                r#"{{"imageIdentifier": "arn:aws:lambda:us-east-1:1:microvm-image:img",
+                     "state": "{state}"}}"#
+            );
+            let parsed: DeleteImageResponseWire = serde_json::from_str(&json).expect("parses");
+            assert_eq!(parsed.state, state);
+            assert_eq!(
+                parsed.image_identifier,
+                "arn:aws:lambda:us-east-1:1:microvm-image:img"
+            );
+        }
     }
 
     /// `ListMicrovmImagesResponse` from the model's own spelling, `nextToken` included.
