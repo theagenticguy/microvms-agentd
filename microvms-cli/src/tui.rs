@@ -226,7 +226,7 @@ mod tests {
         .with_row(vec![
             "1754524801-2".into(),
             "mvm-def456".into(),
-            "arn:aws:lambda:us-east-1:123456789012:microvm-image/img".into(),
+            "arn:aws:lambda:us-east-1:123456789012:microvm-image:img".into(),
         ])
         .alarming()
         .with_footer("2 runs, 1 leaked")
@@ -244,7 +244,7 @@ mod tests {
         assert!(joined.contains("outstanding"), "{joined}");
         assert!(joined.contains("mvm-abc123"), "{joined}");
         assert!(
-            joined.contains("arn:aws:lambda:us-east-1:123456789012:microvm-image/img"),
+            joined.contains("arn:aws:lambda:us-east-1:123456789012:microvm-image:img"),
             "the leaked identifier must survive whole: {joined}"
         );
         assert!(joined.contains("2 runs, 1 leaked"), "{joined}");

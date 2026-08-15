@@ -9,6 +9,14 @@ Measurement context unless stated otherwise: us-east-1, API version `2025-09-09`
 `al2023-minimal` aarch64 base image, measured 2026-08-01 through 2026-08-04
 during the Harbor PR #2469 integration.
 
+> **Merge note, 2026-08-15.** The entries dated 2026-08-15 in this file were added on
+> `fix/pagination-and-ignored-fields` (PR #26) from that branch's live run. Two other
+> branches were adding entries to this same file on the same day from their own live runs,
+> so a conflict here is expected and the resolution is a **union** — these are independent
+> measurements of different operations, not competing accounts of one. Nothing here
+> supersedes another branch's entry; if two entries describe the same operation, keep both
+> and reconcile in a follow-up rather than deleting a measurement someone ran.
+
 ## The service provides no exec and no file transfer
 
 There is no API to run a command in a MicroVM and no API to move a file into or
@@ -545,6 +553,41 @@ then reports `reason=unknown` — which reads as the service failing to populate
 Build roles also need ECR permissions if any task points `docker_image` at a
 same-account ECR repository; without them the build fails outright.
 
+## A failed build's `stateReason` lives on the **build**, not on the version or the image
+
+Measured 2026-08-15, us-east-1, against a deliberately failing Dockerfile (`RUN … && exit
+42`) and confirmed against two unrelated failures already in the account.
+
+Three shapes could carry the reason, and only one does:
+
+| shape | member | populated on a real failure |
+| --- | --- | --- |
+| `GetMicrovmImageOutput` | — | no such member at all |
+| `MicrovmImageVersionSummary` | `stateReason` | **`null`**, with `state: FAILED` |
+| `MicrovmImageBuildSummary` | `stateReason` | **yes** |
+
+So `GetMicrovmImage` reports `CREATE_FAILED` and structurally cannot say why;
+`ListMicrovmImageVersions` reports `FAILED` and, measured across three separate failures,
+said nothing; and `ListMicrovmImageBuilds` carries the sentence. Reaching it costs two
+listings, and `GetMicrovmImage`'s `latestFailedImageVersion` names which version to ask
+about.
+
+Observed reasons, which are worth reading for how much they vary:
+
+```text
+The container image build failed.                 (a RUN exiting non-zero)
+Ready hook invocation timed out after PT5M        (a daemon that never became ready)
+```
+
+Both are terser than a log line and more specific than any guess. Note also that **each
+failed version had two builds**, both `FAILED` with the same reason — so a diagnostic
+reporting "the" build's reason should expect a list.
+
+Where the earlier entry about log permissions still applies: `The container image build
+failed.` names the failure without naming the cause inside the container, so the build log
+group remains the only place the `exit 42` itself appears. The reason and the log group are
+complementary rather than redundant.
+
 ## `idlePolicy`
 
 Documented, and confirmed useful in practice. Idle time is measured by inbound
@@ -580,12 +623,136 @@ that such a poll can be informed by whether the workload is actually running rat
 than being unconditional. See `PROTOCOL.md`, "Idle policy, and why liveness is a
 field rather than a route".
 
-**Not measured:** whether a poll of `/v1/health` from outside the VM does in fact
-reset the idle timer, and by how much. It is inbound traffic through the endpoint by
-construction, so it should, but nobody has run a VM to the edge of its
-`maxIdleDurationSeconds` while polling and watched it not suspend. Treat the
-orchestrator-poll pattern as sound reasoning from a confirmed measurement rather
-than as an observation of the outcome.
+**Since measured**, in "An outside poll of `/v1/health` does reset the idle timer"
+below: a polled VM stayed `RUNNING` through 311 seconds against a 60-second idle
+window while an unpolled control suspended at 66 seconds. The orchestrator-poll
+pattern is an observed outcome rather than an inference.
+
+### `GetMicrovm` returns all three members, in `RUNNING` and in `SUSPENDED`
+
+Measured 2026-08-15, us-east-1, two read-only `GetMicrovm` calls against one VM launched
+with `--max-idle-sec 600 --suspended-sec 600`:
+
+```json
+"idlePolicy": {
+  "maxIdleDurationSeconds": 600,
+  "suspendedDurationSeconds": 600,
+  "autoResumeEnabled": false
+}
+```
+
+Identical in both states. This settles a claim that had gone the other way in the client's
+own comments — that `suspendedDurationSeconds` "exists only in the request", which made the
+client's own record the only authority on the window that terminates a suspended VM. The
+model agrees with the service: there is one `IdlePolicy` shape, used by
+`RunMicrovmRequest`, `RunMicrovmResponse`, and `GetMicrovmResponse` alike, and it marks all
+three members required.
+
+The practical consequence is for the sharp edge above: the window a "resume later"
+affordance depends on is **readable from the platform**, so a client can report the window
+the service says it is enforcing rather than the one it remembers asking for.
+
+## Pagination cursors are URL-safe base64, and the padding still has to be encoded
+
+Measured 2026-08-15, us-east-1, over 26 consecutive `ListMicrovmImages` cursors and 2
+`ListMicrovmImageVersions` cursors.
+
+Cursors are **688–800 bytes**. Their alphabet is URL-safe base64: alphanumerics plus `-`
+and `_` in every cursor sampled, plus `=` padding in 6 of the 26. **No cursor carried `+`
+or `/`** — which is worth recording precisely because the obvious defensive reasoning
+("tokens are opaque base64, so expect `+` and `/`") predicts characters that never arrive,
+and a reader who checks for those two and stops will conclude no encoding is needed.
+
+Encoding is still required, for `=` alone. The same signed request, twice, differing only
+in whether the cursor's padding was percent-encoded:
+
+```text
+GET …/microvm-images?nameFilter=bonk&maxResults=1&nextToken=…%3D   -> 200
+GET …/microvm-images?nameFilter=bonk&maxResults=1&nextToken=…=     -> 400 {"message":null}
+```
+
+A **400 with a null message**, which is this service's shape for a request it cannot parse
+— the same null-message signature an unpriced region answers with, recorded above. It does
+not name the cursor, the query, or the member. So the symptom of an unencoded cursor is a
+blank 400 on page *two* of a listing whose page one worked, which points at neither
+pagination nor encoding.
+
+`-` and `_` are RFC 3986 unreserved, so a correct encoder passes them through unchanged and
+the value the service gets back is the value it minted.
+
+## `maxResults` is applied before `nameFilter`, so a page can be empty while matches remain
+
+Measured 2026-08-15, us-east-1. `ListMicrovmImages` with `nameFilter=bonk&maxResults=1`
+against an account holding 22 images, 10 of which match:
+
+* The **first page carries zero items** and a `nextToken`.
+* Walking the cursor to exhaustion takes **26 pages** to yield the 10 matching images.
+
+So the service pages over the unfiltered collection and then filters the page, rather than
+filtering and then paging. Two consequences for any caller:
+
+1. **An empty page is not the end of the listing.** A loop that stops when `items` is empty
+   finds nothing at all here. The only termination condition is an absent `nextToken`.
+2. **Page count is bounded by the account's total, not by the match count.** A `nameFilter`
+   narrows the *result*, not the work, so a small page size over a large account is many
+   round trips.
+
+This is also why `nameFilter` cannot answer "the image named X" on its own: the filter is a
+documented **substring** match, so the exact-name comparison has to happen client-side, and
+it has to happen across every page.
+
+## A second `CreateMicrovmImage` under an existing name is refused, so a client without `UpdateMicrovmImage` cannot make a second version
+
+Measured 2026-08-15, us-east-1. `CreateMicrovmImage` with the name of an image that already
+exists answers HTTP 400:
+
+```text
+ValidationException: A MicroVM image with the name '<name>' already exists in this account
+```
+
+`UpdateMicrovmImage` (`PUT /2025-09-09/microvm-images/{imageIdentifier}`) is the only
+operation that adds a version — its own documentation says it "triggers a new version
+build" — and it has PUT semantics, so `codeArtifact`, `baseImageArn`, and `buildRoleArn`
+must all be supplied on every call.
+
+The consequence is a coverage limit worth stating plainly rather than discovering: a client
+that does not implement `UpdateMicrovmImage` **cannot produce a multi-version image**, so
+any behaviour that only appears with more than one version — multi-version deletion, a
+version listing that spans pages at the default page size — is unreachable live through
+that client and can only be covered by fakes. Multi-version images do exist in this account
+(`omnigent-host-vpc` carries versions 1.0, 2.0, and 3.0), created by something that does
+call `UpdateMicrovmImage`.
+
+## The image ARN separator is a colon, and the slash form fails as `AccessDeniedException`
+
+Measured 2026-08-15, us-east-1, confirmed five runs out of five with hand-signed requests
+and again through the client's own encoder.
+
+`ListMicrovmImages` returns customer image ARNs spelled
+`arn:aws:lambda:<region>:<account>:microvm-image:<name>` — a **colon** before the name, the
+same separator the managed bases use, and the only form the model's `TaggableResource`
+pattern admits. `GetMicrovmImage` accepts exactly that and answers 200.
+
+The slash form `…:microvm-image/<name>` answers **403 `AccessDeniedException`**: "User …
+is not authorized to perform: lambda:GetMicrovmImage on resource …". IAM evaluates the
+malformed ARN as a resource no policy matches, so the answer is a *permissions* message
+about a resource that exists and is permitted. That misdirection is why the wrong spelling
+can survive review: it reads as an IAM problem, and the natural response is to widen a
+policy that was never too narrow.
+
+An unencoded slash is different again and worth distinguishing, since a client that failed
+to percent-encode the identifier would hit it instead: the raw `/` splits into extra path
+segments and the request answers **404** with an HTML body, from the gateway rather than
+from the service.
+
+### The gateway can answer 502 for `GetMicrovmImage`
+
+Observed once on 2026-08-15 while measuring the above: a `GetMicrovmImage` request answered
+**502 Bad Gateway** with an nginx HTML body rather than a service envelope, where an
+immediate hand-signed repeat of the identical URL answered 403 five times out of five. So a
+5xx on this operation can come from in front of the service and says nothing about the
+request. Anything asserting on a specific 4xx here should retry past a 5xx and never past a
+4xx — a 4xx is the answer.
 
 ## Most public ARM64 base images have no WORKDIR
 

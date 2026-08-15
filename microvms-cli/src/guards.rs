@@ -725,7 +725,7 @@ fn microvm_body(state: &str) -> String {
     format!(
         r#"{{"microvmId": "mvm-abc123", "state": "{state}",
              "endpoint": "https://mvm-abc123.microvm.us-east-1.amazonaws.com",
-             "imageArn": "arn:aws:lambda:us-east-1:123456789012:microvm-image/img",
+             "imageArn": "arn:aws:lambda:us-east-1:123456789012:microvm-image:img",
              "imageVersion": "1", "maximumDurationInSeconds": 3600, "startedAt": 1754524800}}"#
     )
 }
@@ -733,7 +733,7 @@ fn microvm_body(state: &str) -> String {
 /// `run --image`, so the launch reaches the wire without a build or an upload.
 fn interrupt_run_args(state_dir: std::path::PathBuf) -> RunArgs {
     run_args_for_image(
-        "arn:aws:lambda:us-east-1:123456789012:microvm-image/img",
+        "arn:aws:lambda:us-east-1:123456789012:microvm-image:img",
         state_dir,
     )
 }
@@ -954,7 +954,7 @@ fn list_images_body(names: &[&str], next_token: Option<&str>) -> String {
         .iter()
         .map(|name| {
             format!(
-                r#"{{"imageArn": "arn:aws:lambda:us-east-1:123456789012:microvm-image/{name}",
+                r#"{{"imageArn": "arn:aws:lambda:us-east-1:123456789012:microvm-image:{name}",
                      "name": "{name}", "state": "ACTIVE", "createdAt": 1754524800}}"#
             )
         })
@@ -1012,7 +1012,7 @@ async fn a_bare_image_name_is_resolved_to_its_arn_before_the_launch() {
     let body = transport.first_body("RunMicrovm");
     assert_eq!(
         body["imageIdentifier"],
-        "arn:aws:lambda:us-east-1:123456789012:microvm-image/coding-agents",
+        "arn:aws:lambda:us-east-1:123456789012:microvm-image:coding-agents",
         "the launch must carry the resolved ARN, never the bare name — a name here is the \
          Malformed-ARN 400 this exists to close: {body}"
     );
@@ -1040,7 +1040,7 @@ async fn an_arn_image_identifier_launches_with_no_listing_call() {
         transport: Arc::clone(&transport),
         clock: Arc::new(YieldingClock::default()),
     };
-    let arn = "arn:aws:lambda:us-east-1:123456789012:microvm-image/img";
+    let arn = "arn:aws:lambda:us-east-1:123456789012:microvm-image:img";
     let command = Command::Run(run_args_for_image(arn, dir.0.clone()));
     let (result, stderr) = dispatch_with(&seam, &command, full_infra()).await;
     result.expect_err("the scripted RunMicrovm failure ends the run");
@@ -1222,7 +1222,7 @@ async fn resolution_reads_past_the_first_page_of_the_listing() {
     );
     assert_eq!(
         transport.first_body("RunMicrovm")["imageIdentifier"],
-        "arn:aws:lambda:us-east-1:123456789012:microvm-image/coding-agents"
+        "arn:aws:lambda:us-east-1:123456789012:microvm-image:coding-agents"
     );
 }
 
@@ -1300,7 +1300,7 @@ async fn a_reuse_build_whose_hash_name_exists_skips_the_build_entirely() {
     assert_eq!(rendered.data["imageName"], expected.as_str());
     assert_eq!(
         rendered.data["imageIdentifier"],
-        format!("arn:aws:lambda:us-east-1:123456789012:microvm-image/{expected}"),
+        format!("arn:aws:lambda:us-east-1:123456789012:microvm-image:{expected}"),
         "the existing image's identifier is the envelope's answer"
     );
     assert!(stderr.contains("reusing"), "{stderr}");
@@ -1328,7 +1328,7 @@ async fn a_reuse_build_whose_hash_name_is_absent_builds_under_the_derived_name()
             "CreateMicrovmImage",
             201,
             &format!(
-                r#"{{"imageArn": "arn:aws:lambda:us-east-1:123456789012:microvm-image/{expected}",
+                r#"{{"imageArn": "arn:aws:lambda:us-east-1:123456789012:microvm-image:{expected}",
                      "name": "{expected}", "state": "CREATING", "createdAt": 1754524800,
                      "baseImageArn": "arn:aws:lambda:us-east-1:aws:microvm-image:al2023-1",
                      "buildRoleArn": "arn:aws:iam::123456789012:role/build",
@@ -1340,7 +1340,7 @@ async fn a_reuse_build_whose_hash_name_is_absent_builds_under_the_derived_name()
             "GetMicrovmImage",
             200,
             &format!(
-                r#"{{"imageArn": "arn:aws:lambda:us-east-1:123456789012:microvm-image/{expected}",
+                r#"{{"imageArn": "arn:aws:lambda:us-east-1:123456789012:microvm-image:{expected}",
                      "name": "{expected}", "state": "CREATED", "createdAt": 1754524800}}"#
             ),
         );
@@ -1391,7 +1391,7 @@ async fn a_plain_build_never_lists_and_reports_reused_false() {
         .answer(
             "CreateMicrovmImage",
             201,
-            r#"{"imageArn": "arn:aws:lambda:us-east-1:123456789012:microvm-image/img",
+            r#"{"imageArn": "arn:aws:lambda:us-east-1:123456789012:microvm-image:img",
                  "name": "img", "state": "CREATING", "createdAt": 1754524800,
                  "baseImageArn": "arn:aws:lambda:us-east-1:aws:microvm-image:al2023-1",
                  "buildRoleArn": "arn:aws:iam::123456789012:role/build",
@@ -1401,7 +1401,7 @@ async fn a_plain_build_never_lists_and_reports_reused_false() {
         .answer(
             "GetMicrovmImage",
             200,
-            r#"{"imageArn": "arn:aws:lambda:us-east-1:123456789012:microvm-image/img",
+            r#"{"imageArn": "arn:aws:lambda:us-east-1:123456789012:microvm-image:img",
                  "name": "img", "state": "CREATED", "createdAt": 1754524800}"#,
         );
 

@@ -65,11 +65,32 @@ MARKER = "agentd-last-live-run"
 
 #: The three suite members `live` sequences, paired with the env var the harness stub
 #: reads its exit code from. Order matters: it is the order the body must run them in.
-MEMBERS: tuple[tuple[str, str], ...] = (
-    ("live:conformance-rs", "SUITE_EXIT"),
-    ("live:rates", "RATES_EXIT"),
-    ("live:verify-clean", "CLEAN_EXIT"),
-)
+# Read off `[tasks.live]`'s body rather than listed here, so adding a member to the tier
+# cannot leave this harness stubbing three of four and reporting the shortfall as a
+# sequencing defect. The env-var name each member's stub reads is derived from its task
+# name, which is the same rule the harness's generated `mise.toml` follows.
+MEMBER_EXIT_VARS: dict[str, str] = {
+    "live:conformance-rs": "SUITE_EXIT",
+    "live:rates": "RATES_EXIT",
+    "live:verify-clean": "CLEAN_EXIT",
+    "live:paths": "PATHS_EXIT",
+}
+
+
+def members() -> tuple[tuple[str, str], ...]:
+    """Every `mise run live:<name>` the shipped tier body invokes, in order."""
+    found: list[tuple[str, str]] = []
+    for name in re.findall(r"^\s*mise run (live:[a-z-]+)", live_body(), flags=re.M):
+        if name in dict(found):
+            continue
+        exit_var = MEMBER_EXIT_VARS.get(name)
+        if exit_var is None:
+            raise SystemExit(
+                f"check-live-wiring: [tasks.live] invokes {name}, which this harness has "
+                f"no stub for. Add it to MEMBER_EXIT_VARS so the harness can drive it."
+            )
+        found.append((name, exit_var))
+    return tuple(found)
 
 
 def repo() -> Path:
@@ -239,7 +260,7 @@ def harness(at: Path) -> None:
         f'[tasks."{name}"]\n'
         f'env = {{ RAN = "{ran_marker(name)}" }}\n'
         f'run = "echo $RAN; exit ${{{var}:-0}}"\n\n'
-        for name, var in MEMBERS
+        for name, var in members()
     )
     # The body shells out to this script for the marker path, so the harness needs a copy
     # at the same relative path rather than a stub — the real one is what `live` calls.
@@ -289,8 +310,13 @@ def check_sequencing(report: list[str]) -> None:
         # -- green: every member runs, in order, and the marker is written -------
         code, out = run_live(at)
         say(report, code == 0, "a green tier exits 0", f"exit {code}")
-        ran = [name for name, _ in MEMBERS if ran_marker(name) in out]
-        say(report, len(ran) == 3, "all three members run", f"{len(ran)} of 3: {ran}")
+        ran = [name for name, _ in members() if ran_marker(name) in out]
+        say(
+            report,
+            len(ran) == len(members()),
+            "every member runs",
+            f"{len(ran)} of {len(members())}: {ran}",
+        )
         suite_at, clean_at = out.find(suite), out.find(leaks)
         say(
             report,

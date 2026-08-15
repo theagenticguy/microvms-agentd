@@ -321,12 +321,28 @@ impl Clock for TestClock {
 // Every string below is written by hand from `service-2.json`. None is produced by
 // serializing an `ops::` type, which is the point: a member misspelled in `ops.rs` cannot
 // be misspelled identically here by accident.
+//
+// **Every image ARN below uses `microvm-image:<name>`, with a colon.** These fakes used to
+// spell it `microvm-image/<name>` while `artifact.rs` built the colon form for the managed
+// base, so the repo disagreed with itself about the shape of the one identifier every call
+// takes — and the model's own `TaggableResource` pattern accepts only the colon.
+//
+// Settled by measurement rather than by reading, 2026-08-15, one read-only
+// `ListMicrovmImages` plus one `GetMicrovmImage` in us-east-1:
+//
+//     arn:aws:lambda:us-east-1:<account>:microvm-image:coding-agents-on-bedrock
+//
+// The colon form is what the service returns and what it accepts. The slash form is not
+// merely cosmetic: `GetMicrovmImage` on it answers **`AccessDeniedException`**, because IAM
+// evaluates the malformed ARN as a resource the caller has no policy for. So a client that
+// built a slash ARN would report a permissions problem for a resource that exists, which is
+// the most expensive possible spelling of this mistake.
 
 /// `CreateMicrovmImageResponse` for an image that has just entered `CREATING`.
 pub fn create_image_response(name: &str) -> String {
     format!(
         r#"{{
-            "imageArn": "arn:aws:lambda:us-east-1:123456789012:microvm-image/{name}",
+            "imageArn": "arn:aws:lambda:us-east-1:123456789012:microvm-image:{name}",
             "name": "{name}",
             "state": "CREATING",
             "createdAt": 1754524800,
@@ -339,31 +355,93 @@ pub fn create_image_response(name: &str) -> String {
 }
 
 /// `GetMicrovmImageOutput` in `state`.
+///
+/// `tags` and `updatedAt` are here because a real response carries them — measured
+/// 2026-08-15, a `GetMicrovmImage` on an untagged image answers `"tags": {}` and an
+/// `updatedAt` — and a fake that omitted a member the client now reads would let a
+/// misreading of it pass.
 pub fn get_image_response(name: &str, state: &str) -> String {
     format!(
         r#"{{
-            "imageArn": "arn:aws:lambda:us-east-1:123456789012:microvm-image/{name}",
+            "imageArn": "arn:aws:lambda:us-east-1:123456789012:microvm-image:{name}",
             "name": "{name}",
             "state": "{state}",
-            "createdAt": 1754524800
+            "createdAt": 1754524800,
+            "updatedAt": 1754528400,
+            "tags": {{}}
+        }}"#
+    )
+}
+
+/// `GetMicrovmImageOutput` in `state`, naming a failed version and carrying tags.
+///
+/// Separate from [`get_image_response`] rather than another parameter on it, because the
+/// failure-diagnosis path is the only caller that needs `latestFailedImageVersion` and
+/// every other test would have to pass a `None` for it.
+pub fn get_image_response_failed(name: &str, state: &str, failed_version: &str) -> String {
+    format!(
+        r#"{{
+            "imageArn": "arn:aws:lambda:us-east-1:123456789012:microvm-image:{name}",
+            "name": "{name}",
+            "state": "{state}",
+            "latestFailedImageVersion": "{failed_version}",
+            "createdAt": 1754524800,
+            "updatedAt": 1754528400,
+            "tags": {{"owner": "conformance"}}
         }}"#
     )
 }
 
 /// `ListMicrovmImageVersionsOutput` with one version.
 pub fn list_versions_response(version: &str) -> String {
+    list_versions_page(&[version], None)
+}
+
+/// `ListMicrovmImageVersionsOutput` with one version in `state`, carrying `state_reason`.
+pub fn list_versions_response_failed(
+    version: &str,
+    state: &str,
+    state_reason: Option<&str>,
+) -> String {
+    let reason = match state_reason {
+        Some(reason) => format!(r#", "stateReason": {}"#, json_string(reason)),
+        None => String::new(),
+    };
+    format!(
+        r#"{{"items": [{}]}}"#,
+        version_item(version, state, &reason)
+    )
+}
+
+/// One page of `ListMicrovmImageVersionsOutput`, with an optional `nextToken`.
+///
+/// The `nextToken` is **absent** on the last page rather than null, which is what a real
+/// final page looks like and what the pagination loop's exit reads.
+pub fn list_versions_page(versions: &[&str], next_token: Option<&str>) -> String {
+    let items: Vec<String> = versions
+        .iter()
+        .map(|version| version_item(version, "IN_PROGRESS", ""))
+        .collect();
+    let token = match next_token {
+        Some(token) => format!(r#", "nextToken": {}"#, json_string(token)),
+        None => String::new(),
+    };
+    format!(r#"{{"items": [{}]{token}}}"#, items.join(", "))
+}
+
+/// One `MicrovmImageVersionSummary`, in the model's spelling. `state`, not `buildState` —
+/// the asymmetry with the build summary is the whole trap.
+fn version_item(version: &str, state: &str, extra: &str) -> String {
     format!(
         r#"{{
-            "items": [{{
-                "baseImageArn": "arn:aws:lambda:us-east-1:aws:microvm-image:al2023-1",
-                "buildRoleArn": "arn:aws:iam::123456789012:role/build",
-                "codeArtifact": {{"uri": "s3://bucket/img.zip"}},
-                "imageArn": "arn:aws:lambda:us-east-1:123456789012:microvm-image/img",
-                "imageVersion": "{version}",
-                "state": "IN_PROGRESS",
-                "status": "ACTIVE",
-                "createdAt": 1754524800
-            }}]
+            "baseImageArn": "arn:aws:lambda:us-east-1:aws:microvm-image:al2023-1",
+            "buildRoleArn": "arn:aws:iam::123456789012:role/build",
+            "codeArtifact": {{"uri": "s3://bucket/img.zip"}},
+            "imageArn": "arn:aws:lambda:us-east-1:123456789012:microvm-image:img",
+            "imageVersion": "{version}",
+            "state": "{state}",
+            "status": "ACTIVE",
+            "createdAt": 1754524800{extra}
         }}"#
     )
 }
@@ -374,35 +452,63 @@ pub fn list_versions_response(version: &str) -> String {
 /// literal in this file: the Python fake wrote `state` here and that is what made the
 /// stall guard unfalsifiable.
 pub fn list_builds_response(build_state: &str) -> String {
-    format!(
-        r#"{{
-            "items": [
-                {{
-                    "imageArn": "arn:aws:lambda:us-east-1:123456789012:microvm-image/img",
-                    "imageVersion": "1",
-                    "buildId": "build-1",
-                    "buildState": "{build_state}",
-                    "architecture": "ARM_64",
-                    "chipset": "GRAVITON",
-                    "chipsetGeneration": "1",
-                    "createdAt": 1754524800
-                }},
-                {{
-                    "imageArn": "arn:aws:lambda:us-east-1:123456789012:microvm-image/img",
-                    "imageVersion": "1",
-                    "buildId": "build-2",
-                    "buildState": "{build_state}",
-                    "architecture": "ARM_64",
-                    "chipset": "GRAVITON",
-                    "chipsetGeneration": "1",
-                    "createdAt": 1754524800
-                }}
-            ]
-        }}"#
+    list_builds_page(&[("build-1", build_state), ("build-2", build_state)], None)
+}
+
+/// One page of `ListMicrovmImageBuildsOutput`: `(buildId, buildState)` pairs and an
+/// optional `nextToken`.
+///
+/// The pairs are named rather than counted so a two-page test can assert *which* build the
+/// verdict was made over — a page-one/page-two pair with different states is the only shape
+/// that distinguishes a paginating probe from one that stops early.
+pub fn list_builds_page(builds: &[(&str, &str)], next_token: Option<&str>) -> String {
+    list_builds_page_with_reasons(
+        &builds
+            .iter()
+            .map(|(id, state)| (*id, *state, None))
+            .collect::<Vec<_>>(),
+        next_token,
     )
 }
 
+/// One page of `ListMicrovmImageBuildsOutput` whose builds may carry a `stateReason`.
+pub fn list_builds_page_with_reasons(
+    builds: &[(&str, &str, Option<&str>)],
+    next_token: Option<&str>,
+) -> String {
+    let items: Vec<String> = builds
+        .iter()
+        .map(|(build_id, build_state, state_reason)| {
+            let reason = match state_reason {
+                Some(reason) => format!(r#", "stateReason": {}"#, json_string(reason)),
+                None => String::new(),
+            };
+            format!(
+                r#"{{
+                    "imageArn": "arn:aws:lambda:us-east-1:123456789012:microvm-image:img",
+                    "imageVersion": "1",
+                    "buildId": "{build_id}",
+                    "buildState": "{build_state}",
+                    "architecture": "ARM_64",
+                    "chipset": "GRAVITON",
+                    "chipsetGeneration": "1",
+                    "createdAt": 1754524800{reason}
+                }}"#
+            )
+        })
+        .collect();
+    let token = match next_token {
+        Some(token) => format!(r#", "nextToken": {}"#, json_string(token)),
+        None => String::new(),
+    };
+    format!(r#"{{"items": [{}]{token}}}"#, items.join(", "))
+}
+
 /// `RunMicrovmResponse`/`GetMicrovmResponse` in `state`, with an optional `stateReason`.
+///
+/// `idlePolicy` is present with all three members, because a real `GetMicrovm` sends it
+/// that way — measured 2026-08-15 against a RUNNING VM, which is what corrected
+/// [`super::ops::IdlePolicy`]'s claim that `suspendedDurationSeconds` is request-only.
 pub fn microvm_response(state: &str, state_reason: Option<&str>) -> String {
     let reason = match state_reason {
         Some(reason) => format!(r#", "stateReason": {}"#, json_string(reason)),
@@ -413,12 +519,43 @@ pub fn microvm_response(state: &str, state_reason: Option<&str>) -> String {
             "microvmId": "mvm-abc123",
             "state": "{state}",
             "endpoint": "https://mvm-abc123.microvm.us-east-1.amazonaws.com",
-            "imageArn": "arn:aws:lambda:us-east-1:123456789012:microvm-image/img",
+            "imageArn": "arn:aws:lambda:us-east-1:123456789012:microvm-image:img",
             "imageVersion": "1",
+            "idlePolicy": {{
+                "maxIdleDurationSeconds": 1800,
+                "suspendedDurationSeconds": 600,
+                "autoResumeEnabled": false
+            }},
             "maximumDurationInSeconds": 3600,
             "startedAt": 1754524800{reason}
         }}"#
     )
+}
+
+/// One page of `ListMicrovmsResponse`, with an optional `nextToken`.
+///
+/// `MicrovmItem` is narrower than `GetMicrovmResponse`: no `endpoint` and no `stateReason`,
+/// which is the model's own asymmetry and not an omission here.
+pub fn list_microvms_page(ids: &[&str], next_token: Option<&str>) -> String {
+    let items: Vec<String> = ids
+        .iter()
+        .map(|id| {
+            format!(
+                r#"{{
+                    "microvmId": "{id}",
+                    "state": "RUNNING",
+                    "imageArn": "arn:aws:lambda:us-east-1:123456789012:microvm-image:img",
+                    "imageVersion": "1",
+                    "startedAt": 1754524800
+                }}"#
+            )
+        })
+        .collect();
+    let token = match next_token {
+        Some(token) => format!(r#", "nextToken": {}"#, json_string(token)),
+        None => String::new(),
+    };
+    format!(r#"{{"items": [{}]{token}}}"#, items.join(", "))
 }
 
 /// `CreateMicrovmAuthTokenResponse` — a header **map**, per TRAP-7.
@@ -440,7 +577,7 @@ pub fn list_images_response(names: &[&str], next_token: Option<&str>) -> String 
         .map(|name| {
             format!(
                 r#"{{
-                    "imageArn": "arn:aws:lambda:us-east-1:123456789012:microvm-image/{name}",
+                    "imageArn": "arn:aws:lambda:us-east-1:123456789012:microvm-image:{name}",
                     "name": "{name}",
                     "state": "ACTIVE",
                     "latestActiveImageVersion": "1",
@@ -456,11 +593,20 @@ pub fn list_images_response(names: &[&str], next_token: Option<&str>) -> String 
     format!(r#"{{"items": [{}]{token}}}"#, items.join(", "))
 }
 
-/// `DeleteMicrovmImageOutput`.
+/// `DeleteMicrovmImageOutput` in `DELETING`, the ordinary answer.
 pub fn delete_image_response() -> String {
-    r#"{"imageIdentifier": "arn:aws:lambda:us-east-1:123456789012:microvm-image/img",
-        "state": "DELETING"}"#
-        .to_string()
+    delete_image_response_in("DELETING")
+}
+
+/// `DeleteMicrovmImageOutput` in `state`.
+///
+/// The parameter exists so a test can seed the `DELETE_FAILED` readback — a 2xx whose state
+/// says the work was refused, which is the case that makes reading this shape worth doing.
+pub fn delete_image_response_in(state: &str) -> String {
+    format!(
+        r#"{{"imageIdentifier": "arn:aws:lambda:us-east-1:123456789012:microvm-image:img",
+        "state": "{state}"}}"#
+    )
 }
 
 /// `SuspendMicrovmResponse`, `ResumeMicrovmResponse`, `TerminateMicrovmResponse` — all

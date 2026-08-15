@@ -221,7 +221,7 @@ mod tests {
     /// that minted 142 characters before the label was truncated.
     fn worst_legal_scope() -> String {
         format!(
-            "arn:aws:lambda:ap-northeast-1:123456789012:microvm-image/{}",
+            "arn:aws:lambda:ap-northeast-1:123456789012:microvm-image:{}",
             "a".repeat(crate::constants::MAX_IMAGE_NAME_LEN)
         )
     }
@@ -268,7 +268,7 @@ mod tests {
     /// distinct, so a create token can never equal a run token either.
     #[test]
     fn create_and_run_tokens_never_collide_with_each_other() {
-        let scope = "arn:aws:lambda:us-east-1:123456789012:microvm-image/img";
+        let scope = "arn:aws:lambda:us-east-1:123456789012:microvm-image:img";
         let mut minted = HashSet::new();
         for _ in 0..200 {
             minted.insert(create_token(scope));
@@ -320,7 +320,7 @@ mod tests {
     /// all. That near-miss is the reason the length is asserted first.
     #[test]
     fn truncation_keeps_the_tail_so_two_arns_stay_distinguishable() {
-        let prefix = "arn:aws:lambda:ap-northeast-1:123456789012:microvm-image/";
+        let prefix = "arn:aws:lambda:ap-northeast-1:123456789012:microvm-image:";
         let first_scope = format!("{prefix}alpha-conformance-image-name");
         let second_scope = format!("{prefix}omega-conformance-image-name");
         assert!(

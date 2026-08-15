@@ -145,6 +145,22 @@ impl BaseImage {
     }
 
     /// The `baseImageArn` for this base in `region`.
+    ///
+    /// # `microvm-image:<name>`, with a colon, and it is not just the managed base
+    ///
+    /// This was the only place in the repo building the colon form; the fakes and the
+    /// encoding test all used `microvm-image/<name>`, so the repo held two beliefs about the
+    /// shape of the identifier every image call takes. The model's `TaggableResource` pattern
+    /// admits only `(capacity-provider|network-connector|microvm-image):[a-zA-Z0-9-_]+`, and
+    /// a live read settled it: `ListMicrovmImages` in us-east-1 returns
+    /// `arn:aws:lambda:us-east-1:<account>:microvm-image:coding-agents-on-bedrock` for a
+    /// customer image, and `GetMicrovmImage` accepts exactly that (measured 2026-08-15).
+    ///
+    /// So the colon is right for **both** the managed base and a customer image; there is no
+    /// two-form rule, and this comment used to imply there was. The slash form fails as
+    /// `AccessDeniedException` rather than as a validation error, because IAM evaluates the
+    /// malformed ARN as a resource with no matching policy — a permissions message for a
+    /// resource that exists.
     pub fn arn(&self, region: &crate::region::Region) -> String {
         format!(
             "arn:aws:lambda:{}:aws:microvm-image:{}",
@@ -547,11 +563,18 @@ mod tests {
         assert_eq!(error.kind(), ErrorKind::InvalidArg);
     }
 
-    /// The base image ARN, for the region it is requested in. `microvm-image:` with a
-    /// colon, which is the managed-base spelling and not the `microvm-image/` of a
-    /// customer image ARN.
+    /// The base image ARN, for the region it is requested in.
+    ///
+    /// `microvm-image:` with a **colon**, which is the spelling for a managed base *and* for
+    /// a customer image alike — measured 2026-08-15 against real ARNs in us-east-1, and the
+    /// only form the model's `TaggableResource` pattern admits. The docs above this function
+    /// carry the measurement.
+    ///
+    /// **Falsification** — change the separator to `/` and both assertions go red. That was
+    /// the state twelve fakes and the transport encoding test were in, which is why this
+    /// test now asserts the separator explicitly rather than only the region.
     #[test]
-    fn the_base_image_arn_names_the_request_region() {
+    fn the_base_image_arn_names_the_request_region_with_a_colon_separator() {
         assert_eq!(
             BaseImage::al2023().arn(&crate::region::Region::UsEast1),
             "arn:aws:lambda:us-east-1:aws:microvm-image:al2023-1"
@@ -559,6 +582,12 @@ mod tests {
         assert_eq!(
             BaseImage::al2023().arn(&crate::region::Region::ApNortheast1),
             "arn:aws:lambda:ap-northeast-1:aws:microvm-image:al2023-1"
+        );
+        assert!(
+            !BaseImage::al2023()
+                .arn(&crate::region::Region::UsEast1)
+                .contains("microvm-image/"),
+            "the slash form answers AccessDeniedException, not a validation error"
         );
     }
 }

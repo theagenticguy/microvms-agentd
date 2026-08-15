@@ -208,7 +208,7 @@ microvms-core/   the client library: control plane, session, cost, sandbox
 microvms-cli/    the microvm binary: 16 commands, JSON envelopes, a manifest
 microvms-py/     Python binding (PyO3)
 microvms-js/     Node binding (napi-rs)
-conformance/     the live suite: 75 checks against real AWS, via the CLI
+conformance/     the live suite: 77 checks against real AWS, via the CLI
 spec/            51 formal requirements; 3 lifecycle invariants proved in Z3
 ```
 
@@ -231,7 +231,7 @@ mise run check           # the definition of done: lint, security, all test
 The live tier is separate because it creates real MicroVMs and costs money:
 
 ```bash
-mise run live            # conformance (75 checks) + rates + leak check, ~5 min
+mise run live            # conformance (77 checks) + rates + leak check, ~5 min
 mise run live:destroy    # tear the Terraform stack back down
 ```
 

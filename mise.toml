@@ -248,7 +248,7 @@ run = "terraform -chdir=conformance/infra init -input=false && terraform -chdir=
 # discovered them.
 
 [tasks."live:conformance-rs"]
-description = "The live suite through the Rust client: all 75 checks, no SKIP"
+description = "The live suite through the Rust client: all 77 checks, no SKIP"
 depends = ["build", "build:cli", "live:infra"]
 # Both binaries: `--binary` is the aarch64 daemon that gets baked into the image, and
 # `--microvm-binary` is the host-architecture CLI under test. Naming both is what makes the
@@ -275,6 +275,21 @@ run = """
   --binary target/$AGENTD_TARGET/release/agentd \
   --microvm-binary target/release/microvm
 """
+
+[tasks."live:paths"]
+description = "The cursor encoding and the colon image ARN, against the real signer. Free."
+# Read-only and free — four GETs over resources the account already holds — but it needs
+# credentials, so it belongs here rather than in `check` for the reason `live:rates` gives
+# at length.
+#
+# It exists because every other test of the pagination cursor goes through the injected
+# `Transport`, so the fake mints the token the loop reads back and `SignedTransport` plus
+# the SigV4 canonical query are never exercised. That gap is not academic: measured
+# 2026-08-15, a cursor sent with its `=` padding unencoded is refused **400
+# `{"message":null}`** — a blank parse failure on page two of a listing whose page one
+# worked, naming nothing. The tests are `#[ignore]` so a credential-less
+# `cargo test --workspace` stays green; this task is how they run.
+run = "cargo test -p microvms-core --test live_pagination -- --ignored --nocapture"
 
 [tasks."live:rates"]
 description = "Fail if the pinned rate table no longer matches the AWS Pricing API"
@@ -327,9 +342,16 @@ description = "Every live suite, then an independent leak check. BILLABLE."
 # client, and the Python tier moved to git history after the Rust port went live-green:
 # both suites passed against real AWS on the same commit, so the oracle's job was
 # finished rather than duplicated. `live:conformance-rs` is now the whole of the live
-# protocol coverage, and as of the CLI-coverage waves it expresses all 75 named checks
+# protocol coverage, and as of the CLI-coverage waves it expresses all 77 named checks
 # with none skipped — the 34 it used to name as inexpressible are real checks against the
 # five new attached subcommands.
+# 77 rather than the 75 this line and the README carried until 2026-08-15. The count had
+# already drifted to 76 without either being updated — a measured live run reported
+# "76 of 76" against three places claiming 75 — and the log-group delete described in
+# `drive_teardown` adds the 77th. The number is in these descriptions because this is
+# where someone decides whether to trust the tier, so it is worth keeping right; that it
+# drifted once is the argument for reading it off a run rather than from memory.
+#
 # Only the two builds and the stack in `depends`. The three suites are sequenced in the
 # body below instead, and that is a correction rather than a style choice: measured
 # 2026-08-15, `depends = ["live:rates", "live:conformance-rs", "live:verify-clean"]` ran all
@@ -392,6 +414,10 @@ verify_clean() {
 }
 trap verify_clean EXIT INT TERM
 
+# Before the suite: free, read-only, seconds, and it is the member that fails first when
+# a URL member's encoding is wrong, so a signing bug is reported as a signing bug rather
+# than as a launch that could not resolve its image.
+mise run live:paths
 mise run live:conformance-rs
 mise run live:rates
 verify_clean

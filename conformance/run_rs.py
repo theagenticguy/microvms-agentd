@@ -1591,35 +1591,41 @@ def drive_teardown(
     )
     # Named rather than absent, which is the assertion. An empty list here would mean
     # the CLI had quietly stopped reporting a group it still cannot delete.
-    named = torn.data.get("undeletedLogGroups") or []
+    undeleted = torn.data.get("undeletedLogGroups") or []
     results.check(
         "the build log group was named rather than silently left",
-        bool(named),
-        f"{named!r} — this suite deletes it next",
+        bool(undeleted),
+        f"{undeleted!r} — this suite deletes it below, through boto3",
     )
 
-    # And then delete it, because naming it is the client's job and removing it is this
-    # suite's. Every group the report named, not a name rebuilt from the image — a
-    # reconstruction would delete the right thing while proving nothing about the report,
-    # and the report is what a human acts on.
     if logs is None:
         results.skip(
-            "the named build log group was deleted",
+            "the suite deleted the build log group the CLI could not",
             "no CloudWatch client was passed to drive_teardown",
         )
         return
-    for group in named:
+
+    # The suite's own residue, removed by the suite. Asserted rather than best-effort:
+    # a delete that quietly failed would put the tier back where it was, red on a leak
+    # nobody meant to leave.
+    deleted: list[str] = []
+    failures: list[str] = []
+    for group in undeleted:
         try:
-            logs.delete_log_group(logGroupName=group)
-            deleted, detail = True, group
-        except logs.exceptions.ResourceNotFoundException:
-            # Already gone is the outcome this wanted, so it is a pass. The service
-            # recreates a group deleted before its image, which is how six accumulated —
-            # so this runs after the `--wait` terminate above, not before it.
-            deleted, detail = True, f"{group} (already absent)"
-        except Exception as exc:  # noqa: BLE001 - a teardown failure is a finding
-            deleted, detail = False, f"{group}: {type(exc).__name__}: {exc}"
-        results.check("the named build log group was deleted", deleted, detail)
+            logs.delete_log_group(logGroupName=str(group))
+            deleted.append(str(group))
+        except Exception as exc:  # noqa: BLE001 - the reason is the finding
+            # An already-absent group is the desired end state, not a failure: the
+            # service may never have created one for a build that produced no events.
+            if type(exc).__name__ == "ResourceNotFoundException":
+                deleted.append(f"{group} (already absent)")
+            else:
+                failures.append(f"{group}: {type(exc).__name__}: {exc}")
+    results.check(
+        "the suite deleted the build log group the CLI could not",
+        not failures and len(deleted) == len(undeleted),
+        f"deleted={deleted!r} failures={failures!r}",
+    )
 
 
 def read_daemon_logs(logs: Any, image_name: str) -> list[str]:

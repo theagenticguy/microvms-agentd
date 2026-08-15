@@ -227,6 +227,17 @@ pub struct Microvm {
     /// Why the VM is in this state, when the service said. The absence is information —
     /// TRAP-8's message distinguishes "no stateReason" from an empty one.
     pub state_reason: Option<String>,
+    /// The idle policy the service reports the VM is running under.
+    ///
+    /// Carried rather than dropped because it is the platform's own account of the window
+    /// that will suspend and then terminate this VM, and it was measured coming back on a
+    /// real `GetMicrovm` — see [`ops::IdlePolicy`], which used to claim it does not. The
+    /// client's request is what *asked* for a window; this is what the service says it got,
+    /// and a caller diagnosing a VM that vanished earlier than expected needs the second.
+    ///
+    /// `Option` because the model does not mark the member required on either response
+    /// shape, so an absent one must parse rather than fail.
+    pub idle_policy: Option<ops::IdlePolicy>,
 }
 
 impl Microvm {
@@ -249,6 +260,7 @@ impl From<ops::MicrovmResponseWire> for Microvm {
             image_arn: wire.image_arn,
             image_version: wire.image_version,
             state_reason: wire.state_reason,
+            idle_policy: wire.idle_policy,
         }
     }
 }
@@ -477,12 +489,28 @@ impl ControlPlane {
         Ok(got.into())
     }
 
-    /// `ListMicrovms`.
+    /// `ListMicrovms`, read to its last page.
+    ///
+    /// # Why every page
+    ///
+    /// `maxResults` caps at 50, so a fleet above 50 VMs read from one page is a
+    /// **confidently wrong** answer rather than a missing one: the caller gets a list that
+    /// looks complete, and a VM absent from it is a VM nothing here will terminate. That is
+    /// the same argument [`ops::ListImagesResponseWire`] makes for the image listing, and a
+    /// fleet listing is the one a teardown reads.
     pub async fn list_microvms(&self) -> Result<Vec<ops::MicrovmItemWire>, Error> {
-        let call = Call::get("ListMicrovms", paths::microvms());
-        let reply = send_with_retry(self.transport(), call).await?;
-        let listed: ops::ListMicrovmsResponseWire = reply.json("ListMicrovms")?;
-        Ok(listed.items)
+        let mut items = Vec::new();
+        let mut next_token: Option<String> = None;
+        loop {
+            let call = Call::get("ListMicrovms", paths::microvms_list(next_token.as_deref()));
+            let reply = send_with_retry(self.transport(), call).await?;
+            let page: ops::ListMicrovmsResponseWire = reply.json("ListMicrovms")?;
+            items.extend(page.items);
+            match page.next_token {
+                Some(token) => next_token = Some(token),
+                None => return Ok(items),
+            }
+        }
     }
 
     /// `SuspendMicrovm`. Freezes the VM; the caller waits for SUSPENDED.
@@ -1408,6 +1436,110 @@ mod tests {
             );
             assert!(!body.contains("SHELL"), "{body}");
         }
+    }
+
+    /// **Issue #23.** The fleet listing follows `nextToken`, so a fleet larger than one page
+    /// is not silently truncated.
+    ///
+    /// One page is a **confidently wrong** answer rather than a missing one: the caller gets a
+    /// list that looks complete, and a VM absent from it is a VM nothing here will terminate.
+    ///
+    /// The assertion is the fleet **length** and the presence of the page-two ids, which is
+    /// what a test against the single-page code cannot satisfy.
+    ///
+    /// **Falsification** — run 2026-08-15. Replace the `Some(token)` arm with
+    /// `Some(_) => return Ok(items)` and this fails with 2 VMs instead of 3, and both
+    /// page-two `contains` assertions go red. Restored.
+    #[tokio::test]
+    async fn the_fleet_listing_follows_next_token_to_the_vms_on_page_two() {
+        let (plane, fake, _) = planted();
+        fake.answer(
+            "ListMicrovms",
+            Answer::ok(fake::list_microvms_page(
+                &["mvm-page1-a", "mvm-page1-b"],
+                Some("fleet-page-2"),
+            )),
+        )
+        .answer(
+            "ListMicrovms",
+            Answer::ok(fake::list_microvms_page(&["mvm-page2-a"], None)),
+        );
+
+        let fleet = plane.list_microvms().await.expect("lists");
+        assert_eq!(
+            fleet.len(),
+            3,
+            "a fleet spanning two pages is three VMs, not two"
+        );
+
+        let ids: Vec<&str> = fleet.iter().map(|vm| vm.microvm_id.as_str()).collect();
+        assert!(ids.contains(&"mvm-page2-a"), "page two is missing: {ids:?}");
+        assert!(ids.contains(&"mvm-page1-a"), "{ids:?}");
+        assert_eq!(fake.call_count("ListMicrovms"), 2, "both pages were read");
+
+        let paths = fake.paths();
+        assert!(
+            paths[1].contains("nextToken=fleet-page-2"),
+            "the second request must carry the first page's token: {}",
+            paths[1]
+        );
+        assert!(
+            !paths[0].contains('?'),
+            "the first request carries no cursor: {}",
+            paths[0]
+        );
+    }
+
+    /// **Issue #25.** The `idlePolicy` the service reports is carried rather than dropped.
+    ///
+    /// The comment on [`ops::IdlePolicy`] used to claim `suspendedDurationSeconds` "exists
+    /// only in the request". A live `GetMicrovm` on a RUNNING VM disagrees, which is what the
+    /// fake's body now reflects — so this test is over a response shape that was measured
+    /// rather than assumed.
+    ///
+    /// **Falsification** — drop `idle_policy` from the `From<MicrovmResponseWire>` impl and
+    /// this does not compile; set it to `None` there and every field assertion goes red.
+    #[tokio::test]
+    async fn the_reported_idle_policy_is_carried_rather_than_dropped() {
+        let (plane, fake, _) = planted();
+        fake.answer(
+            "GetMicrovm",
+            Answer::ok(fake::microvm_response("RUNNING", None)),
+        );
+
+        let vm = plane.get_microvm("mvm-1").await.expect("reads");
+        let policy = vm
+            .idle_policy
+            .expect("GetMicrovm returns an idlePolicy, measured 2026-08-15");
+        assert_eq!(policy.max_idle_duration_seconds, 1800);
+        assert_eq!(
+            policy.suspended_duration_seconds, 600,
+            "the member the comment claimed was request-only"
+        );
+        assert!(!policy.auto_resume_enabled);
+    }
+
+    /// A response with no `idlePolicy` still parses, and the absence is `None` rather than a
+    /// default. The model does not mark the member required on either response shape, so an
+    /// invented `0` would be a window nobody configured.
+    #[tokio::test]
+    async fn an_absent_idle_policy_is_none_rather_than_a_zero_window() {
+        let (plane, fake, _) = planted();
+        fake.answer(
+            "GetMicrovm",
+            Answer::ok(
+                r#"{
+                    "microvmId": "mvm-1",
+                    "state": "RUNNING",
+                    "endpoint": "https://e",
+                    "imageArn": "arn:aws:lambda:us-east-1:123456789012:microvm-image:img",
+                    "imageVersion": "1"
+                }"#,
+            ),
+        );
+
+        let vm = plane.get_microvm("mvm-1").await.expect("parses");
+        assert_eq!(vm.idle_policy, None);
     }
 
     /// A transport failure is retried and then succeeds, so a connection reset on the way to

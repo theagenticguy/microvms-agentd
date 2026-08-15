@@ -672,24 +672,113 @@ pub mod paths {
         )
     }
 
-    /// `GET /2025-09-09/microvm-images/{imageIdentifier}/versions`
-    pub fn image_versions(image: &str) -> String {
-        format!("{}/versions", microvm_image(image))
+    /// One `nextToken=` query member, appended to `path`, or `path` unchanged.
+    ///
+    /// Shared by the three listings that take nothing else, so the encoding decision is
+    /// made once. The value goes through [`encode_segment`] for the reason
+    /// [`microvm_images_list`] states: a pagination token is **opaque**, so it may carry
+    /// `+`, `/`, or `=`, and an unencoded one desynchronises the SigV4 canonical query
+    /// from the query actually sent — a rejection that reads like bad credentials rather
+    /// than like a malformed URL.
+    fn with_next_token(path: String, next_token: Option<&str>) -> String {
+        match next_token {
+            Some(token) => format!("{path}?nextToken={}", encode_segment(token)),
+            None => path,
+        }
+    }
+
+    /// `GET /2025-09-09/microvm-images/{imageIdentifier}/versions`, with the pagination
+    /// cursor when there is one.
+    ///
+    /// `maxResults` is not sent: the model caps it at 50 and the service's own default is
+    /// what a caller reading every page wants, so naming a page size would only be a
+    /// second number to keep right. [`image_versions_paged`] is the one caller that does
+    /// name one, and says why.
+    pub fn image_versions(image: &str, next_token: Option<&str>) -> String {
+        image_versions_paged(image, next_token, None)
+    }
+
+    /// [`image_versions`] with an explicit `maxResults`, which **no production path sends**.
+    ///
+    /// # Why a page size exists at all when nothing ships one
+    ///
+    /// Because without it the cursor encoding is unfalsifiable against the real service,
+    /// and that encoding is the one place in this module where being wrong reads as a
+    /// *credentials* failure rather than a URL one. A real `nextToken` is opaque base64
+    /// carrying `+`, `/`, and `=`; an unencoded one desynchronises the SigV4 canonical
+    /// query and the service answers 403. Every test that could catch it went through an
+    /// injected transport, so the fake minted the token and the signer never saw it.
+    ///
+    /// Forcing a real cursor needs a listing with more items than one page, and the
+    /// service's default page is larger than any image's version count here — so the only
+    /// way to make the real service mint a real cursor for a resource that already exists
+    /// is to ask for a smaller page. That is what this is for, and
+    /// `microvms-core/tests/live_pagination.rs` is its caller.
+    ///
+    /// # Why it is not simply a parameter on [`image_versions`]
+    ///
+    /// A page size on the production path is a second number to keep right, and a wrong
+    /// one is invisible: reading every page with `maxResults=1` is correct and slow, which
+    /// is the kind of defect that survives. Keeping it to a separately named function means
+    /// the production call sites cannot acquire one by accident, and a reader of
+    /// [`image_versions`] sees no page size to wonder about.
+    ///
+    /// `max_results` is clamped to the model's `1..=50`, because a value outside it is a
+    /// `ValidationException` and a caller of this function is trying to observe pagination
+    /// rather than to discover the bound.
+    pub fn image_versions_paged(
+        image: &str,
+        next_token: Option<&str>,
+        max_results: Option<u32>,
+    ) -> String {
+        let mut query: Vec<String> = Vec::new();
+        if let Some(size) = max_results {
+            query.push(format!("maxResults={}", size.clamp(1, 50)));
+        }
+        if let Some(token) = next_token {
+            query.push(format!("nextToken={}", encode_segment(token)));
+        }
+        let path = format!("{}/versions", microvm_image(image));
+        if query.is_empty() {
+            return path;
+        }
+        format!("{path}?{}", query.join("&"))
     }
 
     /// `DELETE /2025-09-09/microvm-images/{imageIdentifier}/versions/{imageVersion}`
+    ///
+    /// Built from [`microvm_image`] rather than from [`image_versions`], because that one
+    /// now takes a cursor and a `DELETE` of one version must never carry a query member.
     pub fn image_version(image: &str, version: &str) -> String {
-        format!("{}/{}", image_versions(image), encode_segment(version))
+        format!(
+            "{}/versions/{}",
+            microvm_image(image),
+            encode_segment(version)
+        )
     }
 
-    /// `GET /2025-09-09/microvm-images/{imageIdentifier}/versions/{imageVersion}/builds`
-    pub fn image_builds(image: &str, version: &str) -> String {
-        format!("{}/builds", image_version(image, version))
+    /// `GET /2025-09-09/microvm-images/{imageIdentifier}/versions/{imageVersion}/builds`,
+    /// with the pagination cursor when there is one.
+    pub fn image_builds(image: &str, version: &str, next_token: Option<&str>) -> String {
+        with_next_token(
+            format!("{}/builds", image_version(image, version)),
+            next_token,
+        )
     }
 
     /// `POST /2025-09-09/microvms`
+    ///
+    /// The bare collection path, which is what `RunMicrovm` posts to. `ListMicrovms` reads
+    /// the same route and lives in [`microvms_list`] rather than here, so a launch cannot
+    /// accidentally carry a `nextToken` — the same split [`microvm_images`] and
+    /// [`microvm_images_list`] already make.
     pub fn microvms() -> String {
         format!("/{API_PATH_VERSION}/microvms")
+    }
+
+    /// `GET /2025-09-09/microvms`, with the pagination cursor when there is one.
+    pub fn microvms_list(next_token: Option<&str>) -> String {
+        with_next_token(microvms(), next_token)
     }
 
     /// `GET|DELETE /2025-09-09/microvms/{microvmIdentifier}`
@@ -759,7 +848,7 @@ mod tests {
             "/2025-09-09/microvm-images/img"
         );
         assert_eq!(
-            paths::image_versions("img"),
+            paths::image_versions("img", None),
             "/2025-09-09/microvm-images/img/versions"
         );
         assert_eq!(
@@ -767,10 +856,11 @@ mod tests {
             "/2025-09-09/microvm-images/img/versions/1"
         );
         assert_eq!(
-            paths::image_builds("img", "1"),
+            paths::image_builds("img", "1", None),
             "/2025-09-09/microvm-images/img/versions/1/builds"
         );
         assert_eq!(paths::microvms(), "/2025-09-09/microvms");
+        assert_eq!(paths::microvms_list(None), "/2025-09-09/microvms");
         assert_eq!(paths::microvm("mvm-1"), "/2025-09-09/microvms/mvm-1");
         assert_eq!(
             paths::suspend("mvm-1"),
@@ -809,18 +899,139 @@ mod tests {
         );
     }
 
-    /// An ARN in a URI parameter is percent-encoded, slashes included. `MicrovmImageIdentifier`
-    /// is documented as "ARN or ID", so this is the ordinary case rather than an edge one —
-    /// and an unencoded ARN's slashes would split into extra path segments addressing
-    /// something else entirely.
+    /// The other three paginated listings encode their cursor the same way, and emit no
+    /// `?` at all without one.
+    ///
+    /// Written as literals per listing rather than as a loop over a helper, because the
+    /// bug this closes is a path that forgets the cursor entirely — and a loop over the
+    /// helper would pass against three call sites that never pass one.
+    ///
+    /// **Falsification** — drop the [`paths::encode_segment`] call from
+    /// `with_next_token` and every `%2B`/`%2F`/`%3D` assertion below goes red, which is
+    /// the SigV4 canonical-query desynchronisation this encoder exists to prevent.
     #[test]
-    fn an_arn_identifier_is_percent_encoded_including_its_slashes() {
-        let arn = "arn:aws:lambda:us-east-1:123456789012:microvm-image/img";
+    fn the_other_paginated_listings_encode_their_cursor_too() {
+        assert_eq!(
+            paths::image_versions("img", Some("a+b/c=")),
+            "/2025-09-09/microvm-images/img/versions?nextToken=a%2Bb%2Fc%3D"
+        );
+        assert_eq!(
+            paths::image_builds("img", "1", Some("a+b/c=")),
+            "/2025-09-09/microvm-images/img/versions/1/builds?nextToken=a%2Bb%2Fc%3D"
+        );
+        assert_eq!(
+            paths::microvms_list(Some("a+b/c=")),
+            "/2025-09-09/microvms?nextToken=a%2Bb%2Fc%3D"
+        );
+
+        // No cursor means no query string, not an empty one: `?nextToken=` is a member
+        // present and blank, which is a different request from a member absent.
+        for path in [
+            paths::image_versions("img", None),
+            paths::image_builds("img", "1", None),
+            paths::microvms_list(None),
+        ] {
+            assert!(
+                !path.contains('?'),
+                "an absent cursor emits no query: {path}"
+            );
+        }
+    }
+
+    /// The version listing's explicit page size: ordered before the cursor, clamped to the
+    /// model's `1..=50`, and absent from the path when nothing asks for one.
+    ///
+    /// The clamp is asserted at both ends because a value outside the bound is a
+    /// `ValidationException`, and the only caller of this function
+    /// (`tests/live_pagination.rs`) is trying to *observe* a real cursor — a run that
+    /// failed on the page size instead would prove nothing about the encoding it came for.
+    ///
+    /// **Falsification** — remove the `.clamp(1, 50)` and the `0` and `999` cases go red
+    /// with `maxResults=0` and `maxResults=999`, both of which the service refuses.
+    #[test]
+    fn the_version_listings_explicit_page_size_is_ordered_and_clamped() {
+        assert_eq!(
+            paths::image_versions_paged("img", None, Some(1)),
+            "/2025-09-09/microvm-images/img/versions?maxResults=1"
+        );
+        // Both members, and `maxResults` first — the order the query is built in, which is
+        // asserted so a reordering is a visible change rather than a silent one.
+        assert_eq!(
+            paths::image_versions_paged("img", Some("a+b/c="), Some(2)),
+            "/2025-09-09/microvm-images/img/versions?maxResults=2&nextToken=a%2Bb%2Fc%3D"
+        );
+        assert_eq!(
+            paths::image_versions_paged("img", None, Some(0)),
+            "/2025-09-09/microvm-images/img/versions?maxResults=1",
+            "the model's min is 1; a 0 would be refused"
+        );
+        assert_eq!(
+            paths::image_versions_paged("img", None, Some(999)),
+            "/2025-09-09/microvm-images/img/versions?maxResults=50",
+            "the model's max is 50; a larger value would be refused"
+        );
+
+        // And the production spelling is unchanged by the new one existing: `image_versions`
+        // delegates here with no page size, so it must still emit exactly what it did.
+        assert_eq!(
+            paths::image_versions_paged("img", None, None),
+            paths::image_versions("img", None)
+        );
+        assert!(
+            !paths::image_versions("img", Some("t")).contains("maxResults"),
+            "no production path names a page size: {}",
+            paths::image_versions("img", Some("t"))
+        );
+    }
+
+    /// A `DELETE` of one version carries no query member, even though its sibling
+    /// [`paths::image_versions`] now takes a cursor. A version path with `?nextToken=`
+    /// appended addresses nothing.
+    #[test]
+    fn deleting_one_version_carries_no_pagination_cursor() {
+        let path = paths::image_version("img", "1");
+        assert_eq!(path, "/2025-09-09/microvm-images/img/versions/1");
+        assert!(!path.contains('?'), "{path}");
+        assert!(!path.contains("nextToken"), "{path}");
+    }
+
+    /// A **real** image ARN in a URI parameter is percent-encoded, every colon included.
+    /// `MicrovmImageIdentifier` is documented as "ARN or ID", so this is the ordinary case
+    /// rather than an edge one.
+    ///
+    /// The literal is the shape the service actually returns, measured 2026-08-15 in
+    /// us-east-1: `microvm-image:<name>` with a **colon**, which is also the only form the
+    /// model's `TaggableResource` pattern admits. This test used to hold
+    /// `microvm-image/img`, and the slash was not a harmless stand-in — `GetMicrovmImage`
+    /// on that form answers `AccessDeniedException`, because IAM evaluates a malformed ARN
+    /// as a resource with no matching policy.
+    #[test]
+    fn a_real_arn_identifier_is_percent_encoded_colons_and_all() {
+        let arn = "arn:aws:lambda:us-east-1:123456789012:microvm-image:img";
         let path = paths::microvm_image(arn);
         assert_eq!(
             path,
-            "/2025-09-09/microvm-images/arn%3Aaws%3Alambda%3Aus-east-1%3A123456789012%3Amicrovm-image%2Fimg"
+            "/2025-09-09/microvm-images/arn%3Aaws%3Alambda%3Aus-east-1%3A123456789012%3Amicrovm-image%3Aimg"
         );
+        assert!(
+            !path["/2025-09-09/microvm-images/".len()..].contains(':'),
+            "an unencoded colon in a path segment is a signature mismatch: {path}"
+        );
+    }
+
+    /// The encoder still encodes `/`, which is the property that matters even though a real
+    /// image ARN carries none.
+    ///
+    /// Kept as its own case rather than folded into the test above, because the input here
+    /// is a *shape the service does not use* and labelling it "an ARN" is what let the slash
+    /// form look load-bearing for twelve fakes. An unencoded slash would split into extra
+    /// path segments addressing something else, and other identifiers this encoder sees
+    /// (`imageVersion`, a `nextToken` cursor) genuinely can contain one.
+    #[test]
+    fn the_segment_encoder_encodes_slashes_wherever_they_come_from() {
+        assert_eq!(paths::encode_segment("a/b"), "a%2Fb");
+        let path = paths::microvm_image("has/a/slash");
+        assert_eq!(path, "/2025-09-09/microvm-images/has%2Fa%2Fslash");
         assert!(
             !path["/2025-09-09/microvm-images/".len()..].contains('/'),
             "an encoded identifier contributes no path separators: {path}"

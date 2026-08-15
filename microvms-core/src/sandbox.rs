@@ -2021,7 +2021,7 @@ mod tests {
         assert_eq!(report.image_deleted, Some(false));
         assert_eq!(
             report.undeleted,
-            ["arn:aws:lambda:us-east-1:123456789012:microvm-image/img"],
+            ["arn:aws:lambda:us-east-1:123456789012:microvm-image:img"],
             "{report:?}"
         );
         assert!(
