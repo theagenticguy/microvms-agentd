@@ -870,3 +870,46 @@ to know a running VM's memory from the API is to fetch its image version.
 declining a platform feature — a VM with it enabled resumes itself on an incoming request
 rather than needing an explicit `ResumeMicrovm`. Its interaction with the idle timer was
 not measured.
+
+## A detached exec survives the 60-minute proxy-token ceiling
+
+Measured 2026-08-15, us-east-1, API version `2025-09-09`, from an existing
+`coding-agents-b8ea1298a3b2` image at the 2 GB baseline. A **75-minute** detached exec
+(`--detach --exec-id probe4-rotation`) wrote a numbered timestamp every 10 seconds for 450
+iterations and then printed a marker. It ran from 17:17:52Z to 18:32:44Z, crossing the
+proxy token's 60-minute ceiling at 18:17:52Z, and was reattached and polled afterwards
+from a fresh process.
+
+It survived, and the output is continuous across the boundary:
+
+| Check | Observation |
+| --- | --- |
+| Final poll | `phase: exited`, `exitCode: 0`, `truncated: false` |
+| Ticks recovered | 450 of 450, indices contiguous 0..449, plus the `DONE-PROBE4` marker |
+| Span | 74.87 minutes |
+| Largest gap between consecutive ticks | 11 seconds (nominal 10) |
+| Ticks before / after the 60-minute mark | 360 / 90 |
+| The pair straddling the boundary | `1786817864 -> 1786817874`, a gap of **10 seconds** |
+
+The straddling pair is the measurement. A token rotation that disturbed the exec would
+show up as an outlier gap there, and the gap is nominal — indistinguishable from every
+other tick. Nothing in the guest observed the boundary, which follows from where the state
+lives: the exec record is in the daemon, keyed by exec id, and the proxy token is a
+property of the *caller's* connection. Tokens were re-minted naturally throughout, once per
+`microvm` invocation, roughly every eight minutes across the whole run.
+
+**Two conditions this depended on, both worth stating because a caller can get either
+wrong.** The VM was launched with `maxIdleDurationSeconds: 1800` and polled from outside
+every eight minutes; without that traffic it would have suspended at the idle window
+regardless of how healthy the exec was (see the idle-timer entry above). And the exec's
+output was only readable at the end: a poll against a *running* exec returns
+`{"exec_id":"...","phase":"running"}` with **no partial stdout**, verified directly against
+the daemon's route. A caller wanting mid-flight visibility into a long exec must either
+stream it or have the command write to a file and fetch that file, which is what this probe
+did to observe progress while it ran.
+
+Cost: 75 minutes of a 2 GB / 1 vCPU baseline is $0.1576 of compute at the recorded
+us-east-1 rates ($0.0000276944 per vCPU-second and $0.0000036667 per GB-second, so
+4500 vCPU-seconds plus 9000 GB-seconds), plus $0.0031 for one 2 GB snapshot read: about
+**$0.16**. Wall-clock time is the whole cost of this measurement, and it cannot be
+shortened, because the thing being measured is a one-hour boundary.
