@@ -63,15 +63,7 @@ pre-push:
       # the "no live run recorded" branch forever — the quieter failure of the two, and the
       # worse one, because the note it prints is indistinguishable from the truth.
       run: |
-<<<<<<< HEAD
-        # `--git-dir`, not the literal `.git/`: in a worktree `.git` is a file holding a
-        # gitdir pointer, so the literal never finds the marker and this note degrades to
-        # "no live AWS run recorded" on every push from a worktree — advice that looks
-        # like information. `mise run live` writes to the same resolved path.
-        marker="$(git rev-parse --git-dir)/agentd-last-live-run"
-=======
         marker=$(git rev-parse --git-path agentd-last-live-run)
->>>>>>> origin/main
         if [ ! -f "$marker" ]; then
           echo "note: no live AWS run recorded in this clone."
           echo "      \`mise run live\` before merging anything that touches the"
