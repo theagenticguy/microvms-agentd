@@ -69,7 +69,9 @@
 //! # Layout
 //!
 //! [`errors`] is the one conversion out. [`region`], [`hooks`], and [`cost`] are the value
-//! types. [`session`] and [`exec`] are the in-VM surface; [`sandbox`] is the lifecycle.
+//! types. [`session`] and [`exec`] are the in-VM surface; [`process`] is the same exec seen as
+//! two byte streams, for a consumer shaped like the AI SDK's `SandboxProcess`; [`sandbox`] is
+//! the lifecycle.
 
 // `pub` rather than private: the `#[napi]` macro registers each item at module-init time
 // through a link-section constructor rather than through a Rust path, so with private modules
@@ -80,6 +82,7 @@ pub mod cost;
 pub mod errors;
 pub mod exec;
 pub mod hooks;
+pub mod process;
 pub mod region;
 pub mod sandbox;
 pub mod session;

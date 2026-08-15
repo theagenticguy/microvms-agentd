@@ -242,6 +242,28 @@ impl microvms_core::session::TokenMinter for PlaneMinter {
             Ok(minted.into())
         })
     }
+
+    /// The same override `sandbox.rs`'s minter carries, and duplicated for the same reason the
+    /// struct is: core's is private to that module. Without it, an attached session's
+    /// `connect_headers(port)` would answer a header pair behind a token the control plane
+    /// scoped to the agent port alone, which the proxy refuses with 403 `Access to port
+    /// denied` — the defect measured 2026-08-15.
+    fn mint_for_ports(
+        &self,
+        ports: &[u16],
+    ) -> BoxFuture<'_, Result<microvms_core::session::ProxyToken, Error>> {
+        let specs: Vec<microvms_core::control::ops::PortSpecification> = ports
+            .iter()
+            .map(|port| microvms_core::control::ops::PortSpecification::port(*port))
+            .collect();
+        Box::pin(async move {
+            let minted = self
+                .control
+                .mint_auth_token_for(&self.microvm_id, &specs)
+                .await?;
+            Ok(minted.into())
+        })
+    }
 }
 
 /// `aws s3 cp - <uri>`, with the artifact on the child's stdin.

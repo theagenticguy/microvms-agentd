@@ -512,10 +512,47 @@ impl ControlPlane {
     /// through, because over-asking is rejected and the rejection reads like a bad request
     /// rather than like a ceiling. The *refresh* interval — half the ceiling — belongs to
     /// the endpoint client that holds the token (T-W2-5), not here.
+    ///
+    /// Scoped to the agent port alone, which is right for every request this client makes on
+    /// its own behalf and **wrong for a caller reaching another port on the same VM**. That
+    /// caller wants [`Self::mint_auth_token_for`]; see [`ops::PortSpecification`] for the
+    /// measurement that made the distinction necessary.
     pub async fn mint_auth_token(&self, id: &str) -> Result<ProxyToken, Error> {
+        self.mint_auth_token_for(id, &[ops::PortSpecification::port(self.port())])
+            .await
+    }
+
+    /// Mints a proxy token scoped to `ports`, whatever they are.
+    ///
+    /// The agent port is **not** added for you. A caller naming ports is answering the
+    /// question the token asks, and silently widening the scope would hand back a
+    /// credential broader than the one requested — the opposite of the mistake this exists
+    /// to fix, and a worse one, since it is invisible. A caller that needs both the agent
+    /// port and a workload port names both, which is what [`ProxyAuth`] does.
+    ///
+    /// The returned token still records the agent port as its *default* header port, because
+    /// that is the port a request carries when nobody names one.
+    ///
+    /// [`ProxyAuth`]: crate::session::ProxyAuth
+    pub async fn mint_auth_token_for(
+        &self,
+        id: &str,
+        ports: &[ops::PortSpecification],
+    ) -> Result<ProxyToken, Error> {
+        if ports.is_empty() {
+            // The model declares `min: 1` on `allowedPorts`, so an empty list is a
+            // round-trip that comes back as a validation error naming a member the caller
+            // did not know it was sending. Refused here, with the reason.
+            return Err(Error::new(
+                ErrorKind::Precondition,
+                "a proxy token must allow at least one port ('allowedPorts' declares min: 1). \
+                 Name the ports this token is for — the agent port plus any workload port \
+                 reached through the endpoint.",
+            ));
+        }
         let wire = ops::CreateAuthTokenWire {
             expiration_in_minutes: MAX_TOKEN_MINUTES,
-            allowed_ports: vec![ops::PortSpecification { port: self.port() }],
+            allowed_ports: ports.to_vec(),
         };
         let call = Call::post_json("CreateMicrovmAuthToken", paths::auth_token(id), &wire)?;
         let reply = send_with_retry(self.transport(), call).await?;

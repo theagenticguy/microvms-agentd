@@ -27,9 +27,24 @@ protocol = { path = "../protocol" }
 # napi's managed runtime and returns a JavaScript Promise, with `Err` rejecting
 # it. That is why this side needs no `block_on` bridge at all — Node is
 # async-native, so the core's async surface maps straight through.
+#
+# `web_stream` is what makes `napi::bindgen_prelude::ReadableStream` exist, and it is the
+# whole reason `src/process.rs` can hand JS two real `ReadableStream<Uint8Array>` objects
+# rather than a pair of async iterators a consumer would have to adapt. The feature pulls in
+# `futures-core` and `tokio-stream` *inside napi* and re-exports both, which is why this
+# crate still declares no `futures-util` of its own (see the note at the bottom of this file).
+#
+# `napi5` and not `napi4`, forced by `web_stream` rather than chosen: napi 3.12's
+# `web_stream` declares only `napi4`, but its `ReadableStream` finalizer calls
+# `napi_add_finalizer`, which `napi-sys` gates behind `napi5`. Building with `web_stream` and
+# `napi4` fails to compile inside napi itself (`napi_add_finalizer` not found in `sys`), so
+# this is an under-declared dependency in that crate rather than a level this addon wanted.
+# Node-API 5 shipped in Node 10.6; `package.json` already requires Node >= 22.13, which
+# supports Node-API 9, so the raise costs no reachable runtime.
 napi = { version = "3", default-features = false, features = [
-    "napi4",
+    "napi5",
     "async",
+    "web_stream",
 ] }
 napi-derive = "3"
 # The core's own poll and deadline paths need a runtime with `time`; napi
