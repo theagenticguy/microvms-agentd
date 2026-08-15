@@ -1035,16 +1035,24 @@ mod tests {
 
     // ── credentials for a caller's own connection ─────────────────────────────
 
-    /// **A session hands out connect credentials for a port it was not built with, off the
-    /// same token cache, with nothing minted twice.**
+    /// **A session hands out connect credentials for a port it was not built with, off one
+    /// token cache, minting exactly once more to cover that port.**
     ///
     /// The property that makes an external `getPortEndpoint` a few lines rather than a
-    /// reimplementation: one health request warms the cache, and both accessors then answer
-    /// for the workload port without touching the control plane again.
+    /// reimplementation: one health request warms the cache, the first workload-port call
+    /// widens the token, and the two accessors then share it.
+    ///
+    /// This test previously required `mint_count() == 1` after the workload-port calls —
+    /// "resolving a port endpoint burned a second control-plane call". That was the defect
+    /// written down as a requirement: a token scoped to the agent port does not authorize 8080,
+    /// so the credentials it praised are refused with 403 `Access to port denied` on the header
+    /// path and close code 1006 on the WebSocket path. Measured 2026-08-15 against real AWS.
+    /// The one-cache claim survives in the form that is true — **both** accessors answer off
+    /// the same widened token, which is still what stops TRAP-9 becoming two schedules.
     ///
     /// **Guard proof.** Give `connect_subprotocols` its own `ProxyAuth::new(..)` — the shape a
     /// consumer that could not reach this session's auth would be forced into — and the mint
-    /// count reads 2. Verified.
+    /// count reads 3 rather than 2, and the two accessors disagree on the auth value. Verified.
     #[tokio::test]
     async fn a_session_answers_connect_credentials_for_a_port_off_its_own_token_cache() {
         let recorder = Recorder::with([Reply::ok(health_body(true))]);
@@ -1068,9 +1076,12 @@ mod tests {
             Some("8080"),
             "the caller asked for 8080 and would have targeted the session's port"
         );
+        // The *widened* token, which is the second one minted: the first covers 9000 only.
         assert_eq!(
             header_of(&headers, PROXY_AUTH_HEADER).as_deref(),
-            Some(CountingMinter::value(0).as_str())
+            Some(CountingMinter::value(1).as_str()),
+            "the header pair carried the agent-port-only token, which the proxy refuses for \
+             8080 with 403 'Access to port denied'"
         );
         assert_eq!(offered[0], proxy::WS_SUBPROTOCOL);
         assert_eq!(
@@ -1078,7 +1089,7 @@ mod tests {
             format!(
                 "{}{}",
                 proxy::WS_AUTH_SUBPROTOCOL_PREFIX,
-                CountingMinter::value(0)
+                CountingMinter::value(1)
             ),
             "the handshake carried a different token than the header path, so they are two \
              caches rather than one"
@@ -1086,8 +1097,9 @@ mod tests {
         assert_eq!(offered[2], "lambda-microvms.port.8080");
         assert_eq!(
             auth.mint_count(),
-            1,
-            "resolving a port endpoint burned a second control-plane call"
+            2,
+            "one mint covered both the agent port and 8080, which the control plane does not \
+             do — or the second accessor minted a third, which would be two caches"
         );
         assert!(
             recorder.requests().len() == 1,

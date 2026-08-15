@@ -122,6 +122,69 @@ Versions are [semantic](https://semver.org/spec/v2.0.0.html); the wire contract 
 - **`RateTable::minimum_retention_days`**, so the floored-storage note reads its day count
   off the rate row instead of dividing `as_secs()` by 86,400 beside the message.
 
+### Fixed
+
+- **A per-port credential was minted for the wrong port, so `connect_headers` and
+  `connect_subprotocols` handed back credentials the proxy refuses.** Both accessors reused
+  the session's cached proxy token, which the control plane scopes at mint time to the agent
+  port alone — so they answered a correct-looking `X-aws-proxy-port: 8080` (or
+  `lambda-microvms.port.8080`) behind a JWE authorizing only 9000. Found by the first live
+  WebSocket run, 2026-08-15: the handshake failed with close code **1006** and the HTTPS form
+  with **403 `Access to port denied`**.
+
+  Invisible to every local test, and the reason is worth stating: the strings were right.
+  Format assertions, cache-reuse assertions, and the mint-count assertions all passed,
+  because the defect is in a fact only the service knows. Three of those tests had in fact
+  written the bug down as a requirement — "resolving a port endpoint burned a second
+  control-plane call" was recorded as a *failure* message, when a second mint is the fix.
+
+  `ops::PortSpecification` is now the model's real tagged union (`port`, `range`,
+  `allPorts`), `ControlPlane::mint_auth_token_for` takes a scope, `TokenMinter` grew
+  `mint_for_ports`, and `ProxyAuth`'s cache records which ports its token covers so a cache
+  hit means "fresh **and** in scope". A new port extends the scope rather than replacing it,
+  so warming the cache for a workload port does not evict the session's own — one extra mint
+  per new port, cached thereafter. Measured after the fix: the handshake opens, frames flow
+  both ways, and a wrong port still fails as 1006. `docs/PLATFORM.md` carries the
+  four-token table.
+
+- **The live tier's three suites ran in parallel, and each of the three orderings was
+  wrong.** `mise run live` had `depends = ["live:rates", "live:conformance-rs",
+  "live:verify-clean"]`, which mise runs concurrently. So `live:verify-clean` finished at
+  t=5s of a 228-second run and reported "account us-east-1: clean" about an account nothing
+  had touched yet — a false assurance in the one line a caller reads to decide whether to go
+  looking for a leaked MicroVM. `live:rates`, which is free and creates nothing, raced the
+  billable suite it could abort, since mise kills the surviving siblings when one member
+  fails. And nothing ordered the marker write last.
+
+  The three are now sequenced in the task body: suite, then rates, then the leak check in a
+  `trap` so it also runs when the suite **fails**, which is when resources survive. mise has
+  no `if: always()` — `depends_post` runs only on success and a `wait_for` chain stops at the
+  first failure, both measured — so a shell trap is the only always-run primitive available,
+  and it is what `.github/workflows/live-conformance.yml` says with `if: always()`.
+
+- **`mise run live` failed at the very end of a green run, in a worktree.** The last line
+  wrote its live-verified marker to the literal `.git/agentd-last-live-run`, and in a
+  worktree `.git` is a *file* — so the redirect failed with "Not a directory" after all 76
+  checks had passed and the account was clean. The pre-push reader in `lefthook.yml` had the
+  same literal and failed more quietly and worse: it took its "no live AWS run recorded in
+  this clone" branch, which is indistinguishable from the truth. Both now resolve the path
+  through `git rev-parse --git-path`, which answers both repo shapes.
+
+- **The conformance suite created a CloudWatch log group it could not delete and its own
+  leak check called a leak.** Naming it is the client's job — neither `microvms-core` nor the
+  CLI carries a CloudWatch client, by design — but nothing picked up the other half, so five
+  groups accumulated across five runs and `mise run live` could not be green on a clean
+  account no matter what the code did. The suite now deletes the groups the teardown report
+  named, through the boto3 client it already builds to read the daemon's logs. The client
+  still refuses CloudWatch; the thing that created the group is the thing that removes it.
+
+- **`scripts/check-live-wiring`**, a new offline gate in `mise run check` over all three of
+  those tier defects: the marker path round-trips in a plain clone *and* a worktree, and the
+  `live` body — read out of `mise.toml` and run against stubbed members — is exercised green
+  and red to prove the leak check runs after the suite, runs when the suite fails, runs
+  exactly once, and that the marker records successes only. Free and offline, because the
+  alternative is finding the next one of these a billable run at a time.
+
 ### Changed
 
 - **The security job's four scanner downloads are version-pinned and checksummed.** betterleaks

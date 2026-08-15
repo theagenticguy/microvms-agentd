@@ -142,6 +142,62 @@ EOF is an explicit signal rather than inferred, because a child reading stdin
 cannot exit until the daemon drops its own handle. `Child::wait()` drops the
 child's copy of the handle, not the daemon's.
 
+## Reconnect-at-cursor across a real suspend, measured
+
+The claim above — that resume by byte offset is what distinguishes this from a backend
+whose reattach loses the gap — was asserted from the daemon's side only. The cut under
+unit test is a response body ending without an exit frame, which is the condition the
+reconnect keys on, but nothing had put a real platform suspend across a live exec.
+
+Measured 2026-08-15, us-east-1, through `Session.spawn` in `microvms-js` against a
+guest ticking once a second and also appending each tick to a file, so the guest's own
+record is an oracle independent of the stream under test:
+
+| | Observation |
+| --- | --- |
+| Before the suspend | `tick-1`, `tick-2`, `tick-3` delivered on the handle's `stdout` |
+| Suspend / resume | `SUSPENDED`, held ~20s, `RUNNING` |
+| The handle already held | Resumed at **`tick-4`** — contiguous, no restart, no duplicate |
+| Gaps recorded | **None**, on either the held handle or a fresh one |
+| A fresh handle at `offset: 0` | Replayed **200 of 200** ticks, indices contiguous `1..200` |
+| The guest's own file | Agreed with the stream at every point |
+
+So the property holds against the thing it was designed for, and it holds in both
+shapes: the handle a caller was already reading recovers at its cursor, and a *new*
+handle for the same `exec_id` replays the whole output across the suspension. The exec
+itself is untouched by the freeze, which is the `PLATFORM.md` finding this depends on.
+
+The other three `ExecProcess` properties were measured on the same VM. `stdout` and
+`stderr` arrive as separate streams carrying only their own bytes, from one interleaved
+SSE channel with a per-frame discriminator. `wait()` reports the daemon's real exit code
+— 0 for a success, 42 for `exit 42` — because it reads the exec record rather than
+inferring from the stream ending. `kill()` terminates the process group and a second
+call succeeds rather than 404ing, and `wait()` afterwards reports `signal: 15` with no
+exit code, so a killed build cannot read as passing.
+
+## Credentials for a caller's own connection
+
+`Session::connect_headers(port)` and `connect_subprotocols(port)` hand a caller what it
+needs to open its own connection to some other port on the same VM — the header pair for
+HTTPS, the three subprotocols for a WebSocket.
+
+**Both mint a token scoped to the port they name, and that is load-bearing rather than an
+implementation detail.** The service scopes a proxy token at mint time, so a token minted
+for the agent port answers 403 `Access to port denied` for any other port and close code
+1006 with no reason on a WebSocket. An implementation that reused the session's cached
+token would therefore return a *correct-looking* port value behind a credential that does
+not authorize it — which is what this client did until the live run of 2026-08-15 caught
+it. See `PLATFORM.md`, "`allowedPorts` is a union of three forms".
+
+The scope is extended rather than replaced: a mint for a new port asks for every port
+already covered plus that one, so warming the cache for a workload port does not cost the
+session access to its own. One extra control-plane call per new port, cached thereafter,
+and `proxy_mint_count()` is the observable that says so.
+
+**A caller debugging a failed WebSocket should retry the same port over HTTPS with
+`connect_headers`.** Every handshake failure is 1006 and none of them says why; the HTTPS
+request distinguishes 403 (wrong scope) from 502 (right scope, nothing listening).
+
 ## Trust boundary
 
 The platform's `/run` hook arrives from `127.0.0.1` and is indistinguishable at
