@@ -376,14 +376,23 @@ fi
 # Records the commit that was last proven against real AWS. The pre-push hook
 # reads it to tell you whether the daemon has changed since — advisory only,
 # because only a human knows whether a given change could touch the platform
-# boundary. Lives in .git/ so it is per-clone and never committed: a marker
+# boundary. Lives in the git dir so it is per-clone and never committed: a marker
 # claiming someone else's run is worse than no marker.
 #
 # Written only on a fully green run, which the old `depends` shape could not promise: a
 # task body runs after its dependencies *succeed*, but a marker is worth more than that —
 # it is read to decide whether a live run is still needed.
-git rev-parse HEAD > .git/agentd-last-live-run
-echo 'recorded this commit as live-verified'
+#
+# `git rev-parse --git-dir` rather than the literal `.git/`, because in a **worktree**
+# `.git` is a *file* containing a gitdir pointer, not a directory. The literal failed with
+# "sh: .git/agentd-last-live-run: Not a directory" — measured 2026-08-15 at the end of an
+# otherwise fully green run, which is the worst place to put a shell error: every billable
+# member had passed and the tier still reported failure. `--git-dir` resolves to the real
+# per-worktree directory in both layouts, so the marker is per-worktree, which is also the
+# correct scope — two worktrees on two branches have not proven the same commit.
+marker="$(git rev-parse --git-dir)/agentd-last-live-run"
+git rev-parse HEAD > "$marker"
+echo "recorded this commit as live-verified in $marker"
 """
 
 [tasks."live:destroy"]

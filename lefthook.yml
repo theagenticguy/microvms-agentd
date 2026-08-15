@@ -57,7 +57,11 @@ pre-push:
       # tier can see. Leaving them out would have made this note quietest about
       # the newest code. The Python client's path came off the list with the client.
       run: |
-        marker=.git/agentd-last-live-run
+        # `--git-dir`, not the literal `.git/`: in a worktree `.git` is a file holding a
+        # gitdir pointer, so the literal never finds the marker and this note degrades to
+        # "no live AWS run recorded" on every push from a worktree — advice that looks
+        # like information. `mise run live` writes to the same resolved path.
+        marker="$(git rev-parse --git-dir)/agentd-last-live-run"
         if [ ! -f "$marker" ]; then
           echo "note: no live AWS run recorded in this clone."
           echo "      \`mise run live\` before merging anything that touches the"
