@@ -120,7 +120,7 @@ async fn probe(endpoint: &schema::Endpoint) -> StatusCode {
     // Fresh state per probe: the run hook mutates bootstrap state, so a shared one
     // would make the outcome depend on iteration order.
     let state = AppState::new(Config::default());
-    state.bootstrap(PROBE_TOKEN.as_bytes());
+    state.bootstrap(PROBE_TOKEN.as_bytes(), std::collections::HashMap::new());
     let app = routes::app(state);
 
     // `{id}` is axum's capture syntax, not a literal segment.

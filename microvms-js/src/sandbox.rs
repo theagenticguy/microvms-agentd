@@ -289,6 +289,13 @@ pub struct RunOptions {
     /// attempt's — passes it. It rides in `runHookPayload`, which is what keeps it out of the
     /// shared image snapshot.
     pub agent_token: Option<String>,
+    /// Base environment for every exec in the launched VM, delivered in the same
+    /// `runHookPayload` as the token.
+    ///
+    /// Applied *under* each exec's own `env`, so a per-exec value wins on a shared key.
+    /// Shares the token's 4096-byte payload budget; the core refuses an over-ceiling
+    /// payload before the launch, naming the byte count.
+    pub launch_env: Option<std::collections::HashMap<String, String>>,
     /// Whether to request the egress connector. Off means no outbound network.
     pub egress: Option<bool>,
     pub max_idle_sec: Option<u32>,
@@ -506,6 +513,7 @@ impl Sandbox {
             image_identifier: options.image_identifier,
             execution_role_arn: options.execution_role_arn,
             agent_token: options.agent_token,
+            launch_env: options.launch_env.unwrap_or(defaults.launch_env),
             egress: options.egress.unwrap_or(defaults.egress),
             max_idle_sec: options.max_idle_sec.unwrap_or(defaults.max_idle_sec),
             suspended_sec: options.suspended_sec.unwrap_or(defaults.suspended_sec),

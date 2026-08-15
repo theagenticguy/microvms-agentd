@@ -879,6 +879,8 @@ fn health_json(bootstrapped: bool) -> String {
         disk: None,
         identity_degraded: false,
         identity_repaired: true,
+        busy: false,
+        execs: 0,
     })
     .expect("serializes")
 }

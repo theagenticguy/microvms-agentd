@@ -497,6 +497,12 @@ pub async fn health<O: std::io::Write, E: std::io::Write>(
         "diskUnderPressure".into(),
         json!(health.disk.as_ref().map(|disk| disk.under_pressure)),
     );
+    // The pair an orchestrator polls on a loop. `busy` is what makes such a loop
+    // informed rather than unconditional, and the poll itself is the inbound traffic the
+    // platform's idle policy measures — which is the only kind that counts, because the
+    // endpoint proxy terminates outside the guest.
+    data.insert("busy".into(), json!(health.busy));
+    data.insert("execs".into(), json!(health.execs));
 
     if health.identity_degraded {
         ctx.out.warn(
@@ -538,10 +544,26 @@ pub async fn health<O: std::io::Write, E: std::io::Write>(
             ),
             None => "disk: not measurable on this daemon".to_string(),
         },
+        // Both numbers, because they answer different questions and the second is the one
+        // that stops a caller terminating a VM whose output nobody has read.
+        format!(
+            "activity: {}, {} exec(s) registered",
+            if health.busy {
+                "BUSY — at least one exec is still running"
+            } else {
+                "idle — nothing is running"
+            },
+            health.execs,
+        ),
     ];
     let dense = format!(
-        "{}\t{}\t{}\t{}",
-        health.version, health.bootstrapped, health.identity_degraded, health.identity_repaired
+        "{}\t{}\t{}\t{}\t{}\t{}",
+        health.version,
+        health.bootstrapped,
+        health.identity_degraded,
+        health.identity_repaired,
+        health.busy,
+        health.execs,
     );
     let (kind, _) = response_type("health");
     let rendered = Rendered::ok(kind, data, lines.join("\n"), dense);

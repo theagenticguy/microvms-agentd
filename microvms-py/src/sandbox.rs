@@ -565,6 +565,7 @@ impl PySandbox {
         image_identifier=None,
         execution_role_arn=None,
         agent_token=None,
+        launch_env=None,
         egress=false,
         max_idle_sec=None,
         suspended_sec=None,
@@ -584,6 +585,12 @@ impl PySandbox {
         image_identifier: Option<String>,
         execution_role_arn: Option<String>,
         agent_token: Option<String>,
+        // `launch_env` is the base environment for every exec in the launched VM,
+        // delivered in the same `runHookPayload` as the token and applied *under* each
+        // exec's own `env`. It shares the token's 4096-byte payload budget, checked
+        // locally before the launch. Not a doc comment: a doc comment on a function
+        // parameter is a compile error.
+        launch_env: Option<std::collections::HashMap<String, String>>,
         egress: bool,
         max_idle_sec: Option<u32>,
         suspended_sec: Option<u32>,
@@ -601,6 +608,7 @@ impl PySandbox {
             image_identifier,
             execution_role_arn,
             agent_token,
+            launch_env: launch_env.unwrap_or(defaults.launch_env),
             egress,
             max_idle_sec: max_idle_sec.unwrap_or(defaults.max_idle_sec),
             suspended_sec: suspended_sec.unwrap_or(defaults.suspended_sec),
