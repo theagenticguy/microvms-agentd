@@ -79,6 +79,15 @@ botocore does not enforce this client-side. The oversized request goes to the wi
 the server rejects it, so a caller building a payload gets no local signal that it is too
 large. A length check before the call is worth having.
 
+That check now exists and is reachable, which it effectively was not before. This client
+refuses an over-ceiling payload in `RunHookPayload::for_launch`, before any control-plane
+call. It matters more since the payload started carrying a launch `env` map alongside the
+token: a bearer token is a few dozen bytes and fit with room to spare, so the ceiling was
+unreachable through the typed constructor, while a caller putting credentials in `env`
+reaches it easily. Note also that the *daemon* cannot enforce this ceiling at all — an
+over-ceiling `runHookPayload` is rejected at `RunMicrovm` and the request never reaches
+the guest — so the client is the only place the check can live.
+
 The figure was also available without measuring. The botocore service model for
 `lambda-microvms` version `2025-09-09` declares
 `RunMicrovmRequestRunHookPayloadString` with `max: 4096`. That model is a
@@ -513,6 +522,37 @@ Clients that suspend deliberately to preserve state hit a sharp edge. The
 launch-time `idlePolicy` terminates a suspended VM after
 `suspended_timeout_sec`, so a "resume later" affordance silently stops working
 once that window passes. State the window wherever a resume path is offered.
+
+### A guest-side request cannot reset the idle timer
+
+This follows from the loopback measurement above rather than from a separate
+experiment, and it is recorded here because the wrong conclusion is the attractive
+one. Idleness is measured by inbound traffic through the endpoint proxy. That proxy
+terminates *outside* the VM and forwards over loopback ("The platform's own hook
+arrives over loopback"), so traffic a guest process sends to the daemon's own port
+is generated on the far side of the thing doing the measuring and never passes
+through it.
+
+The consequence is a real workload hazard, not a theoretical one. A workload holding
+an outbound connection receives no inbound traffic, and neither does one that is
+simply computing; multi-hour agent runs have been observed past 400 minutes. Such a
+VM can be auto-suspended mid-work while it is busy.
+
+So an in-VM "keep myself alive" route is not implementable against this platform. A
+daemon that offered one would answer 200 and change nothing, and the failure would
+surface as a suspend during exactly the long run the route was added to protect —
+the least debuggable moment available. What works instead is a poll from **outside**
+the VM, which is real inbound traffic; `GET /v1/health` carries `busy` and `execs` so
+that such a poll can be informed by whether the workload is actually running rather
+than being unconditional. See `PROTOCOL.md`, "Idle policy, and why liveness is a
+field rather than a route".
+
+**Not measured:** whether a poll of `/v1/health` from outside the VM does in fact
+reset the idle timer, and by how much. It is inbound traffic through the endpoint by
+construction, so it should, but nobody has run a VM to the edge of its
+`maxIdleDurationSeconds` while polling and watched it not suspend. Treat the
+orchestrator-poll pattern as sound reasoning from a confirmed measurement rather
+than as an observation of the outcome.
 
 ## Most public ARM64 base images have no WORKDIR
 

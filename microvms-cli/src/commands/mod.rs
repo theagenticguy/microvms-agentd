@@ -157,6 +157,8 @@ pub const RESPONSE_TYPES: [(&str, &str, &[&str]); 17] = [
             "identityRepaired",
             "diskAvailableBytes",
             "diskUnderPressure",
+            "busy",
+            "execs",
         ],
     ),
     (

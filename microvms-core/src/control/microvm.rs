@@ -91,14 +91,71 @@ impl RunHookPayload {
     /// caller-supplied: someone passing a JWT or a signed blob rather than a bearer token is
     /// exactly who this catches.
     pub fn for_agent_token(agent_token: &str) -> Result<Self, Error> {
-        let payload = serde_json::json!({ "agent_token": agent_token });
+        Self::for_launch(agent_token, &std::collections::HashMap::new())
+    }
+
+    /// The payload carrying an agent token and a launch environment.
+    ///
+    /// `{"agent_token": "<token>", "env": {...}}`, and the platform wraps that whole
+    /// string as the value of `runHookPayload` — the extra parse the daemon does.
+    /// The daemon applies `env` as the base environment of every subsequent exec,
+    /// under the per-request `env`.
+    ///
+    /// **This is where the 4096-byte refusal fires for a launch env.** The check is
+    /// on the serialized payload rather than on the map, because the ceiling is on
+    /// the string: JSON escaping, the key names, and the punctuation all count, so a
+    /// caller who measured their own values would measure the wrong thing. And it is
+    /// local rather than left to the service for the same reason
+    /// [`super::super::control::image`]'s `require_workdir` and
+    /// `require_matching_from` are local: the service's answer arrives as a
+    /// `ValidationException` on a member the caller did not know they were filling,
+    /// after the call, and botocore does not enforce it client-side at all (measured;
+    /// `docs/PLATFORM.md`). `env` is what makes this reachable in practice — one
+    /// bearer token has always fit with room to spare, and a map of credentials does
+    /// not.
+    ///
+    /// The env is omitted from the JSON entirely when it is empty, so a caller who
+    /// passes no launch env produces byte-for-byte the payload
+    /// [`RunHookPayload::for_agent_token`] always produced. A pinned daemon that has
+    /// never heard of `env` therefore sees no change, and the two constructors do not
+    /// have two different budgets.
+    pub fn for_launch(
+        agent_token: &str,
+        env: &std::collections::HashMap<String, String>,
+    ) -> Result<Self, Error> {
+        let payload = if env.is_empty() {
+            serde_json::json!({ "agent_token": agent_token })
+        } else {
+            serde_json::json!({ "agent_token": agent_token, "env": env })
+        };
         let text = serde_json::to_string(&payload).map_err(|error| {
             Error::new(
                 ErrorKind::Unexpected,
                 format!("could not serialize the run-hook payload: {error}"),
             )
         })?;
-        Self::new(text)
+        // The length is read before the value moves into `new`, so the refusal below can
+        // account for it without rebuilding the payload.
+        let total = text.len();
+        Self::new(text).map_err(|error| {
+            if env.is_empty() {
+                return error;
+            }
+            // The generic message names the byte count and the ceiling, which is the
+            // whole diagnosis for a token. For a launch env it is half of one: the
+            // caller wants to know how much of the budget their env is, because the
+            // fix is to move a value out of it rather than to shorten the token.
+            Error::invalid_arg(format!(
+                "{error} The launch env contributed {} of those bytes across {} variable(s); \
+                 the payload's other {} are the token and the JSON framing. A launch env is \
+                 for small values a workload needs at startup — move credential-scale \
+                 material to PUT /v1/fs/file after bootstrap, or to a role the workload \
+                 assumes.",
+                env_contribution(agent_token, env),
+                env.len(),
+                total.saturating_sub(env_contribution(agent_token, env)),
+            ))
+        })
     }
 
     /// An arbitrary payload, if it fits.
@@ -141,6 +198,21 @@ impl RunHookPayload {
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
+}
+
+/// How many of a launch payload's bytes the env accounts for.
+///
+/// Measured by difference against the token-only payload rather than by summing key and
+/// value lengths, because the ceiling is on the *serialized* string: the `"env":{}`
+/// wrapper, the quotes, the commas, and every backslash JSON escaping adds all count
+/// against the budget, and a figure that summed the raw values would understate exactly
+/// the payloads that are near the limit.
+///
+/// Only ever called on the refusal path, where the payload has already been built once.
+fn env_contribution(agent_token: &str, env: &std::collections::HashMap<String, String>) -> usize {
+    let with = serde_json::json!({ "agent_token": agent_token, "env": env }).to_string();
+    let without = serde_json::json!({ "agent_token": agent_token }).to_string();
+    with.len().saturating_sub(without.len())
 }
 
 /// A launched MicroVM, as the service last described it.
@@ -565,6 +637,127 @@ mod tests {
             error.to_string().contains("one bearer token fits"),
             "{error}"
         );
+    }
+
+    /// An empty launch env produces byte-for-byte the payload the token-only
+    /// constructor always produced, so a caller who never passes one is unaffected by
+    /// the field existing — and a daemon baked into an older image sees no new key.
+    ///
+    /// **Falsification** — always emit `"env"` and this fails on both assertions.
+    #[test]
+    fn an_empty_launch_env_emits_the_payload_the_token_only_constructor_did() {
+        let with_empty = RunHookPayload::for_launch("tok", &std::collections::HashMap::new())
+            .expect("an empty env fits");
+        let token_only = RunHookPayload::for_agent_token("tok").expect("fits");
+        assert_eq!(with_empty.as_str(), token_only.as_str());
+        assert_eq!(with_empty.as_str(), r#"{"agent_token":"tok"}"#);
+        assert!(
+            !with_empty.as_str().contains("env"),
+            "an empty env must not appear on the wire at all: {}",
+            with_empty.as_str()
+        );
+    }
+
+    /// A launch env is carried in the payload the daemon parses.
+    #[test]
+    fn a_launch_env_rides_in_the_payload_the_daemon_parses() {
+        let mut env = std::collections::HashMap::new();
+        env.insert("ANTHROPIC_BASE_URL".to_string(), "https://x".to_string());
+        let payload = RunHookPayload::for_launch("tok", &env).expect("fits");
+
+        // Parsed rather than string-compared, since a HashMap has no key order.
+        let value: serde_json::Value =
+            serde_json::from_str(payload.as_str()).expect("the payload is JSON");
+        assert_eq!(value["agent_token"], "tok");
+        assert_eq!(value["env"]["ANTHROPIC_BASE_URL"], "https://x");
+    }
+
+    /// **The local 4096-byte refusal for a launch env.**
+    ///
+    /// The reason this is the case worth its own test rather than a repeat of the
+    /// ceiling test above: one bearer token has always fit with room to spare, so
+    /// before `env` existed the ceiling was effectively unreachable through the typed
+    /// constructor. A launch env is what makes it reachable, and botocore does not
+    /// enforce it client-side — the oversized request goes to the wire and comes back
+    /// as a `ValidationException` on a member the caller did not know they were
+    /// filling (`docs/PLATFORM.md`). So this refusal is the only local signal there is.
+    ///
+    /// The message must carry the byte count, the ceiling, and the env's share of it.
+    /// Without the share, a caller reading "4128 bytes, ceiling 4096" cannot tell
+    /// whether to shorten the token or drop a variable.
+    ///
+    /// **Falsification** — return `Ok` from `for_launch` without calling `new`, or drop
+    /// the byte-count clause from the message, and this goes red on the specific
+    /// assertion.
+    #[test]
+    fn an_over_ceiling_launch_env_is_refused_locally_with_the_byte_count() {
+        let mut env = std::collections::HashMap::new();
+        // Comfortably over on its own, the way a set of session credentials is.
+        env.insert("CREDENTIALS".to_string(), "c".repeat(4096));
+
+        // The expected figure is derived from the same serialization the constructor
+        // does rather than written as a literal, because a literal here asserts my
+        // arithmetic about JSON framing and the point is the *count*, not the framing.
+        let expected = serde_json::json!({ "agent_token": "tok", "env": &env })
+            .to_string()
+            .len();
+        assert!(
+            expected > 4096,
+            "the fixture must actually be over: {expected}"
+        );
+
+        let error = RunHookPayload::for_launch("tok", &env)
+            .expect_err("a credential-scale launch env does not fit");
+        assert_eq!(error.kind(), ErrorKind::InvalidArg);
+        let message = error.to_string();
+
+        assert!(
+            message.contains("ceiling of 4096"),
+            "the ceiling has to be named: {message}"
+        );
+        assert!(
+            message.contains(&format!("{expected} bytes")),
+            "the actual byte count has to be named: {message}"
+        );
+        assert!(
+            message.contains("launch env contributed"),
+            "the env's share of the budget is the actionable half: {message}"
+        );
+        assert!(
+            message.contains("1 variable(s)"),
+            "the variable count has to be named: {message}"
+        );
+    }
+
+    /// The refusal fires on the *serialized* payload, so a caller who measured their own
+    /// values would be measuring the wrong thing.
+    ///
+    /// Two variables whose raw bytes sum to 4060 — under the ceiling — go over it once
+    /// the JSON framing, the key names, and the quotes are counted. A check on the map
+    /// rather than on the string would accept this and the launch would fail at AWS.
+    #[test]
+    fn the_launch_env_ceiling_counts_the_serialized_payload_and_not_the_raw_values() {
+        let mut env = std::collections::HashMap::new();
+        env.insert("A".to_string(), "a".repeat(2030));
+        env.insert("B".to_string(), "b".repeat(2030));
+        let raw: usize = env.values().map(String::len).sum();
+        assert_eq!(raw, 4060, "the raw values are under the ceiling");
+        assert!(
+            raw <= crate::constants::MAX_RUN_HOOK_PAYLOAD_BYTES,
+            "the fixture only means something if the raw sum fits: {raw}"
+        );
+
+        let error = RunHookPayload::for_launch("tok", &env)
+            .expect_err("the serialized payload is over even though the raw values are not");
+        assert!(error.to_string().contains("2 variable(s)"), "{error}");
+
+        // And the boundary is still inclusive with an env in play: trimmed to fit, the
+        // same shape succeeds — so the refusal is a ceiling and not a blanket ban.
+        let mut fits = std::collections::HashMap::new();
+        fits.insert("A".to_string(), "a".repeat(2000));
+        fits.insert("B".to_string(), "b".repeat(2000));
+        let payload = RunHookPayload::for_launch("tok", &fits).expect("4000-odd bytes fits");
+        assert!(payload.len() <= 4096, "{}", payload.len());
     }
 
     /// An empty payload is legal: the model's minimum is 0.

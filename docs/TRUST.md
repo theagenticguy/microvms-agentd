@@ -151,18 +151,34 @@ Draining without a cap would itself be the denial-of-service you just prevented,
 past the cap the status goes out and the connection closes.
 
 **The token is absent from child environments.** Every exec'd child starts from an
-empty environment via `env_clear()`, and only the variables the request named are
-added (`agentd/src/exec.rs`, `build_command`). Nothing on that path reads `std::env`.
-The test proves it by running `/usr/bin/env` in a child and asserting empty output
+empty environment via `env_clear()`, and only the variables the launch and the
+request named are added (`agentd/src/exec.rs`, `build_command`). Nothing on that path
+reads `std::env`. The test proves it by running `/usr/bin/env` in a child and
+asserting empty output
 (`the_agent_token_never_reaches_the_child_environment`). Privilege demotion, when
 requested, goes through `Command::uid`/`gid` rather than a `pre_exec` closure, so the
 uid change happens in C between fork and exec. A closure there would run in a forked
 child of a threaded process, where an allocator lock another thread held at fork time
 is held forever.
 
-This defense has two limits. Demotion is opt-in per request, so the default child is
-root. And the defense only matters when the child is *not* the token holder, which is
-true of a task subprocess and false of the agent harness itself.
+The launch environment does not weaken this, and it is the one addition that could
+have. The run-hook payload now carries both the token and an optional `env` map, so
+the hazard is a code path that forwards the first into the second.
+`AppState::bootstrap` takes them as two separate parameters and there is no struct
+field holding both, which is what makes such a path unwritable rather than merely
+unwritten. A second test
+(`a_launch_environment_does_not_carry_the_agent_token_into_a_child`) installs a
+launch env, spawns `/usr/bin/env`, and asserts the child's environment is *exactly*
+that map. Asserting the whole environment rather than "does not contain the token" is
+deliberate: a token forwarded under some other key would satisfy a substring check on
+the token's own name, and an extra variable of any name is what a leak looks like.
+
+This defense has three limits. Demotion is opt-in per request, so the default child
+is root. The defense only matters when the child is *not* the token holder, which is
+true of a task subprocess and false of the agent harness itself. And a launch env is
+material the *caller* chose to put in every child's environment, so anything a caller
+places there is readable by every process they exec — which is the point of the
+channel and is worth stating rather than assuming they know.
 
 **Honest status codes, as a security property.** The three codes are chosen for what
 they leak and how they mislead. `503` means no token is installed yet. `401` means a
@@ -308,6 +324,18 @@ AWS session credentials runs well past a kilobyte once the session token is incl
 so a handful of them exhausts the budget. Rotation is also out of reach at any size,
 because the payload is delivered exactly once at launch and there is no second
 delivery. The smaller ceiling makes the conclusion firmer rather than changing it.
+
+The launch-environment channel shares this budget and does not enlarge it, which is
+the whole reason it is worth mentioning here. Before it existed the ceiling was
+effectively unreachable — a bearer token is a few dozen bytes — and a caller filling
+`env` with credentials is spending the token's room. `microvms-core`'s
+`RunHookPayload::for_launch` refuses an over-budget payload locally, before any
+control-plane call, and the refusal names how many of the bytes the env accounted for
+rather than only the total: without that split a caller cannot tell whether to shorten
+the token or drop a variable. The check is client-side because it has to be. The
+platform rejects an over-ceiling `runHookPayload` at `RunMicrovm`, so the request never
+reaches the guest and the daemon has nothing to enforce; botocore does not enforce it
+either, so the local check is the only signal before AWS answers.
 `runHookPayload` is a bootstrap channel for one small secret, and it should be sized
 for the token that unlocks a broker rather than for the material the broker holds.
 This contract has nothing to say about how you get that material in. That is the gap

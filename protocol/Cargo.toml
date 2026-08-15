@@ -14,9 +14,11 @@ serde = { version = "1", features = ["derive"] }
 # the generated artifact reproducible across the two crates that feed it.
 schemars = { version = "1.2.2", default-features = false, features = ["derive", "std"] }
 
-# Not a runtime dependency, and not a new one either: schemars already pulls
-# `serde_json` in, so this only names what is in the tree. The round-trip tests need
-# a concrete format — a type that derives both halves of serde and is never driven
-# through one is a type whose halves can still disagree.
-[dev-dependencies]
+# Not a new edge in the tree — schemars already pulls `serde_json` in — but it is now
+# a *runtime* one rather than only a dev one, and the reason is `RunHook::parse`.
+# That function walks the payload as a `Value` instead of deriving the read, because
+# the payload carries the agent token and serde's own error messages quote the value
+# they rejected. Quoting a value there would put secret material into a log line and
+# a response body, which is the one thing docs/TRUST.md promises never happens, so
+# every refusal names a key or a shape and the walk is what makes that possible.
 serde_json = "1"

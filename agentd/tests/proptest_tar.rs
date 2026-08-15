@@ -877,7 +877,7 @@ proptest! {
         let presented = bearer_bytes(&headers);
 
         let state = AppState::new(Config::default());
-        state.bootstrap(&token);
+        state.bootstrap(&token, std::collections::HashMap::new());
         let matched = presented.is_some_and(|bytes| state.token_matches(bytes) == Some(true));
 
         if matched {
@@ -919,7 +919,7 @@ proptest! {
         prop_assert_eq!(bearer_bytes(&headers), Some(token.as_slice()));
 
         let state = AppState::new(Config::default());
-        state.bootstrap(&token);
+        state.bootstrap(&token, std::collections::HashMap::new());
         prop_assert_eq!(state.token_matches(&token), Some(true));
     }
 

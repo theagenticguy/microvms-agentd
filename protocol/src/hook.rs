@@ -6,6 +6,8 @@
 //! repeatable — but the shapes belong here anyway, because a client generator
 //! reading the schema has to be told what the daemon accepts on them.
 
+use std::collections::HashMap;
+
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -27,14 +29,125 @@ pub struct RunHookEnvelope {
     pub run_hook_payload: Option<String>,
 }
 
-/// The caller's own payload, carrying the per-VM secret.
+/// The caller's own payload, carrying the per-VM secret and an optional launch
+/// environment.
 ///
 /// Passing the token at launch is what keeps it out of the shared image snapshot.
 /// It is safe because the platform forwards no external traffic until this hook
 /// returns 200.
-#[derive(Debug, Deserialize, JsonSchema, Serialize)]
+///
+/// `env` rides the same channel because the channel is the only per-VM one the
+/// platform offers, and a launch environment is the same kind of thing as the
+/// token: something a caller knows at launch and cannot bake into a shared image.
+/// The whole payload shares one 4096-byte budget, so a caller who fills `env`
+/// with credentials is spending the token's room; `microvms-core` refuses an
+/// over-budget payload locally, before the call.
+#[derive(Debug, Default, Deserialize, JsonSchema, Serialize)]
 pub struct RunHook {
     pub agent_token: String,
+    /// Base environment applied to every subsequent exec, under the per-request
+    /// `env`. Absent and empty mean the same thing, which is why this is a plain
+    /// map rather than an `Option`: there is nothing a caller could express by
+    /// sending `"env": {}` that omitting the key does not already say.
+    #[serde(default)]
+    pub env: HashMap<String, String>,
+}
+
+/// Why a `runHookPayload` string could not be read as a [`RunHook`].
+///
+/// A typed error rather than serde's own message, and the reason is the trust
+/// contract rather than tidiness: this payload carries the agent token, and
+/// `serde_json`'s messages quote the offending value. A message that quoted a
+/// value would put payload contents into a log line and a response body, which is
+/// the one thing `docs/TRUST.md` promises never happens. Each variant below names
+/// a *key* or a *shape* and never a value.
+#[derive(Debug, Eq, PartialEq)]
+pub enum RunHookError {
+    /// The payload string parsed as JSON but is not an object, or is not JSON.
+    NotAnObject,
+    /// No `agent_token` key, or one whose value is not a string.
+    TokenMissingOrNotAString,
+    /// `agent_token` is the empty string. Accepting it would install a credential
+    /// every caller can guess.
+    TokenEmpty,
+    /// `env` is present but is not a JSON object.
+    EnvNotAnObject,
+    /// `env` holds a value that is not a string, under this key. Only the key is
+    /// named — a value is where a secret would be.
+    EnvValueNotAString(String),
+}
+
+impl std::fmt::Display for RunHookError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RunHookError::NotAnObject => f.write_str(
+                "runHookPayload is not a JSON object. The platform wraps the string given to \
+                 RunMicrovm, so the payload is one parse deeper than the request body: \
+                 {\"runHookPayload\": \"{\\\"agent_token\\\": \\\"...\\\"}\"}",
+            ),
+            RunHookError::TokenMissingOrNotAString => {
+                f.write_str("runHookPayload has no agent_token string")
+            }
+            RunHookError::TokenEmpty => f.write_str("agent_token is empty"),
+            RunHookError::EnvNotAnObject => f.write_str(
+                "env must be a JSON object of string keys to string values, and it is not an \
+                 object",
+            ),
+            RunHookError::EnvValueNotAString(key) => write!(
+                f,
+                "env[{key:?}] is not a string. Every launch-environment value is a string, \
+                 because an environment variable is a string — a number or a nested object \
+                 would have to be stringified by someone, and guessing which spelling the \
+                 caller meant is how a credential arrives mangled"
+            ),
+        }
+    }
+}
+
+impl RunHook {
+    /// Reads the caller's payload, ignoring keys this version does not know.
+    ///
+    /// Unknown keys are ignored on purpose: a newer client sending a field this
+    /// daemon has never heard of must still be able to bootstrap it, because the
+    /// alternative is a 400 at the run hook and the platform terminating the VM
+    /// before any traffic is forwarded. Forward compatibility here is the
+    /// difference between an ignored field and a dead launch.
+    ///
+    /// Hand-walked rather than `serde_json::from_str::<RunHook>` so every refusal
+    /// is one of the named variants above. `serde`'s own messages quote values,
+    /// and the values here are secrets.
+    pub fn parse(raw: &str) -> Result<Self, RunHookError> {
+        let value: serde_json::Value =
+            serde_json::from_str(raw).map_err(|_| RunHookError::NotAnObject)?;
+        let object = value.as_object().ok_or(RunHookError::NotAnObject)?;
+
+        let agent_token = object
+            .get("agent_token")
+            .and_then(serde_json::Value::as_str)
+            .ok_or(RunHookError::TokenMissingOrNotAString)?;
+        if agent_token.is_empty() {
+            return Err(RunHookError::TokenEmpty);
+        }
+
+        let mut env = HashMap::new();
+        match object.get("env") {
+            None | Some(serde_json::Value::Null) => {}
+            Some(raw_env) => {
+                let entries = raw_env.as_object().ok_or(RunHookError::EnvNotAnObject)?;
+                for (key, value) in entries {
+                    let value = value
+                        .as_str()
+                        .ok_or_else(|| RunHookError::EnvValueNotAString(key.clone()))?;
+                    env.insert(key.clone(), value.to_string());
+                }
+            }
+        }
+
+        Ok(Self {
+            agent_token: agent_token.to_string(),
+            env,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -60,5 +173,91 @@ mod tests {
     fn an_envelope_with_no_payload_parses_as_none() {
         let envelope: RunHookEnvelope = serde_json::from_str("{}").expect("deserializes");
         assert!(envelope.run_hook_payload.is_none());
+    }
+
+    /// The payload every launch before the launch-env feature sent still parses,
+    /// with an empty environment. This is the compatibility floor: a client pinned
+    /// to the old shape must keep bootstrapping.
+    #[test]
+    fn a_payload_with_only_a_token_parses_with_an_empty_environment() {
+        let hook = RunHook::parse(r#"{"agent_token":"tok"}"#).expect("parses");
+        assert_eq!(hook.agent_token, "tok");
+        assert!(hook.env.is_empty());
+    }
+
+    /// The env map comes through with every pair, and an empty value survives —
+    /// `FOO=` is a variable set to the empty string, which is a different fact
+    /// from `FOO` being unset.
+    #[test]
+    fn a_payload_with_an_environment_carries_every_pair_including_an_empty_value() {
+        let hook =
+            RunHook::parse(r#"{"agent_token":"tok","env":{"A":"1","EMPTY":""}}"#).expect("parses");
+        assert_eq!(hook.env.get("A").map(String::as_str), Some("1"));
+        assert_eq!(hook.env.get("EMPTY").map(String::as_str), Some(""));
+        assert_eq!(hook.env.len(), 2);
+    }
+
+    /// An unknown key is ignored rather than refused. A 400 at the run hook makes
+    /// the platform terminate the VM before any traffic is forwarded, so a newer
+    /// client sending a field this daemon has never heard of must still be able to
+    /// bootstrap it.
+    #[test]
+    fn an_unknown_key_is_ignored_rather_than_failing_the_launch() {
+        let hook = RunHook::parse(r#"{"agent_token":"tok","future_field":{"nested":true}}"#)
+            .expect("an unknown key does not fail the launch");
+        assert_eq!(hook.agent_token, "tok");
+        assert!(hook.env.is_empty());
+    }
+
+    /// Each malformed shape gets its own named refusal, and none of them quotes a
+    /// value. The payload carries the agent token, so a message that echoed a
+    /// value would publish secret material into a log line.
+    #[test]
+    fn each_malformed_payload_names_its_own_problem_without_quoting_a_value() {
+        /// Asserts one payload's refusal. A helper because `RunHook` itself is not
+        /// `PartialEq` — comparing whole `Result`s would need a derive on a wire
+        /// type for the benefit of one test.
+        fn refuses(payload: &str, expected: RunHookError) {
+            let found = RunHook::parse(payload).expect_err("refused");
+            assert_eq!(found, expected, "payload {payload}");
+        }
+
+        refuses("not json", RunHookError::NotAnObject);
+        refuses("[]", RunHookError::NotAnObject);
+        refuses("{}", RunHookError::TokenMissingOrNotAString);
+        refuses(
+            r#"{"agent_token":7}"#,
+            RunHookError::TokenMissingOrNotAString,
+        );
+        refuses(r#"{"agent_token":""}"#, RunHookError::TokenEmpty);
+        refuses(
+            r#"{"agent_token":"tok","env":"A=1"}"#,
+            RunHookError::EnvNotAnObject,
+        );
+        refuses(
+            r#"{"agent_token":"tok","env":["A=1"]}"#,
+            RunHookError::EnvNotAnObject,
+        );
+        refuses(
+            r#"{"agent_token":"tok","env":{"PORT":8080}}"#,
+            RunHookError::EnvValueNotAString("PORT".to_string()),
+        );
+
+        // The one value in these payloads that is secret-shaped is the token, and
+        // no message may carry it.
+        let refusal =
+            RunHook::parse(r#"{"agent_token":"s3cr3t","env":{"PORT":8080}}"#).expect_err("refused");
+        let message = refusal.to_string();
+        assert!(!message.contains("s3cr3t"), "{message}");
+        assert!(message.contains("PORT"), "the key is nameable: {message}");
+    }
+
+    /// `"env": null` is the same as no `env` at all. A generator that fills unset
+    /// optional fields with null is common enough that refusing it would be a 400
+    /// nobody could debug from the outside.
+    #[test]
+    fn an_explicitly_null_environment_is_the_same_as_none() {
+        let hook = RunHook::parse(r#"{"agent_token":"tok","env":null}"#).expect("parses");
+        assert!(hook.env.is_empty());
     }
 }

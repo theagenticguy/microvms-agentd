@@ -213,6 +213,7 @@ fn aws_commands(binary: &std::path::Path) -> Vec<(&'static str, Command, Door)> 
                 dockerfile: None,
                 repair_identity: false,
                 egress: false,
+                launch_env: Vec::new(),
                 keep: false,
                 timeout: 30.0,
                 max_idle_sec: 600,
@@ -749,6 +750,7 @@ fn run_args_for_image(identifier: &str, state_dir: std::path::PathBuf) -> RunArg
         dockerfile: None,
         repair_identity: false,
         egress: false,
+        launch_env: Vec::new(),
         keep: false,
         timeout: 30.0,
         max_idle_sec: 600,
@@ -1053,6 +1055,92 @@ async fn an_arn_image_identifier_launches_with_no_listing_call() {
     assert!(
         !stderr.contains("resolved image name"),
         "nothing was resolved, so nothing says so: {stderr}"
+    );
+}
+
+/// **`run --launch-env` reaches the `runHookPayload` the daemon parses.**
+///
+/// Asserted on the wire body rather than on `RunArgs`, because the flag existing and the
+/// value arriving are two different facts — and the second one is what a workload depends
+/// on. `RunMicrovm` is scripted to fail so the test ends at the launch, which is after the
+/// payload is built.
+///
+/// **Guard proof.** Drop the `with_launch_env` loop from `commands/lifecycle.rs` and the
+/// `env` assertions read `null`.
+#[tokio::test]
+async fn a_launch_env_flag_reaches_the_run_hook_payload() {
+    let dir = TempDir::new("launch-env");
+    let transport = Arc::new(ScriptedTransport::new());
+    transport.answer("RunMicrovm", 400, r#"{"message": "scripted stop"}"#);
+
+    let seam = ScriptedSeam {
+        transport: Arc::clone(&transport),
+        clock: Arc::new(YieldingClock::default()),
+    };
+    let mut args = run_args_for_image(
+        "arn:aws:lambda:us-east-1:123456789012:microvm-image/img",
+        dir.0.clone(),
+    );
+    args.launch_env = vec![
+        (
+            "ANTHROPIC_BASE_URL".to_string(),
+            "https://gateway.example".to_string(),
+        ),
+        ("EMPTY".to_string(), String::new()),
+    ];
+    let (result, _) = dispatch_with(&seam, &Command::Run(args), full_infra()).await;
+    result.expect_err("the scripted RunMicrovm failure ends the run after the payload is built");
+
+    let body = transport.first_body("RunMicrovm");
+    let payload = body["runHookPayload"]
+        .as_str()
+        .expect("runHookPayload is a string");
+    // One parse deeper, which is where the daemon reads it from as well.
+    let inner: serde_json::Value =
+        serde_json::from_str(payload).expect("the payload is itself JSON");
+    assert_eq!(
+        inner["env"]["ANTHROPIC_BASE_URL"],
+        "https://gateway.example"
+    );
+    assert_eq!(
+        inner["env"]["EMPTY"], "",
+        "an empty VALUE is a variable set to the empty string, not an omitted one"
+    );
+    assert!(
+        inner["agent_token"].as_str().is_some_and(|t| !t.is_empty()),
+        "the token still rides alongside the env: {payload}"
+    );
+}
+
+/// **A run with no `--launch-env` emits no `env` key at all.**
+///
+/// The compatibility floor, and it is worth a guard because the cheap implementation —
+/// always serialize the map — would put `"env":{}` on the wire for every existing caller
+/// and spend their payload budget on nothing.
+#[tokio::test]
+async fn a_run_without_a_launch_env_emits_no_env_key() {
+    let dir = TempDir::new("launch-env-absent");
+    let transport = Arc::new(ScriptedTransport::new());
+    transport.answer("RunMicrovm", 400, r#"{"message": "scripted stop"}"#);
+
+    let seam = ScriptedSeam {
+        transport: Arc::clone(&transport),
+        clock: Arc::new(YieldingClock::default()),
+    };
+    let command = Command::Run(run_args_for_image(
+        "arn:aws:lambda:us-east-1:123456789012:microvm-image/img",
+        dir.0.clone(),
+    ));
+    let (result, _) = dispatch_with(&seam, &command, full_infra()).await;
+    result.expect_err("the scripted RunMicrovm failure ends the run");
+
+    let payload = transport.first_body("RunMicrovm")["runHookPayload"]
+        .as_str()
+        .expect("a string")
+        .to_string();
+    assert!(
+        !payload.contains("env"),
+        "an unset launch env must not appear on the wire: {payload}"
     );
 }
 
@@ -2475,7 +2563,8 @@ async fn health_reports_the_identity_flags_and_warns_without_failing_on_a_degrad
         200,
         r#"{"version": "0.1.0", "bootstrapped": true,
              "disk": {"available_bytes": 1024, "reserve_bytes": 4096, "under_pressure": true},
-             "identity_degraded": true, "identity_repaired": true}"#,
+             "identity_degraded": true, "identity_repaired": true,
+             "busy": true, "execs": 2}"#,
     );
 
     let command = Command::Health(HealthArgs {
@@ -2491,6 +2580,12 @@ async fn health_reports_the_identity_flags_and_warns_without_failing_on_a_degrad
     assert_eq!(rendered.data["bootstrapped"], true);
     assert_eq!(rendered.data["diskUnderPressure"], true);
     assert_eq!(rendered.data["diskAvailableBytes"], 1024);
+    // The activity pair an orchestrator polls on a loop, to decide whether to keep the VM
+    // alive. Its own poll is the inbound traffic the platform's idle policy measures —
+    // which is the only kind that counts, because the endpoint proxy terminates outside
+    // the guest and an in-guest keepalive never reaches it.
+    assert_eq!(rendered.data["busy"], true);
+    assert_eq!(rendered.data["execs"], 2);
     assert_eq!(
         rendered.already_reported, None,
         "the daemon serves a degraded identity by design; failing here would report a working VM \

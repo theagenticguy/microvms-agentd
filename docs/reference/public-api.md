@@ -216,6 +216,8 @@ pub struct RunRequest {
 
 `RunRequest` holds everything a launch needs. Its defaults are the values the Python client measured, and it has an optional `agent_token` field for a caller that mints its own token.
 
+`launch_env` is a `HashMap<String, String>` delivered in the same `runHookPayload` as the token, and the daemon applies it as the base environment of every exec in that VM, under each request's own `env`. Empty by default, and an empty map produces byte-for-byte the payload this client always sent, so a caller who never touches the field cannot be affected by it existing. Build it one pair at a time with `with_launch_env(key, value)`. It shares the token's 4096-byte payload budget, and `RunHookPayload::for_launch` refuses an over-ceiling payload before any control-plane call, naming the byte count and how much of it the env accounted for.
+
 `microvms-core/src/sandbox.rs:145-146`
 
 ### TeardownReport
@@ -334,7 +336,9 @@ pub struct PollResponse {
 pub struct Health {
 ```
 
-`Health` is the `GET /v1/health` response. It reports the daemon version, bootstrap state, disk pressure, and whether startup identity repair degraded.
+`Health` is the `GET /v1/health` response. It reports the daemon version, bootstrap state, disk pressure, whether startup identity repair degraded, and the exec-activity pair `busy` / `execs`.
+
+`busy` and `execs` exist for an orchestrator *outside* the VM: the platform measures idleness by inbound traffic through the endpoint proxy, which terminates outside the guest, so a request from inside the guest cannot reset the idle timer and the orchestrator's own poll is the only traffic that counts. `busy` is true only while some exec is actually running, so an exited-but-unacked exec reads false; `execs` counts every registered entry in any phase. Both are `#[serde(default)]`, unlike every other field, because a client routinely talks to a daemon baked into an older image and a required field would make a health call fail outright against one.
 
 `protocol/src/health.rs:10-11`
 
@@ -352,7 +356,43 @@ pub struct RunHookEnvelope {
 
 `protocol/src/hook.rs:24-28`
 
-Also public and not given their own entry: `VERSION_HEADER`, the `microvms-agentd-version` response header on every response including errors (`protocol/src/lib.rs:66`); `protocol::exec::StreamKind`, `OutputEvent`, `GapEvent`, `ExitEvent`, `StdinRequest`, `StdinResponse`, `KillResponse`, `ErrorBody`, and the ten `ERROR_*` slugs a client branches on (`protocol/src/exec.rs:227-247`).
+### protocol::hook::RunHook
+
+```rs
+#[derive(Debug, Default, Deserialize, JsonSchema, Serialize)]
+pub struct RunHook {
+    pub agent_token: String,
+    #[serde(default)]
+    pub env: HashMap<String, String>,
+}
+```
+
+`RunHook` is the caller's own payload, one parse inside `RunHookEnvelope`. `env` is optional and becomes the base environment of every later exec, under each request's own `env`.
+
+Read it with `RunHook::parse`, not with `serde_json::from_str`. The function walks the payload by hand so that every refusal is one of `RunHookError`'s named variants, and the reason is the trust contract rather than tidiness: serde's own messages quote the value they rejected, and the value here is the agent token. Each variant names a key or a shape and never a value. `parse` also ignores unknown keys, because a 400 at this hook makes the platform terminate the VM before forwarding any traffic — a newer client's unrecognised field must not be a dead launch.
+
+`protocol/src/hook.rs`
+
+### protocol::fs::FileReadQuery
+
+```rs
+#[derive(Debug, Default, Deserialize, JsonSchema, Serialize)]
+pub struct FileReadQuery {
+    pub path: String,
+    #[serde(default)]
+    pub start_line: Option<u64>,
+    #[serde(default)]
+    pub end_line: Option<u64>,
+}
+```
+
+`FileReadQuery` is `GET /v1/fs/file`'s query: `FsQuery`'s `path` plus an optional line range. A separate type from `FsQuery` because a line range means nothing on the write or tar routes and a shared type would publish it on all four; `mode` is absent here for the same reason pointing the other way.
+
+Both bounds are 1-based and inclusive, matching the AI SDK harness's `readTextFile`. An `end_line` past the last line reads through EOF without an error rather than answering 416. `start_line=0` and `end_line < start_line` are 400.
+
+`protocol/src/fs.rs`
+
+Also public and not given their own entry: `VERSION_HEADER`, the `microvms-agentd-version` response header on every response including errors (`protocol/src/lib.rs:66`); `protocol::exec::StreamKind`, `OutputEvent`, `GapEvent`, `ExitEvent`, `StdinRequest`, `StdinResponse`, `KillResponse`, `ErrorBody`, and the ten `ERROR_*` slugs a client branches on (`protocol/src/exec.rs:227-247`); and `protocol::hook::RunHookError`, the typed refusal `RunHook::parse` answers with.
 
 ## Bindings
 

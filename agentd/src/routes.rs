@@ -17,7 +17,7 @@ use crate::{auth, exec, fs, schema};
 /// original paths so every call site and doc reference here stays valid.
 pub use protocol::VERSION_HEADER;
 pub use protocol::health::{DiskHealth, Health};
-pub use protocol::hook::{HOOK_PREFIX, RunHook, RunHookEnvelope};
+pub use protocol::hook::{HOOK_PREFIX, RunHook, RunHookEnvelope, RunHookError};
 
 /// Version reported by `/v1/health` and the `microvms-agentd-version` header.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -163,12 +163,18 @@ async fn stamp_version(request: axum::extract::Request, next: middleware::Next) 
     response
 }
 
-/// One-shot token bootstrap.
+/// One-shot token bootstrap, and the launch-environment channel beside it.
 ///
 /// Deliberately unauthenticated: the platform has no credential to present, and
 /// its request arrives over loopback indistinguishably from an in-VM process
 /// (measured; see `docs/PLATFORM.md`). The defense is that this route can only
 /// succeed once.
+///
+/// The payload may also carry `env`, a map applied as the base environment of every
+/// subsequent exec. It rides here because this is the only per-VM channel the
+/// platform offers, and it shares the token's 4096-byte budget. The token itself
+/// never becomes part of that base environment — [`AppState::bootstrap`] takes the
+/// two as separate arguments precisely so no code path can move one into the other.
 async fn run_hook(
     State(state): State<AppState>,
     body: Result<Json<RunHookEnvelope>, JsonRejection>,
@@ -186,20 +192,33 @@ async fn run_hook(
         return StatusCode::BAD_REQUEST.into_response();
     };
 
-    // The token is never logged, and neither is the payload that carries it.
-    let Ok(hook) = serde_json::from_str::<RunHook>(&raw) else {
-        tracing::warn!("runHookPayload is not a JSON object with agent_token");
-        return StatusCode::BAD_REQUEST.into_response();
+    // The token is never logged, and neither is the payload that carries it. The
+    // refusal is safe to log for the same reason: `RunHookError` names a key or a
+    // shape and never a value, which is why it is a typed error rather than serde's
+    // own message.
+    let hook = match RunHook::parse(&raw) {
+        Ok(hook) => hook,
+        Err(err) => {
+            tracing::warn!(%err, "runHookPayload rejected");
+            // The body names the problem too. This is the one route whose failure
+            // is invisible from outside the VM — the platform terminates it with
+            // "Run lifecycle hook returned HTTP status 400" before forwarding any
+            // traffic — so a caller debugging a launch that died young has only
+            // `stateReason` and the guest logs, and a bare 400 tells them nothing
+            // about which key they got wrong.
+            return (StatusCode::BAD_REQUEST, err.to_string()).into_response();
+        }
     };
 
-    if hook.agent_token.is_empty() {
-        tracing::warn!("agent_token is empty");
-        return StatusCode::BAD_REQUEST.into_response();
-    }
-
-    match state.bootstrap(hook.agent_token.as_bytes()) {
+    match state.bootstrap(hook.agent_token.as_bytes(), hook.env) {
         Bootstrap::Installed => {
-            tracing::info!("agent token installed");
+            // The count and the keys, never the values: a launch env is where a
+            // caller puts a credential, and the whole reason it travels in this
+            // payload is that the payload is not logged.
+            tracing::info!(
+                launch_env_vars = state.launch_env().len(),
+                "agent token installed"
+            );
             StatusCode::OK.into_response()
         }
         Bootstrap::AlreadyIdentical => {
@@ -275,8 +294,26 @@ async fn terminate_hook() -> StatusCode {
     StatusCode::OK
 }
 
+/// `GET /v1/health` — liveness, and the exec-activity signal an orchestrator polls.
+///
+/// `busy` is here rather than on a route the workload calls itself, and the reason is
+/// measured. The platform measures idleness by inbound traffic through the endpoint
+/// proxy; that proxy terminates *outside* the guest and forwards over loopback
+/// (`docs/PLATFORM.md`, "The platform's own hook arrives over loopback"), so a
+/// request an in-VM process sends to this port never reaches the thing counting
+/// traffic. An in-guest keepalive route would therefore keep nothing alive, and would
+/// be discovered as broken by a multi-hour run auto-suspending mid-work.
+///
+/// So the honest shape is the other way round: an orchestrator outside the VM polls
+/// this endpoint, which *is* real inbound traffic, and reads `busy` to decide whether
+/// to keep polling. The assertion of liveness is repeated and is the caller's, which
+/// is what the daemon self-keepaliving would not be — a hung process would then bill
+/// to the 8-hour `maximumDurationInSeconds` ceiling with nobody having asked for it.
+/// Nothing here is opt-in because nothing here perpetuates anything: two fields on a
+/// response the route already returned.
 async fn health(State(state): State<AppState>) -> Json<Health> {
     let identity = state.identity_report();
+    let (busy, execs) = exec::activity(&state).await;
     Json(Health {
         // `Cow` on the wire type so a client deserializes into an owned string; the
         // daemon's own version is a `&'static str` and stays borrowed.
@@ -297,6 +334,8 @@ async fn health(State(state): State<AppState>) -> Json<Health> {
             }),
         identity_degraded: identity.degraded(),
         identity_repaired: identity.attempted,
+        busy,
+        execs,
     })
 }
 
@@ -380,9 +419,20 @@ pub fn surface_docs() -> Vec<schema::Endpoint> {
                 "POST",
                 hook("run"),
                 Auth::PlatformHook,
-                "one-shot token bootstrap. The platform wraps the caller's string, \
-                 so agent_token is one JSON parse deeper than the request body: \
-                 {\"runHookPayload\": \"{\\\"agent_token\\\": \\\"...\\\"}\"}.",
+                "one-shot token bootstrap, plus the optional launch environment. \
+                 The platform wraps the caller's string, so the payload's own \
+                 fields are one JSON parse deeper than the request body: \
+                 {\"runHookPayload\": \"{\\\"agent_token\\\": \\\"...\\\", \
+                 \\\"env\\\": {\\\"KEY\\\": \\\"VALUE\\\"}}\"}. `agent_token` is \
+                 required and non-empty; `env` is optional and becomes the BASE \
+                 environment of every later exec, with each request's own `env` \
+                 overlaid on top of it. Values must be strings. Unknown keys are \
+                 ignored, so a newer client can still bootstrap this daemon. The \
+                 whole payload is capped by the platform at 4096 bytes inclusive, \
+                 measured in UTF-8 bytes — the token and the env share that \
+                 budget. `env` is installed only by the first successful \
+                 bootstrap: a replay cannot edit it and a conflicting token \
+                 cannot either.",
                 schema::HOOK_RUN,
             )
         },
@@ -490,13 +540,18 @@ pub fn surface_docs() -> Vec<schema::Endpoint> {
             )
         },
         schema::Endpoint {
-            query: Some(query::<fs::FsQuery>()),
+            query: Some(query::<fs::FileReadQuery>()),
             response: octet_stream("the file's bytes, streamed"),
             ..row(
                 "GET",
                 "/v1/fs/file".into(),
                 Auth::Bearer,
-                "read one file",
+                "read one file, or a 1-based inclusive line range of it. \
+                 ?start_line=&end_line= are the AI SDK harness's readTextFile \
+                 semantics: an end_line past the last line reads through EOF \
+                 without error, and omitting both returns the whole file \
+                 byte-identically. Still streamed — the range never buffers the \
+                 file to slice it.",
                 schema::FS_READ_FILE,
             )
         },
@@ -547,7 +602,13 @@ pub fn surface_docs() -> Vec<schema::Endpoint> {
                 "GET",
                 "/v1/health".into(),
                 Auth::Open,
-                "liveness, daemon version, and whether bootstrap has completed",
+                "liveness, daemon version, whether bootstrap has completed, and \
+                 whether any exec is still running. `busy` exists so an \
+                 orchestrator OUTSIDE the VM can hold it alive: the platform \
+                 measures idleness by inbound traffic through the endpoint proxy, \
+                 which terminates outside the guest, so a request from inside the \
+                 guest cannot reset the idle timer. Polling this from outside is \
+                 both the traffic and the decision.",
                 schema::HEALTH,
             )
         },
@@ -592,3 +653,155 @@ static SSE_EVENTS: &[schema::SseEvent] = &[
          total bytes published, so a client can assert it saw all of them.",
     ),
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Config;
+
+    /// The platform's own body shape: the caller's payload as a JSON *string* inside
+    /// `{"runHookPayload": ...}`. Built with `serde_json` rather than by formatting,
+    /// so the inner escaping is the platform's and not a hand-rolled approximation —
+    /// getting that wrong is what made a whole tier pass against a daemon the
+    /// platform could not bootstrap.
+    fn envelope(payload: serde_json::Value) -> RunHookEnvelope {
+        RunHookEnvelope {
+            run_hook_payload: Some(payload.to_string()),
+        }
+    }
+
+    /// Posts a run-hook envelope through the handler and returns the status.
+    async fn post_hook(state: &AppState, envelope: RunHookEnvelope) -> StatusCode {
+        run_hook(State(state.clone()), Ok(Json(envelope)))
+            .await
+            .status()
+    }
+
+    /// A launch env in the payload installs, and the response is the same 200 a
+    /// token-only bootstrap has always been.
+    #[tokio::test]
+    async fn a_run_hook_carrying_an_env_installs_both_halves() {
+        let state = AppState::new(Config::default());
+        let status = post_hook(
+            &state,
+            envelope(serde_json::json!({
+                "agent_token": "tok",
+                "env": {"FROM_LAUNCH": "yes", "EMPTY": ""},
+            })),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert!(state.is_bootstrapped());
+        let installed = state.launch_env();
+        assert_eq!(
+            installed.get("FROM_LAUNCH").map(String::as_str),
+            Some("yes")
+        );
+        assert_eq!(installed.get("EMPTY").map(String::as_str), Some(""));
+        assert_eq!(installed.len(), 2);
+    }
+
+    /// A payload with no `env` bootstraps exactly as it always did. This is the
+    /// compatibility floor: every launch that predates the feature sends this.
+    #[tokio::test]
+    async fn a_run_hook_with_no_env_still_bootstraps_with_an_empty_one() {
+        let state = AppState::new(Config::default());
+        let status = post_hook(&state, envelope(serde_json::json!({"agent_token": "tok"}))).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(state.is_bootstrapped());
+        assert!(state.launch_env().is_empty());
+    }
+
+    /// An unknown key is ignored and the launch still succeeds. A 400 here makes the
+    /// platform terminate the VM before forwarding any traffic, so refusing a field
+    /// this daemon has never heard of would turn a newer client into a dead launch.
+    #[tokio::test]
+    async fn an_unknown_payload_key_does_not_fail_the_launch() {
+        let state = AppState::new(Config::default());
+        let status = post_hook(
+            &state,
+            envelope(serde_json::json!({
+                "agent_token": "tok",
+                "env": {"A": "1"},
+                "some_future_field": {"nested": [1, 2, 3]},
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(state.launch_env().len(), 1);
+    }
+
+    /// Each malformed shape is a 400 that names the problem, and nothing is
+    /// bootstrapped. The body is asserted on because this route's failure is
+    /// invisible from outside the VM — the platform terminates it before forwarding
+    /// traffic — so the guest log and the body are the only evidence.
+    #[tokio::test]
+    async fn a_malformed_env_is_a_400_that_names_the_problem_and_installs_nothing() {
+        for (payload, expected) in [
+            (
+                serde_json::json!({"agent_token": "tok", "env": "A=1"}),
+                "env",
+            ),
+            (
+                serde_json::json!({"agent_token": "tok", "env": {"PORT": 8080}}),
+                "PORT",
+            ),
+            (serde_json::json!({"agent_token": ""}), "empty"),
+            (serde_json::json!({"env": {"A": "1"}}), "agent_token"),
+        ] {
+            let state = AppState::new(Config::default());
+            let response =
+                run_hook(State(state.clone()), Ok(Json(envelope(payload.clone())))).await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{payload}");
+            let body = axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .expect("body");
+            let detail = String::from_utf8(body.to_vec()).expect("utf-8");
+            assert!(
+                detail.contains(expected),
+                "the refusal must name {expected}: {detail}"
+            );
+            assert!(
+                !state.is_bootstrapped(),
+                "a refused payload must install nothing: {payload}"
+            );
+            assert!(state.launch_env().is_empty());
+        }
+    }
+
+    /// The refusal body never carries the token. The route's whole reason for a typed
+    /// error rather than serde's message is that serde quotes the value it rejected,
+    /// and the value next to a bad `env` is a credential.
+    #[tokio::test]
+    async fn a_refusal_body_does_not_echo_the_agent_token() {
+        let state = AppState::new(Config::default());
+        let response = run_hook(
+            State(state),
+            Ok(Json(envelope(serde_json::json!({
+                "agent_token": "super-secret-agent-token",
+                "env": {"PORT": 8080},
+            })))),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .expect("body");
+        let detail = String::from_utf8(body.to_vec()).expect("utf-8");
+        assert!(
+            !detail.contains("super-secret-agent-token"),
+            "the token reached a response body: {detail}"
+        );
+    }
+
+    /// `busy` and `execs` are on the health response, and an idle daemon reports
+    /// false and zero rather than omitting them.
+    #[tokio::test]
+    async fn health_reports_an_idle_daemon_as_not_busy_with_no_execs() {
+        let state = AppState::new(Config::default());
+        let Json(report) = health(State(state)).await;
+        assert!(!report.busy);
+        assert_eq!(report.execs, 0);
+    }
+}

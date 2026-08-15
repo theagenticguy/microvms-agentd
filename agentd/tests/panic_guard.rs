@@ -214,7 +214,7 @@ async fn the_real_appstate_still_authorizes_after_a_panic() {
     // drives the real `AppState` rather than the local stand-in.
     let _quiet = hush();
     let state = AppState::new(Config::default());
-    state.bootstrap(b"tok");
+    state.bootstrap(b"tok", std::collections::HashMap::new());
 
     let response = app(fragile())
         .oneshot(get_request("/panic"))

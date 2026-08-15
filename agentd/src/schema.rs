@@ -531,13 +531,18 @@ pub const FS_READ_FILE: &[Status] = &[
     Status::new(
         StatusCode::OK,
         "",
-        "the file's bytes, streamed rather than buffered",
+        "the file's bytes, streamed rather than buffered — or the requested line \
+         range of them, also streamed. A range whose end_line is past the last line \
+         answers 200 through EOF, never 416: 416 is about a range the file cannot \
+         satisfy, and reading through EOF is the harness contract.",
     ),
     Status::new(
         StatusCode::BAD_REQUEST,
         "",
-        "the path query parameter is missing, or it names a directory — use \
-         /v1/fs/tar for that. Never 404 for either: a protocol error must not look \
+        "the path query parameter is missing, it names a directory — use \
+         /v1/fs/tar for that — start_line or end_line is not an integer, \
+         start_line is 0 (the range is 1-based), or end_line is before \
+         start_line. Never 404 for any of them: a protocol error must not look \
          like an absent file.",
     ),
     UNAUTHORIZED,
@@ -638,7 +643,11 @@ pub const HEALTH: &[Status] = &[Status::new(
     StatusCode::OK,
     "",
     "always, whether or not the daemon is bootstrapped. bootstrapped is how a \
-     client learns whether the control API is open yet.",
+     client learns whether the control API is open yet; busy is how an \
+     orchestrator outside the VM learns whether a workload is still running, so \
+     its own poll doubles as the inbound traffic the platform's idle policy \
+     measures. An in-guest request cannot serve that purpose: the endpoint proxy \
+     terminates outside the guest.",
 )];
 
 pub const SCHEMA: &[Status] = &[Status::new(
@@ -667,14 +676,22 @@ pub const HOOK_RUN: &[Status] = &[
         StatusCode::BAD_REQUEST,
         "",
         "the body is not JSON, carries no runHookPayload, the payload is not a \
-         JSON object with agent_token, or the token is empty. The platform \
-         terminates the VM on this, before any traffic is forwarded.",
+         JSON object, agent_token is absent or not a string or empty, env is \
+         present but not an object, or an env value is not a string. The body \
+         names which of those it was, and never quotes a value — the payload \
+         carries the token. An unknown key is NOT one of these: it is ignored, \
+         because the platform terminates the VM on any 400 here, before any \
+         traffic is forwarded, so a newer client's unrecognised field must not \
+         kill the launch.",
     ),
     Status::new(
         StatusCode::CONFLICT,
         "",
-        "a different token is already installed. Refused, and nothing changes: \
-         bootstrap is one-shot so a losing racer never replaces the winner.",
+        "a different token is already installed. Refused, and nothing changes — \
+         including the launch env, which only the first successful bootstrap \
+         sets: bootstrap is one-shot so a losing racer never replaces the \
+         winner's token, and cannot rewrite the environment every later child \
+         runs in either.",
     ),
 ];
 

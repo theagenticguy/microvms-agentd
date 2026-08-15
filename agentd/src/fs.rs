@@ -82,6 +82,7 @@ use axum::body::Body;
 use axum::extract::{Request, State};
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
+use bytes::Bytes;
 use futures_util::TryStreamExt;
 use tar::EntryType;
 use tokio_util::io::{ReaderStream, StreamReader};
@@ -89,9 +90,9 @@ use tokio_util::io::{ReaderStream, StreamReader};
 use crate::disk::{self, CopyError};
 use crate::state::AppState;
 
-/// The one typed shape in this module, re-exported from its original path. The
+/// The two typed shapes in this module, re-exported from their original paths. The
 /// bodies here are opaque byte streams, so the query is the whole wire contract.
-pub use protocol::fs::FsQuery;
+pub use protocol::fs::{FileReadQuery, FsQuery};
 
 /// The refusal a write gets when the target filesystem is under the configured
 /// reserve.
@@ -927,11 +928,177 @@ fn fs_query(request: &Request) -> Result<FsQuery, (StatusCode, &'static str)> {
     }
 }
 
-/// Reads one file. 404 only when the path is genuinely absent.
+/// Extracts `GET /v1/fs/file`'s query, which is [`fs_query`]'s plus a line range.
+///
+/// Two attempts rather than one, and the second is the point. A request whose
+/// `start_line` is not a number and one that omits `path` entirely both fail the
+/// first parse, and they are different mistakes: the missing-path body is the exact
+/// string this surface has answered since the first commit and a test pins it, so
+/// the fallback parse is what decides which of the two happened rather than
+/// flattening both into whichever message reads better.
+fn file_read_query(request: &Request) -> Result<FileReadQuery, (StatusCode, &'static str)> {
+    match axum::extract::Query::<FileReadQuery>::try_from_uri(request.uri()) {
+        Ok(query) => Ok(query.0),
+        // `FsQuery` ignores the range keys, so it succeeds exactly when `path` is
+        // present and well-formed — which makes it the discriminator.
+        Err(_) => match axum::extract::Query::<FsQuery>::try_from_uri(request.uri()) {
+            Ok(_) => Err((
+                StatusCode::BAD_REQUEST,
+                "start_line and end_line must be integers",
+            )),
+            Err(_) => Err((StatusCode::BAD_REQUEST, "path query parameter is required")),
+        },
+    }
+}
+
+/// Turns the requested range into a slicer, or names why it cannot be one.
+///
+/// `Ok(None)` means no range was asked for, and that case must stay distinguishable
+/// from a range that happens to cover the whole file: with no range the response is
+/// the un-sliced stream it has always been, byte for byte.
+///
+/// Both refusals are 400. Neither is 416 `Range Not Satisfiable`, which is the
+/// tempting answer and the wrong one: 416 is about a range the *file* cannot
+/// satisfy, and both of these are ranges no file could — a 1-based line 0 does not
+/// exist and an end before a start is not a window. A caller who saw 416 would go
+/// looking at the file.
+fn line_range(query: &FileReadQuery) -> Result<Option<LineSlicer>, String> {
+    if query.start_line.is_none() && query.end_line.is_none() {
+        return Ok(None);
+    }
+
+    // Defaulted rather than required, matching the harness contract: `startLine`
+    // absent is 1, `endLine` absent is through EOF.
+    let start = query.start_line.unwrap_or(1);
+    if start == 0 {
+        return Err(
+            "start_line is 1-based, so 0 is not a line. Line 1 is the first line; a caller \
+             working from 0-based offsets wants start_line=1."
+                .to_string(),
+        );
+    }
+    if let Some(end) = query.end_line
+        && end < start
+    {
+        return Err(format!(
+            "end_line {end} is before start_line {start}. Both bounds are 1-based and \
+             inclusive, so end_line must be at least start_line. An end_line past the last \
+             line is fine and reads through EOF — this refusal is for an inverted range, \
+             which no file can satisfy."
+        ));
+    }
+
+    Ok(Some(LineSlicer::new(start, query.end_line)))
+}
+
+/// Keeps a byte-oriented read inside a line-oriented window, one chunk at a time.
+///
+/// Written as a chunk filter rather than as "read the file, split on newlines, join
+/// the slice" because the second one buffers a whole file to hand back four lines of
+/// it, on a VM whose baseline memory can be 512 MiB. This holds one chunk and a line
+/// counter, and once the window closes it reports [`LineSlicer::finished`] so the
+/// caller stops reading — lines 1..5 of a 10 GB file cost the first chunk.
+///
+/// **A line owns its terminating newline.** Lines 1..3 of `a\nb\nc\nd\n` are
+/// `a\nb\nc\n`, so consecutive ranges concatenate back into the file rather than
+/// losing a separator at every seam. The last line of a file with no trailing
+/// newline simply has none to own.
+struct LineSlicer {
+    /// 1-based, inclusive.
+    start: u64,
+    /// 1-based, inclusive. `None` reads through EOF, which is also what an
+    /// `end_line` past the last line does — the two are the same traversal.
+    end: Option<u64>,
+    /// The line the next unconsumed byte belongs to. Carried across chunks, because
+    /// a chunk boundary is not a line boundary.
+    line: u64,
+    finished: bool,
+}
+
+impl LineSlicer {
+    fn new(start: u64, end: Option<u64>) -> Self {
+        Self {
+            start,
+            end,
+            line: 1,
+            finished: false,
+        }
+    }
+
+    /// The part of `chunk` inside the window.
+    ///
+    /// The in-range bytes of any one chunk are contiguous — the window is a run of
+    /// whole lines — so this is a single slice rather than a rebuilt buffer.
+    fn take(&mut self, chunk: &[u8]) -> Bytes {
+        if self.finished || chunk.is_empty() {
+            return Bytes::new();
+        }
+        let mut from: Option<usize> = None;
+        let mut to = 0usize;
+        let mut pos = 0usize;
+
+        while pos < chunk.len() {
+            let inside = self.line >= self.start && self.end.is_none_or(|end| self.line <= end);
+            // Where this line ends inside this chunk: just past its newline, or the
+            // end of the chunk when the line continues into the next one.
+            let newline = chunk[pos..]
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .map(|offset| pos + offset);
+            let segment_end = newline.map_or(chunk.len(), |at| at + 1);
+
+            if inside {
+                if from.is_none() {
+                    from = Some(pos);
+                }
+                to = segment_end;
+            }
+            pos = segment_end;
+
+            if newline.is_some() {
+                self.line += 1;
+                if let Some(end) = self.end
+                    && self.line > end
+                {
+                    // The window closed inside this chunk, so the rest of the file
+                    // is never read.
+                    self.finished = true;
+                    break;
+                }
+            }
+        }
+
+        match from {
+            Some(from) => Bytes::copy_from_slice(&chunk[from..to]),
+            None => Bytes::new(),
+        }
+    }
+
+    /// Whether the window has closed, so the caller can stop reading.
+    fn finished(&self) -> bool {
+        self.finished
+    }
+}
+
+/// Reads one file, optionally a line range of it. 404 only when the path is
+/// genuinely absent.
+///
+/// With no `start_line` or `end_line` the response is exactly what it has always
+/// been: the file's bytes, streamed. With a range it is still streamed — see
+/// [`LineSlicer`] — and the range is 1-based and inclusive on both ends, with an
+/// `end_line` past the last line reading through EOF rather than answering an error.
+/// Those are the AI SDK harness's `readTextFile` semantics, and they are copied
+/// rather than chosen: this route is what that method is implemented on top of.
 pub async fn read_file(request: Request) -> Response {
-    let query = match fs_query(&request) {
+    let query = match file_read_query(&request) {
         Ok(query) => query,
         Err(refusal) => return refusal.into_response(),
+    };
+    // Validated before the file is opened, so a bad range costs no syscall and
+    // cannot be reported as anything about the file.
+    let slicer = match line_range(&query) {
+        Ok(slicer) => slicer,
+        Err(detail) => return (StatusCode::BAD_REQUEST, detail).into_response(),
     };
     let path = PathBuf::from(&query.path);
 
@@ -966,13 +1133,49 @@ pub async fn read_file(request: Request) -> Response {
     }
 
     // Streamed rather than read into a Vec, for the same memory reason as upload.
-    let body = Body::from_stream(ReaderStream::new(file));
+    // The un-ranged arm hands back the reader stream untouched: a range feature that
+    // rewrapped every read would put its own bug surface on the path taken by every
+    // caller who never asked for one.
+    let body = match slicer {
+        None => Body::from_stream(ReaderStream::new(file)),
+        Some(slicer) => Body::from_stream(sliced_stream(ReaderStream::new(file), slicer)),
+    };
     (
         StatusCode::OK,
         [(header::CONTENT_TYPE, "application/octet-stream")],
         body,
     )
         .into_response()
+}
+
+/// Filters a byte stream down to the slicer's line window, still a stream.
+///
+/// `try_unfold` rather than a `map` over the source, because closing the window has
+/// to *stop reading* — a `map` would filter every remaining chunk of a large file to
+/// nothing while still paying to read it. Ending the stream here drops the reader,
+/// which is what makes lines 1..5 of a huge file cost the first chunk.
+///
+/// Empty chunks are dropped rather than yielded: a chunk entirely outside the window
+/// is not a zero-byte read, and some HTTP bodies treat one as end-of-stream.
+fn sliced_stream(
+    source: ReaderStream<tokio::fs::File>,
+    slicer: LineSlicer,
+) -> impl futures_util::Stream<Item = io::Result<Bytes>> {
+    futures_util::stream::try_unfold((source, slicer), |(mut source, mut slicer)| async move {
+        use futures_util::StreamExt as _;
+        loop {
+            if slicer.finished() {
+                return Ok(None);
+            }
+            let Some(chunk) = source.next().await else {
+                return Ok(None);
+            };
+            let taken = slicer.take(&chunk?);
+            if !taken.is_empty() {
+                return Ok(Some((taken, (source, slicer))));
+            }
+        }
+    })
 }
 
 /// Writes one file. Not confined to a root; see the module comment.
@@ -1983,6 +2186,208 @@ mod tests {
                 .expect("body");
             assert_eq!(&body[..], b"path query parameter is required");
         }
+    }
+
+    // ── line-ranged reads ───────────────────────────────────────────────────
+
+    /// Drives `read_file` through the real handler and returns the status and body.
+    ///
+    /// Through the handler rather than against [`LineSlicer`] directly, because the
+    /// three things most likely to break are not in the slicer: the query parse, the
+    /// validation ordering, and whether the stream terminates. A unit test on the
+    /// slicer would pass against a handler that never called it.
+    async fn read_range(path: &Path, query: &str) -> (StatusCode, Vec<u8>) {
+        let uri = format!(
+            "/v1/fs/file?path={}{}{query}",
+            path.display(),
+            if query.is_empty() { "" } else { "&" }
+        );
+        let request = axum::http::Request::builder()
+            .method("GET")
+            .uri(uri)
+            .body(Body::empty())
+            .expect("request");
+        let response = read_file(request).await;
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .expect("body")
+            .to_vec();
+        (status, body)
+    }
+
+    /// Writes a five-line file with a trailing newline and returns its path.
+    fn five_lines(dir: &TempDir) -> PathBuf {
+        let path = dir.path().join("five.txt");
+        std::fs::write(&path, b"one\ntwo\nthree\nfour\nfive\n").expect("write");
+        path
+    }
+
+    /// The ranges, all against one fixture, so a regression in the line counter shows
+    /// up as a specific window rather than as "ranges are broken".
+    ///
+    /// A line owns its terminating newline, which is what makes 1..2 and 3..5
+    /// concatenate back into the file. Dropping the newline would look correct on a
+    /// single-line read and lose a separator on every seam.
+    #[tokio::test]
+    async fn a_line_range_returns_exactly_the_requested_inclusive_window() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = five_lines(&dir);
+
+        for (query, expected) in [
+            ("start_line=1&end_line=1", "one\n"),
+            ("start_line=1&end_line=2", "one\ntwo\n"),
+            ("start_line=3&end_line=3", "three\n"),
+            ("start_line=2&end_line=4", "two\nthree\nfour\n"),
+            // Both bounds inclusive, so the whole file is expressible.
+            ("start_line=1&end_line=5", "one\ntwo\nthree\nfour\nfive\n"),
+            // start_line alone reads through EOF.
+            ("start_line=4", "four\nfive\n"),
+            // end_line alone starts at line 1, per the harness contract's default.
+            ("end_line=2", "one\ntwo\n"),
+        ] {
+            let (status, body) = read_range(&path, query).await;
+            assert_eq!(status, StatusCode::OK, "{query}");
+            assert_eq!(
+                String::from_utf8(body).expect("utf-8 fixture"),
+                expected,
+                "{query}"
+            );
+        }
+
+        // The seam: two adjacent ranges rebuild the file exactly.
+        let (_, head) = read_range(&path, "start_line=1&end_line=2").await;
+        let (_, tail) = read_range(&path, "start_line=3&end_line=5").await;
+        assert_eq!(
+            [head, tail].concat(),
+            std::fs::read(&path).expect("fixture"),
+            "adjacent ranges must concatenate back into the file",
+        );
+    }
+
+    /// An `end_line` past the last line reads through EOF and answers 200.
+    ///
+    /// This is the harness contract's own sentence, and it is the one a range
+    /// implementation is most likely to get wrong: 416 or a 400 is the reflexive
+    /// answer, and both would break a caller who asked for "lines 1..1000" of a short
+    /// file without first counting it.
+    #[tokio::test]
+    async fn an_end_line_past_eof_reads_through_eof_without_an_error() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = five_lines(&dir);
+
+        for query in ["start_line=1&end_line=1000", "start_line=4&end_line=99"] {
+            let (status, _) = read_range(&path, query).await;
+            assert_eq!(status, StatusCode::OK, "{query}");
+        }
+        let (_, whole) = read_range(&path, "start_line=1&end_line=1000").await;
+        assert_eq!(whole, std::fs::read(&path).expect("fixture"));
+        let (_, tail) = read_range(&path, "start_line=4&end_line=99").await;
+        assert_eq!(tail, b"four\nfive\n");
+
+        // And a start_line past EOF is an empty 200 rather than a 404: the file is
+        // there and the window is empty, which are different facts from the file
+        // being absent.
+        let (status, empty) = read_range(&path, "start_line=99").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(empty.is_empty(), "{empty:?}");
+    }
+
+    /// A file with no trailing newline still ends where it ends. Its last line owns
+    /// no newline because there is none to own, so a range covering it must not
+    /// invent one.
+    #[tokio::test]
+    async fn a_final_line_without_a_newline_is_returned_as_it_is() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("bare.txt");
+        std::fs::write(&path, b"alpha\nbeta").expect("write");
+
+        let (_, last) = read_range(&path, "start_line=2&end_line=2").await;
+        assert_eq!(last, b"beta");
+        let (_, both) = read_range(&path, "start_line=1&end_line=2").await;
+        assert_eq!(both, b"alpha\nbeta");
+        let (_, past) = read_range(&path, "start_line=1&end_line=50").await;
+        assert_eq!(past, b"alpha\nbeta");
+    }
+
+    /// The two refusals, and both are 400 rather than 416. Neither range is one a
+    /// file could satisfy, so a client sent to look at the file would be looking in
+    /// the wrong place.
+    #[tokio::test]
+    async fn a_zero_start_or_an_inverted_range_is_refused_with_400() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = five_lines(&dir);
+
+        let (status, body) = read_range(&path, "start_line=0").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let detail = String::from_utf8(body).expect("utf-8");
+        assert!(detail.contains("1-based"), "{detail}");
+
+        let (status, body) = read_range(&path, "start_line=4&end_line=2").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let detail = String::from_utf8(body).expect("utf-8");
+        assert!(detail.contains("before start_line"), "{detail}");
+        // The refusal has to say that a *past-EOF* end is fine, or a reader takes
+        // this message as "ranges must be inside the file" and starts counting lines
+        // before every read.
+        assert!(detail.contains("through EOF"), "{detail}");
+
+        // A non-integer bound is also 400, and it does not masquerade as the
+        // missing-path refusal.
+        let (status, body) = read_range(&path, "start_line=first").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(&body[..], b"start_line and end_line must be integers");
+    }
+
+    /// No range means the old path, untouched. The un-ranged read is what every
+    /// existing client uses, so it is asserted byte-for-byte against the file rather
+    /// than against a re-derived expectation.
+    #[tokio::test]
+    async fn a_read_with_no_range_is_byte_identical_to_the_file() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("binary.bin");
+        // Deliberately not text: the un-ranged path must not have acquired any
+        // line-awareness, and a file with no newline at all and a NUL in it is where
+        // that would show.
+        let bytes: Vec<u8> = (0u8..=255).chain(0u8..=255).collect();
+        std::fs::write(&path, &bytes).expect("write");
+
+        let (status, body) = read_range(&path, "").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, bytes);
+    }
+
+    /// The slicer stops reading once the window closes, which is what keeps a
+    /// small range off a large file cheap.
+    ///
+    /// Asserted on the slicer's own state rather than on timing: a wall-clock
+    /// assertion would be flaky, and what matters is that `finished` is set, because
+    /// that is the flag [`sliced_stream`] ends the stream on.
+    #[test]
+    fn the_slicer_stops_reading_once_the_window_closes() {
+        let mut slicer = LineSlicer::new(1, Some(2));
+        assert_eq!(&slicer.take(b"one\ntwo\nthree\n")[..], b"one\ntwo\n");
+        assert!(
+            slicer.finished(),
+            "the window closed inside the chunk, so nothing more should be read"
+        );
+        // And a later chunk yields nothing even if one arrives.
+        assert!(slicer.take(b"four\n").is_empty());
+    }
+
+    /// A window that straddles chunk boundaries still comes out whole, including a
+    /// line split across two chunks. A slicer that reset its counter per chunk would
+    /// pass every single-chunk test above and fail here.
+    #[test]
+    fn the_slicer_carries_its_line_counter_across_chunk_boundaries() {
+        let mut slicer = LineSlicer::new(2, Some(3));
+        let mut out = Vec::new();
+        // "one\ntwo\nthree\nfour\n" cut at three arbitrary points, one of them mid-line.
+        for chunk in [&b"one\ntw"[..], &b"o\nthr"[..], &b"ee\nfour\n"[..]] {
+            out.extend_from_slice(&slicer.take(chunk));
+        }
+        assert_eq!(out, b"two\nthree\n");
+        assert!(slicer.finished());
     }
 
     #[test]

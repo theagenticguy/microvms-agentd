@@ -355,7 +355,7 @@ pub async fn start(
         Err(detail) => return fail(StatusCode::BAD_REQUEST, ERROR_MALFORMED_REQUEST, detail),
     };
 
-    let command = match build_command(&req) {
+    let command = match build_command(&req, &state.launch_env()) {
         Ok(command) => command,
         Err(detail) => return fail(StatusCode::BAD_REQUEST, ERROR_MALFORMED_REQUEST, detail),
     };
@@ -961,6 +961,56 @@ pub fn collect_expired(state: &AppState) -> usize {
     })
 }
 
+/// Whether any exec is still running, and how many are registered.
+///
+/// Reported on `GET /v1/health` so that an orchestrator *outside* the VM can decide
+/// whether to keep it alive. The reason the consumer is outside is measured rather
+/// than chosen: the platform measures idleness by inbound traffic through the
+/// endpoint proxy, and that proxy terminates outside the guest and forwards over
+/// loopback (`docs/PLATFORM.md`, "The platform's own hook arrives over loopback"), so
+/// a request from inside the guest never reaches the thing doing the measuring. The
+/// orchestrator's poll is the inbound traffic; this is what tells it whether to keep
+/// polling.
+///
+/// **Busy is "producing", not "unfinished".** An exec whose child has exited and
+/// whose result is waiting to be acked is not busy: nothing is running, and keeping a
+/// VM alive for it would bill for a command that is over. That distinction is why
+/// this reads a per-exec marker rather than counting entries — the count is reported
+/// separately, because a VM holding unacked output is one a caller should drain
+/// before terminating even though it is idle.
+///
+/// **[`Terminal`], not `result`.** `result` is the obvious slot and it is wrong here,
+/// for the reason its own docstring gives: `ack` *takes* the `Outcome`, so after an
+/// ack `result` is `None` again and is no longer usable as "has this exec finished?".
+/// Reading it would report every acked exec as running, which is a keepalive signal
+/// that never goes false — the exact failure this field exists to prevent, arriving
+/// as an unbounded bill instead of a suspended VM. `Terminal` is written once and
+/// never taken. A test asserts the acked case specifically, and it is what caught
+/// this.
+///
+/// `try_lock` rather than an await, and it is load-bearing: this runs on the
+/// unauthenticated health path, and a health probe that blocked on a per-exec lock
+/// held by a publishing waiter would be a liveness endpoint that stops answering
+/// exactly when the VM is busiest. A slot whose lock is held right now is a slot
+/// something is actively writing to, which is `busy` — so the contended case answers
+/// the question correctly instead of waiting to answer it.
+pub async fn activity(state: &AppState) -> (bool, usize) {
+    let shared: Vec<_> = state.with_execs(|execs| {
+        execs
+            .values()
+            .map(|entry| Arc::clone(&entry.shared))
+            .collect()
+    });
+    let count = shared.len();
+    let busy = shared
+        .iter()
+        .any(|shared| match shared.terminal.try_lock() {
+            Ok(terminal) => terminal.is_none(),
+            Err(_) => true,
+        });
+    (busy, count)
+}
+
 /// Rejects a timeout that cannot describe a real budget.
 ///
 /// `f64` from JSON admits NaN and infinity through some encoders, and both turn
@@ -976,7 +1026,21 @@ fn validate_timeout(raw: Option<f64>) -> Result<Option<Duration>, String> {
 }
 
 /// Assembles the child command, including the shell decision and demotion.
-fn build_command(req: &StartRequest) -> Result<Command, String> {
+///
+/// `launch_env` is the map delivered in the run-hook payload, and it is the *base*
+/// of the child's environment: the per-request `env` is overlaid on top of it, so a
+/// request that names a key the launch set wins. That direction is the useful one —
+/// a launch env is a default for the whole VM and a request is the specific thing
+/// happening now — and it is also the only direction that leaves the per-request
+/// contract unchanged for callers who never send a launch env at all.
+///
+/// The agent token is not in either map and cannot be: `launch_env` comes from a
+/// parameter [`crate::state::AppState::bootstrap`] never writes the token into, and
+/// `env_clear` below still runs, so the daemon's own environment reaches nothing.
+fn build_command(
+    req: &StartRequest,
+    launch_env: &std::collections::HashMap<String, String>,
+) -> Result<Command, String> {
     let mut command = if req.shell {
         // A single argument to `sh -c`, not a constructed wrapper. The
         // predecessor built `"cd %s && {\n%s\n}"`, which made an empty command
@@ -996,11 +1060,17 @@ fn build_command(req: &StartRequest) -> Result<Command, String> {
         command
     };
 
-    // Only what the request asks for. Inheriting the daemon's environment would
-    // carry the agent token into the child, and that is one of the three security
-    // properties the model pins — so the environment starts empty and nothing
-    // reads from `std::env`.
+    // Only what the launch and the request asked for. Inheriting the daemon's
+    // environment would carry the agent token into the child, and that is one of the
+    // three security properties the model pins — so the environment starts empty and
+    // nothing here reads from `std::env`.
+    //
+    // Two `envs` calls in this order, not a merged map: `Command::envs` applies each
+    // pair in turn, so the request's copy of a key overwrites the launch's. Written
+    // as a pre-merged `HashMap` it would be one more place the precedence could be
+    // silently inverted by an `extend` in the wrong direction.
     command.env_clear();
+    command.envs(launch_env);
     command.envs(&req.env);
 
     // Omitted cwd means inherit. Not `/`.
@@ -1424,12 +1494,28 @@ mod tests {
     /// Drives an exec to completion the way the daemon does, then returns the
     /// outcome. Polls the shared slot rather than sleeping a fixed interval, so
     /// the test is fast and does not race.
+    ///
+    /// The launch env comes off the state rather than being a parameter, which is
+    /// what `start` does: a test that passed one directly could assert a merge the
+    /// handler never performs.
     async fn run(state: &AppState, req: StartRequest) -> Outcome {
         let id = req.exec_id.clone();
         let timeout = validate_timeout(req.timeout_sec).expect("valid timeout");
-        let command = build_command(&req).expect("buildable command");
+        let command = build_command(&req, &state.launch_env()).expect("buildable command");
         spawn(state, &id, command, timeout).expect("spawn");
         await_result(state, &id).await
+    }
+
+    /// A launch env from pairs, so the tests read the way the payload does.
+    ///
+    /// `launch_env` rather than `launch`: the sibling `launch` starts an exec without
+    /// waiting, and two helpers a letter apart in one module is a test that reads as
+    /// the opposite of what it does.
+    fn launch_env(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+            .collect()
     }
 
     /// Waits for the waiter task to publish, with a bounded number of attempts so
@@ -1594,7 +1680,7 @@ mod tests {
     fn launch(state: &AppState, request: StartRequest) {
         let id = request.exec_id.clone();
         let timeout = validate_timeout(request.timeout_sec).expect("valid timeout");
-        let command = build_command(&request).expect("buildable command");
+        let command = build_command(&request, &state.launch_env()).expect("buildable command");
         spawn(state, &id, command, timeout).expect("spawn");
     }
 
@@ -1777,7 +1863,7 @@ mod tests {
     #[tokio::test]
     async fn the_agent_token_never_reaches_the_child_environment() {
         let state = state();
-        state.bootstrap(b"super-secret-agent-token");
+        state.bootstrap(b"super-secret-agent-token", HashMap::new());
         // Also present in the daemon's own environment, so an inherited env — not
         // just an explicitly forwarded one — would fail this test.
         // SAFETY-free alternative to set_var: the child env starts empty because
@@ -1803,6 +1889,43 @@ mod tests {
         );
     }
 
+    /// The same property with a launch env installed, which is the new way the
+    /// token could have leaked: a bootstrap that carried both a token and an env
+    /// map could have forwarded the token into that map on the way through.
+    ///
+    /// The child's whole environment is asserted to be exactly the launch env — not
+    /// merely "does not contain the token" — because an extra variable is how a
+    /// leak would look. A token forwarded under some other key would satisfy a
+    /// substring check on the token's own name and fail this.
+    #[tokio::test]
+    async fn a_launch_environment_does_not_carry_the_agent_token_into_a_child() {
+        let state = state();
+        state.bootstrap(
+            b"super-secret-agent-token",
+            launch_env(&[("SAFE", "value"), ("ALSO_SAFE", "other")]),
+        );
+        let outcome = run(&state, req("launchenvtoken", &["/usr/bin/env"])).await;
+
+        assert_eq!(outcome.exit_code, Some(0));
+        assert!(
+            !outcome.stdout.contains("super-secret-agent-token"),
+            "the agent token appeared in the child environment: {:?}",
+            outcome.stdout
+        );
+        assert!(
+            !outcome.stdout.to_ascii_lowercase().contains("agent_token"),
+            "an agent token variable name leaked: {:?}",
+            outcome.stdout
+        );
+        let mut lines: Vec<&str> = outcome.stdout.lines().collect();
+        lines.sort_unstable();
+        assert_eq!(
+            lines,
+            ["ALSO_SAFE=other", "SAFE=value"],
+            "the child's environment must be exactly the launch env and nothing else",
+        );
+    }
+
     /// Requested variables do reach the child, so the emptiness above is a
     /// property of what we pass and not of a broken env path.
     #[tokio::test]
@@ -1812,6 +1935,47 @@ mod tests {
         request.env.insert("WANTED".to_string(), "yes".to_string());
         let outcome = run(&state, request).await;
         assert_eq!(outcome.stdout.trim(), "yes");
+    }
+
+    /// The launch env reaches a child that asked for nothing, which is the whole
+    /// point of the feature: a workload started by a harness that does not know the
+    /// launch env exists still runs with it.
+    #[tokio::test]
+    async fn the_launch_environment_reaches_a_child_that_requested_nothing() {
+        let state = state();
+        state.bootstrap(b"tok", launch_env(&[("FROM_LAUNCH", "yes")]));
+        let outcome = run(
+            &state,
+            req("launchenv", &["/bin/sh", "-c", "echo $FROM_LAUNCH"]),
+        )
+        .await;
+        assert_eq!(outcome.stdout.trim(), "yes");
+    }
+
+    /// Precedence, in both directions at once. The request wins on a shared key,
+    /// and the launch env's *other* keys survive rather than being replaced
+    /// wholesale — which is the mistake a single `envs` call on a merged map makes
+    /// if the merge runs the wrong way.
+    #[tokio::test]
+    async fn a_per_request_variable_overrides_the_launch_environment() {
+        let state = state();
+        state.bootstrap(
+            b"tok",
+            launch_env(&[("SHARED", "from-launch"), ("ONLY_LAUNCH", "kept")]),
+        );
+        let mut request = req(
+            "override",
+            &["/bin/sh", "-c", "echo $SHARED; echo $ONLY_LAUNCH"],
+        );
+        request
+            .env
+            .insert("SHARED".to_string(), "from-request".to_string());
+        let outcome = run(&state, request).await;
+        assert_eq!(
+            outcome.stdout.lines().collect::<Vec<_>>(),
+            ["from-request", "kept"],
+            "the request must win the shared key without dropping the launch's own",
+        );
     }
 
     /// Output past the cap truncates and says so, rather than growing until the
@@ -1916,7 +2080,7 @@ mod tests {
         let state = state();
         let request = req("live", &["/bin/sh", "-c", "sleep 30"]);
         let timeout = validate_timeout(request.timeout_sec).expect("valid");
-        let command = build_command(&request).expect("buildable");
+        let command = build_command(&request, &state.launch_env()).expect("buildable");
         spawn(&state, "live", command, timeout).expect("spawn");
 
         let response = ack(State(state.clone()), Path("live".to_string())).await;
@@ -1939,7 +2103,7 @@ mod tests {
             cfg.output_linger = Duration::from_millis(200);
         });
         let request = req("group", &["/bin/sh", "-c", "sleep 30 & echo started; wait"]);
-        let command = build_command(&request).expect("buildable");
+        let command = build_command(&request, &state.launch_env()).expect("buildable");
         spawn(&state, "group", command, None).expect("spawn");
 
         let pgid = state
@@ -2017,6 +2181,72 @@ mod tests {
         assert_eq!(collect_expired(&state), 1);
         assert!(state.with_execs(|execs| execs.contains_key("gc-unacked")));
         assert!(!state.with_execs(|execs| execs.contains_key("gc-acked")));
+    }
+
+    /// The liveness signal, through its three states in order.
+    ///
+    /// Busy is "producing", not "unfinished", and the middle assertion is the one that
+    /// matters: an exec that exited and is waiting to be acked reports **not** busy. An
+    /// orchestrator that read it as busy would hold a VM alive — at baseline billing —
+    /// for a command that is over, until the 8-hour ceiling or until someone noticed.
+    /// The count stays non-zero across that boundary, which is what tells the same
+    /// orchestrator there is still output to collect before terminating.
+    #[tokio::test]
+    async fn busy_is_true_only_while_something_is_actually_running() {
+        let state = state();
+        assert_eq!(
+            activity(&state).await,
+            (false, 0),
+            "a fresh daemon is idle with nothing registered"
+        );
+
+        // A command that will not finish on its own, so "running" is observable
+        // rather than raced.
+        launch(&state, req("busy-sleeper", &["/bin/sleep", "30"]));
+        // The waiter task publishes nothing until the child exits, so the slot is
+        // empty from the moment it is registered.
+        assert_eq!(
+            activity(&state).await,
+            (true, 1),
+            "a running exec must read as busy"
+        );
+
+        kill(State(state.clone()), Path("busy-sleeper".to_string())).await;
+        await_result(&state, "busy-sleeper").await;
+        assert_eq!(
+            activity(&state).await,
+            (false, 1),
+            "an exited-but-unacked exec is NOT busy, and is still counted",
+        );
+
+        ack(State(state.clone()), Path("busy-sleeper".to_string())).await;
+        assert_eq!(
+            activity(&state).await,
+            (false, 1),
+            "an acked entry stays counted until TTL collection takes it, which is what \
+             stops the count from being a proxy for 'anything left to do'",
+        );
+    }
+
+    /// Two running execs are one `busy`, and finishing one does not clear it. A
+    /// signal computed from "the most recent exec" would pass the single-exec test
+    /// above and drop a VM out from under a second concurrent command.
+    #[tokio::test]
+    async fn busy_stays_true_while_any_one_of_several_execs_runs() {
+        let state = state();
+        launch(&state, req("multi-fast", &["/bin/true"]));
+        launch(&state, req("multi-slow", &["/bin/sleep", "30"]));
+        await_result(&state, "multi-fast").await;
+
+        assert_eq!(
+            activity(&state).await,
+            (true, 2),
+            "one finished exec must not clear busy while another runs",
+        );
+
+        kill(State(state.clone()), Path("multi-slow".to_string())).await;
+        await_result(&state, "multi-slow").await;
+        assert_eq!(activity(&state).await, (false, 2));
     }
 
     #[tokio::test]
@@ -2132,7 +2362,7 @@ mod tests {
         let mut request = req("demote", &["/bin/true"]);
         request.user = Some(65534);
         request.group = Some(65534);
-        let command = build_command(&request).expect("buildable");
+        let command = build_command(&request, &HashMap::new()).expect("buildable");
         assert_eq!(
             command.as_std().get_program(),
             std::ffi::OsStr::new("/bin/true")
