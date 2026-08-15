@@ -1,0 +1,407 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = []
+# ///
+# SPDX-License-Identifier: Apache-2.0
+"""The live tier's own wiring, checked offline — because its defects only show up late.
+
+`mise run check` proves the code. Nothing proved the *tier that runs the code against
+real AWS*, and on 2026-08-15 a 228-second billable run found three defects in it, all of
+them in `mise.toml` rather than in anything the suite tests. Each was invisible until
+money had already been spent, which is what makes an offline guard worth having: the
+alternative is discovering them one billable run at a time.
+
+What it checks, and the defect each one is about
+-----------------------------------------------
+
+**1. The marker path resolves in a worktree.** `mise run live` records the commit it
+proved into a file in the git directory, and lefthook's pre-push note reads it back to
+say whether the daemon has changed since. Both spelled it as the literal
+`.git/agentd-last-live-run`, which is right for exactly one repo shape. In a worktree
+`.git` is a *file*, so that literal names a path inside a non-directory: the writer
+failed with "Not a directory" after every one of the run's 76 checks had passed, and the
+reader failed more quietly and worse — it took its "no live AWS run recorded in this
+clone" branch, which is indistinguishable from the truth, so a stale-daemon push would
+never have been flagged. This project's live runs happen in the shape that breaks: a
+worktree per branch is how several branches get measured against one account.
+`git rev-parse --git-path` answers both shapes, and `--marker-path` below is the one
+place that knows it.
+
+**2. The leak check runs after the suite, not before it.** Under
+`depends = [rates, conformance-rs, verify-clean]` mise ran all three in parallel, and
+`live:verify-clean` finished at t=5s of the 228-second run — reporting "account
+us-east-1: clean" about an account nothing had touched yet. That is not a weak check, it
+is a false assurance, and it is the one line a caller reads to decide whether to go
+looking for a leaked MicroVM.
+
+**3. The leak check runs even when the suite fails.** Which is when resources survive.
+mise has no `if: always()`: `depends_post` runs only on success and a `wait_for` chain
+stops at the first failure, both measured, so under either one the leak check is skipped
+in exactly the case that needs it. A shell trap is the only always-run primitive
+available, so `live`'s body is a sequence with one — and this guard asserts the trap is
+there and that it fires, rather than trusting the comment saying so.
+
+The sequencing half is behavioral: it builds a throwaway repo whose `live` task body is
+**the real one, read out of `mise.toml`**, with the three suite members stubbed, and runs
+it green and red. A textual assertion would keep passing against a body that had stopped
+working, which is the failure mode this whole file exists to answer.
+
+Usage:
+    scripts/check-live-wiring                 # the guard. Offline, free
+    scripts/check-live-wiring --marker-path   # print the marker path, for `live` to use
+"""
+
+from __future__ import annotations
+
+import os
+import re
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+MARKER = "agentd-last-live-run"
+
+#: The three suite members `live` sequences, paired with the env var the harness stub
+#: reads its exit code from. Order matters: it is the order the body must run them in.
+# Read off `[tasks.live]`'s body rather than listed here, so adding a member to the tier
+# cannot leave this harness stubbing three of four and reporting the shortfall as a
+# sequencing defect. The env-var name each member's stub reads is derived from its task
+# name, which is the same rule the harness's generated `mise.toml` follows.
+MEMBER_EXIT_VARS: dict[str, str] = {
+    "live:conformance-rs": "SUITE_EXIT",
+    "live:rates": "RATES_EXIT",
+    "live:verify-clean": "CLEAN_EXIT",
+    "live:paths": "PATHS_EXIT",
+}
+
+
+def members() -> tuple[tuple[str, str], ...]:
+    """Every `mise run live:<name>` the shipped tier body invokes, in order."""
+    found: list[tuple[str, str]] = []
+    for name in re.findall(r"^\s*mise run (live:[a-z-]+)", live_body(), flags=re.M):
+        if name in dict(found):
+            continue
+        exit_var = MEMBER_EXIT_VARS.get(name)
+        if exit_var is None:
+            raise SystemExit(
+                f"check-live-wiring: [tasks.live] invokes {name}, which this harness has "
+                f"no stub for. Add it to MEMBER_EXIT_VARS so the harness can drive it."
+            )
+        found.append((name, exit_var))
+    return tuple(found)
+
+
+def repo() -> Path:
+    return Path(__file__).resolve().parent.parent
+
+
+def ran_marker(member: str) -> str:
+    """What a stubbed member prints when it runs.
+
+    No colon, because `live:verify-clean` appears in mise's own task-header lines
+    (`[live:verify-clean] $ ...`) and counting those instead of the task's output is how a
+    "ran exactly once" assertion silently becomes "was scheduled once".
+    """
+    return "RAN-" + member.replace(":", "-")
+
+
+# ── 1. the marker path ───────────────────────────────────────────────────────
+
+
+def marker_path(cwd: Path | None = None) -> str:
+    """The marker's path, as git answers it for *this* repo shape."""
+    out = subprocess.run(
+        ["git", "rev-parse", "--git-path", MARKER],
+        capture_output=True,
+        text=True,
+        check=True,
+        cwd=cwd,
+    )
+    return out.stdout.strip()
+
+
+def git(*args: str, cwd: Path) -> str:
+    """A git invocation with an identity, so `commit` works in a throwaway repo."""
+    out = subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.email=guard@example.invalid",
+            "-c",
+            "user.name=guard",
+            "-c",
+            "commit.gpgsign=false",
+            *args,
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+        cwd=cwd,
+    )
+    return out.stdout.strip()
+
+
+def round_trip(cwd: Path) -> tuple[bool, str]:
+    """Write the marker and read it back, exactly as the two consumers do.
+
+    Behavioral rather than textual: it performs the redirect that failed live, so a path
+    naming a location nothing can be written to fails here as it did there.
+    """
+    head = git("rev-parse", "HEAD", cwd=cwd)
+    path = marker_path(cwd)
+    target = cwd / path
+    try:
+        target.write_text(head + "\n", encoding="utf-8")
+    except OSError as exc:
+        return False, f"the write failed: {exc}"
+    if not target.is_file():
+        return False, f"{path} is not a file after the write"
+    if target.read_text(encoding="utf-8").strip() != head:
+        return False, "the marker does not read back as the commit written"
+    return True, path
+
+
+def seed_repo(at: Path) -> None:
+    at.mkdir(parents=True, exist_ok=True)
+    git("init", "-q", "-b", "main", ".", cwd=at)
+    (at / "a").write_text("a\n", encoding="utf-8")
+    git("add", "a", cwd=at)
+    git("commit", "-qm", "one", cwd=at)
+
+
+def check_marker_path(report: list[str]) -> None:
+    """Both repo shapes, plus the literal's absence from the two consumers.
+
+    **Guard proof.** Replacing `marker_path`'s body with `return f".git/{MARKER}"` fails
+    the worktree case — `Errno 20 Not a directory` on the write, the live failure
+    reproduced — while the plain-clone case stays green. That asymmetry is the point: a
+    guard exercising only a plain clone would pass on the code that lost a 228-second run.
+    Verified.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        clone = root / "clone"
+        seed_repo(clone)
+        say(report, *round_trip_named(clone, "plain clone"))
+
+        # The shape this project's live runs use, and the one the literal cannot express.
+        tree = root / "wt"
+        git("worktree", "add", "-q", "-b", "guard", str(tree), cwd=clone)
+        if not (tree / ".git").is_file():
+            say(
+                report,
+                False,
+                "worktree",
+                "a worktree's .git is not a file — harness bug",
+            )
+        else:
+            say(report, *round_trip_named(tree, "worktree"))
+
+    # The textual half. The behavioral half proves *this script* is right and says nothing
+    # about whether the consumers call it; a regression here is someone re-inlining the
+    # literal, which is how it got into two files.
+    for name in ("mise.toml", "lefthook.yml"):
+        text = (repo() / name).read_text(encoding="utf-8")
+        # In a comment the literal is describing the bug, which both files now do at
+        # length. Only a live line can reintroduce it.
+        offenders = [
+            line
+            for line in text.splitlines()
+            if f".git/{MARKER}" in line and not line.lstrip().startswith("#")
+        ]
+        say(
+            report,
+            not offenders,
+            f"{name} does not inline the .git/ literal",
+            "ok" if not offenders else f"spells it: {offenders[0].strip()}",
+        )
+
+
+def round_trip_named(at: Path, label: str) -> tuple[bool, str, str]:
+    ok, detail = round_trip(at)
+    return ok, f"the marker round-trips in a {label}", detail
+
+
+# ── 2 and 3. the sequencing, and the trap that survives a failure ────────────
+
+
+def live_body() -> str:
+    """`[tasks.live]`'s `run` body, read out of the real `mise.toml`.
+
+    Read rather than re-described, so the harness exercises the shipped text. A
+    hand-written imitation would keep passing after the real body stopped working, which
+    is the one thing this file must not do.
+    """
+    text = (repo() / "mise.toml").read_text(encoding="utf-8")
+    after = text[text.index("[tasks.live]\n") + len("[tasks.live]\n") :]
+    block = after[: after.index("\n[tasks.")]
+    match = re.search(r'^run = """\n(.*?)^"""$', block, flags=re.M | re.S)
+    if match is None:
+        raise SystemExit(
+            "check-live-wiring: [tasks.live] has no multi-line `run` body.\n"
+            "  The sequencing has moved back into `depends`, which is defects 2 and 3\n"
+            "  again — see this script's docstring for what each one cost."
+        )
+    return match.group(1)
+
+
+def harness(at: Path) -> None:
+    """A throwaway repo whose `live` task is the real body over stubbed members."""
+    seed_repo(at)
+    # The stub's marker comes through `env` rather than being written into the `run`
+    # line, and that is a correctness fix rather than tidiness: mise echoes each task's
+    # command before running it, so a literal `echo RAN-live:verify-clean` puts the token
+    # in the transcript **twice** — once echoed, once printed — and every "ran exactly
+    # once" assertion below reads 2. Behind `$RAN` the echoed line is `echo $RAN` and the
+    # token appears only where the task actually produced it.
+    stubs = "".join(
+        f'[tasks."{name}"]\n'
+        f'env = {{ RAN = "{ran_marker(name)}" }}\n'
+        f'run = "echo $RAN; exit ${{{var}:-0}}"\n\n'
+        for name, var in members()
+    )
+    # The body shells out to this script for the marker path, so the harness needs a copy
+    # at the same relative path rather than a stub — the real one is what `live` calls.
+    (at / "scripts").mkdir(exist_ok=True)
+    mine = repo() / "scripts" / "check-live-wiring"
+    copy = at / "scripts" / "check-live-wiring"
+    copy.write_bytes(mine.read_bytes())
+    copy.chmod(0o755)
+    (at / "mise.toml").write_text(
+        f'{stubs}[tasks.live]\nrun = """\n{live_body()}"""\n', encoding="utf-8"
+    )
+
+
+def run_live(at: Path, **overrides: str) -> tuple[int, str]:
+    out = subprocess.run(
+        ["mise", "run", "live"],
+        capture_output=True,
+        text=True,
+        cwd=at,
+        # `MISE_CONFIG_FILE` dropped so the harness reads its own `mise.toml` rather than
+        # this repo's, which would run the real billable tier.
+        env={k: v for k, v in os.environ.items() if k != "MISE_CONFIG_FILE"}
+        | overrides,
+    )
+    return out.returncode, out.stdout + out.stderr
+
+
+def check_sequencing(report: list[str]) -> None:
+    """The order, the trap, and the marker's dependence on success.
+
+    **Guard proof, each breakage applied to `mise.toml` and observed:**
+
+    - `trap verify_clean EXIT INT TERM` deleted: the suite-fails case reports **0** leak
+      checks instead of 1. Verified. This is defect 3, and it is the whole reason the body
+      is a shell sequence rather than `depends_post`.
+    - the `verified` flag deleted: the green case reports **2** leak checks. Verified. A
+      double report reads like two leaks.
+    - the members put back into `depends`: `live_body` raises and names the defect.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        at = Path(tmp) / "harness"
+        harness(at)
+        marker = at / marker_path(at)
+        leaks = ran_marker("live:verify-clean")
+        suite = ran_marker("live:conformance-rs")
+
+        # -- green: every member runs, in order, and the marker is written -------
+        code, out = run_live(at)
+        say(report, code == 0, "a green tier exits 0", f"exit {code}")
+        ran = [name for name, _ in members() if ran_marker(name) in out]
+        say(
+            report,
+            len(ran) == len(members()),
+            "every member runs",
+            f"{len(ran)} of {len(members())}: {ran}",
+        )
+        suite_at, clean_at = out.find(suite), out.find(leaks)
+        say(
+            report,
+            0 <= suite_at < clean_at,
+            "the leak check runs AFTER the suite (defect 2)",
+            f"suite at {suite_at}, leak check at {clean_at}",
+        )
+        say(
+            report,
+            out.count(leaks) == 1,
+            "the leak check runs exactly once",
+            f"{out.count(leaks)} time(s)",
+        )
+        say(
+            report, marker.is_file(), "the marker records a successful run", marker.name
+        )
+
+        # -- red: the suite fails, which is when resources survive ---------------
+        marker.unlink()
+        code, out = run_live(at, SUITE_EXIT="1")
+        say(report, code != 0, "a failed suite fails the tier", f"exit {code}")
+        say(
+            report,
+            out.count(leaks) == 1,
+            "the leak check runs when the SUITE FAILS (defect 3)",
+            f"{out.count(leaks)} time(s)",
+        )
+        say(
+            report,
+            not marker.is_file(),
+            "no marker for a failed run",
+            "absent" if not marker.is_file() else "written anyway",
+        )
+
+        # -- red: the free rate check fails after the billable suite ------------
+        code, out = run_live(at, RATES_EXIT="1")
+        say(
+            report,
+            suite in out,
+            "a drifted rate cannot pre-empt the billable suite",
+            "the suite ran first" if suite in out else "it did not run",
+        )
+        say(
+            report,
+            out.count(leaks) == 1 and not marker.is_file(),
+            "a rate failure still gets a leak check and no marker",
+            f"{out.count(leaks)} leak check(s), "
+            f"marker {'present' if marker.is_file() else 'absent'}",
+        )
+
+
+# ── reporting ────────────────────────────────────────────────────────────────
+
+
+def say(report: list[str], ok: bool, name: str, detail: str) -> None:
+    print(f"  {'ok  ' if ok else 'FAIL'}  {name:<52} {detail}")
+    if not ok:
+        report.append(f"{name}: {detail}")
+
+
+def check() -> int:
+    report: list[str] = []
+    print("== the live tier's wiring, offline ==")
+    print("-- 1. the marker path, in both repo shapes --")
+    check_marker_path(report)
+    print("-- 2 and 3. the sequencing, and the trap that survives a failure --")
+    check_sequencing(report)
+    if report:
+        print("\nlive wiring: the tier would not do what its comments say")
+        for line in report:
+            print(f"  {line}")
+        return 1
+    print(
+        "\nlive wiring: the marker resolves in both repo shapes; the leak check runs "
+        "after\nthe suite and on the failure path; the marker records successes only"
+    )
+    return 0
+
+
+def main() -> int:
+    if "--marker-path" in sys.argv[1:]:
+        print(marker_path())
+        return 0
+    return check()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

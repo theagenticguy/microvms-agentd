@@ -12,7 +12,7 @@
     "build": "napi build --manifest-path ../Cargo.toml --package microvms-js --platform --output-dir .",
     "test": "node --test __test__/*.mjs",
     "test:smoke": "node --test __test__/smoke.mjs",
-    "test:unit": "node --test __test__/cost.mjs __test__/errors.mjs __test__/exec.mjs __test__/session.mjs"
+    "test:unit": "node --test __test__/cost.mjs __test__/errors.mjs __test__/exec.mjs __test__/process.mjs __test__/session.mjs"
   },
   "devDependencies": {
     "@napi-rs/cli": "^3.8.2"

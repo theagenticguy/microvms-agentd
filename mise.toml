@@ -200,9 +200,32 @@ description = "Release build of the `microvm` CLI, for the host"
 # an artifact only the live tier consumes.
 run = "cargo build --release -p microvms-cli"
 
+[tasks."live:check"]
+description = "Fail if the live tier's own wiring is wrong. Offline and free"
+# In `check` rather than `live` for the reason `model:check` gives: no network, no
+# credentials, no money, so it costs the same as a lint. It is also the one gate whose
+# subject is *this file*, which nothing checked — and a 228-second billable run on
+# 2026-08-15 found three defects in it, none of them in anything the suite tests: a leak
+# check that reported clean at t=5s before the suite created anything, a free rate check
+# racing the billable suite it could abort, and a marker write that failed outright in a
+# worktree. All three are cheap to assert offline and expensive to find any other way.
+#
+# `live:` prefixed but deliberately NOT in `live`'s own dependency list: a guard over the
+# tier's wiring belongs in the gate that runs every time, not in the tier it describes,
+# which runs when someone decides to spend money.
+run = "./scripts/check-live-wiring"
+
 [tasks.check]
 description = "The full local gate — the definition of done"
-depends = ["lint", "security", "test", "schema:check", "model:check", "build"]
+depends = [
+  "lint",
+  "security",
+  "test",
+  "schema:check",
+  "model:check",
+  "live:check",
+  "build",
+]
 
 # ── live AWS suites (billable, manual) ──────────────────────────────────────
 
@@ -294,6 +317,11 @@ description = "Ask the account what leaked, rather than trusting teardown"
 # Independent of the code that did the cleanup, which is the whole point:
 # `terraform destroy` once reported success while six service-created log groups
 # survived, because Terraform never owned them.
+#
+# Ordering it *after* the suite is `live`'s job, not a `wait_for` here — see that task's
+# body for why the sequencing had to move out of `depends` entirely. This task stays a
+# plain one so `mise run live:verify-clean` remains the bare "what is in my account right
+# now" question, which is what someone reaches for after an interrupted run.
 run = "./scripts/verify-clean"
 
 [tasks.live]
@@ -317,7 +345,6 @@ description = "Every live suite, then an independent leak check. BILLABLE."
 # protocol coverage, and as of the CLI-coverage waves it expresses all 77 named checks
 # with none skipped — the 34 it used to name as inexpressible are real checks against the
 # five new attached subcommands.
-#
 # 77 rather than the 75 this line and the README carried until 2026-08-15. The count had
 # already drifted to 76 without either being updated — a measured live run reported
 # "76 of 76" against three places claiming 75 — and the log-group delete described in
@@ -325,74 +352,78 @@ description = "Every live suite, then an independent leak check. BILLABLE."
 # where someone decides whether to trust the tier, so it is worth keeping right; that it
 # drifted once is the argument for reading it off a run rather than from memory.
 #
-# ── Called in sequence here, NOT declared as `depends` ──────────────────────
+# Only the two builds and the stack in `depends`. The three suites are sequenced in the
+# body below instead, and that is a correction rather than a style choice: measured
+# 2026-08-15, `depends = ["live:rates", "live:conformance-rs", "live:verify-clean"]` ran all
+# three **in parallel**, and each of the three orderings it produced was wrong.
 #
-# This read `depends = ["live:rates", "live:conformance-rs", "live:verify-clean"]`, and
-# `depends` in mise is a *parallel* set with no order between siblings. So the leak check
-# raced the suite that creates the resources it checks for, and this description — "then
-# an independent leak check" — described an ordering the task did not have.
+#   `live:verify-clean` finished at t=5s of a 228-second run and printed "account
+#   us-east-1: clean" — about an account nothing had touched yet. A leak check that
+#   cannot have seen the leak is not a weak check, it is a false assurance, and it is
+#   the one line a caller reads to decide whether to go looking.
 #
-# Measured 2026-08-15, and it did not merely report the wrong thing, it *broke the run*:
-# `live:verify-clean` finished in 5s against an account another live run was mid-build in,
-# reported that run's CREATING image as a leak, exited 1, and mise cancelled the whole
-# graph — killing `terraform init` at "Provider installation was canceled by an interrupt
-# signal." The suite never started. A leak check that runs before the suite cannot see
-# what the suite leaked, and can only see what someone else is using.
+#   `live:rates` raced the billable suite. mise kills the surviving siblings when one
+#   member of a parallel set fails, so a rate drifting past the 0.5% tolerance — a free
+#   check about a published figure — would have aborted the run that spends the money,
+#   mid-flight, with a MicroVM up. The killed task gets a TERM and a shell trap fires,
+#   but the VM here is launched by a Python driver two processes down.
 #
-# Three properties are wanted at once, and no single mise primitive has all three:
+#   And nothing ordered the marker write after the suites at all.
 #
-#   1. **Order.** The suite must finish before the account is asked what leaked.
-#   2. **The leak check runs even when the suite fails.** A failed suite is exactly when
-#      resources are most likely to survive, so cleanup must not be skipped by the failure
-#      that made it necessary — which is what `if: always()` already says in
-#      `.github/workflows/live-conformance.yml`, and the reason it says it.
-#   3. **A failure anywhere fails the task**, and the live-verified marker is not written.
+# mise has no `if: always()`. `depends_post` runs only when the task succeeds, and a
+# `wait_for` chain stops dead at the first failure — both measured — so under either one
+# the leak check is skipped exactly when the suite failed, which is precisely when
+# resources survive. That is the reason this is a shell body with a trap: the trap is the
+# only always-run primitive available, and `.github/workflows/live-conformance.yml` says
+# the same thing with `if: always()` on both cleanup steps.
+depends = ["build", "build:cli", "live:infra"]
+# Order, and what each position buys:
 #
-# `wait_for` gives 1 and 3 but not 2: a `wait_for` dependent is *skipped* when what it
-# waits on fails (measured — the leak check did not run at all). `depends` gives 2 and 3
-# but not 1, which is the bug above. So the members are invoked from the body in order,
-# each failure recorded rather than short-circuiting, and the marker written only when
-# every one passed. `mise run <task>` nested inside a task body is ordinary and still
-# resolves that task's own `depends` — `live:conformance-rs` still gets its two builds and
-# the stack applied.
+# 1. the suite, first, because it is the billable one and nothing free should be able to
+#    kill it. The stack it needs is already applied by `depends`.
+# 2. `live:rates` after, so a drifted rate is reported once the VM is down. Same order
+#    the CI workflow uses, for the reason it states: "runs after the suite so a rate that
+#    moved does not stop the account from being torn down".
+# 3. `live:verify-clean` in the trap, so it runs on the failure path too — an interrupted
+#    or failed suite is the case where the account most needs asking.
+# 4. the marker only on the success path, because it is a claim that this commit is
+#    live-verified and a failed run does not support it. `set -e` above is what makes
+#    that true by construction rather than by an `if`.
 #
-# The three tasks stay separately nameable, which is the property `depends` was buying:
-# `mise run live:verify-clean` alone is how someone asks the account what leaked without
-# spending anything.
+# Records the commit that was last proven against real AWS. The pre-push hook reads it to
+# tell you whether the daemon has changed since — advisory only, because only a human knows
+# whether a given change could touch the platform boundary. Lives in the git directory so
+# it is per-clone and never committed: a marker claiming someone else's run is worse than
+# no marker.
+#
+# The path comes from `scripts/live-marker-path` rather than the literal `.git/…`, because
+# in a **worktree** `.git` is a *file* and the redirect fails with "Not a directory" —
+# measured 2026-08-15, where a 228-second billable run ended `[live] ERROR task failed` on
+# this line with all 76 checks green and the account clean. `mise run marker:check` is the
+# offline guard over both repo shapes, and that script's docstring carries the rest.
 run = """
-status=0
-mise run live:rates || status=1
-# Before the suite: it is free, read-only, and takes a second, and it is the member that
-# fails first when a URL member's encoding is wrong — so a signing bug is reported as a
-# signing bug rather than as a launch that could not resolve its image.
-mise run live:paths || status=1
-mise run live:conformance-rs || status=1
-# Always, even when the suite above failed — see property 2.
-mise run live:verify-clean || status=1
-if [ "$status" -ne 0 ]; then
-  echo 'a live member failed; NOT recording this commit as live-verified' >&2
-  exit "$status"
-fi
-# Records the commit that was last proven against real AWS. The pre-push hook
-# reads it to tell you whether the daemon has changed since — advisory only,
-# because only a human knows whether a given change could touch the platform
-# boundary. Lives in the git dir so it is per-clone and never committed: a marker
-# claiming someone else's run is worse than no marker.
-#
-# Written only on a fully green run, which the old `depends` shape could not promise: a
-# task body runs after its dependencies *succeed*, but a marker is worth more than that —
-# it is read to decide whether a live run is still needed.
-#
-# `git rev-parse --git-dir` rather than the literal `.git/`, because in a **worktree**
-# `.git` is a *file* containing a gitdir pointer, not a directory. The literal failed with
-# "sh: .git/agentd-last-live-run: Not a directory" — measured 2026-08-15 at the end of an
-# otherwise fully green run, which is the worst place to put a shell error: every billable
-# member had passed and the tier still reported failure. `--git-dir` resolves to the real
-# per-worktree directory in both layouts, so the marker is per-worktree, which is also the
-# correct scope — two worktrees on two branches have not proven the same commit.
-marker="$(git rev-parse --git-dir)/agentd-last-live-run"
-git rev-parse HEAD > "$marker"
-echo "recorded this commit as live-verified in $marker"
+set -e
+# Idempotent, because the trap fires on the normal exit as well as on a failure and a
+# double leak report reads like two leaks.
+verified=0
+verify_clean() {
+  [ "$verified" = 1 ] && return 0
+  verified=1
+  echo '== independent leak check =='
+  mise run live:verify-clean
+}
+trap verify_clean EXIT INT TERM
+
+# Before the suite: free, read-only, seconds, and it is the member that fails first when
+# a URL member's encoding is wrong, so a signing bug is reported as a signing bug rather
+# than as a launch that could not resolve its image.
+mise run live:paths
+mise run live:conformance-rs
+mise run live:rates
+verify_clean
+
+git rev-parse HEAD > "$(./scripts/check-live-wiring --marker-path)"
+echo 'recorded this commit as live-verified'
 """
 
 [tasks."live:destroy"]

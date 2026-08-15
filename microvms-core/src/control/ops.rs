@@ -199,12 +199,94 @@ pub struct CreateAuthTokenWire {
     pub allowed_ports: Vec<PortSpecification>,
 }
 
-/// `PortSpecification`, a union. This client only ever names a single port.
+/// `PortSpecification`, the model's tagged union: one port, a range, or all of them.
+///
+/// A union rather than the single-field struct this was, and the change is a defect fix
+/// rather than completeness for its own sake. `Session::connect_headers(port)` and
+/// `connect_subprotocols(port)` exist to reach *another* port on the same VM, and they were
+/// built over a token the control plane had minted with `allowedPorts: [{port: 9000}]` — so
+/// they returned a correct-looking port header behind a credential that did not authorize
+/// it. Measured 2026-08-15 on one VM with a listener on 8080, varying only the mint:
+///
+/// | `allowedPorts` | `GET :8080` through the endpoint |
+/// | --- | --- |
+/// | `[{port: 9000}]` | **403 `Access to port denied`** |
+/// | `[{port: 9000}, {port: 8080}]` | 200, the guest answered |
+/// | `[{allPorts: {}}]` | 200 |
+/// | `[{range: {startPort: 8000, endPort: 9100}}]` | 200 |
+///
+/// One variable, four outcomes, so the token's scope is the whole of it. On the WebSocket
+/// path the same rejection is close code 1006 with no reason, which is why this was
+/// invisible to a client-side test: the strings were right and the credential behind them
+/// was not.
+///
+/// `#[serde(untagged)]` because the wire form is the *member name* as the key —
+/// `{"port": 9000}`, `{"range": {..}}`, `{"allPorts": {}}` — not a discriminator field, and
+/// serde's default enum representation would emit `{"Port": 9000}`. Each variant names its
+/// own key through `rename`.
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(untagged)]
+pub enum PortSpecification {
+    /// Exactly one port. What a session built for the agent port asks for.
+    One {
+        #[serde(rename = "port")]
+        port: u16,
+    },
+    /// An inclusive range. Both members are required by the model.
+    Range {
+        #[serde(rename = "range")]
+        range: PortRange,
+    },
+    /// Every port on the VM.
+    ///
+    /// Deliberately **not** what this client mints by default. A token good for every port
+    /// is one whose leak is worth more, and the ports a caller actually needs are knowable:
+    /// the agent port plus whatever it asked for. Present because the model has it and a
+    /// caller building a general proxy needs it, reached only through an explicit scope.
+    All {
+        #[serde(rename = "allPorts")]
+        all_ports: AllPorts,
+    },
+}
+
+impl PortSpecification {
+    /// One port.
+    pub fn port(port: u16) -> Self {
+        Self::One { port }
+    }
+
+    /// An inclusive range of ports.
+    pub fn range(start: u16, end: u16) -> Self {
+        Self::Range {
+            range: PortRange {
+                start_port: start,
+                end_port: end,
+            },
+        }
+    }
+
+    /// Every port. See [`PortSpecification::All`] for why this is not a default.
+    pub fn all() -> Self {
+        Self::All {
+            all_ports: AllPorts {},
+        }
+    }
+}
+
+/// `PortRange`. Inclusive at both ends, per the model's `min: 1, max: 65535` on each.
 #[derive(Clone, Copy, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct PortSpecification {
-    pub port: u16,
+pub struct PortRange {
+    pub start_port: u16,
+    pub end_port: u16,
 }
+
+/// `AllPorts`, which the model declares with no members.
+///
+/// An empty struct rather than a unit one, because the wire form is `{}` and a unit struct
+/// serialises to `null` — which the service rejects as a malformed union member.
+#[derive(Clone, Copy, Debug, Serialize)]
+pub struct AllPorts {}
 
 // ── responses ───────────────────────────────────────────────────────────────
 
@@ -1033,7 +1115,7 @@ mod tests {
     fn the_auth_token_request_body_carries_no_uri_parameter() {
         let wire = CreateAuthTokenWire {
             expiration_in_minutes: 60,
-            allowed_ports: vec![PortSpecification { port: 9000 }],
+            allowed_ports: vec![PortSpecification::port(9000)],
         };
         let value = serde_json::to_value(&wire).expect("serialises");
         assert_eq!(value["expirationInMinutes"], 60);
@@ -1045,6 +1127,50 @@ mod tests {
                 .contains_key("microvmIdentifier"),
             "it is a uri-located member: {value}"
         );
+    }
+
+    /// **Each union variant serialises as the member name the model declares, with nothing
+    /// else alongside it.**
+    ///
+    /// The wire form of a Smithy union is one key, and serde's default enum representation is
+    /// `{"One": {"port": 9000}}` — a shape the service rejects as an undeclared member. So
+    /// `untagged` plus a `rename` per field is not a style choice, and this test is what says
+    /// so: it asserts the *exact* key set, because a variant that serialised as two keys or as
+    /// the wrong one would still be valid JSON and would fail only against real AWS.
+    ///
+    /// The three variants together are what the port-scope fix rests on. Measured 2026-08-15:
+    /// a token minted with only `{"port": 9000}` answers 403 `Access to port denied` for a
+    /// `GET :8080`, and all three of the forms below answer 200.
+    ///
+    /// **Guard proof.** Dropping `#[serde(untagged)]` makes every case fail with the variant
+    /// name as the key (`{"One": ..}`). Renaming `all_ports`'s field to snake_case makes the
+    /// `allPorts` case fail. Making `AllPorts` a unit struct serialises it as `null` and the
+    /// object assertion fails. Each applied and observed.
+    #[test]
+    fn each_port_specification_variant_serialises_as_its_model_member() {
+        let cases = [
+            (
+                PortSpecification::port(8080),
+                "port",
+                serde_json::json!(8080),
+            ),
+            (
+                PortSpecification::range(8000, 9100),
+                "range",
+                serde_json::json!({ "startPort": 8000, "endPort": 9100 }),
+            ),
+            (PortSpecification::all(), "allPorts", serde_json::json!({})),
+        ];
+        for (spec, key, expected) in cases {
+            let value = serde_json::to_value(spec).expect("serialises");
+            let object = value.as_object().expect("a union member is an object");
+            assert_eq!(
+                object.keys().collect::<Vec<_>>(),
+                vec![key],
+                "a union serialises as exactly one member named by the model: {value}"
+            );
+            assert_eq!(object[key], expected, "{key} carries the model's shape");
+        }
     }
 
     fn minimal_create_wire() -> CreateMicrovmImageWire {

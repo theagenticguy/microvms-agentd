@@ -56,12 +56,22 @@ pre-push:
       # seam — so a change to the real AWS path is exactly the change no local
       # tier can see. Leaving them out would have made this note quietest about
       # the newest code. The Python client's path came off the list with the client.
+      #
+      # `git rev-parse --git-path` rather than the literal `.git/`, matching the writer in
+      # `mise.toml`. In a worktree `.git` is a file, so the literal names a path inside a
+      # non-directory: the writer failed outright there, and this reader would have taken
+      # the "no live run recorded" branch forever — the quieter failure of the two, and the
+      # worse one, because the note it prints is indistinguishable from the truth.
       run: |
+<<<<<<< HEAD
         # `--git-dir`, not the literal `.git/`: in a worktree `.git` is a file holding a
         # gitdir pointer, so the literal never finds the marker and this note degrades to
         # "no live AWS run recorded" on every push from a worktree — advice that looks
         # like information. `mise run live` writes to the same resolved path.
         marker="$(git rev-parse --git-dir)/agentd-last-live-run"
+=======
+        marker=$(git rev-parse --git-path agentd-last-live-run)
+>>>>>>> origin/main
         if [ ! -f "$marker" ]; then
           echo "note: no live AWS run recorded in this clone."
           echo "      \`mise run live\` before merging anything that touches the"

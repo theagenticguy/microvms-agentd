@@ -492,6 +492,39 @@ The 60-minute ceiling means a long-running trial will mint a fresh token
 mid-flight. Token minting therefore sits inside the retry path, and boto/HTTP
 errors from minting must be handled wherever a request can be retried.
 
+### `allowedPorts` is a union of three forms, and the scoping is enforced
+
+Measured 2026-08-15, us-east-1, API version `2025-09-09`. One VM with a listener on
+8080, four tokens, varying **only** `allowedPorts` — so the token's scope is the whole
+of the difference:
+
+| `allowedPorts` | `GET :8080` through the endpoint |
+| --- | --- |
+| `[{"port": 9000}]` | **403 `Access to port denied`** |
+| `[{"port": 9000}, {"port": 8080}]` | 200, the guest's own server answered |
+| `[{"allPorts": {}}]` | 200 |
+| `[{"range": {"startPort": 8000, "endPort": 9100}}]` | 200 |
+
+So the documented sentence above — "a token minted for port 9000 cannot reach port
+8080" — is exactly true, and it is enforced at the proxy rather than at mint time. The
+mint of a token for a port with nothing listening succeeds; a request through it
+answers **502** rather than 403, which is the distinction between "not authorized" and
+"authorized, nothing there". That pair is the only diagnostic separating a scope
+mistake from a dead server, and it is worth more than it looks: **on the WebSocket path
+both are close code 1006 with no reason string.**
+
+`PortSpecification` is a Smithy tagged union with three members — `port`, `range`
+(`startPort`/`endPort`, both required), and `allPorts` (no members, wire form `{}`).
+The wire form is the member name as the sole key. A client emitting a discriminator
+field instead — which is what most enum serializers do by default — sends a member the
+shape does not declare and is rejected.
+
+**One token can cover several ports, which is what makes a per-port credential helper
+possible at all.** A client reaching more than one port on a VM has a choice: one token
+per port, or one token naming all of them. Naming them together is fewer control-plane
+calls and one refresh schedule instead of several; the cost is a credential whose leak
+reaches further, which is why `allPorts` should not be a default.
+
 ## `clientToken` is a permanent idempotency key
 
 Measured 2026-08-02, us-east-1. A `clientToken` derived from a
@@ -726,6 +759,63 @@ request. Anything asserting on a specific 4xx here should retry past a 5xx and n
 Measured 2026-08-05. `al2023-minimal`, `python:3.12-slim`, and `node:20-slim` all
 leave `WorkingDir` empty. Anything that tests WORKDIR inheritance needs a purpose
 -built image with `WORKDIR` set, since there is nothing to inherit otherwise.
+
+## A WebSocket reaches a guest server through the endpoint, and the proxy strips its own subprotocols
+
+> **Merge note.** `feat/live-measurements` adds a section under this same heading from an
+> independent run. The two agree on every shared observation — the three-value handshake
+> works, the guest sees no `sec-websocket-protocol`, a full-length JWE is token-legal, a
+> fourth application value reaches the guest, every failure is 1006 — so either text can be
+> kept. **What is only here** is the fourth row of the table below and the paragraph after
+> it: the credentials came out of `Session::connect_subprotocols`, and that is what exposed
+> the port-scope defect. Keep that part regardless of which prose survives.
+
+Measured 2026-08-15, us-east-1, API version `2025-09-09`, from an existing
+`coding-agents-b8ea1298a3b2` image. The guest ran a hand-rolled RFC 6455 echo server on
+node 18 (the image has no `ws` package and node has no built-in WebSocket *server*),
+logging every request header it received. The host connected with node's global
+`WebSocket` — the client shape that matters, because it is the one that cannot set a
+request header and is therefore the reason the platform moves auth into subprotocols.
+
+**Every credential in this run came from `Session::connect_subprotocols(port)` and
+`connect_headers(port)` through the built napi addon, not from strings assembled by the
+test.** That distinction is the whole value of the run: a test that spells the three
+values itself measures the platform, and the platform was never in doubt.
+
+| Question | Observation |
+| --- | --- |
+| Does the upgrade succeed with our helper's output | Yes. `readyState` 1 against `wss://<endpoint>/` |
+| What `Sec-WebSocket-Protocol` reaches the guest | **Nothing.** Absent from `req.headers` *and* from `rawHeaders`, so not a normalization artifact |
+| Must the guest echo a subprotocol | **No.** A 101 naming none is accepted, and the client still reports `ws.protocol === "lambda-microvms"` |
+| Do frames flow both ways | Yes. Three text frames out, three prefixed echoes back, in order |
+| Does a full-length JWE survive as a subprotocol name | Yes. An 899-byte auth value, zero non-RFC-7230-token bytes |
+
+The offered list is `["lambda-microvms", "lambda-microvms.authentication.<jwe>",
+"lambda-microvms.port.<n>"]` at lengths 15, 899, and 25. The JWE is token-legal by
+construction rather than by luck: compact-serialization JWE is base64url segments joined
+by `.`, and every one of those bytes is a tchar. No length limit was reached and nothing
+is re-encoded, so a caller does not escape or chunk the token.
+
+**The proxy strips its own headers on the plain-HTTPS path too.** The same guest, asked
+with `connect_headers(8080)`, answered 200 and reported `x-aws-proxy-auth` absent and
+`x-aws-proxy-port` absent from what it received. So neither transport leaks the
+credential into the VM, and a server inside needs no MicroVM awareness on either.
+
+**An application subprotocol passes through and the guest may negotiate it.** A fourth
+value alongside the three platform ones arrives as `sec-websocket-protocol:
+my-app-protocol`, alone, with all three platform values still stripped. If the guest
+names it in its 101 the client observes `ws.protocol === "my-app-protocol"`; if the guest
+names nothing the client observes `lambda-microvms`, which the proxy supplies on the
+guest's behalf. **So client-visible `ws.protocol` is not evidence about the guest** and
+must not be used as a negotiation check.
+
+**Every handshake failure is close code 1006 with no reason, and that is the reason the
+header path matters.** A token minted for the wrong port, a missing auth value, a dead
+TCP connection: all 1006, indistinguishable. The same wrong port on a plain authenticated
+`GET` answers 403 `Access to port denied` — or 502 when the scope is right and nothing is
+listening. That HTTPS request is the only way to tell a scope mistake from a dead server,
+which is why a client offering `connect_subprotocols` should offer `connect_headers`
+beside it.
 
 ## The guest kernel is 6.1, which `openat2` needs
 

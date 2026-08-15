@@ -372,6 +372,30 @@ impl TokenMinter for ControlPlaneMinter {
             Ok(minted.into())
         })
     }
+
+    /// Overrides the default, which ignores the ports and delegates.
+    ///
+    /// This is the minter that has a control plane behind it, so it is the one that can
+    /// actually widen a token's scope — and without this override
+    /// `Session::connect_headers(8080)` would keep answering a header pair behind a token
+    /// scoped to 9000 only, which the proxy refuses with 403 `Access to port denied`. See
+    /// [`TokenMinter::mint_for_ports`] for the measurement.
+    fn mint_for_ports(
+        &self,
+        ports: &[u16],
+    ) -> futures_util::future::BoxFuture<'_, Result<crate::session::ProxyToken, Error>> {
+        let specs: Vec<crate::control::ops::PortSpecification> = ports
+            .iter()
+            .map(|port| crate::control::ops::PortSpecification::port(*port))
+            .collect();
+        Box::pin(async move {
+            let minted = self
+                .control
+                .mint_auth_token_for(&self.microvm_id, &specs)
+                .await?;
+            Ok(minted.into())
+        })
+    }
 }
 
 /// One MicroVM's whole life.

@@ -476,6 +476,53 @@ impl PySession {
         Ok(PyBytes::new(py, &bytes))
     }
 
+    /// Both proxy headers for `port`, so a caller can open its **own** connection.
+    ///
+    /// A `dict[str, str]`, for pairing with `endpoint` when something outside this client
+    /// opens a socket to a port on this VM. Minted through the session's existing token
+    /// cache, so this does not burn a second control-plane call and does not open a second
+    /// refresh schedule (TRAP-9).
+    ///
+    /// **Empty for a direct session**, which is the true answer rather than a missing one: a
+    /// daemon reached directly takes no proxy headers.
+    ///
+    /// The auth value is a bearer credential and this returns it. Nothing here logs or
+    /// stores it, and no method *takes* a header map — so a caller cannot feed a forged or
+    /// expired one back in.
+    fn connect_headers(
+        &self,
+        py: Python<'_>,
+        port: u16,
+    ) -> PyCoreResult<std::collections::HashMap<String, String>> {
+        Ok(self.detached(py, |session| {
+            Ok(runtime::block_on_detached(session.connect_headers(port))?
+                .into_iter()
+                .collect())
+        })?)
+    }
+
+    /// The three WebSocket subprotocols for `port`, in the order a handshake offers them.
+    ///
+    /// A MicroVM endpoint takes the auth and the target port as `Sec-WebSocket-Protocol`
+    /// values rather than as headers, because the browser `WebSocket` constructor cannot set
+    /// a header — and the platform strips all three before forwarding, so a server inside
+    /// the VM never negotiates them.
+    ///
+    /// `None` for a direct session, and deliberately not an empty list: the subprotocol form
+    /// exists only for a request through the endpoint proxy, so a list carrying the base
+    /// value with no token would open a handshake refused for a reason naming neither the
+    /// token nor the port.
+    ///
+    /// The middle string carries the credential. Same rule as `connect_headers`.
+    fn connect_subprotocols(&self, py: Python<'_>, port: u16) -> PyCoreResult<Option<Vec<String>>> {
+        Ok(self.detached(py, |session| {
+            Ok(
+                runtime::block_on_detached(session.connect_subprotocols(port))?
+                    .map(|offered| offered.to_vec()),
+            )
+        })?)
+    }
+
     /// How many proxy tokens this session has minted, or `None` for a direct session.
     ///
     /// Exposed because it is the only observable that distinguishes a client which

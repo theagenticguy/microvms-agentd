@@ -40,7 +40,8 @@ pub use exec::{EndReason, ExecHandle, ExecResult, StreamEnd, StreamOptions, mint
 pub use http::{ChunkSource, HttpBackend, HttpRequest, HttpResponse, OpenStream, ReqwestBackend};
 pub use proxy::{
     Clock, DEFAULT_AGENT_PORT, DEFAULT_REFRESH_AFTER, MAX_TOKEN_LIFETIME, PROXY_AUTH_HEADER,
-    PROXY_PORT_HEADER, ProxyAuth, ProxyToken, TokenMinter, TokioClock,
+    PROXY_PORT_HEADER, ProxyAuth, ProxyToken, TokenMinter, TokioClock, WS_AUTH_SUBPROTOCOL_PREFIX,
+    WS_PORT_SUBPROTOCOL_PREFIX, WS_SUBPROTOCOL,
 };
 pub use sse::{ExecEvent, Frame, SseParser};
 
@@ -251,6 +252,52 @@ impl Session {
     /// The proxy auth, for a caller that needs the mint count or an invalidation.
     pub fn proxy_auth(&self) -> Option<&Arc<ProxyAuth>> {
         self.transport.proxy()
+    }
+
+    // -- credentials for a connection this session does not open ------------
+    //
+    // Both of the next two exist for one caller shape: something that opens its own socket
+    // to a port on this VM — a WebSocket to an in-VM bridge, an HTTP client the caller
+    // already owns — and needs the auth that would otherwise only be reachable by going
+    // through this session's own request path. They mint through [`ProxyAuth`]'s existing
+    // cache, so a consumer never reimplements TRAP-9's schedule, and neither stores what it
+    // returns.
+
+    /// Both proxy headers for `port`, minted through this session's token cache.
+    ///
+    /// The `{url, headers}` half of a port-endpoint resolution: pair these with
+    /// [`Self::endpoint`] and a caller can open its own connection with no knowledge of how
+    /// the token is minted or when it refreshes.
+    ///
+    /// **Empty for a direct session**, which is the correct answer rather than a missing one:
+    /// a daemon reached directly takes no proxy headers, so an empty set is exactly what its
+    /// requests carry today (see [`Transport::proxy`]).
+    ///
+    /// The auth value is a bearer credential and this returns it. Nothing in this crate logs
+    /// or stores the result.
+    pub async fn connect_headers(&self, port: u16) -> Result<Vec<(String, String)>, Error> {
+        match self.transport.proxy() {
+            Some(proxy) => proxy.headers_for_port(port).await,
+            None => Ok(Vec::new()),
+        }
+    }
+
+    /// The three WebSocket subprotocols for `port`, minted through this session's token
+    /// cache.
+    ///
+    /// `None` for a direct session, and that is deliberately not an empty list: the
+    /// subprotocol form exists only because a request through the *endpoint proxy* cannot set
+    /// headers, so there is nothing for a directly-reached daemon to offer, and a caller
+    /// handed `["lambda-microvms"]` with no token would open a handshake that is refused for a
+    /// reason naming neither.
+    ///
+    /// See [`ProxyAuth::subprotocols`] for the wire format and for the platform's stripping
+    /// behaviour. The middle value carries the credential.
+    pub async fn connect_subprotocols(&self, port: u16) -> Result<Option<[String; 3]>, Error> {
+        match self.transport.proxy() {
+            Some(proxy) => Ok(Some(proxy.subprotocols(port).await?)),
+            None => Ok(None),
+        }
     }
 
     /// Points the session at a new endpoint and drops the cached proxy token (STATE-8).
@@ -688,6 +735,14 @@ mod tests {
         request.header(name).map(str::to_string)
     }
 
+    /// One value out of a header pair list, matched as HTTP matches names.
+    fn header_of(headers: &[(String, String)], name: &str) -> Option<String> {
+        headers
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.clone())
+    }
+
     /// The live-run regression: `Transport::request` REPLACED the header vec with
     /// the auth headers, stripping the content type the caller set — the daemon
     /// answered 400 "body is not a valid start request" against real axum while
@@ -976,6 +1031,155 @@ mod tests {
         let err = session.health().await.expect_err("the body will not parse");
         assert_eq!(err.wire_kind(), Some(WireKind::ProtocolError));
         assert!(err.to_string().contains("/v1/schema"), "{err}");
+    }
+
+    // ── credentials for a caller's own connection ─────────────────────────────
+
+    /// **A session hands out connect credentials for a port it was not built with, off one
+    /// token cache, minting exactly once more to cover that port.**
+    ///
+    /// The property that makes an external `getPortEndpoint` a few lines rather than a
+    /// reimplementation: one health request warms the cache, the first workload-port call
+    /// widens the token, and the two accessors then share it.
+    ///
+    /// This test previously required `mint_count() == 1` after the workload-port calls —
+    /// "resolving a port endpoint burned a second control-plane call". That was the defect
+    /// written down as a requirement: a token scoped to the agent port does not authorize 8080,
+    /// so the credentials it praised are refused with 403 `Access to port denied` on the header
+    /// path and close code 1006 on the WebSocket path. Measured 2026-08-15 against real AWS.
+    /// The one-cache claim survives in the form that is true — **both** accessors answer off
+    /// the same widened token, which is still what stops TRAP-9 becoming two schedules.
+    ///
+    /// **Guard proof.** Give `connect_subprotocols` its own `ProxyAuth::new(..)` — the shape a
+    /// consumer that could not reach this session's auth would be forced into — and the mint
+    /// count reads 3 rather than 2, and the two accessors disagree on the auth value. Verified.
+    #[tokio::test]
+    async fn a_session_answers_connect_credentials_for_a_port_off_its_own_token_cache() {
+        let recorder = Recorder::with([Reply::ok(health_body(true))]);
+        let (session, auth, _) = session_with(Arc::clone(&recorder));
+
+        session.health().await.expect("health warms the cache");
+        assert_eq!(auth.mint_count(), 1);
+
+        let headers = session
+            .connect_headers(8080)
+            .await
+            .expect("the cached token answers");
+        let offered = session
+            .connect_subprotocols(8080)
+            .await
+            .expect("the cached token answers")
+            .expect("a proxied session offers subprotocols");
+
+        assert_eq!(
+            header_of(&headers, PROXY_PORT_HEADER).as_deref(),
+            Some("8080"),
+            "the caller asked for 8080 and would have targeted the session's port"
+        );
+        // The *widened* token, which is the second one minted: the first covers 9000 only.
+        assert_eq!(
+            header_of(&headers, PROXY_AUTH_HEADER).as_deref(),
+            Some(CountingMinter::value(1).as_str()),
+            "the header pair carried the agent-port-only token, which the proxy refuses for \
+             8080 with 403 'Access to port denied'"
+        );
+        assert_eq!(offered[0], proxy::WS_SUBPROTOCOL);
+        assert_eq!(
+            offered[1],
+            format!(
+                "{}{}",
+                proxy::WS_AUTH_SUBPROTOCOL_PREFIX,
+                CountingMinter::value(1)
+            ),
+            "the handshake carried a different token than the header path, so they are two \
+             caches rather than one"
+        );
+        assert_eq!(offered[2], "lambda-microvms.port.8080");
+        assert_eq!(
+            auth.mint_count(),
+            2,
+            "one mint covered both the agent port and 8080, which the control plane does not \
+             do — or the second accessor minted a third, which would be two caches"
+        );
+        assert!(
+            recorder.requests().len() == 1,
+            "building credentials sent a request to the VM: {:?}",
+            recorder.requests()
+        );
+    }
+
+    /// **A direct session offers no subprotocols at all, and that is not an empty list.**
+    ///
+    /// The asymmetry between the two accessors, asserted because it is the one thing a caller
+    /// could reasonably get backwards. Empty headers are what a direct session's requests
+    /// really carry, so `[]` there is a true answer. A subprotocol list *without* the token
+    /// would be a false one: the handshake would be offered, refused, and the refusal would
+    /// name neither the token nor the port.
+    ///
+    /// **Guard proof.** Return `Some([WS_SUBPROTOCOL.into(), String::new(), ..])` for the
+    /// direct case and the `is_none` assertion is red. Verified.
+    #[tokio::test]
+    async fn a_direct_session_offers_no_subprotocols_and_empty_headers() {
+        let recorder = Recorder::with([]);
+        let session = Session::builder("http://127.0.0.1:9000", "token")
+            .with_backend(recorder as http::SharedBackend)
+            .build()
+            .expect("builds");
+
+        assert!(
+            session
+                .connect_headers(9000)
+                .await
+                .expect("no proxy is not a failure")
+                .is_empty(),
+            "a direct session's requests carry no proxy headers, so neither should this"
+        );
+        assert!(
+            session
+                .connect_subprotocols(9000)
+                .await
+                .expect("no proxy is not a failure")
+                .is_none(),
+            "a handshake with the base subprotocol and no token is refused for a reason that \
+             names neither"
+        );
+    }
+
+    /// **A connect credential built after the refresh window carries the fresh token.**
+    ///
+    /// TRAP-9 through this door. A WebSocket outlives a request, so a connection opened at
+    /// minute fifty must hold a token minted at minute fifty — and the only observable is the
+    /// value, because a stale token and a fresh one produce identical successful handshakes
+    /// until one is rejected.
+    ///
+    /// **Guard proof.** Snapshot the subprotocols at `build()` and answer from the snapshot —
+    /// the shape a caller who resolved a port endpoint once would get — and the second value
+    /// still reads `jwe-0`. Verified.
+    #[tokio::test]
+    async fn connect_credentials_re_mint_when_the_refresh_window_has_rolled_over() {
+        let recorder = Recorder::with([]);
+        let (session, auth, clock) = session_with(recorder);
+
+        let first = session
+            .connect_subprotocols(9000)
+            .await
+            .expect("mints")
+            .expect("proxied");
+        assert!(first[1].ends_with(&CountingMinter::value(0)));
+
+        clock.advance(DEFAULT_REFRESH_AFTER + Duration::from_secs(1));
+        let second = session
+            .connect_subprotocols(9000)
+            .await
+            .expect("re-mints")
+            .expect("proxied");
+
+        assert_eq!(auth.mint_count(), 2);
+        assert!(
+            second[1].ends_with(&CountingMinter::value(1)),
+            "the handshake would carry a token past its refresh window: {}",
+            second[1]
+        );
     }
 
     /// A session's `Debug` does not print the agent token.

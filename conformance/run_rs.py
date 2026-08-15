@@ -1542,6 +1542,7 @@ def drive_suspend_resume(cli: Cli, launched: Envelope, results: Results) -> None
         )
 
 
+<<<<<<< HEAD
 def drive_teardown(cli: Cli, launched: Envelope, results: Results, logs: Any) -> None:
     """`microvm terminate --delete-image`, and what it honestly reports as left behind.
 
@@ -1572,6 +1573,34 @@ def drive_teardown(cli: Cli, launched: Envelope, results: Results, logs: Any) ->
 
     Deleted last, after the image, for the reason the `finally` block gives: the service
     can recreate a group whose image still exists, which is how six leaked.
+=======
+def drive_teardown(
+    cli: Cli, launched: Envelope, results: Results, logs: Any = None
+) -> None:
+    """`microvm terminate --delete-image`, what it names as left behind, and then this
+    suite deleting that.
+
+    The build log group appearing in `undeletedLogGroups` is a **normal outcome for the
+    client**, not a failure: neither `microvms-core` nor the CLI carries a CloudWatch
+    client, so the group is named rather than deleted. That is the whole reason it is
+    named — the service created it, no Terraform stack owns it, and `terraform destroy`
+    leaves it behind. Six of them accumulated before anyone noticed.
+
+    **But naming is where the client's responsibility ends and this suite's begins, and
+    it did not pick it up.** Measured 2026-08-15, once `mise run live` was fixed to run
+    its leak check *after* the suite rather than beside it: five log groups from five
+    conformance runs, and `scripts/verify-clean` calls every one a leak — correctly, since
+    a service-created group nothing owns is exactly what that script exists to find. So
+    the two halves of one tier disagreed by construction. `mise run live` could not be
+    green on a clean account no matter what the code did, and the only stable responses to
+    a gate that always fails are to stop reading it or to weaken it.
+
+    The suite deletes its own group, which is the resolution that keeps both claims: the
+    client still refuses CloudWatch (CLI-2) and still names what it cannot remove, and the
+    thing that *created* the group is the thing that removes it. `logs` is the boto3 client
+    already built for `read_daemon_logs` — this needs no new dependency, only for the suite
+    to finish the job the report handed it.
+>>>>>>> origin/main
     """
     print("\n== teardown ==")
     torn = cli.call(
@@ -1595,6 +1624,7 @@ def drive_teardown(cli: Cli, launched: Envelope, results: Results, logs: Any) ->
     )
     # Named rather than absent, which is the assertion. An empty list here would mean
     # the CLI had quietly stopped reporting a group it still cannot delete.
+<<<<<<< HEAD
     undeleted = torn.data.get("undeletedLogGroups") or []
     results.check(
         "the build log group was named rather than silently left",
@@ -1622,7 +1652,37 @@ def drive_teardown(cli: Cli, launched: Envelope, results: Results, logs: Any) ->
         "the suite deleted the build log group the CLI could not",
         not failures and len(deleted) == len(undeleted),
         f"deleted={deleted!r} failures={failures!r}",
+=======
+    named = torn.data.get("undeletedLogGroups") or []
+    results.check(
+        "the build log group was named rather than silently left",
+        bool(named),
+        f"{named!r} — this suite deletes it next",
+>>>>>>> origin/main
     )
+
+    # And then delete it, because naming it is the client's job and removing it is this
+    # suite's. Every group the report named, not a name rebuilt from the image — a
+    # reconstruction would delete the right thing while proving nothing about the report,
+    # and the report is what a human acts on.
+    if logs is None:
+        results.skip(
+            "the named build log group was deleted",
+            "no CloudWatch client was passed to drive_teardown",
+        )
+        return
+    for group in named:
+        try:
+            logs.delete_log_group(logGroupName=group)
+            deleted, detail = True, group
+        except logs.exceptions.ResourceNotFoundException:
+            # Already gone is the outcome this wanted, so it is a pass. The service
+            # recreates a group deleted before its image, which is how six accumulated —
+            # so this runs after the `--wait` terminate above, not before it.
+            deleted, detail = True, f"{group} (already absent)"
+        except Exception as exc:  # noqa: BLE001 - a teardown failure is a finding
+            deleted, detail = False, f"{group}: {type(exc).__name__}: {exc}"
+        results.check("the named build log group was deleted", deleted, detail)
 
 
 def read_daemon_logs(logs: Any, image_name: str) -> list[str]:
@@ -2226,11 +2286,18 @@ def main() -> int:
     results = Results()
     launched: Envelope | None = None
     daemon: Daemon | None = None
+<<<<<<< HEAD
     # Built here rather than inside the `try` below, because `drive_teardown` needs a
     # CloudWatch client to delete the build log group and it runs from the `finally` —
     # where a name bound inside the `try` may not exist at all. A teardown that raises
     # `UnboundLocalError` on the cleanup path would replace a real failure with a bug in
     # this file, on exactly the runs where cleanup matters most.
+=======
+    # Built here rather than inside the `try`, because the teardown in the `finally` needs a
+    # CloudWatch client and a name bound inside the block it is cleaning up after is a
+    # `NameError` waiting for the one run that fails early — which would replace a real
+    # failure with this file's own. Creating a boto3 session costs no API call.
+>>>>>>> origin/main
     aws = boto3.Session(region_name=cli.region)
 
     with tempfile.TemporaryDirectory() as tmp:
@@ -2292,9 +2359,13 @@ def main() -> int:
                 print("\n== teardown: nothing was launched ==")
             else:
                 # Never raises out of here: an exception in teardown would replace the
-                # real failure with a teardown failure. The log group is reported LAST
+                # real failure with a teardown failure. The log group is handled LAST
                 # because the service can recreate a group deleted before its image —
                 # which is how six of them leaked.
+                #
+                # `aws` is bound before the `try` for this call site's sake: a session
+                # created inside the block would be a `NameError` here on the one run that
+                # failed early, which would replace a real failure with this file's own.
                 try:
                     drive_teardown(cli, launched, results, aws.client("logs"))
                 except Exception as exc:  # noqa: BLE001 - a teardown failure is a finding
