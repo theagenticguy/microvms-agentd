@@ -383,7 +383,7 @@ mod tests {
     #[test]
     fn a_build_summary_deserialises_from_the_models_own_spelling() {
         let json = r#"{
-            "imageArn": "arn:aws:lambda:us-east-1:123456789012:microvm-image/img",
+            "imageArn": "arn:aws:lambda:us-east-1:123456789012:microvm-image:img",
             "imageVersion": "1",
             "buildId": "build-abc",
             "buildState": "PENDING",
@@ -411,7 +411,7 @@ mod tests {
     #[test]
     fn a_summary_spelled_state_instead_of_build_state_fails_to_deserialise() {
         let json = r#"{
-            "imageArn": "arn:aws:lambda:us-east-1:123456789012:microvm-image/img",
+            "imageArn": "arn:aws:lambda:us-east-1:123456789012:microvm-image:img",
             "imageVersion": "1",
             "buildId": "build-abc",
             "state": "PENDING",
@@ -435,10 +435,10 @@ mod tests {
     #[test]
     fn a_version_summary_does_use_state_which_is_why_the_build_one_confuses() {
         let json = r#"{
-            "baseImageArn": "arn:aws:lambda:us-east-1:aws:microvm-image/al2023-1",
+            "baseImageArn": "arn:aws:lambda:us-east-1:aws:microvm-image:al2023-1",
             "buildRoleArn": "arn:aws:iam::123456789012:role/build",
             "codeArtifact": {"uri": "s3://bucket/img.zip"},
-            "imageArn": "arn:aws:lambda:us-east-1:123456789012:microvm-image/img",
+            "imageArn": "arn:aws:lambda:us-east-1:123456789012:microvm-image:img",
             "imageVersion": "1",
             "state": "SUCCESSFUL",
             "status": "ACTIVE",
@@ -459,7 +459,7 @@ mod tests {
     fn an_image_listing_deserialises_from_the_models_own_spelling() {
         let json = r#"{
             "items": [{
-                "imageArn": "arn:aws:lambda:us-east-1:123456789012:microvm-image/img",
+                "imageArn": "arn:aws:lambda:us-east-1:123456789012:microvm-image:img",
                 "name": "img",
                 "state": "ACTIVE",
                 "latestActiveImageVersion": "1",
@@ -473,7 +473,7 @@ mod tests {
         assert_eq!(parsed.items[0].name, "img");
         assert_eq!(
             parsed.items[0].image_arn,
-            "arn:aws:lambda:us-east-1:123456789012:microvm-image/img"
+            "arn:aws:lambda:us-east-1:123456789012:microvm-image:img"
         );
         assert_eq!(parsed.items[0].state, "ACTIVE");
         assert_eq!(parsed.next_token.as_deref(), Some("opaque-page-2-token"));
@@ -493,7 +493,7 @@ mod tests {
             "microvmId": "mvm-123",
             "state": "TERMINATED",
             "endpoint": "https://mvm-123.microvm.amazonaws.com",
-            "imageArn": "arn:aws:lambda:us-east-1:123456789012:microvm-image/img",
+            "imageArn": "arn:aws:lambda:us-east-1:123456789012:microvm-image:img",
             "imageVersion": "1",
             "maximumDurationInSeconds": 3600,
             "startedAt": 1754524800,
@@ -517,7 +517,7 @@ mod tests {
             "microvmId": "mvm-123",
             "state": "RUNNING",
             "endpoint": "https://mvm-123.microvm.amazonaws.com",
-            "imageArn": "arn:aws:lambda:us-east-1:123456789012:microvm-image/img",
+            "imageArn": "arn:aws:lambda:us-east-1:123456789012:microvm-image:img",
             "imageVersion": "1",
             "maximumDurationInSeconds": 3600,
             "startedAt": 1754524800

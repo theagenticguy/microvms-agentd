@@ -809,18 +809,43 @@ mod tests {
         );
     }
 
-    /// An ARN in a URI parameter is percent-encoded, slashes included. `MicrovmImageIdentifier`
-    /// is documented as "ARN or ID", so this is the ordinary case rather than an edge one —
-    /// and an unencoded ARN's slashes would split into extra path segments addressing
-    /// something else entirely.
+    /// A **real** image ARN in a URI parameter is percent-encoded, every colon included.
+    /// `MicrovmImageIdentifier` is documented as "ARN or ID", so this is the ordinary case
+    /// rather than an edge one.
+    ///
+    /// The literal is the shape the service actually returns, measured 2026-08-15 in
+    /// us-east-1: `microvm-image:<name>` with a **colon**, which is also the only form the
+    /// model's `TaggableResource` pattern admits. This test used to hold
+    /// `microvm-image/img`, and the slash was not a harmless stand-in — `GetMicrovmImage`
+    /// on that form answers `AccessDeniedException`, because IAM evaluates a malformed ARN
+    /// as a resource with no matching policy.
     #[test]
-    fn an_arn_identifier_is_percent_encoded_including_its_slashes() {
-        let arn = "arn:aws:lambda:us-east-1:123456789012:microvm-image/img";
+    fn a_real_arn_identifier_is_percent_encoded_colons_and_all() {
+        let arn = "arn:aws:lambda:us-east-1:123456789012:microvm-image:img";
         let path = paths::microvm_image(arn);
         assert_eq!(
             path,
-            "/2025-09-09/microvm-images/arn%3Aaws%3Alambda%3Aus-east-1%3A123456789012%3Amicrovm-image%2Fimg"
+            "/2025-09-09/microvm-images/arn%3Aaws%3Alambda%3Aus-east-1%3A123456789012%3Amicrovm-image%3Aimg"
         );
+        assert!(
+            !path["/2025-09-09/microvm-images/".len()..].contains(':'),
+            "an unencoded colon in a path segment is a signature mismatch: {path}"
+        );
+    }
+
+    /// The encoder still encodes `/`, which is the property that matters even though a real
+    /// image ARN carries none.
+    ///
+    /// Kept as its own case rather than folded into the test above, because the input here
+    /// is a *shape the service does not use* and labelling it "an ARN" is what let the slash
+    /// form look load-bearing for twelve fakes. An unencoded slash would split into extra
+    /// path segments addressing something else, and other identifiers this encoder sees
+    /// (`imageVersion`, a `nextToken` cursor) genuinely can contain one.
+    #[test]
+    fn the_segment_encoder_encodes_slashes_wherever_they_come_from() {
+        assert_eq!(paths::encode_segment("a/b"), "a%2Fb");
+        let path = paths::microvm_image("has/a/slash");
+        assert_eq!(path, "/2025-09-09/microvm-images/has%2Fa%2Fslash");
         assert!(
             !path["/2025-09-09/microvm-images/".len()..].contains('/'),
             "an encoded identifier contributes no path separators: {path}"

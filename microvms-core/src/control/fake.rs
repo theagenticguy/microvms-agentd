@@ -321,12 +321,28 @@ impl Clock for TestClock {
 // Every string below is written by hand from `service-2.json`. None is produced by
 // serializing an `ops::` type, which is the point: a member misspelled in `ops.rs` cannot
 // be misspelled identically here by accident.
+//
+// **Every image ARN below uses `microvm-image:<name>`, with a colon.** These fakes used to
+// spell it `microvm-image/<name>` while `artifact.rs` built the colon form for the managed
+// base, so the repo disagreed with itself about the shape of the one identifier every call
+// takes — and the model's own `TaggableResource` pattern accepts only the colon.
+//
+// Settled by measurement rather than by reading, 2026-08-15, one read-only
+// `ListMicrovmImages` plus one `GetMicrovmImage` in us-east-1:
+//
+//     arn:aws:lambda:us-east-1:<account>:microvm-image:coding-agents-on-bedrock
+//
+// The colon form is what the service returns and what it accepts. The slash form is not
+// merely cosmetic: `GetMicrovmImage` on it answers **`AccessDeniedException`**, because IAM
+// evaluates the malformed ARN as a resource the caller has no policy for. So a client that
+// built a slash ARN would report a permissions problem for a resource that exists, which is
+// the most expensive possible spelling of this mistake.
 
 /// `CreateMicrovmImageResponse` for an image that has just entered `CREATING`.
 pub fn create_image_response(name: &str) -> String {
     format!(
         r#"{{
-            "imageArn": "arn:aws:lambda:us-east-1:123456789012:microvm-image/{name}",
+            "imageArn": "arn:aws:lambda:us-east-1:123456789012:microvm-image:{name}",
             "name": "{name}",
             "state": "CREATING",
             "createdAt": 1754524800,
@@ -342,7 +358,7 @@ pub fn create_image_response(name: &str) -> String {
 pub fn get_image_response(name: &str, state: &str) -> String {
     format!(
         r#"{{
-            "imageArn": "arn:aws:lambda:us-east-1:123456789012:microvm-image/{name}",
+            "imageArn": "arn:aws:lambda:us-east-1:123456789012:microvm-image:{name}",
             "name": "{name}",
             "state": "{state}",
             "createdAt": 1754524800
@@ -358,7 +374,7 @@ pub fn list_versions_response(version: &str) -> String {
                 "baseImageArn": "arn:aws:lambda:us-east-1:aws:microvm-image:al2023-1",
                 "buildRoleArn": "arn:aws:iam::123456789012:role/build",
                 "codeArtifact": {{"uri": "s3://bucket/img.zip"}},
-                "imageArn": "arn:aws:lambda:us-east-1:123456789012:microvm-image/img",
+                "imageArn": "arn:aws:lambda:us-east-1:123456789012:microvm-image:img",
                 "imageVersion": "{version}",
                 "state": "IN_PROGRESS",
                 "status": "ACTIVE",
@@ -378,7 +394,7 @@ pub fn list_builds_response(build_state: &str) -> String {
         r#"{{
             "items": [
                 {{
-                    "imageArn": "arn:aws:lambda:us-east-1:123456789012:microvm-image/img",
+                    "imageArn": "arn:aws:lambda:us-east-1:123456789012:microvm-image:img",
                     "imageVersion": "1",
                     "buildId": "build-1",
                     "buildState": "{build_state}",
@@ -388,7 +404,7 @@ pub fn list_builds_response(build_state: &str) -> String {
                     "createdAt": 1754524800
                 }},
                 {{
-                    "imageArn": "arn:aws:lambda:us-east-1:123456789012:microvm-image/img",
+                    "imageArn": "arn:aws:lambda:us-east-1:123456789012:microvm-image:img",
                     "imageVersion": "1",
                     "buildId": "build-2",
                     "buildState": "{build_state}",
@@ -413,7 +429,7 @@ pub fn microvm_response(state: &str, state_reason: Option<&str>) -> String {
             "microvmId": "mvm-abc123",
             "state": "{state}",
             "endpoint": "https://mvm-abc123.microvm.us-east-1.amazonaws.com",
-            "imageArn": "arn:aws:lambda:us-east-1:123456789012:microvm-image/img",
+            "imageArn": "arn:aws:lambda:us-east-1:123456789012:microvm-image:img",
             "imageVersion": "1",
             "maximumDurationInSeconds": 3600,
             "startedAt": 1754524800{reason}
@@ -440,7 +456,7 @@ pub fn list_images_response(names: &[&str], next_token: Option<&str>) -> String 
         .map(|name| {
             format!(
                 r#"{{
-                    "imageArn": "arn:aws:lambda:us-east-1:123456789012:microvm-image/{name}",
+                    "imageArn": "arn:aws:lambda:us-east-1:123456789012:microvm-image:{name}",
                     "name": "{name}",
                     "state": "ACTIVE",
                     "latestActiveImageVersion": "1",
@@ -458,7 +474,7 @@ pub fn list_images_response(names: &[&str], next_token: Option<&str>) -> String 
 
 /// `DeleteMicrovmImageOutput`.
 pub fn delete_image_response() -> String {
-    r#"{"imageIdentifier": "arn:aws:lambda:us-east-1:123456789012:microvm-image/img",
+    r#"{"imageIdentifier": "arn:aws:lambda:us-east-1:123456789012:microvm-image:img",
         "state": "DELETING"}"#
         .to_string()
 }

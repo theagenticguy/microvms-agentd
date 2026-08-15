@@ -1144,7 +1144,7 @@ mod tests {
             .await
             .expect("resolves");
         assert_eq!(
-            arn, "arn:aws:lambda:us-east-1:123456789012:microvm-image/agentd-conformance",
+            arn, "arn:aws:lambda:us-east-1:123456789012:microvm-image:agentd-conformance",
             "the exact match wins, not the first substring hit"
         );
 
@@ -1162,7 +1162,7 @@ mod tests {
     #[tokio::test]
     async fn an_arn_identifier_passes_through_with_no_listing_call() {
         let (plane, fake, _) = planted();
-        let arn = "arn:aws:lambda:us-east-1:123456789012:microvm-image/img";
+        let arn = "arn:aws:lambda:us-east-1:123456789012:microvm-image:img";
         let resolved = plane.resolve_image_arn(arn).await.expect("passes through");
         assert_eq!(resolved, arn);
         assert_eq!(
@@ -1225,7 +1225,7 @@ mod tests {
             .expect("found on page two");
         assert_eq!(
             arn,
-            "arn:aws:lambda:us-east-1:123456789012:microvm-image/wanted-image"
+            "arn:aws:lambda:us-east-1:123456789012:microvm-image:wanted-image"
         );
         assert_eq!(fake.call_count("ListMicrovmImages"), 2, "both pages read");
 
