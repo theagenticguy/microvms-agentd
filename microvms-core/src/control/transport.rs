@@ -692,9 +692,57 @@ pub mod paths {
     ///
     /// `maxResults` is not sent: the model caps it at 50 and the service's own default is
     /// what a caller reading every page wants, so naming a page size would only be a
-    /// second number to keep right.
+    /// second number to keep right. [`image_versions_paged`] is the one caller that does
+    /// name one, and says why.
     pub fn image_versions(image: &str, next_token: Option<&str>) -> String {
-        with_next_token(format!("{}/versions", microvm_image(image)), next_token)
+        image_versions_paged(image, next_token, None)
+    }
+
+    /// [`image_versions`] with an explicit `maxResults`, which **no production path sends**.
+    ///
+    /// # Why a page size exists at all when nothing ships one
+    ///
+    /// Because without it the cursor encoding is unfalsifiable against the real service,
+    /// and that encoding is the one place in this module where being wrong reads as a
+    /// *credentials* failure rather than a URL one. A real `nextToken` is opaque base64
+    /// carrying `+`, `/`, and `=`; an unencoded one desynchronises the SigV4 canonical
+    /// query and the service answers 403. Every test that could catch it went through an
+    /// injected transport, so the fake minted the token and the signer never saw it.
+    ///
+    /// Forcing a real cursor needs a listing with more items than one page, and the
+    /// service's default page is larger than any image's version count here — so the only
+    /// way to make the real service mint a real cursor for a resource that already exists
+    /// is to ask for a smaller page. That is what this is for, and
+    /// `microvms-core/tests/live_pagination.rs` is its caller.
+    ///
+    /// # Why it is not simply a parameter on [`image_versions`]
+    ///
+    /// A page size on the production path is a second number to keep right, and a wrong
+    /// one is invisible: reading every page with `maxResults=1` is correct and slow, which
+    /// is the kind of defect that survives. Keeping it to a separately named function means
+    /// the production call sites cannot acquire one by accident, and a reader of
+    /// [`image_versions`] sees no page size to wonder about.
+    ///
+    /// `max_results` is clamped to the model's `1..=50`, because a value outside it is a
+    /// `ValidationException` and a caller of this function is trying to observe pagination
+    /// rather than to discover the bound.
+    pub fn image_versions_paged(
+        image: &str,
+        next_token: Option<&str>,
+        max_results: Option<u32>,
+    ) -> String {
+        let mut query: Vec<String> = Vec::new();
+        if let Some(size) = max_results {
+            query.push(format!("maxResults={}", size.clamp(1, 50)));
+        }
+        if let Some(token) = next_token {
+            query.push(format!("nextToken={}", encode_segment(token)));
+        }
+        let path = format!("{}/versions", microvm_image(image));
+        if query.is_empty() {
+            return path;
+        }
+        format!("{path}?{}", query.join("&"))
     }
 
     /// `DELETE /2025-09-09/microvm-images/{imageIdentifier}/versions/{imageVersion}`
@@ -888,6 +936,52 @@ mod tests {
                 "an absent cursor emits no query: {path}"
             );
         }
+    }
+
+    /// The version listing's explicit page size: ordered before the cursor, clamped to the
+    /// model's `1..=50`, and absent from the path when nothing asks for one.
+    ///
+    /// The clamp is asserted at both ends because a value outside the bound is a
+    /// `ValidationException`, and the only caller of this function
+    /// (`tests/live_pagination.rs`) is trying to *observe* a real cursor — a run that
+    /// failed on the page size instead would prove nothing about the encoding it came for.
+    ///
+    /// **Falsification** — remove the `.clamp(1, 50)` and the `0` and `999` cases go red
+    /// with `maxResults=0` and `maxResults=999`, both of which the service refuses.
+    #[test]
+    fn the_version_listings_explicit_page_size_is_ordered_and_clamped() {
+        assert_eq!(
+            paths::image_versions_paged("img", None, Some(1)),
+            "/2025-09-09/microvm-images/img/versions?maxResults=1"
+        );
+        // Both members, and `maxResults` first — the order the query is built in, which is
+        // asserted so a reordering is a visible change rather than a silent one.
+        assert_eq!(
+            paths::image_versions_paged("img", Some("a+b/c="), Some(2)),
+            "/2025-09-09/microvm-images/img/versions?maxResults=2&nextToken=a%2Bb%2Fc%3D"
+        );
+        assert_eq!(
+            paths::image_versions_paged("img", None, Some(0)),
+            "/2025-09-09/microvm-images/img/versions?maxResults=1",
+            "the model's min is 1; a 0 would be refused"
+        );
+        assert_eq!(
+            paths::image_versions_paged("img", None, Some(999)),
+            "/2025-09-09/microvm-images/img/versions?maxResults=50",
+            "the model's max is 50; a larger value would be refused"
+        );
+
+        // And the production spelling is unchanged by the new one existing: `image_versions`
+        // delegates here with no page size, so it must still emit exactly what it did.
+        assert_eq!(
+            paths::image_versions_paged("img", None, None),
+            paths::image_versions("img", None)
+        );
+        assert!(
+            !paths::image_versions("img", Some("t")).contains("maxResults"),
+            "no production path names a page size: {}",
+            paths::image_versions("img", Some("t"))
+        );
     }
 
     /// A `DELETE` of one version carries no query member, even though its sibling

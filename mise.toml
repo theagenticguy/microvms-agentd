@@ -225,7 +225,7 @@ run = "terraform -chdir=conformance/infra init -input=false && terraform -chdir=
 # discovered them.
 
 [tasks."live:conformance-rs"]
-description = "The live suite through the Rust client: all 75 checks, no SKIP"
+description = "The live suite through the Rust client: all 77 checks, no SKIP"
 depends = ["build", "build:cli", "live:infra"]
 # Both binaries: `--binary` is the aarch64 daemon that gets baked into the image, and
 # `--microvm-binary` is the host-architecture CLI under test. Naming both is what makes the
@@ -252,6 +252,21 @@ run = """
   --binary target/$AGENTD_TARGET/release/agentd \
   --microvm-binary target/release/microvm
 """
+
+[tasks."live:paths"]
+description = "The cursor encoding and the colon image ARN, against the real signer. Free."
+# Read-only and free — four GETs over resources the account already holds — but it needs
+# credentials, so it belongs here rather than in `check` for the reason `live:rates` gives
+# at length.
+#
+# It exists because every other test of the pagination cursor goes through the injected
+# `Transport`, so the fake mints the token the loop reads back and `SignedTransport` plus
+# the SigV4 canonical query are never exercised. That gap is not academic: measured
+# 2026-08-15, a cursor sent with its `=` padding unencoded is refused **400
+# `{"message":null}`** — a blank parse failure on page two of a listing whose page one
+# worked, naming nothing. The tests are `#[ignore]` so a credential-less
+# `cargo test --workspace` stays green; this task is how they run.
+run = "cargo test -p microvms-core --test live_pagination -- --ignored --nocapture"
 
 [tasks."live:rates"]
 description = "Fail if the pinned rate table no longer matches the AWS Pricing API"
@@ -299,16 +314,77 @@ description = "Every live suite, then an independent leak check. BILLABLE."
 # client, and the Python tier moved to git history after the Rust port went live-green:
 # both suites passed against real AWS on the same commit, so the oracle's job was
 # finished rather than duplicated. `live:conformance-rs` is now the whole of the live
-# protocol coverage, and as of the CLI-coverage waves it expresses all 75 named checks
+# protocol coverage, and as of the CLI-coverage waves it expresses all 77 named checks
 # with none skipped — the 34 it used to name as inexpressible are real checks against the
 # five new attached subcommands.
-depends = ["live:rates", "live:conformance-rs", "live:verify-clean"]
+#
+# 77 rather than the 75 this line and the README carried until 2026-08-15. The count had
+# already drifted to 76 without either being updated — a measured live run reported
+# "76 of 76" against three places claiming 75 — and the log-group delete described in
+# `drive_teardown` adds the 77th. The number is in these descriptions because this is
+# where someone decides whether to trust the tier, so it is worth keeping right; that it
+# drifted once is the argument for reading it off a run rather than from memory.
+#
+# ── Called in sequence here, NOT declared as `depends` ──────────────────────
+#
+# This read `depends = ["live:rates", "live:conformance-rs", "live:verify-clean"]`, and
+# `depends` in mise is a *parallel* set with no order between siblings. So the leak check
+# raced the suite that creates the resources it checks for, and this description — "then
+# an independent leak check" — described an ordering the task did not have.
+#
+# Measured 2026-08-15, and it did not merely report the wrong thing, it *broke the run*:
+# `live:verify-clean` finished in 5s against an account another live run was mid-build in,
+# reported that run's CREATING image as a leak, exited 1, and mise cancelled the whole
+# graph — killing `terraform init` at "Provider installation was canceled by an interrupt
+# signal." The suite never started. A leak check that runs before the suite cannot see
+# what the suite leaked, and can only see what someone else is using.
+#
+# Three properties are wanted at once, and no single mise primitive has all three:
+#
+#   1. **Order.** The suite must finish before the account is asked what leaked.
+#   2. **The leak check runs even when the suite fails.** A failed suite is exactly when
+#      resources are most likely to survive, so cleanup must not be skipped by the failure
+#      that made it necessary — which is what `if: always()` already says in
+#      `.github/workflows/live-conformance.yml`, and the reason it says it.
+#   3. **A failure anywhere fails the task**, and the live-verified marker is not written.
+#
+# `wait_for` gives 1 and 3 but not 2: a `wait_for` dependent is *skipped* when what it
+# waits on fails (measured — the leak check did not run at all). `depends` gives 2 and 3
+# but not 1, which is the bug above. So the members are invoked from the body in order,
+# each failure recorded rather than short-circuiting, and the marker written only when
+# every one passed. `mise run <task>` nested inside a task body is ordinary and still
+# resolves that task's own `depends` — `live:conformance-rs` still gets its two builds and
+# the stack applied.
+#
+# The three tasks stay separately nameable, which is the property `depends` was buying:
+# `mise run live:verify-clean` alone is how someone asks the account what leaked without
+# spending anything.
+run = """
+status=0
+mise run live:rates || status=1
+# Before the suite: it is free, read-only, and takes a second, and it is the member that
+# fails first when a URL member's encoding is wrong — so a signing bug is reported as a
+# signing bug rather than as a launch that could not resolve its image.
+mise run live:paths || status=1
+mise run live:conformance-rs || status=1
+# Always, even when the suite above failed — see property 2.
+mise run live:verify-clean || status=1
+if [ "$status" -ne 0 ]; then
+  echo 'a live member failed; NOT recording this commit as live-verified' >&2
+  exit "$status"
+fi
 # Records the commit that was last proven against real AWS. The pre-push hook
 # reads it to tell you whether the daemon has changed since — advisory only,
 # because only a human knows whether a given change could touch the platform
 # boundary. Lives in .git/ so it is per-clone and never committed: a marker
 # claiming someone else's run is worse than no marker.
-run = "git rev-parse HEAD > .git/agentd-last-live-run && echo 'recorded this commit as live-verified'"
+#
+# Written only on a fully green run, which the old `depends` shape could not promise: a
+# task body runs after its dependencies *succeed*, but a marker is worth more than that —
+# it is read to decide whether a live run is still needed.
+git rev-parse HEAD > .git/agentd-last-live-run
+echo 'recorded this commit as live-verified'
+"""
 
 [tasks."live:destroy"]
 description = "Tear down the conformance stack"

@@ -1542,7 +1542,7 @@ def drive_suspend_resume(cli: Cli, launched: Envelope, results: Results) -> None
         )
 
 
-def drive_teardown(cli: Cli, launched: Envelope, results: Results) -> None:
+def drive_teardown(cli: Cli, launched: Envelope, results: Results, logs: Any) -> None:
     """`microvm terminate --delete-image`, and what it honestly reports as left behind.
 
     The build log group appearing in `undeletedLogGroups` is a **normal outcome**, not a
@@ -1550,6 +1550,28 @@ def drive_teardown(cli: Cli, launched: Envelope, results: Results) -> None:
     group is named rather than deleted. That is the whole reason it is named — the
     service created it, no Terraform stack owns it, and `terraform destroy` leaves it
     behind. Six of them accumulated before anyone noticed.
+
+    And then this suite deletes it, which is new
+    ----------------------------------------------
+
+    Naming the group and *leaving* it made `mise run live` unpassable, because the tier's
+    own leak check counts a surviving `/aws/lambda-microvms/<image>` group as a leak — see
+    `scripts/verify-clean`'s `LOG_GROUP_PREFIXES`. So a fully green suite handed
+    `live:verify-clean` a guaranteed exit 1, every run, on a resource the suite created on
+    purpose and asserted the CLI could not remove. Measured 2026-08-15: 76/76 checks PASS,
+    tier red, one leaked log group.
+
+    Two ways out, and this is the one that keeps both claims. Teaching `verify-clean` to
+    ignore the group would blind the check that exists *because* six of these accumulated
+    unnoticed — the exact false assurance its own header paragraph warns against. Deleting
+    it here keeps the check absolute and makes the suite responsible for its own residue:
+    the assertion above still proves the CLI **named** the group rather than silently
+    dropping it (which is the client behaviour under test), and the delete below is the
+    *suite* cleaning up after itself through boto3, which it already holds for
+    `read_daemon_logs`.
+
+    Deleted last, after the image, for the reason the `finally` block gives: the service
+    can recreate a group whose image still exists, which is how six leaked.
     """
     print("\n== teardown ==")
     torn = cli.call(
@@ -1573,10 +1595,33 @@ def drive_teardown(cli: Cli, launched: Envelope, results: Results) -> None:
     )
     # Named rather than absent, which is the assertion. An empty list here would mean
     # the CLI had quietly stopped reporting a group it still cannot delete.
+    undeleted = torn.data.get("undeletedLogGroups") or []
     results.check(
         "the build log group was named rather than silently left",
-        bool(torn.data.get("undeletedLogGroups")),
-        f"{torn.data.get('undeletedLogGroups')!r} — delete with `aws logs delete-log-group`",
+        bool(undeleted),
+        f"{undeleted!r} — this suite deletes it below, through boto3",
+    )
+
+    # The suite's own residue, removed by the suite. Asserted rather than best-effort:
+    # a delete that quietly failed would put the tier back where it was, red on a leak
+    # nobody meant to leave.
+    deleted: list[str] = []
+    failures: list[str] = []
+    for group in undeleted:
+        try:
+            logs.delete_log_group(logGroupName=str(group))
+            deleted.append(str(group))
+        except Exception as exc:  # noqa: BLE001 - the reason is the finding
+            # An already-absent group is the desired end state, not a failure: the
+            # service may never have created one for a build that produced no events.
+            if type(exc).__name__ == "ResourceNotFoundException":
+                deleted.append(f"{group} (already absent)")
+            else:
+                failures.append(f"{group}: {type(exc).__name__}: {exc}")
+    results.check(
+        "the suite deleted the build log group the CLI could not",
+        not failures and len(deleted) == len(undeleted),
+        f"deleted={deleted!r} failures={failures!r}",
     )
 
 
@@ -2181,6 +2226,12 @@ def main() -> int:
     results = Results()
     launched: Envelope | None = None
     daemon: Daemon | None = None
+    # Built here rather than inside the `try` below, because `drive_teardown` needs a
+    # CloudWatch client to delete the build log group and it runs from the `finally` —
+    # where a name bound inside the `try` may not exist at all. A teardown that raises
+    # `UnboundLocalError` on the cleanup path would replace a real failure with a bug in
+    # this file, on exactly the runs where cleanup matters most.
+    aws = boto3.Session(region_name=cli.region)
 
     with tempfile.TemporaryDirectory() as tmp:
         dockerfile = Path(tmp) / "Dockerfile"
@@ -2200,7 +2251,6 @@ def main() -> int:
             # rather than duplicated: the Rust client launched it and this reaches
             # around every client, which is the honest division of labour for six
             # checks that are about neither one.
-            aws = boto3.Session(region_name=cli.region)
             daemon = Daemon(
                 endpoint=str(launched.data["endpoint"]),
                 agent_token=str(launched.data["agentToken"]),
@@ -2246,7 +2296,7 @@ def main() -> int:
                 # because the service can recreate a group deleted before its image —
                 # which is how six of them leaked.
                 try:
-                    drive_teardown(cli, launched, results)
+                    drive_teardown(cli, launched, results, aws.client("logs"))
                 except Exception as exc:  # noqa: BLE001 - a teardown failure is a finding
                     results.check("teardown completed", False, repr(exc))
 
