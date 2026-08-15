@@ -67,6 +67,17 @@ pub struct Health {
     /// False when identity repair was switched off by config. Separate from `degraded` so a
     /// monitor can tell "opted out" from "nothing to do".
     pub identity_repaired: bool,
+    /// Whether any exec is still running.
+    ///
+    /// For an orchestrator *outside* the VM deciding whether to keep it alive. The platform
+    /// measures idleness by inbound traffic through the endpoint proxy, which terminates
+    /// outside the guest, so an in-guest keepalive cannot reset the idle timer — polling this
+    /// from outside is both the traffic and the decision. An exec that exited and is awaiting
+    /// an ack is not busy.
+    pub busy: bool,
+    /// How many execs are registered, in any phase. `busy: false` with a non-zero count is a
+    /// VM holding unacked output somebody still has to collect.
+    pub execs: i64,
 }
 
 impl Health {
@@ -79,6 +90,8 @@ impl Health {
             under_pressure: health.disk.as_ref().map(|disk| disk.under_pressure),
             identity_degraded: health.identity_degraded,
             identity_repaired: health.identity_repaired,
+            busy: health.busy,
+            execs: health.execs as i64,
         }
     }
 }

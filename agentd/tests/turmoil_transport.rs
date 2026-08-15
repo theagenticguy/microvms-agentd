@@ -290,8 +290,17 @@ impl Client {
 /// exactly what happened before a live run reported
 /// "Run lifecycle hook returned HTTP status 400".
 fn run_hook(token: &str) -> Request<Full<Bytes>> {
-    let inner = format!(r#"{{"agent_token":"{token}"}}"#);
-    let body = serde_json::json!({ "runHookPayload": inner }).to_string();
+    run_hook_payload(serde_json::json!({ "agent_token": token }))
+}
+
+/// A `POST` to the run hook carrying an arbitrary payload object.
+///
+/// The double wrap stays the platform's: `payload` is serialized to a string and *that*
+/// string is the value of `runHookPayload`. A test that built the body any other way
+/// would pass against a daemon the platform cannot bootstrap, which is exactly what
+/// happened before a live run reported "Run lifecycle hook returned HTTP status 400".
+fn run_hook_payload(payload: serde_json::Value) -> Request<Full<Bytes>> {
+    let body = serde_json::json!({ "runHookPayload": payload.to_string() }).to_string();
     Request::builder()
         .method("POST")
         .uri(RUN_HOOK)
@@ -941,6 +950,70 @@ fn a_bootstrapped_daemon_serves_an_authorized_control_request() -> turmoil::Resu
             .body(Full::new(Bytes::new()))?;
         let (status, _) = client.send(unauthorized).await?;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+        Ok(())
+    });
+
+    sim.run()
+}
+
+/// A launch env delivered through the platform's real payload shape reaches a child,
+/// and the per-request `env` still wins on a shared key.
+///
+/// End-to-end over the simulated network rather than against `build_command`, because the
+/// thing most likely to break is not the merge: it is the double-wrapped payload the
+/// platform delivers. A unit test on the merge would pass against a daemon that answers
+/// 400 to every real launch and terminates the VM before any traffic is forwarded.
+#[test]
+fn a_launch_env_from_the_run_hook_reaches_a_child_and_a_request_overrides_it() -> turmoil::Result {
+    let mut sim = sim(0x5EED_0007);
+    spawn_daemon(&mut sim, Config::default());
+
+    sim.client("harness", async {
+        let mut client = Client::connect().await?;
+        let (status, body) = client
+            .send(run_hook_payload(serde_json::json!({
+                "agent_token": TOKEN,
+                "env": {"FROM_LAUNCH": "launch", "SHARED": "launch"},
+                // Ignored rather than refused. A 400 here kills the launch, so a newer
+                // client's unrecognised field must not be fatal.
+                "a_field_this_daemon_has_never_heard_of": [1, 2, 3],
+            })))
+            .await?;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "bootstrap with an env refused: {}",
+            String::from_utf8_lossy(&body)
+        );
+
+        // A child that names nothing gets the launch env; the one key the request also
+        // names is the request's.
+        let mut client = Client::connect().await?;
+        let (status, body) = client
+            .send(authorized(
+                "POST",
+                "/v1/exec/start",
+                serde_json::json!({
+                    "exec_id": "launch-env",
+                    "command": ["/bin/sh", "-c", "echo $FROM_LAUNCH; echo $SHARED"],
+                    "env": {"SHARED": "request"},
+                }),
+            ))
+            .await?;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "start refused: {}",
+            String::from_utf8_lossy(&body)
+        );
+
+        let finished = await_exit("launch-env").await?;
+        assert_eq!(
+            finished["stdout"], "launch\nrequest\n",
+            "the launch env must reach the child and the request must win the shared key: \
+             {finished}"
+        );
 
         Ok(())
     });

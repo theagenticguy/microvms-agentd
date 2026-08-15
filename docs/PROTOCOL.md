@@ -14,7 +14,7 @@ never gets bootstrapped.
 | --- | --- | --- |
 | `POST HOOKS/ready` | none (platform hook) | image-build readiness probe |
 | `POST HOOKS/validate` | none (platform hook) | image-build validation probe |
-| `POST HOOKS/run` | none (platform hook) | one-shot token bootstrap from `runHookPayload` |
+| `POST HOOKS/run` | none (platform hook) | one-shot token bootstrap from `runHookPayload`, plus the optional launch environment |
 | `POST HOOKS/suspend` | none (platform hook) | acknowledged and logged |
 | `POST HOOKS/resume` | none (platform hook) | acknowledged; signals in-memory state loss |
 | `POST HOOKS/terminate` | none (platform hook) | acknowledged; begins graceful shutdown |
@@ -27,8 +27,8 @@ never gets bootstrapped.
 | `PUT /v1/fs/tar` | bearer | streaming tar upload and confined extraction |
 | `GET /v1/fs/tar?path=` | bearer | streaming tar download |
 | `PUT /v1/fs/file` | bearer | write one file |
-| `GET /v1/fs/file?path=` | bearer | read one file |
-| `GET /v1/health` | none | liveness, version, bootstrap state |
+| `GET /v1/fs/file?path=&start_line=&end_line=` | bearer | read one file, or a 1-based inclusive line range of it |
+| `GET /v1/health` | none | liveness, version, bootstrap state, exec-activity |
 
 ## Rules that exist because a defect proved them necessary
 
@@ -107,6 +107,124 @@ for a 327-byte archive, so the size guard almost never fired.
 
 **Output is bounded, and truncation is marked explicitly.** A post-exit linger
 deadline bounds how long the daemon waits on grandchildren still holding the pipe.
+
+## The launch environment
+
+The run-hook payload may carry an `env` map alongside `agent_token`. It becomes
+the base environment of every later exec.
+
+```json
+{"runHookPayload": "{\"agent_token\": \"...\", \"env\": {\"KEY\": \"VALUE\"}}"}
+```
+
+**The per-request `env` wins on a key both set.** The daemon applies the launch
+env first and the request's own map second, so a launch env is a default for the
+whole VM and a request is the specific thing happening now. A caller who never
+sends a launch env sees no change: the child's environment is the request's map
+and nothing else, exactly as before.
+
+**The agent token never becomes part of it.** `env_clear()` still runs, so the
+daemon's own environment reaches no child, and the launch env and the token are
+separate parameters through the whole install path — there is no field a refactor
+could forward one into. Proven by a test that spawns `/usr/bin/env` with a launch
+env installed and asserts the child's environment is *exactly* that map: an extra
+variable of any name fails it, which is what a leak would look like.
+
+**Only the first successful bootstrap sets it.** A replay of the identical token
+answers 200 and leaves the installed env alone, and a conflicting token answers
+409 and leaves it alone. Without that, a caller who cannot win the token could
+still rewrite the environment every later child runs in.
+
+**Every value is a string, and a malformed `env` is 400 naming the problem.** A
+non-object `env`, or a value that is a number or a nested object, is refused with
+a body that names the key or the shape. The body never quotes a value, because
+the payload carries the token.
+
+**Unknown payload keys are ignored.** A 400 at this hook makes the platform
+terminate the VM before forwarding any traffic, so a newer client sending a field
+this daemon has never heard of must still be able to bootstrap it. Forward
+compatibility here is the difference between an ignored field and a dead launch.
+
+**The token and the env share one 4096-byte budget, measured in UTF-8 bytes and
+inclusive** (`PLATFORM.md`). The daemon cannot enforce what the platform already
+rejected — an over-ceiling payload never reaches the guest — so the check is on
+the *client* side, in `microvms-core`'s `RunHookPayload::for_launch`, and it fires
+before any control-plane call. botocore does not enforce the ceiling either, so
+without that local check there is no signal at all until AWS answers with a
+`ValidationException` on a member the caller did not know they were filling. The
+refusal names the byte count, the ceiling, and how much of it the env is, because
+"4142 bytes, ceiling 4096" alone does not say whether to shorten the token or drop
+a variable. One bearer token fits with room to spare; a set of AWS session
+credentials does not, and that is what makes this ceiling reachable in practice.
+
+## Line-ranged text reads
+
+`GET /v1/fs/file` takes optional `start_line` and `end_line`. The semantics are
+the AI SDK harness contract's `readTextFile`, copied rather than chosen, because
+this route is what that method is implemented on top of:
+
+**Both bounds are 1-based and inclusive.** `start_line=2&end_line=4` is three
+lines. `start_line` absent means 1 and `end_line` absent means through EOF.
+
+**An `end_line` past the last line reads through EOF without an error.** Lines
+1..1000 of a twelve-line file is a 200 carrying twelve lines, never a 416. A
+`start_line` past the last line is an empty 200, not a 404: the file is there and
+the window is empty, which is a different fact from the file being absent.
+
+**A line owns its terminating newline.** Lines 1..2 and lines 3..5 concatenate
+back into the file rather than losing a separator at the seam. A last line with no
+trailing newline has none to own and is returned as it is.
+
+**`start_line=0` and `end_line < start_line` are 400.** Neither is 416: 416 is
+about a range the file cannot satisfy, and both of these are ranges no file could,
+so a client sent to look at the file would be looking in the wrong place. A
+non-integer bound is also 400, and it does not masquerade as the missing-`path`
+refusal.
+
+**A range still streams.** The read is filtered chunk by chunk and stops reading
+once the window closes, so lines 1..5 of a large file cost the first chunk. Nothing
+buffers a file to slice it, for the same reason nothing buffers an upload: an
+OOM-killed daemon in a MicroVM is unrecoverable.
+
+**With no range the response is byte-identical to what it always was.** The
+un-ranged read hands back the reader stream untouched, so the path every existing
+caller uses does not acquire the range feature's bug surface.
+
+## Idle policy, and why liveness is a field rather than a route
+
+The platform measures idleness by inbound traffic through the endpoint proxy
+(`PLATFORM.md`, "`idlePolicy`"). A workload holding an outbound connection, or one
+simply computing for hours, receives none, so auto-suspend can freeze a VM
+mid-work. Multi-hour agent runs are the real case.
+
+**A guest-side request cannot fix this, and the daemon does not pretend
+otherwise.** The endpoint proxy terminates *outside* the VM and forwards over
+loopback — measured, `PLATFORM.md`, "The platform's own hook arrives over
+loopback". A request an in-VM process sends to the daemon's own port therefore
+never reaches the thing counting traffic. A "keep myself alive" route would be a
+keepalive that keeps nothing alive, and it would be discovered as broken by a
+multi-hour run auto-suspending mid-work, which is the failure it was added to
+prevent.
+
+**So `GET /v1/health` carries `busy` and `execs`, for an orchestrator outside the
+VM.** The orchestrator's own poll *is* the inbound traffic, and `busy` is what
+makes that poll informed rather than unconditional. The assertion of liveness is
+therefore repeated and is explicitly the caller's, which is the property that rules
+out the daemon self-keepaliving: a hung process would then bill to the 8-hour
+`maximumDurationInSeconds` ceiling with nobody having asked.
+
+**`busy` means producing, not unfinished.** An exec whose child has exited and
+whose result is waiting to be acked is not busy — nothing is running, and holding a
+VM alive at baseline billing for a command that is over is the mistake this
+distinction exists to prevent. `execs` counts every registered entry in any phase,
+so `busy: false` with a non-zero count is a VM holding unacked output somebody
+still has to collect before terminating it.
+
+Both fields default to `false` and `0` when absent, unlike every other field on
+the response. The daemon is baked into an image while a client is installed
+separately, so a current client routinely talks to a daemon from whenever that
+image was built; a required field would make a health call fail outright against an
+older daemon, turning a missing signal into an unreachable VM.
 
 ## Streaming and stdin
 

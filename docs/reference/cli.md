@@ -63,6 +63,7 @@ Flags:
 - `--dockerfile <DOCKERFILE>` — a Dockerfile to use instead of the library's default; its `FROM` must match the base. `microvms-cli/src/cli.rs:391-392`.
 - `--repair-identity` — widen the guest so `sethostname` and the `boot_id` bind mount work. `microvms-cli/src/cli.rs:397-398`.
 - `--egress` — give the VM outbound network; omitted by default. `microvms-cli/src/cli.rs:401-402`.
+- `--launch-env <KEY=VALUE>` — set one launch-environment variable for every exec in the VM; repeatable. Delivered in the same `runHookPayload` as the agent token, at launch, so it never touches the shared image snapshot and never touches disk. The daemon applies it as the *base* environment of every exec, with `exec --env` on the same key winning. Same parser as `exec --env`, so the first `=` splits, an empty VALUE is legal, and a missing `=` or empty KEY is refused at parse time. The whole payload shares a 4096-byte ceiling with the token, checked locally before the launch: an over-budget env fails with the byte count and the env's share of it, rather than as an AWS `ValidationException` after the call. One bearer token fits with room to spare; a set of AWS session credentials does not, so large material belongs on `microvm cp` after bootstrap or on a role the workload assumes. `microvms-cli/src/cli.rs`, wiring in `microvms-cli/src/commands/lifecycle.rs`.
 - `--keep` — leave the VM and image running; both keep billing until you tear them down. `microvms-cli/src/cli.rs:405-406`.
 - `--timeout <TIMEOUT>` — how long to wait for the exec, in seconds; default `300`. `microvms-cli/src/cli.rs:409-410`.
 - `--max-idle-sec <MAX_IDLE_SEC>` — suspend the VM after this much inbound-traffic idleness; default `600`. `microvms-cli/src/cli.rs:413-414`.
@@ -129,6 +130,8 @@ microvm health [OPTIONS] --endpoint <ENDPOINT> --agent-token <AGENT_TOKEN> --mic
 ```
 
 Asks a running MicroVM's daemon whether it is up and what its identity repair did. This is the one command that reports `identityDegraded` and `diskUnderPressure`, and either flag is a reason to drain the VM rather than keep scheduling onto it.
+
+It also reports `busy` and `execs`, which is what makes this the command an orchestrator loops on to hold a long-running VM alive. The platform measures idleness by inbound traffic through the endpoint proxy, and that proxy terminates outside the guest, so a request sent from *inside* the VM cannot reset the idle timer — only a poll from outside counts, and this poll is that traffic. `busy` is what makes the loop informed rather than unconditional: it is true only while some exec is actually running, so an exec that exited and is waiting to be acked reads false. `execs` counts every registered entry in any phase, so `busy: false` with a non-zero count is a VM holding unacked output somebody still has to collect before terminating it. See `docs/PROTOCOL.md`, "Idle policy, and why liveness is a field rather than a route".
 
 `microvms-cli/src/commands/attached.rs:471`
 

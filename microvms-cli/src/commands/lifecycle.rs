@@ -321,6 +321,13 @@ async fn launch_and_exec<O: std::io::Write, E: std::io::Write>(
     request.max_idle_sec = args.max_idle_sec;
     request.max_duration_sec = args.max_duration_sec;
     request.token_scope = Some(name.to_string());
+    // One pair at a time through the builder rather than assigning the collected vector,
+    // so the flag's repeatability and the map's key-uniqueness meet in one place: a
+    // caller who passes the same key twice gets the last value, the way every other
+    // KEY=VALUE surface behaves.
+    for (key, value) in &args.launch_env {
+        request = request.with_launch_env(key, value);
+    }
     if args.egress {
         request = request.with_egress();
     }

@@ -65,6 +65,8 @@ pub struct PyHealth {
     under_pressure: Option<bool>,
     identity_degraded: bool,
     identity_repaired: bool,
+    busy: bool,
+    execs: usize,
 }
 
 impl PyHealth {
@@ -77,6 +79,8 @@ impl PyHealth {
             under_pressure: health.disk.as_ref().map(|disk| disk.under_pressure),
             identity_degraded: health.identity_degraded,
             identity_repaired: health.identity_repaired,
+            busy: health.busy,
+            execs: health.execs,
         }
     }
 }
@@ -132,10 +136,29 @@ impl PyHealth {
         self.identity_repaired
     }
 
+    /// Whether any exec is still running.
+    ///
+    /// For an orchestrator *outside* the VM deciding whether to keep it alive. The
+    /// platform measures idleness by inbound traffic through the endpoint proxy, which
+    /// terminates outside the guest, so an in-guest keepalive cannot reset the idle
+    /// timer — polling this from outside is both the traffic and the decision. An exec
+    /// that exited and is awaiting an ack is not busy.
+    #[getter]
+    fn busy(&self) -> bool {
+        self.busy
+    }
+
+    /// How many execs are registered, in any phase. `busy` false with a non-zero count
+    /// is a VM holding unacked output somebody still has to collect.
+    #[getter]
+    fn execs(&self) -> usize {
+        self.execs
+    }
+
     fn __repr__(&self) -> String {
         format!(
-            "Health(version={:?}, bootstrapped={}, identity_degraded={})",
-            self.version, self.bootstrapped, self.identity_degraded
+            "Health(version={:?}, bootstrapped={}, identity_degraded={}, busy={}, execs={})",
+            self.version, self.bootstrapped, self.identity_degraded, self.busy, self.execs
         )
     }
 }

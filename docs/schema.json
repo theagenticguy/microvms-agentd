@@ -66,6 +66,38 @@
       ],
       "type": "object"
     },
+    "FileReadQuery": {
+      "description": "Query string for `GET /v1/fs/file`, which is [`FsQuery`] plus an optional line\nrange.\n\nA separate type rather than two more fields on [`FsQuery`], because a line range\nmeans nothing on `PUT /v1/fs/file` or on either tar route and a shared type would\npublish it on all four. `mode` is absent here for the same reason pointing the\nother way: it is a property of a write.\n\nThe semantics are the AI SDK harness contract's, verbatim, because that is the\nconsumer: **1-based and inclusive on both ends**, and an `end_line` past the\nfile's last line reads through EOF without an error. A caller asking for lines\n1..1000 of a 12-line file gets the 12 lines and a 200, not a 416.",
+      "properties": {
+        "end_line": {
+          "default": null,
+          "description": "Last line to return, 1-based inclusive. Absent means through EOF.\n\nPast the last line is **not** an error: the read returns through EOF. A range\nending before `start_line` is refused with 400, because it can only be a\ncaller who computed one of the two wrong — there is no file for which it is\nthe right question.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "path": {
+          "type": "string"
+        },
+        "start_line": {
+          "default": null,
+          "description": "First line to return, 1-based inclusive. Absent means 1.\n\nZero is refused with 400 rather than treated as 1. A caller who sends 0 is\nworking from a 0-based mental model, and silently reinterpreting it would\nhand back a window one line off from the one they will compute offsets\nagainst.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "path"
+      ],
+      "type": "object"
+    },
     "FsQuery": {
       "description": "Query string for every route in this module.\n\n`path` is required. A request missing it is 400, never 404: clients map 404\nonto `FileNotFoundError`, so answering 404 for a protocol typo made a missing\nquery key look like an absent artifact — that is how one defect hid for a full\nreview round.",
       "properties": {
@@ -112,6 +144,11 @@
         "bootstrapped": {
           "type": "boolean"
         },
+        "busy": {
+          "default": false,
+          "description": "Whether any exec is still running right now.\n\nHere so that an orchestrator *outside* the VM can decide whether to keep the\nVM alive, and the \"outside\" is the whole design. The platform measures\nidleness by inbound traffic through the endpoint proxy, and that proxy\nterminates outside the guest and forwards over loopback (measured;\n`docs/PLATFORM.md`, \"The platform's own hook arrives over loopback\"). A\nrequest a guest process sends to the daemon's own port never reaches the\nproxy, so no amount of in-guest traffic can reset the idle timer. A route\nthat promised otherwise would be a keepalive that does not keep anything\nalive, discovered when a multi-hour run auto-suspends mid-work.\n\nWhat does reset it is a poll from outside, and this field is what makes such\na poll *informed* rather than unconditional: the orchestrator polls, which is\nitself the inbound traffic, and reads whether the workload is busy to decide\nwhether to keep polling. The assertion is therefore repeated and explicitly\nthe caller's, which is what the daemon self-keepaliving would not be — a hung\nprocess would then bill to the 8-hour ceiling with nobody asking.\n\nComputed from the exec registry rather than remembered: true iff at least one\nregistered exec has not yet published a result. An exec that exited and is\nwaiting to be acked is not busy — its output is being *held*, not produced —\nso an orchestrator does not keep a VM alive for a command that finished.\n\n`#[serde(default)]`, unlike every field above it, and the asymmetry is not an\noversight. The daemon is baked into an image while the client is installed\nseparately, so a current client routinely talks to a daemon from whenever that\nimage was built — and a required field would make `health()` fail outright\nagainst a daemon that predates it, turning a missing signal into an\nunreachable VM. False is also the right absence: a daemon that cannot say\nwhether it is busy has not asserted that it is.",
+          "type": "boolean"
+        },
         "disk": {
           "anyOf": [
             {
@@ -122,6 +159,13 @@
             }
           ],
           "description": "Free space on the daemon's working filesystem, and the reserve it is judged\nagainst.\n\nReported so disk pressure is something an orchestrator *watches* rather than\nsomething it discovers from a failed write. anthropics/claude-code#59856\nfilled two 10 GB disks to 100% with never-collected session directories and\nthe first symptom was `useradd: No space left on device` — by which point\nevery writer in the sandbox was already broken. A number on a health endpoint\nis what makes that curve visible while there is still time to act.\n\n`None` when free space could not be measured, which is deliberately distinct\nfrom zero: unmeasurable is not full, and a monitor that conflated them would\npage on a missing `statvfs`."
+        },
+        "execs": {
+          "default": 0,
+          "description": "How many execs are registered, in any phase.\n\nAlongside `busy` because the two answer different questions and a monitor\nwants both: `busy: false, execs: 0` is a fresh or drained VM, while\n`busy: false, execs: 7` is a VM holding seven unacked results that somebody\nstill has to collect. Terminating the second loses output nobody read.\n\nDefaulted for the same reason as `busy`: a client routinely talks to a daemon\nbaked into an older image, and zero is the honest reading of a daemon that\ndoes not report a count.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
         },
         "identity_degraded": {
           "description": "Whether any startup identity repair step failed. True means the VM is serving\nwith a value from the shared image still in place — a duplicate machine-id or\nboot_id — which is a security-relevant condition an operator may want to\ndrain the VM over, but is never a reason for the daemon to refuse to serve.",
@@ -140,7 +184,9 @@
         "bootstrapped",
         "disk",
         "identity_degraded",
-        "identity_repaired"
+        "identity_repaired",
+        "busy",
+        "execs"
       ],
       "type": "object"
     },
@@ -499,15 +545,15 @@
         {
           "code": 400,
           "error": "",
-          "meaning": "the body is not JSON, carries no runHookPayload, the payload is not a JSON object with agent_token, or the token is empty. The platform terminates the VM on this, before any traffic is forwarded."
+          "meaning": "the body is not JSON, carries no runHookPayload, the payload is not a JSON object, agent_token is absent or not a string or empty, env is present but not an object, or an env value is not a string. The body names which of those it was, and never quotes a value — the payload carries the token. An unknown key is NOT one of these: it is ignored, because the platform terminates the VM on any 400 here, before any traffic is forwarded, so a newer client's unrecognised field must not kill the launch."
         },
         {
           "code": 409,
           "error": "",
-          "meaning": "a different token is already installed. Refused, and nothing changes: bootstrap is one-shot so a losing racer never replaces the winner."
+          "meaning": "a different token is already installed. Refused, and nothing changes — including the launch env, which only the first successful bootstrap sets: bootstrap is one-shot so a losing racer never replaces the winner's token, and cannot rewrite the environment every later child runs in either."
         }
       ],
-      "summary": "one-shot token bootstrap. The platform wraps the caller's string, so agent_token is one JSON parse deeper than the request body: {\"runHookPayload\": \"{\\\"agent_token\\\": \\\"...\\\"}\"}."
+      "summary": "one-shot token bootstrap, plus the optional launch environment. The platform wraps the caller's string, so the payload's own fields are one JSON parse deeper than the request body: {\"runHookPayload\": \"{\\\"agent_token\\\": \\\"...\\\", \\\"env\\\": {\\\"KEY\\\": \\\"VALUE\\\"}}\"}. `agent_token` is required and non-empty; `env` is optional and becomes the BASE environment of every later exec, with each request's own `env` overlaid on top of it. Values must be strings. Unknown keys are ignored, so a newer client can still bootstrap this daemon. The whole payload is capped by the platform at 4096 bytes inclusive, measured in UTF-8 bytes — the token and the env share that budget. `env` is installed only by the first successful bootstrap: a replay cannot edit it and a conflicting token cannot either."
     },
     {
       "auth": "none (platform hook)",
@@ -863,7 +909,7 @@
       "query": {
         "media_type": "application/x-www-form-urlencoded",
         "schema": {
-          "$ref": "#/$defs/FsQuery"
+          "$ref": "#/$defs/FileReadQuery"
         }
       },
       "request": null,
@@ -875,12 +921,12 @@
         {
           "code": 200,
           "error": "",
-          "meaning": "the file's bytes, streamed rather than buffered"
+          "meaning": "the file's bytes, streamed rather than buffered — or the requested line range of them, also streamed. A range whose end_line is past the last line answers 200 through EOF, never 416: 416 is about a range the file cannot satisfy, and reading through EOF is the harness contract."
         },
         {
           "code": 400,
           "error": "",
-          "meaning": "the path query parameter is missing, or it names a directory — use /v1/fs/tar for that. Never 404 for either: a protocol error must not look like an absent file."
+          "meaning": "the path query parameter is missing, it names a directory — use /v1/fs/tar for that — start_line or end_line is not an integer, start_line is 0 (the range is 1-based), or end_line is before start_line. Never 404 for any of them: a protocol error must not look like an absent file."
         },
         {
           "code": 401,
@@ -903,7 +949,7 @@
           "meaning": "the file could not be opened or stat'ed"
         }
       ],
-      "summary": "read one file"
+      "summary": "read one file, or a 1-based inclusive line range of it. ?start_line=&end_line= are the AI SDK harness's readTextFile semantics: an end_line past the last line reads through EOF without error, and omitting both returns the whole file byte-identically. Still streamed — the range never buffers the file to slice it."
     },
     {
       "auth": "bearer",
@@ -1082,10 +1128,10 @@
         {
           "code": 200,
           "error": "",
-          "meaning": "always, whether or not the daemon is bootstrapped. bootstrapped is how a client learns whether the control API is open yet."
+          "meaning": "always, whether or not the daemon is bootstrapped. bootstrapped is how a client learns whether the control API is open yet; busy is how an orchestrator outside the VM learns whether a workload is still running, so its own poll doubles as the inbound traffic the platform's idle policy measures. An in-guest request cannot serve that purpose: the endpoint proxy terminates outside the guest."
         }
       ],
-      "summary": "liveness, daemon version, and whether bootstrap has completed"
+      "summary": "liveness, daemon version, whether bootstrap has completed, and whether any exec is still running. `busy` exists so an orchestrator OUTSIDE the VM can hold it alive: the platform measures idleness by inbound traffic through the endpoint proxy, which terminates outside the guest, so a request from inside the guest cannot reset the idle timer. Polling this from outside is both the traffic and the decision."
     },
     {
       "auth": "none",

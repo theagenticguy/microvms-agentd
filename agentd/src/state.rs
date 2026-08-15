@@ -35,6 +35,15 @@
 //! *install* a token, and the one-shot check is re-run from whatever is there.
 //! Poisoning is not a way to bypass bootstrap.
 //!
+//! **`launch_env`** is the same argument as `token`, one step weaker in the same
+//! direction and stronger in another. Every write is a single whole-value
+//! assignment of a `HashMap`, so there is no intermediate state to be caught in;
+//! and unlike the token it carries nothing that authorizes anything, so a recovered
+//! guard cannot hand back a credential. What it *can* be is stale or absent, which
+//! means a child spawned afterwards runs without a variable the caller set. That is
+//! visible in the child's own failure rather than silent, and it is a far better
+//! outcome than a VM nothing can reach.
+//!
 //! **`execs`** is weaker and worth being explicit about, because it is a
 //! `HashMap` mutated through arbitrary caller closures in [`AppState::with_execs`].
 //! A panic inside one of those closures can leave the map missing an insert, or
@@ -108,6 +117,22 @@ struct Inner {
     /// compared in constant time on bytes: comparing `str` values raises on
     /// non-ASCII input in some runtimes, and any caller controls that header.
     token: Mutex<Option<Vec<u8>>>,
+    /// The base environment for every exec, delivered in the run-hook payload
+    /// alongside the token.
+    ///
+    /// Empty until a run hook carrying `env` arrives, and empty forever if none
+    /// does — which is why it is a plain map rather than an `Option`. There is no
+    /// behavior "no launch env was delivered" has that "an empty one was" does
+    /// not, and collapsing them means no call site has to decide.
+    ///
+    /// Deliberately **not** the same slot as the token, and deliberately never
+    /// holding it. The token's whole security property is that it stays out of
+    /// child environments (`docs/TRUST.md`), and the way to keep that true while
+    /// adding an environment channel is to have no code path that can put the
+    /// token in this map: [`AppState::bootstrap`] takes the token as bytes and the
+    /// env as a separate argument, so there is no struct field a future refactor
+    /// could accidentally forward.
+    launch_env: Mutex<HashMap<String, String>>,
     execs: Mutex<HashMap<String, ExecEntry>>,
     /// How free space is measured. Held here rather than called directly from the
     /// write paths so a test can inject a filesystem that is full, or one that
@@ -134,6 +159,7 @@ impl AppState {
             inner: Arc::new(Inner {
                 config,
                 token: Mutex::new(None),
+                launch_env: Mutex::new(HashMap::new()),
                 execs: Mutex::new(HashMap::new()),
                 space_probe,
                 identity,
@@ -158,13 +184,30 @@ impl AppState {
         &self.inner.identity
     }
 
-    /// Installs the agent token, once. Returns which of the three outcomes
-    /// occurred so the route can map it to a status code.
-    pub fn bootstrap(&self, presented: &[u8]) -> Bootstrap {
+    /// Installs the agent token and the launch environment, once. Returns which of
+    /// the three outcomes occurred so the route can map it to a status code.
+    ///
+    /// The two arrive together because they arrive in one payload, and they are
+    /// separate parameters because they must never be one value: the token is bytes
+    /// that authorize, the env is a map that reaches children, and the whole point
+    /// of the split is that no code path can move a byte from the first into the
+    /// second. See [`Inner::launch_env`].
+    ///
+    /// `launch_env` is installed only on [`Bootstrap::Installed`] — the first
+    /// caller's. A replay of the identical token is the platform retrying its own
+    /// hook, so its env is the same map; and a *different* env under the same token
+    /// would be a second caller editing the first's environment without ever
+    /// holding a different credential, which is precisely the one-shot property
+    /// stated for the other half of the payload.
+    pub fn bootstrap(&self, presented: &[u8], launch_env: HashMap<String, String>) -> Bootstrap {
         let mut slot = recover(&self.inner.token, "token");
         match slot.as_deref() {
             None => {
                 *slot = Some(presented.to_vec());
+                // Under the token lock, so a racer that loses the token cannot win
+                // the environment: the winner's map is in place before any other
+                // caller can observe a token installed.
+                *recover(&self.inner.launch_env, "launch_env") = launch_env;
                 Bootstrap::Installed
             }
             Some(installed) => {
@@ -175,6 +218,19 @@ impl AppState {
                 }
             }
         }
+    }
+
+    /// The launch environment, cloned for a caller about to build a child command.
+    ///
+    /// Cloned rather than handed out behind the guard because the caller merges it
+    /// with the per-request map and then hands the result to `Command::envs`, and
+    /// holding a `std::sync::Mutex` guard across that would put a non-`Send` value
+    /// on an async path.
+    ///
+    /// Empty when no launch env was delivered, which is the same answer as an empty
+    /// one having been delivered. Nothing branches on the difference.
+    pub fn launch_env(&self) -> HashMap<String, String> {
+        recover(&self.inner.launch_env, "launch_env").clone()
     }
 
     /// Whether bootstrap has completed. Control routes answer 503 until it has.
@@ -212,25 +268,73 @@ mod tests {
         AppState::new(Config::default())
     }
 
+    /// A launch env from pairs, so the tests below read as the payload does.
+    fn env(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+            .collect()
+    }
+
     #[test]
     fn first_bootstrap_installs() {
         let state = state();
         assert!(!state.is_bootstrapped());
-        assert_eq!(state.bootstrap(b"tok-a"), Bootstrap::Installed);
+        assert_eq!(
+            state.bootstrap(b"tok-a", HashMap::new()),
+            Bootstrap::Installed
+        );
         assert!(state.is_bootstrapped());
     }
 
     #[test]
     fn identical_replay_succeeds_and_a_different_token_conflicts() {
         let state = state();
-        state.bootstrap(b"tok-a");
+        state.bootstrap(b"tok-a", HashMap::new());
 
         // The platform retrying its own hook must not be told the VM is broken.
-        assert_eq!(state.bootstrap(b"tok-a"), Bootstrap::AlreadyIdentical);
+        assert_eq!(
+            state.bootstrap(b"tok-a", HashMap::new()),
+            Bootstrap::AlreadyIdentical
+        );
         // A hijack attempt is refused and changes nothing.
-        assert_eq!(state.bootstrap(b"tok-b"), Bootstrap::Conflict);
+        assert_eq!(
+            state.bootstrap(b"tok-b", HashMap::new()),
+            Bootstrap::Conflict
+        );
         assert_eq!(state.token_matches(b"tok-a"), Some(true));
         assert_eq!(state.token_matches(b"tok-b"), Some(false));
+    }
+
+    /// The winner's launch env is installed and no later hook can edit it, whether
+    /// it replays the same token or presents a different one. The second case is
+    /// the interesting one: without this, a caller who cannot win the token could
+    /// still rewrite the environment every subsequent child runs in.
+    #[test]
+    fn only_the_first_bootstrap_sets_the_launch_environment() {
+        let state = state();
+        assert!(state.launch_env().is_empty(), "empty before bootstrap");
+
+        assert_eq!(
+            state.bootstrap(b"tok-a", env(&[("WANTED", "yes")])),
+            Bootstrap::Installed
+        );
+        assert_eq!(state.launch_env(), env(&[("WANTED", "yes")]));
+
+        // The platform's own retry carries the same payload, so accepting its env
+        // would be a no-op — but a *changed* env under the same token would not be,
+        // and this is where that is refused.
+        assert_eq!(
+            state.bootstrap(b"tok-a", env(&[("WANTED", "hijacked")])),
+            Bootstrap::AlreadyIdentical
+        );
+        assert_eq!(state.launch_env(), env(&[("WANTED", "yes")]));
+
+        assert_eq!(
+            state.bootstrap(b"tok-b", env(&[("WANTED", "hijacked")])),
+            Bootstrap::Conflict
+        );
+        assert_eq!(state.launch_env(), env(&[("WANTED", "yes")]));
     }
 
     #[test]
@@ -287,7 +391,7 @@ mod tests {
         // request, so propagating this poison closes the whole control API
         // permanently.
         let state = state();
-        state.bootstrap(b"tok-a");
+        state.bootstrap(b"tok-a", env(&[("WANTED", "yes")]));
 
         // Poisoned directly, since no closure runs under the token lock.
         let inner = state.inner.clone();
@@ -311,7 +415,13 @@ mod tests {
         assert_eq!(state.token_matches(b"tok-b"), Some(false));
         // A different token is still refused, so the one-shot check is re-run
         // against what is really there rather than against an empty slot.
-        assert_eq!(state.bootstrap(b"tok-b"), Bootstrap::Conflict);
+        assert_eq!(
+            state.bootstrap(b"tok-b", env(&[("WANTED", "hijacked")])),
+            Bootstrap::Conflict
+        );
         assert_eq!(state.token_matches(b"tok-a"), Some(true));
+        // And the env the winner installed is still what a child would get, which
+        // is the launch-env half of "poisoning is not a bootstrap bypass".
+        assert_eq!(state.launch_env(), env(&[("WANTED", "yes")]));
     }
 }

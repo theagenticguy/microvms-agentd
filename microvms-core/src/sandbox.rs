@@ -150,6 +150,20 @@ pub struct RunRequest {
     pub execution_role_arn: Option<String>,
     /// The bearer token the daemon will accept, or `None` to mint one.
     pub agent_token: Option<String>,
+    /// Base environment for every exec in the launched VM, delivered in the same
+    /// `runHookPayload` as the token.
+    ///
+    /// The daemon applies this *under* each request's own `env`, so a per-exec value
+    /// wins on a key both set. Empty by default, and an empty map produces byte-for-byte
+    /// the payload this client always sent — a caller who never touches this field
+    /// cannot be affected by the field existing.
+    ///
+    /// It shares the token's 4096-byte payload budget, and the check is local:
+    /// [`crate::control::RunHookPayload::for_launch`] refuses an over-ceiling payload
+    /// before any call, naming the byte count and how much of it the env is. That
+    /// matters here more than for the token, because one bearer token has always fit
+    /// with room to spare and a map of credentials does not.
+    pub launch_env: std::collections::HashMap<String, String>,
     /// Whether to request the egress connector. Off means no outbound network.
     pub egress: bool,
     /// `idlePolicy.maxIdleDurationSeconds`.
@@ -172,6 +186,7 @@ impl Default for RunRequest {
             image_identifier: None,
             execution_role_arn: None,
             agent_token: None,
+            launch_env: std::collections::HashMap::new(),
             egress: false,
             max_idle_sec: 600,
             suspended_sec: 600,
@@ -215,6 +230,18 @@ impl RunRequest {
     #[must_use]
     pub fn with_agent_token(mut self, token: impl Into<String>) -> Self {
         self.agent_token = Some(token.into());
+        self
+    }
+
+    /// Adds one launch-environment variable, which every exec in the VM starts with.
+    ///
+    /// One pair per call rather than a whole map, because that is how a caller builds
+    /// one — from flags, from a config file, one credential at a time — and a
+    /// map-taking setter makes the second call silently discard the first. The field is
+    /// public for a caller who really does hold a map.
+    #[must_use]
+    pub fn with_launch_env(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.launch_env.insert(key.into(), value.into());
         self
     }
 }
@@ -571,10 +598,13 @@ impl Sandbox {
         };
 
         let agent_token = request.agent_token.clone().unwrap_or_else(mint_agent_token);
-        // Checked even though this builds the JSON itself, because the token may be
-        // caller-supplied: someone passing a signed blob rather than a bearer token is
-        // exactly who this catches (TRAP-5).
-        let payload = RunHookPayload::for_agent_token(&agent_token)?;
+        // Checked even though this builds the JSON itself, because neither half is ours:
+        // the token may be caller-supplied, so someone passing a signed blob rather than a
+        // bearer token is exactly who this catches (TRAP-5), and the launch env is entirely
+        // the caller's. This is the pre-flight refusal — over-ceiling fails here with the
+        // byte count, before the launch, rather than as a `ValidationException` on a member
+        // the caller did not know they were filling.
+        let payload = RunHookPayload::for_launch(&agent_token, &request.launch_env)?;
 
         let mut wire = RunMicrovmRequest::new(&identifier, payload);
         wire.execution_role_arn = request.execution_role_arn.clone();
@@ -1168,6 +1198,82 @@ mod tests {
         let payload = body["runHookPayload"].as_str().expect("a string");
         assert!(payload.starts_with(r#"{"agent_token":"#), "{payload}");
         assert_eq!(body["idlePolicy"]["suspendedDurationSeconds"], 600);
+    }
+
+    /// A launch env reaches the wire member the daemon parses, and it is the only thing
+    /// that changes about the request.
+    ///
+    /// Read off `runHookPayload` rather than off the request struct: a field on a struct
+    /// proves nothing about what was emitted, which is the same argument the test above
+    /// makes about the token.
+    #[tokio::test]
+    async fn a_launch_env_reaches_the_run_hook_payload_on_the_wire() {
+        let (mut sandbox, recorder, _) = planted();
+        answer_launch(&recorder);
+        sandbox
+            .run(
+                RunRequest::new()
+                    .with_image("arn:image")
+                    .with_launch_env("ANTHROPIC_BASE_URL", "https://gateway.example")
+                    .with_launch_env("PATH", "/usr/local/bin:/usr/bin:/bin"),
+            )
+            .await
+            .expect("launches");
+
+        let body = recorder.first_body("RunMicrovm");
+        let payload = body["runHookPayload"].as_str().expect("a string");
+        // One parse deeper, because that is where the daemon reads it from too.
+        let inner: serde_json::Value =
+            serde_json::from_str(payload).expect("the payload is itself JSON");
+        assert!(
+            inner["agent_token"].as_str().is_some_and(|t| !t.is_empty()),
+            "the token still rides alongside: {payload}"
+        );
+        assert_eq!(
+            inner["env"]["ANTHROPIC_BASE_URL"],
+            "https://gateway.example"
+        );
+        assert_eq!(inner["env"]["PATH"], "/usr/local/bin:/usr/bin:/bin");
+    }
+
+    /// **The local refusal, with zero control-plane calls.**
+    ///
+    /// The observable difference between this client and one that lets AWS answer, and the
+    /// same shape as STATE-5's suspend refusal: an over-budget launch env fails before the
+    /// launch rather than as a `ValidationException` on a member the caller did not know
+    /// they were filling. botocore does not enforce the ceiling client-side, so without
+    /// this there is no local signal at all.
+    ///
+    /// **Falsification** — build the payload after `run_microvm` instead of before, and the
+    /// call count assertion goes red.
+    #[tokio::test]
+    async fn an_over_budget_launch_env_is_refused_before_any_control_plane_call() {
+        let (mut sandbox, recorder, _) = planted();
+        answer_launch(&recorder);
+
+        let error = sandbox
+            .run(
+                RunRequest::new()
+                    .with_image("arn:image")
+                    .with_launch_env("AWS_SESSION_TOKEN", "t".repeat(4096)),
+            )
+            .await
+            .expect_err("a credential-scale launch env does not fit the payload");
+
+        assert_eq!(error.kind(), ErrorKind::InvalidArg);
+        let message = error.to_string();
+        assert!(message.contains("ceiling of 4096"), "{message}");
+        assert!(message.contains("launch env contributed"), "{message}");
+        assert_eq!(
+            recorder.calls().len(),
+            0,
+            "the refusal has to be local: a launch that reached AWS costs a VM and a bill"
+        );
+        // And the sandbox is left usable rather than half-launched, so a caller can trim
+        // the env and retry through the same handle.
+        assert_eq!(sandbox.lifecycle(), Lifecycle::Pending);
+        assert_eq!(sandbox.bootstrap_count(), 0);
+        assert!(sandbox.microvm().is_none());
     }
 
     /// A launch whose VM dies during startup leaves the token **not** installed, because

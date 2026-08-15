@@ -119,15 +119,22 @@ ARNs by listing, and both key image names to content hashes to avoid the
 stale-snapshot-on-name-reuse hazard. Resolve names client-side and offer
 `build --reuse` keyed on artifact content hash.
 
-**4. A per-launch environment channel.** Omnigent's whole hooks-server shim
-exists because the platform offers no per-launch env vars; the 4 KB
-`runHookPayload` is the only per-VM secret channel and it currently carries
-exactly one token. Extending the daemon's run-hook handling to accept an
-optional caller-supplied env map (delivered through the same payload,
-applied to subsequent execs as base environment) gives both Omnigent's
-entrypoint model and our own example a clean credential path without files.
-The 4 KB payload budget is real; large secrets stay on the file path or a
-role.
+**4. A per-launch environment channel. Shipped.** Omnigent's whole
+hooks-server shim existed because the platform offers no per-launch env
+vars; the `runHookPayload` is the only per-VM secret channel and it carried
+exactly one token. The run hook now accepts an optional `env` map in the
+same payload and the daemon applies it as the base environment of every
+later exec, with the per-request `env` winning on a shared key.
+`RunRequest::with_launch_env`, `run --launch-env KEY=VALUE`, and both
+bindings expose it. Two things the design pinned rather than left open: the
+token never becomes part of that base environment, proven by a test that
+asserts a child's whole environment equals the launch map; and only the
+first successful bootstrap sets it, so a caller who cannot win the token
+cannot rewrite the environment either. The payload budget is 4096 bytes and
+not 4 KB of headroom — it is shared with the token, and `microvms-core`
+refuses an over-budget payload locally, naming the env's share of it, since
+AWS's own answer arrives after the call and botocore does not check.
+Credential-scale material still belongs on the file path or a role.
 
 **5. Session-lifetime alignment for long execs.** Harbor's daemon exists
 partly because commands must outlive the 60-minute proxy-token ceiling. Our
@@ -136,12 +143,32 @@ re-minted token reattaches), but nothing documents or tests the
 reattach-after-token-rotation path explicitly. A conformance check plus a
 doc section turns an accident of design into a contract.
 
-**6. Idle-signal correctness for outbound-tunnel workloads.** The platform
-measures idleness only by inbound endpoint traffic. Omnigent's host holds an
-outbound tunnel and receives none, so auto-suspend can freeze a VM
-mid-turn. The daemon can see exec activity; exposing a "busy" signal (or
-documented keepalive recipe, a trivial periodic authenticated request)
-prevents mid-work freezes without platform changes.
+**6. Idle-signal correctness for outbound-tunnel workloads. Shipped, with
+the naive half ruled out.** The platform measures idleness only by inbound
+endpoint traffic. Omnigent's host holds an outbound tunnel and receives
+none, so auto-suspend can freeze a VM mid-turn; multi-hour agent runs past
+400 minutes are the case that hurts.
+
+The parenthetical above — "a trivial periodic authenticated request" — is
+the thing that does not work, and the reason is measured rather than
+argued. The endpoint proxy terminates *outside* the VM and forwards over
+loopback (`docs/PLATFORM.md`), so a request an in-VM process sends to the
+daemon's port is generated on the far side of the meter and never passes
+through it. A keepalive route inside the guest would answer 200 and change
+nothing, discovered as a suspend during exactly the long run it was added
+to protect.
+
+So `GET /v1/health` now carries `busy` and `execs`, and the consumer is an
+orchestrator outside the VM whose own poll *is* the inbound traffic. That
+also keeps the assertion repeated and explicitly the caller's, which is
+what rules out the daemon self-keepaliving: a hung process would otherwise
+bill silently to the 8-hour ceiling. `busy` is "producing", not
+"unfinished" — an exited exec awaiting an ack reads false — and `execs`
+counts every registered entry so a caller can tell a drained VM from one
+holding output nobody read. Not measured: that a poll from outside does in
+fact reset the timer. It is inbound endpoint traffic by construction, so it
+should, but nobody has run a VM to the edge of its idle window while
+polling and watched it survive.
 
 **7. An eve backend adapter (separate package, later).** Ten session
 methods over the Node binding makes this platform a pinnable eve backend:
@@ -170,7 +197,27 @@ can never live here.
 ## What this changes next
 
 Items 1 and 3 are CLI work measured in hours and unblock every harness
-equally. Item 2 is documentation plus a small helper. Items 4-6 are daemon
-work with real design decisions (payload budget, env precedence, busy
-semantics) and deserve their own proposals. Item 7 waits for the first
-three.
+equally. Item 2 is documentation plus a small helper. Item 7 waits for the
+first three.
+
+Items 4 and 6 have shipped, and the three design decisions this section
+predicted they would need were the right three. Payload budget: the token
+and the env share 4096 bytes, checked locally before the launch because
+neither AWS nor botocore gives a caller a signal in time. Env precedence:
+the launch env is the base and the per-request map is overlaid, which leaves
+the existing per-request contract unchanged for anyone who sends no launch
+env. Busy semantics: producing rather than unfinished, reported to an
+orchestrator *outside* the VM, because the guest-side keepalive this
+document floated cannot work against a proxy that terminates outside the
+guest. Item 5 is still open: the reattach-after-token-rotation path works by
+design and nothing tests or documents it explicitly.
+
+Reading `readTextFile` from the AI SDK sandbox contract while item 4 was
+being built turned up one gap this document had missed. That method takes
+1-based inclusive `startLine`/`endLine` and returns through EOF when
+`endLine` is past the end, and `GET /v1/fs/file` had no way to express it —
+a harness implementing it over this daemon would read whole files and slice
+them client-side, which on a multi-megabyte file is the transfer this route
+exists to avoid. The route now takes `start_line` and `end_line` with
+exactly those semantics, still streamed, with the un-ranged read
+byte-identical to what it was.

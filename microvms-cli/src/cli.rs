@@ -436,6 +436,27 @@ pub struct RunArgs {
     #[arg(long)]
     pub egress: bool,
 
+    /// Set one launch-environment variable for every exec in the VM, as KEY=VALUE.
+    /// Repeatable.
+    ///
+    /// Delivered in the same `runHookPayload` as the agent token, at launch, so it never
+    /// touches the shared image snapshot and never touches disk. The daemon applies it as
+    /// the *base* environment of every exec: `exec --env` on the same key wins, because a
+    /// launch env is a default for the VM and a per-exec flag is the specific thing
+    /// happening now.
+    ///
+    /// The whole payload shares a 4096-byte ceiling with the token, checked locally before
+    /// the launch — an over-budget env fails here with the byte count rather than as an
+    /// AWS `ValidationException` after the call. One bearer token fits with room to spare;
+    /// a set of AWS session credentials does not. Large material belongs on `microvm cp`
+    /// after bootstrap, or on a role the workload assumes.
+    ///
+    /// Same KEY=VALUE parsing as `exec --env`, and the same parser: split at the first
+    /// `=`, an empty VALUE is legal, a missing `=` or an empty KEY is refused at parse
+    /// time.
+    #[arg(long, value_name = "KEY=VALUE", value_parser = parse_env_pair)]
+    pub launch_env: Vec<(String, String)>,
+
     /// Leave the VM and image running. You are then paying for them.
     #[arg(long)]
     pub keep: bool,
@@ -1315,6 +1336,63 @@ mod tests {
             Cli::try_parse_from(&bad).is_err(),
             "a pair with no `=` must fail before any handler runs"
         );
+    }
+
+    /// `run --launch-env` is repeatable and goes through the **same** parser as
+    /// `exec --env`.
+    ///
+    /// Asserted by exercising the same three inputs that test pins — the first-`=` split,
+    /// the legal empty VALUE, and the refused bare word — because a second parser is the
+    /// thing that goes wrong here: one of the two would gain a rule and the other would
+    /// not, and a caller would learn the difference from a variable the shell cannot read
+    /// back.
+    #[test]
+    fn launch_env_is_repeatable_and_shares_the_exec_env_parser() {
+        let cli = Cli::try_parse_from([
+            "microvm",
+            "run",
+            "/tmp/agentd",
+            "--launch-env",
+            "A=1",
+            "--launch-env",
+            "EMPTY=",
+            "--launch-env",
+            "DSN=postgres://u:p@h/db?sslmode=require",
+        ])
+        .expect("three pairs parse");
+        let Command::Run(args) = cli.command else {
+            panic!("a run parses as a run");
+        };
+        assert_eq!(
+            args.launch_env,
+            [
+                ("A".to_string(), "1".to_string()),
+                ("EMPTY".to_string(), String::new()),
+                (
+                    "DSN".to_string(),
+                    "postgres://u:p@h/db?sslmode=require".to_string()
+                ),
+            ]
+        );
+
+        assert!(
+            Cli::try_parse_from(["microvm", "run", "/tmp/agentd", "--launch-env", "NOEQUALS"])
+                .is_err(),
+            "the shared parser's refusal has to apply here too"
+        );
+        assert!(
+            Cli::try_parse_from(["microvm", "run", "/tmp/agentd", "--launch-env", "=value"])
+                .is_err(),
+            "a nameless variable is refused on this flag as well"
+        );
+
+        // Absent by default, so a caller who never passes it sends the payload this
+        // client always sent.
+        let bare = Cli::try_parse_from(["microvm", "run", "/tmp/agentd"]).expect("parses");
+        let Command::Run(args) = bare.command else {
+            panic!("a run parses as a run");
+        };
+        assert!(args.launch_env.is_empty());
     }
 
     /// `--user` and `--group` are numeric, because that is the protocol's type.
