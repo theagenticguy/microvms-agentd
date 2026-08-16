@@ -231,13 +231,21 @@ jobs:
       # when the Python client was deleted.
       - run: ./scripts/check-model-drift
 
-      # Both remaining Python files, linted here rather than in a job of their
-      # own. `conformance/run_rs.py` is the live suite's driver and the two
-      # `scripts/check-*` gates are this job's own tooling, so the lint belongs
-      # beside the thing it lints. The `python` job that ran the client library's
+      # Every Python file, linted here rather than in a job of its own. `conformance/run_rs.py`
+      # is the live suite's driver and the `scripts/` gates are this job's own tooling, so the
+      # lint belongs beside the thing it lints. The `python` job that ran the client library's
       # 83 tests went away with that client.
-      - run: uvx ruff check conformance scripts
-      - run: uvx ruff format --check conformance scripts
+      #
+      # `.` rather than `conformance scripts`, and the coverage guard ahead of it, because these
+      # two lines had the same defect `mise run lint` did: ruff discovers Python by extension, so
+      # `scripts` — six extensionless PEP 723 gates — contributed nothing, and both lines passed
+      # over one file while reading as though they covered two directories. `ruff.toml`'s
+      # `extend-include` is the fix and `check-lint-coverage` is what keeps it honest; the config
+      # is also what makes this job and `mise run lint` provably the same check rather than two
+      # path lists that agree today.
+      - run: ./scripts/check-lint-coverage
+      - run: uvx ruff check .
+      - run: uvx ruff format --check .
 
   bindings:
     name: python and node bindings

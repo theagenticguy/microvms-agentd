@@ -37,7 +37,6 @@ from __future__ import annotations
 import pytest
 
 import microvms
-
 from conftest import exit_frame, gap_frame, output_frame
 
 # A syntactically valid exec id, in the `x-<16 hex>` shape the client mints.
@@ -85,7 +84,9 @@ def test_two_handles_for_one_id_address_the_same_exec() -> None:
     assert session.exec(EXEC_ID).exec_id == session.exec(EXEC_ID).exec_id
 
 
-@pytest.mark.parametrize("bad", [-1.0, -0.001, float("nan"), float("inf"), float("-inf")])
+@pytest.mark.parametrize(
+    "bad", [-1.0, -0.001, float("nan"), float("inf"), float("-inf")]
+)
 def test_the_stream_idle_timeout_is_refused_by_the_core_before_any_request(
     bad: float,
 ) -> None:
@@ -105,7 +106,9 @@ def test_the_stream_idle_timeout_is_refused_by_the_core_before_any_request(
 
 
 @pytest.mark.parametrize("bad", [-1.0, float("nan"), float("inf")])
-def test_every_timeout_parameter_on_the_surface_shares_the_one_refusal(bad: float) -> None:
+def test_every_timeout_parameter_on_the_surface_shares_the_one_refusal(
+    bad: float,
+) -> None:
     """Four entry points, one check, so none of them is the loose one.
 
     A binding that validated `stream(idle_timeout=)` and not `wait(timeout=)` would leave the
@@ -204,7 +207,14 @@ def test_a_gap_is_a_typed_event_carrying_the_range_that_is_gone(
     exclusive, so `end` is where a cursor resumes and `size` is how much was lost.
     """
     server = sse_server(  # type: ignore[operator]
-        [[output_frame(0, b"AA"), gap_frame(2, 900), output_frame(900, b"ZZ"), exit_frame(902)]]
+        [
+            [
+                output_frame(0, b"AA"),
+                gap_frame(2, 900),
+                output_frame(900, b"ZZ"),
+                exit_frame(902),
+            ]
+        ]
     )
     events = list(handle_against(server).stream(idle_timeout=5.0))
 
@@ -263,7 +273,14 @@ def test_the_three_event_classes_are_distinct_so_isinstance_and_kind_both_work(
     down the happy path.
     """
     server = sse_server(  # type: ignore[operator]
-        [[output_frame(0, b"AA"), gap_frame(2, 4), output_frame(4, b"BB"), exit_frame(6)]]
+        [
+            [
+                output_frame(0, b"AA"),
+                gap_frame(2, 4),
+                output_frame(4, b"BB"),
+                exit_frame(6),
+            ]
+        ]
     )
     events = list(handle_against(server).stream(idle_timeout=5.0))
 
@@ -317,7 +334,9 @@ def test_events_reach_the_iterator_in_wire_order(sse_server: object) -> None:
 
     assert [event.offset for event in events if event.kind == "output"] == [0, 5, 10]
     assert b"".join(e.data for e in events if e.kind == "output") == b"AAAAABBBBBCCCCC"
-    assert events[-1].kind == "exit", "the terminal event has to be delivered, not swallowed"
+    assert events[-1].kind == "exit", (
+        "the terminal event has to be delivered, not swallowed"
+    )
 
 
 def test_the_iterator_ends_after_the_terminal_event_rather_than_hanging(
@@ -393,9 +412,13 @@ def test_a_cut_stream_reconnects_at_the_cursor_losing_and_duplicating_nothing(
     )
     events = list(handle_against(server).stream(idle_timeout=5.0))
 
-    assert b"".join(e.data for e in events if e.kind == "output") == b"AAAA\nBBBB\nCCCC\n"
+    assert (
+        b"".join(e.data for e in events if e.kind == "output") == b"AAAA\nBBBB\nCCCC\n"
+    )
     assert events[-1].kind == "exit"
-    assert server.offsets_requested() == [0, 10], "the reconnect asked for the wrong byte"  # type: ignore[attr-defined]
+    assert server.offsets_requested() == [0, 10], (
+        "the reconnect asked for the wrong byte"
+    )  # type: ignore[attr-defined]
 
 
 def test_a_gap_advances_the_cursor_so_a_reconnect_does_not_ask_for_evicted_bytes(
@@ -474,7 +497,9 @@ def test_error_on_gap_raises_the_typed_error_instead_of_yielding_a_gap_event(
     assert "[2, 900)" in str(raised.value), str(raised.value)
 
 
-def test_a_stream_error_is_raised_out_of_the_iterator_rather_than_ending_it_silently() -> None:
+def test_a_stream_error_is_raised_out_of_the_iterator_rather_than_ending_it_silently() -> (
+    None
+):
     """A silent end would read as complete output, which is the failure to avoid.
 
     No server here at all: a connection refused is the simplest real transport failure, and it
@@ -483,7 +508,9 @@ def test_a_stream_error_is_raised_out_of_the_iterator_rather_than_ending_it_sile
     """
     with pytest.raises(microvms.MicrovmError) as raised:
         list(offline_handle().stream(reconnect=False, idle_timeout=1.0))
-    assert raised.value.retryable is True, "a refused connection says nothing about the exec"
+    assert raised.value.retryable is True, (
+        "a refused connection says nothing about the exec"
+    )
     assert raised.value.code == "ERR_RETRYABLE"
 
 
@@ -504,8 +531,16 @@ def test_two_streams_over_one_handle_each_get_their_own_events(
     )
     handle = handle_against(server)
 
-    first = [event.data for event in handle.stream(idle_timeout=5.0) if event.kind == "output"]
-    second = [event.data for event in handle.stream(idle_timeout=5.0) if event.kind == "output"]
+    first = [
+        event.data
+        for event in handle.stream(idle_timeout=5.0)
+        if event.kind == "output"
+    ]
+    second = [
+        event.data
+        for event in handle.stream(idle_timeout=5.0)
+        if event.kind == "output"
+    ]
 
     assert first == [b"first\n"]
     assert second == [b"second\n"]
@@ -610,7 +645,8 @@ def test_a_stderr_chunk_reports_its_own_stream_in_the_shared_offset_space(
         ]
     )
     outputs = [
-        event for event in handle_against(server).stream(idle_timeout=5.0)
+        event
+        for event in handle_against(server).stream(idle_timeout=5.0)
         if event.kind == "output"
     ]
 

@@ -470,7 +470,9 @@ class Checker:
 
     def enum(self, label: str, shape: str, ours: Iterable[str]) -> None:
         self.touched.add(shape)
-        self.record(label, tuple(sorted(ours)), tuple(sorted(self.shape(shape)["enum"])))
+        self.record(
+            label, tuple(sorted(ours)), tuple(sorted(self.shape(shape)["enum"]))
+        )
 
     def bound(self, label: str, shape: str, key: str, ours: Any) -> None:
         self.touched.add(shape)
@@ -516,10 +518,9 @@ def check(src: Source, model: dict[str, Any]) -> Checker:
     # keep right. What matters is that the claim is still there — the day it is fixed, this line
     # goes red and `DOCUMENTED_RUN_HOOK_PAYLOAD_BYTES` and its warning should be deleted.
     documented = src.get("DOCUMENTED_RUN_HOOK_PAYLOAD_BYTES")
-    payload_docs = (
-        model["shapes"]["RunMicrovmRequest"]["members"]["runHookPayload"]
-        .get("documentation", "")
-    )
+    payload_docs = model["shapes"]["RunMicrovmRequest"]["members"][
+        "runHookPayload"
+    ].get("documentation", "")
     c.record(
         "runHookPayload documentation still claims the wrong ceiling",
         f"{documented:,}",
@@ -588,7 +589,9 @@ def check(src: Source, model: dict[str, Any]) -> Checker:
         ("DEAD_STATES ⊆ MicrovmState", src.get("DEAD_STATES")),
     ):
         unknown = sorted(set(ours) - model_states)
-        c.record(label, unknown, [], note="states our code branches on that the model omits")
+        c.record(
+            label, unknown, [], note="states our code branches on that the model omits"
+        )
 
     # `IMAGE_READY_STATES` deliberately carries two spellings the enum does not have
     # (`ACTIVE`, `AVAILABLE`), kept for older API versions. So the model-derived half
@@ -638,7 +641,12 @@ def check(src: Source, model: dict[str, Any]) -> Checker:
     # The client sends `CodeArtifact.uri`, `CreateMicrovmImage.baseImageArn`, and
     # `ListMicrovmImages.nameFilter` as this shape, plus `GetMicrovmImageBuild`'s `buildId` and
     # `imageVersion` URI members. `require_non_blank` is the guard.
-    c.bound("NonBlankString max length", "NonBlankString", "max", src.get("MAX_NON_BLANK_LEN"))
+    c.bound(
+        "NonBlankString max length",
+        "NonBlankString",
+        "max",
+        src.get("MAX_NON_BLANK_LEN"),
+    )
     c.bound("NonBlankString min length", "NonBlankString", "min", 1)
     c.pattern("NonBlankString pattern", "NonBlankString", src.get("NON_BLANK_PATTERN"))
 
@@ -654,7 +662,12 @@ def check(src: Source, model: dict[str, Any]) -> Checker:
     # identifier. If AWS ever narrows this to 256 the contradiction is gone, and this line plus
     # `constants.rs`'s `a_legal_image_arn_can_be_longer_than_a_legal_identifier` are what would
     # say so.
-    c.bound("MicrovmImageArn max length", "MicrovmImageArn", "max", src.get("MAX_IMAGE_ARN_LEN"))
+    c.bound(
+        "MicrovmImageArn max length",
+        "MicrovmImageArn",
+        "max",
+        src.get("MAX_IMAGE_ARN_LEN"),
+    )
     c.record(
         "MicrovmImageArn max > MicrovmImageIdentifier max (the model's own contradiction)",
         src.get("MAX_IMAGE_ARN_LEN") > src.get("MAX_IDENTIFIER_LEN"),
@@ -792,7 +805,12 @@ def check(src: Source, model: dict[str, Any]) -> Checker:
     ):
         c.bound(f"{shape} max", shape, "max", MAX_LIST_PAGE_SIZE)
         c.bound(f"{shape} min", shape, "min", 1)
-    c.bound("EnvironmentVariableMap max", "EnvironmentVariableMap", "max", MAX_ENVIRONMENT_VARIABLES)
+    c.bound(
+        "EnvironmentVariableMap max",
+        "EnvironmentVariableMap",
+        "max",
+        MAX_ENVIRONMENT_VARIABLES,
+    )
 
     # `min: 60` with no max. This comment used to say it was "the one constraint here botocore
     # *does* enforce locally — so the client adds no check for it", and that was the exemption
@@ -829,7 +847,9 @@ def check(src: Source, model: dict[str, Any]) -> Checker:
         for member, spec in body.get("members", {}).items()
         if spec.get("idempotencyToken")
     }
-    c.record("idempotencyToken members", sorted(IDEMPOTENCY_TOKEN_MEMBERS), sorted(found))
+    c.record(
+        "idempotencyToken members", sorted(IDEMPOTENCY_TOKEN_MEMBERS), sorted(found)
+    )
 
     # All three token shapes, separately. This one earned its place: the coverage
     # report below named `RunMicrovmRequestClientTokenString` as unbound, and checking
@@ -1030,7 +1050,9 @@ def main() -> int:
     if args.verbose:
         for name in missing:
             body = model["shapes"][name]
-            stated = {k: v for k, v in body.items() if k in ("enum", "min", "max", "pattern")}
+            stated = {
+                k: v for k, v in body.items() if k in ("enum", "min", "max", "pattern")
+            }
             print(f"  -- {name} {stated}")
     else:
         print(f"  {', '.join(missing[:8])}{', ...' if len(missing) > 8 else ''}")
@@ -1042,9 +1064,13 @@ def main() -> int:
     )
 
     if drifted:
-        print(f"\n{len(drifted)} constraint(s) drifted. Either the model moved, one of our")
+        print(
+            f"\n{len(drifted)} constraint(s) drifted. Either the model moved, one of our"
+        )
         print("values was wrong, or a value the model cannot state disagrees with this")
-        print("script's pinned copy of it. Read the model, fix the constant, and re-measure")
+        print(
+            "script's pinned copy of it. Read the model, fix the constant, and re-measure"
+        )
         print("if it is a ceiling.")
         return 1
     print(

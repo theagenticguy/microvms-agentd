@@ -90,7 +90,9 @@ def test_parse_accepts_every_supported_name_and_round_trips_it(name: str) -> Non
         "local",
     ],
 )
-def test_parse_refuses_everything_outside_the_five_without_normalising(name: str) -> None:
+def test_parse_refuses_everything_outside_the_five_without_normalising(
+    name: str,
+) -> None:
     """Exact matching, and that is deliberate rather than an oversight.
 
     A `parse` that trimmed or case-folded would accept two spellings of one region, and whichever
@@ -138,7 +140,9 @@ def test_unlisted_produces_a_region_that_says_it_is_unlisted() -> None:
 
 
 @pytest.mark.parametrize("name", SUPPORTED)
-def test_unlisted_normalises_a_supported_name_back_to_the_real_region(name: str) -> None:
+def test_unlisted_normalises_a_supported_name_back_to_the_real_region(
+    name: str,
+) -> None:
     """One region, one value, however it was reached.
 
     Without this, `unlisted("us-east-1")` would be a *second* value for a supported region —
@@ -164,7 +168,9 @@ def test_unlisted_accepts_a_name_parse_refuses_which_is_the_whole_point() -> Non
     assert microvms.Region.unlisted(name).name == name
 
 
-def test_an_unlisted_name_is_carried_verbatim_including_a_spelling_parse_would_reject() -> None:
+def test_an_unlisted_name_is_carried_verbatim_including_a_spelling_parse_would_reject() -> (
+    None
+):
     """No normalising on the way through, because the caller may know something we do not.
 
     A name is what goes into the endpoint's middle segment, so altering it would address a
@@ -241,7 +247,9 @@ def test_the_repr_says_both_the_name_and_whether_it_is_supported() -> None:
     assert supported != unlisted
 
 
-def test_a_region_cannot_be_constructed_from_a_bare_string_by_calling_the_class() -> None:
+def test_a_region_cannot_be_constructed_from_a_bare_string_by_calling_the_class() -> (
+    None
+):
     """No `__new__`, so an unchecked name is not writable.
 
     With a constructor, `Region("eu-central-1")` would be the shortest path in the module and it

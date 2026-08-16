@@ -40,35 +40,54 @@ AGENTD_TARGET = "aarch64-unknown-linux-musl"
 
 [tasks.fmt]
 description = "Format everything (writes)"
+# `ruff format .` rather than a path list, and the whole repo rather than four named
+# directories, because `ruff.toml` now carries the discovery. See `[tasks.lint]` below for
+# the trap that made the list necessary and the `extend-include` that retired it — this
+# line has to stay the same shape as the `--check` one there, or `fmt` would leave work
+# for `lint` to find.
 run = [
   "cargo fmt --all",
-  "ruff format conformance scripts scripts/generate-py-stubs microvms-py/examples microvms-py/tests/test_stubs.py",
+  "ruff format .",
   "terraform -chdir=conformance/infra fmt",
 ]
 
 [tasks.lint]
 description = "Format check + clippy + ruff, no writes"
-# `scripts/generate-py-stubs` is named on its own even though `scripts` is already in the
-# list, and that is not redundancy. ruff discovers files by **extension** when it walks a
-# directory, and every gate in `scripts/` is an extensionless PEP 723 script with a
-# `uv run --script` shebang — so `ruff check scripts` reports "No Python files found under
-# the given path(s)" as a *warning* and exits 0. Measured here: the two existing ruff lines
-# have been linting `conformance/run_rs.py` and nothing else. Naming the file directly is
-# what makes ruff read it (it found real F401s in this one that way).
+# `ruff check .` and `ruff format --check .`, one path each, because the file selection now
+# lives in `ruff.toml` where a config can be reasoned about — and because this line spent its
+# whole life not linting most of the repo.
 #
-# The rest of `scripts/` is deliberately not named yet: those four gates predate this
-# change, and reformatting 80 KB of unrelated tooling to satisfy a lint is a diff that
-# buries the change it travels with. `scripts` stays in the list so the directory is already
-# there when someone does that pass.
+# ruff discovers files by **extension** when it walks a directory, and every gate in
+# `scripts/` is an extensionless PEP 723 script with a `uv run --script` shebang. So
+# `ruff check scripts` reported "No Python files found under the given path(s)" as a
+# *warning* and exited 0: measured, the two ruff lines here were reading
+# `conformance/run_rs.py` and nothing else, for as long as they had existed. That is a gate
+# passing over an empty set, which is the failure mode `check-model-drift`'s own header
+# warns about, and it was hiding real findings — naming one script explicitly surfaced F401s
+# in it immediately.
 #
-# `microvms-py/tests/test_stubs.py` rather than `microvms-py/tests`, for the same reason:
-# the seven test files that were there before this commit are not ruff-formatted (they were
-# never in scope), and bringing them in is its own commit.
+# The list this replaces was that naming, and it worked for exactly the files someone
+# remembered. `ruff.toml`'s `extend-include = ["scripts/*"]` is the structural version: a new
+# script under `scripts/` is linted the day it lands, with nobody editing this file. The
+# config states the rule set, the two target-version floors, and the one generated artifact
+# the formatter skips, each with its reason.
+#
+# `./scripts/check-lint-coverage` is the guard over that, and it is a separate gate on
+# purpose: a config that stops matching goes quiet the same way the original bug did, and
+# `ruff check .` would still print "All checks passed!" over nothing. It compares ruff's own
+# `--show-files` answer against every tracked file that is Python by extension or by shebang,
+# and names any shortfall. Offline, free, milliseconds. Proven able to fail by pointing it at
+# an empty directory, which is the original defect reproduced deliberately.
+#
+# Nothing named individually any more, and the previous "deliberately not named yet" pass is
+# done: the five other `scripts/` gates and all eight `microvms-py/tests` files are in, with
+# their import sorting and formatting fixed here.
 run = [
   "cargo fmt --all -- --check",
   "cargo clippy --all-targets -- -D warnings",
-  "ruff check conformance scripts scripts/generate-py-stubs microvms-py/examples microvms-py/tests/test_stubs.py",
-  "ruff format --check conformance scripts scripts/generate-py-stubs microvms-py/examples microvms-py/tests/test_stubs.py",
+  "./scripts/check-lint-coverage",
+  "ruff check .",
+  "ruff format --check .",
   "terraform -chdir=conformance/infra fmt -check",
 ]
 
@@ -123,9 +142,15 @@ run = "cargo test --all"
 # loopback socket. The Python tier moved to git history after the Rust port went
 # live-green — both suites passed against real AWS on the same commit (Python oracle
 # 56/56, Rust CLI 38/38), which is what made the oracle's job finished rather than
-# merely duplicated. The two Python files left in the tree are tooling, not a client:
-# `conformance/run_rs.py` drives the Rust CLI, and the two `scripts/check-*` gates read
-# botocore's model and the AWS Pricing API. Both are still linted by `fmt` and `lint`.
+# merely duplicated. The Python left in the tree is tooling and binding tests, not a client:
+# `conformance/run_rs.py` drives the Rust CLI, the six `scripts/` gates read botocore's model,
+# the Pricing API, the account, and the pyo3 surface, and `microvms-py/tests` covers the
+# bindings (run in CI against a built wheel, not here — it needs `maturin develop`).
+#
+# Every one of them is linted by `fmt` and `lint`, which is newly true rather than restated:
+# eighteen files are what `ruff.toml` reaches now, against the one file the two ruff lines
+# used to see. `./scripts/check-lint-coverage` prints the count on every run, which is what
+# keeps this number from drifting the way the live-suite counts above did.
 
 [tasks.schema]
 description = "Regenerate docs/schema.json from the serde types"

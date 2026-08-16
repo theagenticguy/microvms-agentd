@@ -1,0 +1,117 @@
+# The ruff configuration, and the reason this file exists at all.
+#
+# ruff discovers Python by **extension** when it walks a directory. Every gate in `scripts/`
+# is an extensionless PEP 723 script with a `uv run --script` shebang, so `ruff check
+# scripts` found nothing, warned "No Python files found under the given path(s)", and exited
+# 0 — for the whole life of that line in `mise.toml`. A gate reporting success over an empty
+# set is the failure mode `scripts/check-model-drift`'s own header names, and it was hiding
+# real findings: the first script to be named explicitly turned out to have unused imports.
+#
+# `extend-include` answers it structurally rather than by name. Naming each file in the mise
+# task worked, but only for the files someone remembered — a new script under `scripts/`
+# escaped again silently, which is the same defect with a longer fuse. With the glob below,
+# `ruff check .` reads every gate, and a new one is linted the day it lands.
+#
+# `scripts/*` says the quiet part out loud: in this repo, a file in `scripts/` is Python. A
+# shell helper dropped there would be parsed as Python and reported as a wall of syntax
+# errors that name the symptom rather than the cause, so `scripts/check-lint-coverage`
+# compares ruff's file set against the shebangs and reports that case directly, by name, with
+# the two honest responses (move it out, or exclude it here with a reason).
+
+extend-include = ["scripts/*"]
+
+# So the excludes below also apply to a path named on the command line. Without it an
+# excluded file is skipped when ruff walks a directory and processed when someone types its
+# name, which makes the exclusion advisory rather than a decision.
+force-exclude = true
+
+# The floor `microvms-py/pyproject.toml` declares (`requires-python = ">=3.9"`), because the
+# abi3-py39 wheel means a consumer really can be on 3.9 and a rule that assumes newer syntax
+# would approve a file that will not import there.
+target-version = "py39"
+
+# The tooling is not the wheel. Every PEP 723 script and `conformance/run_rs.py` carries
+# `requires-python = ">=3.11"` in its own inline metadata block, and `uv run --script`
+# enforces it — so holding them to the wheel's 3.9 floor would be a constraint nothing
+# imposes. ruff does not read the PEP 723 block itself (measured: a `py39` config still
+# passes `Optional[int]` in a script whose block says 3.11), so this restates it. Keep the two
+# in step if a script's block ever moves.
+per-file-target-version = { "scripts/*" = "py311", "conformance/*" = "py311" }
+
+[format]
+# `microvms-py/microvms.pyi` is generated: `./scripts/generate-py-stubs` renders it from
+# pyo3's introspection, and `mise run stubs:check` fails when it drifts from the Rust
+# surface. Formatting it here would put two writers on one file — ruff's pass would be undone
+# by the next `mise run stubs`, and `stubs:check` would then fail on a diff nobody wrote. A
+# formatting decision about this artifact belongs in the generator, which does not make one
+# today. Revisit if `generate-py-stubs` ever formats its own output; the 60-odd differences
+# ruff would make to it are real (blank-line and `X | None` spacing that maturin emits
+# unformatted).
+exclude = ["microvms-py/microvms.pyi"]
+
+[lint]
+# `select` rather than `extend-select`, and the four default codes written out, because the
+# default set is not stable across ruff releases and `[tools] ruff = "latest"` in `mise.toml`
+# means this repo takes whatever the newest one selects. Measured 2026-08-16: the pinned
+# 0.15.22 reports 0 findings here, and 0.16.3 — which `mise latest ruff` already resolves to —
+# reports 53 under the same `extend-select`, having pulled PYI, FURB, ISC, PL and RUF015 into
+# its defaults. An `extend-select` config would have turned that release into a red build on
+# an unrelated `mise install`, with a diff nobody wrote. Naming the set makes a rule arrive
+# when someone adds it here.
+#
+# Three families beyond the default E4/E7/E9/F, each chosen because this commit fixes what it
+# found rather than because the list looks thorough.
+#
+#   I       import sorting. Three files under `microvms-py/tests/` had un-grouped blocks —
+#           `test_exec.py`, `test_smoke.py`, `test_stubs.py`. All three are fixed here and the
+#           rule is what keeps them sorted. Six without `known-first-party` below, which is
+#           the measurement that argued for declaring it rather than reordering to satisfy a
+#           misclassification.
+#   BLE     blind-except. Zero new findings, and that is its whole purpose: it makes the five
+#           existing `# noqa: BLE001` comments *mean* something. Each of the five names the
+#           reason its bare `except Exception` is correct ("any error is the finding"), and
+#           with the rule unselected they suppressed nothing — a comment claiming a
+#           constraint that was not there.
+#   RUF100  unused noqa. The meta-rule over the line above: a suppression that no longer
+#           suppresses is exactly the kind of quiet wrongness this repo's comments are
+#           supposed to prevent. It is what found those five, plus one directive that was
+#           genuinely stale.
+#
+# Deliberately left, each with the reason rather than a silence:
+#
+#   E4/E7/E9/F
+#           the default four, restated rather than inherited for the reason above. F is the
+#           one that pays here: F401 on unused imports is what a script escaping the walk was
+#           hiding.
+#   RUF015  three `list(stream)[0]` reads in the exec tests. `next(...)` is the tidier
+#           expression and a different one: it abandons the SSE generator after the first
+#           frame instead of draining it, and those tests exist to assert what a whole
+#           stream delivers. A lint fix that changes what a test exercises is not a lint fix.
+#   N818    two exception classes in `check-live-rates` with no `Error` suffix. Renaming them
+#           is a rename inside a live gate, and it belongs to a commit whose subject is that
+#           script.
+#   E501    852 findings, and every one is a comment or docstring line in a repo whose
+#           comments carry the reasoning. Reflowing them is a prose decision, not a lint pass.
+#   D, ANN, TRY, EM, T20, PL
+#           476 / 22 / 35 / 36 / 101 / 56 findings, and each family argues with what this
+#           surface *is*: tooling and one conformance driver, not a library. T20 would flag
+#           the `print` calls that are these gates' entire output; PLR2004 would flag the
+#           service limits `check-model-drift` exists to compare against.
+#
+#   PYI, FURB, ISC
+#           39 / 5 / 4 of the 53 that 0.16's defaults would add, none of them reviewed by
+#           anyone. PYI029's 36 are `__repr__` declarations in the generated `microvms.pyi`,
+#           so satisfying that rule means changing the *generator* — exactly the kind of
+#           decision that should not arrive by way of a version bump.
+#
+# UP, B, C4 and SIM are clean today and still not selected, on the same rule: this list is
+# what the commit fixed, and a rule enabled over a clean tree is one nobody has yet had to
+# satisfy. Turn them on in the commit that fixes their first finding.
+select = ["E4", "E7", "E9", "F", "I", "BLE", "RUF100"]
+
+[lint.isort]
+# `microvms` is this repo's own extension module and `conftest` is the test helper beside the
+# files that import it, but neither is installed as a source directory ruff can see, so isort
+# read both as third-party and wanted them sorted in beside `pytest`. Declaring them is what
+# makes the grouping ruff enforces the grouping a reader would write.
+known-first-party = ["microvms", "conftest"]

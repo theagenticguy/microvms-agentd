@@ -59,7 +59,9 @@ def test_a_direct_session_has_no_minter_so_nothing_mints() -> None:
     assert direct().proxy_mint_count is None
 
 
-def test_there_is_no_constructor_so_a_session_comes_from_direct_or_from_a_sandbox() -> None:
+def test_there_is_no_constructor_so_a_session_comes_from_direct_or_from_a_sandbox() -> (
+    None
+):
     """Two doors, both named.
 
     A `Session(...)` constructor would be a third, and the thing it would most plausibly take is
@@ -99,7 +101,9 @@ def test_the_repr_names_the_endpoint_and_port_without_the_token() -> None:
     An endpoint and a port are addresses; the agent token is a credential. A repr carrying it
     would put a bearer token into every traceback and log line that formatted a session.
     """
-    rendered = repr(microvms.Session.direct("http://127.0.0.1:9000", "super-secret-token"))
+    rendered = repr(
+        microvms.Session.direct("http://127.0.0.1:9000", "super-secret-token")
+    )
     assert "127.0.0.1:9000" in rendered
     assert "9000" in rendered
     assert "super-secret-token" not in rendered
@@ -175,7 +179,9 @@ def test_every_exec_option_is_keyword_only_so_none_can_be_transposed() -> None:
         )
 
 
-def test_a_supplied_exec_id_is_the_idempotency_key_and_comes_back_on_the_handle() -> None:
+def test_a_supplied_exec_id_is_the_idempotency_key_and_comes_back_on_the_handle() -> (
+    None
+):
     """What a caller whose retry must be safe across its own restart passes.
 
     Asserted through the reattach path, which needs no daemon: the handle carries the id it was
@@ -216,7 +222,9 @@ def test_file_transfer_takes_bytes_rather_than_str_so_no_encode_is_implied() -> 
 # -- the failure taxonomy of an unreachable daemon -----------------------------
 
 
-def test_a_refused_connection_is_retryable_on_every_method_that_makes_a_request() -> None:
+def test_a_refused_connection_is_retryable_on_every_method_that_makes_a_request() -> (
+    None
+):
     """The branch a caller's retry loop reads, checked across the surface rather than once.
 
     A refused connection says nothing about the VM or the exec — it is exactly what a VM that
@@ -280,7 +288,9 @@ def test_the_build_family_accepts_its_whole_documented_range(seconds: int) -> No
 
 
 @pytest.mark.parametrize("seconds", [0, 61, 3600, 100_000])
-def test_the_run_family_refuses_everything_above_its_ceiling_and_zero(seconds: int) -> None:
+def test_the_run_family_refuses_everything_above_its_ceiling_and_zero(
+    seconds: int,
+) -> None:
     """Zero as well as the overshoots: a zero-second hook cannot complete.
 
     3600 is in this list on purpose — it is the *build* family's ceiling, so it is the number
@@ -300,7 +310,9 @@ def test_the_build_family_refuses_everything_above_its_own_ceiling_and_zero(
         microvms.BuildHookTimeout(seconds)
 
 
-def test_the_refusal_names_both_ceilings_because_the_caller_picked_the_other_one() -> None:
+def test_the_refusal_names_both_ceilings_because_the_caller_picked_the_other_one() -> (
+    None
+):
     """Telling someone "the limit is 60" answers a question they did not ask.
 
     A caller who passes 3600 to the run family is nearly always someone who read the build
@@ -336,7 +348,9 @@ def test_the_two_timeout_types_are_not_interchangeable_in_either_direction() -> 
 # -- the session constants -----------------------------------------------------
 
 
-def test_both_proxy_headers_are_published_because_one_without_the_other_is_rejected() -> None:
+def test_both_proxy_headers_are_published_because_one_without_the_other_is_rejected() -> (
+    None
+):
     """TRAP-7: they go out together or the request is refused indistinguishably.
 
     Published so a harness asserting against the wire contract does not hardcode a spelling, and

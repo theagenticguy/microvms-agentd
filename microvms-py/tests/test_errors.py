@@ -80,7 +80,9 @@ def test_no_exception_is_a_subclass_of_another_so_no_except_clause_overlaps() ->
             assert not issubclass(inner, outer), (inner.__name__, outer.__name__)
 
 
-def test_the_library_exceptions_do_not_shadow_the_builtins_they_are_named_after() -> None:
+def test_the_library_exceptions_do_not_shadow_the_builtins_they_are_named_after() -> (
+    None
+):
     """`microvms.TimeoutError` is **not** the builtin, and neither is `InterruptedError`.
 
     Two of the thirteen collide with builtin names, which is a real hazard: a caller writing
@@ -103,7 +105,9 @@ def raise_invalid_arg() -> microvms.MicrovmError:
     return raised.value
 
 
-def test_a_raised_exception_carries_all_four_attributes_and_not_a_parsed_message() -> None:
+def test_a_raised_exception_carries_all_four_attributes_and_not_a_parsed_message() -> (
+    None
+):
     """`.code`, `.kind`, `.wire_kind`, `.retryable` — the whole set, on the instance.
 
     Nobody parses a message. That rule is why these are attributes, and a missing one sends a
@@ -131,7 +135,9 @@ def test_code_and_kind_are_the_same_string_because_there_is_one_taxonomy() -> No
     assert error.code.startswith("ERR_")
 
 
-def test_a_local_refusal_reports_no_wire_kind_because_nothing_reached_the_daemon() -> None:
+def test_a_local_refusal_reports_no_wire_kind_because_nothing_reached_the_daemon() -> (
+    None
+):
     """`None` and not a guessed status.
 
     Inventing a wire kind for a local refusal would be a claim nobody made, and a monitor
@@ -272,4 +278,6 @@ def test_each_exception_documents_the_condition_it_stands_for() -> None:
     for code, exception in KIND_TO_EXCEPTION:
         doc = exception.__doc__ or ""
         assert code in doc, f"{exception.__name__}'s docstring does not name {code}"
-        assert len(doc) > len(code) + 20, f"{exception.__name__} has no real explanation"
+        assert len(doc) > len(code) + 20, (
+            f"{exception.__name__} has no real explanation"
+        )

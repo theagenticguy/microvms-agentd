@@ -23,7 +23,6 @@ import pytest
 
 import microvms
 
-
 # -- BIND-5: EstimatedUsd has no numeric door ---------------------------------
 
 
@@ -313,7 +312,9 @@ def test_no_method_on_the_surface_takes_a_region_string() -> None:
 # -- BIND-2: no parameter bypasses a trap closure -----------------------------
 
 
-def test_there_is_no_client_token_parameter_anywhere(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_there_is_no_client_token_parameter_anywhere(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """TRAP-1 is closed by absence at both levels.
 
     A digest-derived `clientToken` replays the original create and wedges an image in
@@ -501,7 +502,9 @@ def test_the_cost_constants_are_the_documented_figures() -> None:
 
 def test_the_residency_comparison_carries_its_own_counter_argument() -> None:
     """The warm-pool argument stays honest: per-cycle cost and a break-even hold."""
-    comparison = microvms.compare_residency(microvms.SizeClass.default_class(), 86400.0, 1)
+    comparison = microvms.compare_residency(
+        microvms.SizeClass.default_class(), 86400.0, 1
+    )
     assert comparison.cycles == 1
     # Projected, always: a comparison is a hypothetical about a hold nobody has taken.
     assert comparison.hold.provenance == "projected"

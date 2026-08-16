@@ -47,7 +47,9 @@ def gap_frame(start: int, end: int) -> bytes:
     return f'event: gap\ndata: {{"from":{start},"to":{end}}}\n\n'.encode()
 
 
-def exit_frame(total: int, exit_code: int | None = 0, signal: int | None = None) -> bytes:
+def exit_frame(
+    total: int, exit_code: int | None = 0, signal: int | None = None
+) -> bytes:
     """The terminal `exit` frame. Its absence is what makes a stream a cut."""
     code = "null" if exit_code is None else str(exit_code)
     sig = "null" if signal is None else str(signal)
@@ -76,7 +78,14 @@ class SseServer:
         class Handler(http.server.BaseHTTPRequestHandler):
             protocol_version = "HTTP/1.1"
 
-            def do_GET(self) -> None:  # noqa: N802 — http.server's own spelling
+            # `do_GET` rather than `do_get` because it is http.server's own dispatch
+            # spelling — `BaseHTTPRequestHandler` looks up `"do_" + command`, so a
+            # snake_case name is simply never called. This line carried a suppression of
+            # N802 until ruff learned the convention itself: measured on 0.15.22, that rule
+            # exempts `do_*` on a `BaseHTTPRequestHandler` subclass, so the directive
+            # suppressed nothing and RUF100 flagged it. The reason survives as prose; the
+            # dead suppression does not.
+            def do_GET(self) -> None:
                 paths.append(self.path)
                 try:
                     frames = next(remaining)
