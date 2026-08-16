@@ -3,6 +3,7 @@
 # requires-python = ">=3.11"
 # dependencies = ["boto3>=1.40"]
 # ///
+# SPDX-License-Identifier: Apache-2.0
 #
 # boto3 is here for the botocore it bundles, which is what carries the model. It used
 # to carry httpx and cyclopts too, because importing `microvms_agentd.sandbox` ran that
@@ -25,7 +26,7 @@ rejects, and the model loosening means we refuse something valid.
 
 *A checker that reports clean while a constraint has drifted is worse than no
 checker*, because it converts an unknown into false assurance. That exact failure
-has already happened here — `scripts/verify-clean` reported an account clean while
+has already happened here — `scripts/verify-clean.py` reported an account clean while
 a log group billed, because its prefix list knew two of the four name prefixes (see
 the comment above `NAME_PREFIXES`). The response is the same one: this script
 enumerates every check by name, and is loud about the constraints the model states

@@ -3,6 +3,7 @@
 # requires-python = ">=3.11"
 # dependencies = ["boto3>=1.40"]
 # ///
+# SPDX-License-Identifier: Apache-2.0
 """Fail if the pinned rate table no longer matches the AWS Pricing API.
 
 The rate table `microvms-core` ships is pinned by hand, and a 90-day staleness
@@ -46,8 +47,8 @@ history; this script is the whole of what the gate needed from it, with the pinn
 figures inlined as literals rather than imported.
 
 Usage:
-    scripts/check-live-rates              # fetch and compare. Needs credentials.
-    scripts/check-live-rates --twin-only  # the twin cross-check alone. Offline, free.
+    scripts/check-live-rates.py              # fetch and compare. Needs credentials.
+    scripts/check-live-rates.py --twin-only  # the twin cross-check alone. Offline, free.
 """
 
 from __future__ import annotations
@@ -80,7 +81,7 @@ PRICING_API_REGION = "us-east-1"
 #: used to *write* the error and never to refuse: the fetch runs first and this is
 #: consulted only when the catalog came back empty. So a region AWS adds after today
 #: returns rates from this script rather than a refusal, and the cost of the list
-#: being stale is one misleading sentence. `scripts/check-model-drift` is what holds
+#: being stale is one misleading sentence. `scripts/check-model-drift.py` is what holds
 #: it equal to `microvms-core`'s.
 MICROVM_REGIONS = (
     "ap-northeast-1",
@@ -161,7 +162,7 @@ def verify_twin(repo: Path) -> list[str]:
     The cost of the trade is that this reads Rust as text, so a reformat of
     `pinned_rates()` breaks it. That failure is an exit 1 naming the field it could not
     find, never a silent pass — which is the only property that matters, and it is the
-    same discipline `scripts/check-model-drift` states for a missing model.
+    same discipline `scripts/check-model-drift.py` states for a missing model.
 
     Returns the disagreements as text. Empty means the twins match.
     """

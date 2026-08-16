@@ -1,24 +1,37 @@
-# The ruff configuration, and the reason this file exists at all.
+# The ruff configuration, and the reason this file no longer opens with a workaround.
 #
 # ruff discovers Python by **extension** when it walks a directory. Every gate in `scripts/`
-# is an extensionless PEP 723 script with a `uv run --script` shebang, so `ruff check
-# scripts` found nothing, warned "No Python files found under the given path(s)", and exited
-# 0 — for the whole life of that line in `mise.toml`. A gate reporting success over an empty
-# set is the failure mode `scripts/check-model-drift`'s own header names, and it was hiding
-# real findings: the first script to be named explicitly turned out to have unused imports.
+# used to be an *extensionless* PEP 723 script, so `ruff check scripts` found nothing, warned
+# "No Python files found under the given path(s)", and exited 0 — for the whole life of that
+# line in `mise.toml`. A gate reporting success over an empty set is the failure mode
+# `scripts/check-model-drift.py`'s own header names, and it was hiding real findings.
 #
-# `extend-include` answers it structurally rather than by name. Naming each file in the mise
-# task worked, but only for the files someone remembered — a new script under `scripts/`
-# escaped again silently, which is the same defect with a longer fuse. With the glob below,
-# `ruff check .` reads every gate, and a new one is linted the day it lands.
+# The first fix here was `extend-include = ["scripts/*"]`: tell ruff that a file in `scripts/`
+# is Python regardless of its name. It worked, and it was the wrong layer. The same extension
+# blindness then hit a second gate that had nothing to do with ruff —
+# `scripts/check-license-headers.py` enumerates with `git ls-files "*.rs" "*.py"`, so it
+# reported "all 100 tracked source files carry the SPDX line" while three of the scripts
+# implementing this repo's gates carried no SPDX line at all (issue #32). Two gates blind for
+# one reason is a naming problem, not a config problem, and `extend-include` only ever taught
+# ruff. So the scripts are now `scripts/*.py`, which every extension-based enumerator in the
+# repo already understands, and `extend-include` is gone with the condition it existed for.
 #
-# `scripts/*` says the quiet part out loud: in this repo, a file in `scripts/` is Python. A
-# shell helper dropped there would be parsed as Python and reported as a wall of syntax
-# errors that name the symptom rather than the cause, so `scripts/check-lint-coverage`
-# compares ruff's file set against the shebangs and reports that case directly, by name, with
-# the two honest responses (move it out, or exclude it here with a reason).
-
-extend-include = ["scripts/*"]
+# What the glob also did, and what removing it fixes: `scripts/*` claimed that *everything* in
+# that directory is Python, so a shell helper dropped there was handed to ruff and reported as
+# a wall of syntax errors naming the symptom rather than the cause. Measured — a two-line
+# `scripts/tmp-helper.sh` produced exactly that. Without the glob ruff skips it, by extension,
+# with no special case. `scripts/check-lint-coverage.py` is still the guard *over* this file,
+# because a config that stops matching fails the same silent way the original bug did; its
+# shebang pass now catches the one case an extension cannot, a new script landing
+# extensionless. Also measured: with the glob removed, a `scripts/tmp-new-gate` with a
+# `uv run --script` shebang is reported by name as unlinted. The shebang branch is why the
+# rename is enforced rather than merely conventional.
+#
+# The scripts keep their shebangs and their executable bit, so `./scripts/check-model-drift.py`
+# is still a direct invocation. `per-file-target-version` below matches `scripts/*`, which
+# `scripts/*.py` satisfies (measured: UP045 fires on `Optional[int]` in a file there and not in
+# `microvms-py/`), so the 3.11 floor those scripts declare in their own PEP 723 blocks is
+# unaffected by the rename.
 
 # So the excludes below also apply to a path named on the command line. Without it an
 # excluded file is skipped when ruff walks a directory and processed when someone types its
@@ -39,7 +52,7 @@ target-version = "py39"
 per-file-target-version = { "scripts/*" = "py311", "conformance/*" = "py311" }
 
 [format]
-# `microvms-py/microvms.pyi` is generated: `./scripts/generate-py-stubs` renders it from
+# `microvms-py/microvms.pyi` is generated: `./scripts/generate-py-stubs.py` renders it from
 # pyo3's introspection, and `mise run stubs:check` fails when it drifts from the Rust
 # surface. Formatting it here would put two writers on one file — ruff's pass would be undone
 # by the next `mise run stubs`, and `stubs:check` would then fail on a diff nobody wrote. A

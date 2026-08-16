@@ -9,22 +9,29 @@
 The defect this exists for is not a lint finding, it is a lint gate that passed over an
 empty set. `mise run lint` ran `ruff check conformance scripts` for the whole life of that
 line, and `scripts/` contributed nothing to it: ruff discovers Python by **extension** when
-it walks a directory, every gate in `scripts/` is an extensionless PEP 723 script, so ruff
+it walks a directory, every gate in `scripts/` was an extensionless PEP 723 script, so ruff
 warned "No Python files found under the given path(s)" and exited 0. Green tick, zero files.
-That is the shape `scripts/check-model-drift`'s own header names — "a green tick over three
+That is the shape `scripts/check-model-drift.py`'s own header names — "a green tick over three
 silent checks is the failure mode" — and it hid real findings, since the first script to be
 named explicitly turned out to have unused imports in it.
 
-`ruff.toml`'s `extend-include = ["scripts/*"]` is the fix. This is the guard *over* the fix,
-and it is separate for a reason: a config that stops matching fails the same silent way the
-original bug did. `ruff check .` would still print "All checks passed!" over nothing.
+The fix is now the file names: the gates are `scripts/*.py`, so ruff finds them the ordinary
+way. `ruff.toml`'s `extend-include = ["scripts/*"]` was the earlier fix and is gone, because
+it taught only ruff — the identical blindness showed up next in
+`scripts/check-license-headers.py`, which enumerates with `git ls-files "*.rs" "*.py"` and had
+therefore never seen these scripts either (issue #32).
+
+This is the guard *over* that, and it is separate for a reason: a naming convention nothing
+checks is a convention, and a file that stops matching fails the same silent way the original
+bug did. `ruff check .` would still print "All checks passed!" over nothing.
 
 So this compares two independently derived answers to "what is the Python in this repo":
 
   **expected** — every tracked file that is Python, read off git. That is `*.py` and `*.pyi`
-  by extension, plus every tracked file whose first line is a `python` or `uv run` shebang,
-  which is what makes the extensionless gates visible without naming any of them. A new
-  script under `scripts/` joins this set by existing.
+  by extension, plus every tracked file whose first line is a `python` or `uv run` shebang.
+  The shebang half is what enforces the `.py` convention rather than trusting it: a new gate
+  dropped in extensionless is Python to this enumerator and invisible to ruff, so it is
+  reported by name. A new script under `scripts/` joins this set by existing, either way.
 
   **actual** — `ruff check --show-files`, which is ruff reporting the files it would
   inspect under its own configuration.
@@ -33,7 +40,7 @@ Any file in the first set and not the second is the bug, by name. The count is r
 either way, because a file count beside a passing gate is the line that would have made the
 original defect obvious to a reader.
 
-Three further assertions, each about a way the comparison itself could go quiet:
+Two further assertions, each about a way the comparison itself could go quiet:
 
   1. `expected` must not be empty. Two derived sets agreeing on nothing is not agreement.
      `MIN_EXPECTED` is a floor on the *enumerator*, not on the repo — it fires when git
@@ -45,19 +52,30 @@ Three further assertions, each about a way the comparison itself could go quiet:
      format-side blindness the config does not account for; **widening** `[format] exclude`
      lowers both sides and passes, by design — that is a config edit visible in a diff, and
      `ruff.toml` is where each entry states its reason.
-  3. A tracked file under `scripts/` with a non-Python shebang is reported as its own
-     finding. `extend-include = ["scripts/*"]` claims everything in that directory is
-     Python; a shell helper dropped there would otherwise be reported as a wall of syntax
-     errors that name the symptom and not the cause.
+
+There used to be a third, and it went away with `extend-include`. That glob claimed every file
+under `scripts/` was Python, so a shell helper dropped there was handed to ruff and reported as
+a wall of syntax errors naming the symptom rather than the cause; this gate reported that case
+directly instead. With the glob gone ruff skips a `.sh` by extension like anything else, so the
+assertion had no hazard left to guard and its message would have stated a mechanism that no
+longer exists. Removed rather than reworded, because a finding whose explanation is false is
+worse than no finding.
+
+One hole is left open knowingly: a file under `scripts/` that is Python, has no `.py`
+extension, **and** has no shebang is invisible to both sides here, so it agrees vacuously. It
+is also invisible to `uv`, to `python`, and to a reader, which is to say it is not a script
+anybody can run — the smallest reachable version of this is a module a `.py` gate imports, and
+that import would fail. If that ever stops being true, the fix is the same as the last two
+times: name the file for what it is.
 
 Usage:
-    scripts/check-lint-coverage           # the guard. Offline, free, milliseconds
-    scripts/check-lint-coverage --root D  # hand ruff a different path; the expected set
-                                          # still comes from the repo. This is how the
-                                          # gate is proven able to fail: point it at a
-                                          # directory with no Python and it reports every
-                                          # expected file as unseen, which is exactly the
-                                          # original defect reproduced on purpose.
+    scripts/check-lint-coverage.py           # the guard. Offline, free, milliseconds
+    scripts/check-lint-coverage.py --root D  # hand ruff a different path; the expected set
+                                             # still comes from the repo. This is how the
+                                             # gate is proven able to fail: point it at a
+                                             # directory with no Python and it reports every
+                                             # expected file as unseen, which is exactly the
+                                             # original defect reproduced on purpose.
 """
 
 from __future__ import annotations
@@ -84,6 +102,13 @@ MIN_EXPECTED = 8
 #: Matches the interpreter line on the PEP 723 gates (`#!/usr/bin/env -S uv run --script`)
 #: and on a plain `#!/usr/bin/env python3`. Read from the file rather than inferred from the
 #: directory, so a shell script in `scripts/` is classified as what it is.
+#:
+#: Every gate is `scripts/*.py` today, so nothing in the repo currently reaches `expected`
+#: through this pattern rather than through its extension — the shebang pass finds no file the
+#: extension pass had not already found. It stays because that is exactly the state it is
+#: guarding: it is what fails the day someone adds an extensionless gate, which is the defect
+#: this file and issue #32 were both about. Measured, with a `scripts/tmp-new-gate` carrying a
+#: `uv run --script` shebang: reported by name as unlinted, exit 1.
 PY_SHEBANG = re.compile(r"^#!.*(?:\bpython|\buv\s+run\b)")
 
 #: `ruff format --check`'s summary: "N files would be reformatted, M files already
@@ -119,23 +144,18 @@ def first_line(path: Path) -> str:
         return ""
 
 
-def python_surface() -> tuple[set[Path], list[Path]]:
-    """The expected Python set, and the `scripts/` files that are not Python.
+def python_surface() -> set[Path]:
+    """Every tracked file that is Python: by extension, or failing that by shebang.
 
-    Extension first, shebang second. The shebang pass is what reaches the extensionless
-    gates, and it is the half that makes this set grow by itself.
+    The shebang pass finds nothing the extension pass missed today, and that is the point of
+    it — see `PY_SHEBANG`. It is what makes the `.py` naming an enforced property rather than
+    a habit.
     """
     expected: set[Path] = set()
-    intruders: list[Path] = []
     for path in tracked():
-        if path.suffix in {".py", ".pyi"}:
+        if path.suffix in {".py", ".pyi"} or PY_SHEBANG.match(first_line(path)):
             expected.add(path)
-            continue
-        if PY_SHEBANG.match(first_line(path)):
-            expected.add(path)
-        elif path.parent == Path("scripts"):
-            intruders.append(path)
-    return expected, intruders
+    return expected
 
 
 def ruff_command() -> list[str]:
@@ -220,7 +240,7 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    expected, intruders = python_surface()
+    expected = python_surface()
     findings: list[str] = []
 
     if len(expected) < MIN_EXPECTED:
@@ -238,9 +258,10 @@ def main() -> int:
             f"ruff inspects {len(seen)} files under '{args.root}' and the repo has"
             f" {len(expected)}. {len(unseen)} Python files are NOT linted:\n"
             + "\n".join(f"    {path}" for path in unseen)
-            + "\n  An extensionless script needs `extend-include` in ruff.toml to match it."
-            " That is the defect this gate exists for: ruff exits 0 over files it never"
-            " opened."
+            + "\n  ruff finds Python by extension when it walks a directory, so a gate"
+            " under scripts/ must be named `.py` to be seen. Rename it (keep the shebang"
+            " and the executable bit; `./scripts/name.py` still runs). That is the defect"
+            " this gate exists for: ruff exits 0 over files it never opened."
         )
 
     want_formatted = len(expected - format_excluded())
@@ -251,16 +272,6 @@ def main() -> int:
             f" {want_formatted} are expected ({len(expected)} Python files less the"
             " ones `[format] exclude` names). The formatter resolves its own excludes,"
             " so it can go blind while the linter still reads the file."
-        )
-
-    if intruders:
-        findings.append(
-            "these tracked files under scripts/ have no Python shebang, and"
-            ' `extend-include = ["scripts/*"]` will hand them to ruff as Python:\n'
-            + "\n".join(f"    {path}" for path in intruders)
-            + "\n  Either move the file out of scripts/, or add it to `exclude` in"
-            " ruff.toml with the reason — the same rule .trivyignore.yaml states, that"
-            " an ignore without a reason is a finding someone silenced."
         )
 
     if findings:

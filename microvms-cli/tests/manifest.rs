@@ -217,7 +217,7 @@ fn a_bare_manifest_invocation_emits_json() {
 
 /// **`microvm constants --emit-json` emits the bare object the drift gate reads.**
 ///
-/// Unwrapped by an envelope, deliberately: `scripts/check-model-drift` compares key-for-key against
+/// Unwrapped by an envelope, deliberately: `scripts/check-model-drift.py` compares key-for-key against
 /// the pinned botocore model, and an envelope would put every comparison behind
 /// `["data"]["constants"]` for no gain. The keys are the coupling — the script looks them up by
 /// name, so a rename makes it report that nothing disagreed, which is worse than a crash.
@@ -261,7 +261,7 @@ fn constants_emit_json_writes_the_bare_object_the_drift_gate_reads() {
     ] {
         assert!(
             parsed.get(key).is_some(),
-            "{key} is missing; scripts/check-model-drift looks it up by name and a rename makes \
+            "{key} is missing; scripts/check-model-drift.py looks it up by name and a rename makes \
              it report that nothing disagreed: {parsed}"
         );
     }

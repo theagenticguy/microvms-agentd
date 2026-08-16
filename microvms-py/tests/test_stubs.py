@@ -8,7 +8,7 @@ reader: they parse `microvms.pyi` with `ast` — never importing it, never trust
 generator's own bookkeeping — and compare what it declares against what `import microvms`
 actually exposes.
 
-That is the same argument `scripts/check-model-drift` makes about a self-comparison: a check
+That is the same argument `scripts/check-model-drift.py` makes about a self-comparison: a check
 whose two sides come from one source cannot fail. So the assertions below deliberately do not
 call the generator, and one of them (`test_no_getattr_escape_hatch`) exists to fail if a
 future maturin reintroduces the line that made the whole stub unable to fail.

@@ -869,7 +869,7 @@ pub struct MicrovmItemWire {
 /// spelling. That is the service accepting the delete request and refusing the work, and
 /// without the readback it is indistinguishable from a successful delete: `delete_image`
 /// answers `true`, teardown reports clean, and an image keeps billing. This project has
-/// had exactly that failure once already, in `scripts/verify-clean`, which is why the
+/// had exactly that failure once already, in `scripts/verify-clean.py`, which is why the
 /// account is now asked what leaked rather than trusted to have been cleaned.
 ///
 /// **`DELETING` and `DELETED` are both success** and the call site treats them alike. The

@@ -48,8 +48,8 @@ it green and red. A textual assertion would keep passing against a body that had
 working, which is the failure mode this whole file exists to answer.
 
 Usage:
-    scripts/check-live-wiring                 # the guard. Offline, free
-    scripts/check-live-wiring --marker-path   # print the marker path, for `live` to use
+    scripts/check-live-wiring.py                 # the guard. Offline, free
+    scripts/check-live-wiring.py --marker-path   # print the marker path, for `live` to use
 """
 
 from __future__ import annotations
@@ -119,12 +119,44 @@ def marker_path(cwd: Path | None = None) -> str:
         text=True,
         check=True,
         cwd=cwd,
+        # Scrubbed for the reason `_GIT_ENV_LEAKS` records, and it matters most here: this
+        # function's whole job is asking git which shape `cwd` is, and an inherited
+        # `GIT_DIR` makes it answer about the hook's repo instead. Both cases would then
+        # report the same path and the asymmetry this check exists to prove would vanish
+        # while still printing ok.
+        env=_clean_git_env(),
     )
     return out.stdout.strip()
 
 
+# The git variables a hook inherits, which would aim this gate's throwaway repos at the
+# real one. `lefthook` runs `pre-push` with `GIT_DIR` (and often `GIT_INDEX_FILE`,
+# `GIT_WORK_TREE`, `GIT_OBJECT_DIRECTORY`) exported, and a `git init` in a temp directory
+# does not override them: `git commit` then writes into whichever repo `GIT_DIR` names.
+# Measured, and it is why this gate crashed only under `git push`: the same run passes
+# from a shell and fails from the hook, which is the worst shape a gate can have.
+_GIT_ENV_LEAKS = (
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_COMMON_DIR",
+    "GIT_CEILING_DIRECTORIES",
+)
+
+
+def _clean_git_env() -> dict[str, str]:
+    """`os.environ` with the inherited git pointers removed."""
+    return {k: v for k, v in os.environ.items() if k not in _GIT_ENV_LEAKS}
+
+
 def git(*args: str, cwd: Path) -> str:
-    """A git invocation with an identity, so `commit` works in a throwaway repo."""
+    """A git invocation with an identity, so `commit` works in a throwaway repo.
+
+    The environment is scrubbed rather than inherited, for the reason `_GIT_ENV_LEAKS`
+    records: a hook exports `GIT_DIR`, and a temp repo that inherits it is not a temp repo.
+    """
     out = subprocess.run(
         [
             "git",
@@ -140,6 +172,7 @@ def git(*args: str, cwd: Path) -> str:
         text=True,
         check=True,
         cwd=cwd,
+        env=_clean_git_env(),
     )
     return out.stdout.strip()
 
@@ -265,9 +298,15 @@ def harness(at: Path) -> None:
     )
     # The body shells out to this script for the marker path, so the harness needs a copy
     # at the same relative path rather than a stub — the real one is what `live` calls.
+    #
+    # The name comes from `__file__` rather than a literal, because a literal is a second
+    # place this file's own name is written and it went stale the first time the name
+    # changed: renaming the gates to `*.py` left `"check-live-wiring"` here, and the copy
+    # step then raised `FileNotFoundError` on a path that no longer existed. Deriving it
+    # means a rename cannot desync the two again.
     (at / "scripts").mkdir(exist_ok=True)
-    mine = repo() / "scripts" / "check-live-wiring"
-    copy = at / "scripts" / "check-live-wiring"
+    mine = Path(__file__).resolve()
+    copy = at / "scripts" / mine.name
     copy.write_bytes(mine.read_bytes())
     copy.chmod(0o755)
     (at / "mise.toml").write_text(
@@ -283,7 +322,10 @@ def run_live(at: Path, **overrides: str) -> tuple[int, str]:
         cwd=at,
         # `MISE_CONFIG_FILE` dropped so the harness reads its own `mise.toml` rather than
         # this repo's, which would run the real billable tier.
-        env={k: v for k, v in os.environ.items() if k != "MISE_CONFIG_FILE"}
+        # `MISE_CONFIG_FILE` dropped for the reason above; the git pointers dropped for
+        # the reason `_GIT_ENV_LEAKS` records, since the tier body this runs writes the
+        # marker through git and would write it into the hook's repo.
+        env={k: v for k, v in _clean_git_env().items() if k != "MISE_CONFIG_FILE"}
         | overrides,
     )
     return out.returncode, out.stdout + out.stderr

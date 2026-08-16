@@ -210,7 +210,7 @@ pub enum Command {
 
     /// Emit every service constraint this client believes, for the drift gate.
     ///
-    /// TRAP-12's second source. `scripts/check-model-drift` compares this against the pinned
+    /// TRAP-12's second source. `scripts/check-model-drift.py` compares this against the pinned
     /// botocore model, and against its own pinned literals for the two values no model shape
     /// states — the region list and the sizing table, which is the only check available for a
     /// value no API answers. (It compared against the Python client's constants too, until that
@@ -955,7 +955,7 @@ pub struct ConstantsArgs {
     /// Emit the raw constants object, unwrapped by an envelope.
     ///
     /// The one stdout write in this binary that is not an envelope, and the reason is its
-    /// consumer: `scripts/check-model-drift` compares key-for-key against a pinned service
+    /// consumer: `scripts/check-model-drift.py` compares key-for-key against a pinned service
     /// model, so an envelope would put every comparison behind `["data"]` for no gain. The
     /// global --json wraps the same object if you want the envelope instead.
     #[arg(long)]

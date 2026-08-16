@@ -167,10 +167,10 @@ Verification tooling and requirements documents; none is a workspace crate.
 - `spec/core.symspec.json` (1049 LOC) — 51 requirements in the v5 `docVersion: 3` format, checked with a state model the 0.1.0 `symspec` on PATH cannot read (`mise.toml:128-130`).
 - `spec/microvms-core-kickoff.md` (175 LOC)
 - `spec/agentd.symspec.json` (117 LOC) — six bootstrap and control-token requirements, gated by `symspec check --strict` (`mise.toml:135`).
-- `scripts/check-model-drift` (807 LOC) — checks the constraints the client hardcodes against the shipped service model (`mise.toml:185`).
-- `scripts/check-live-rates` (624 LOC) — fails if the pinned rate table no longer matches the AWS Pricing API (`mise.toml:275`).
-- `scripts/verify-clean` (167 LOC) — queries the account for resources the project left behind, instead of assuming teardown succeeded (`mise.toml:282`).
-- `scripts/check-license-headers` (81 LOC) — checks that every tracked `.rs` and `.py` file carries its SPDX line (`lefthook.yml:31`).
+- `scripts/check-model-drift.py` (807 LOC) — checks the constraints the client hardcodes against the shipped service model (`mise.toml:185`).
+- `scripts/check-live-rates.py` (624 LOC) — fails if the pinned rate table no longer matches the AWS Pricing API (`mise.toml:275`).
+- `scripts/verify-clean.py` (167 LOC) — queries the account for resources the project left behind, instead of assuming teardown succeeded (`mise.toml:282`).
+- `scripts/check-license-headers.py` (81 LOC) — checks that every tracked `.rs` and `.py` file carries its SPDX line (`lefthook.yml:31`).
 
 ## See also
 

@@ -332,7 +332,7 @@ pub fn classify_failure(operation: &str, reply: &Reply) -> Error {
              request here: this client signs with aws-sigv4 and sends with reqwest, so botocore's \
              VALIDATED_METADATA_ATTRS never applies to it. So reaching this status means a \
              constraint this client does not yet check, and closing it is a guard in \
-             microvms-core/src/control plus a line in scripts/check-model-drift."
+             microvms-core/src/control plus a line in scripts/check-model-drift.py."
                 .to_string(),
         ),
         402 => (

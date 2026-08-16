@@ -34,7 +34,7 @@
 //!
 //! [`as_json`] emits every value in this module as one object, keyed with the names the
 //! deleted Python client's `sandbox.py` used. That is what makes the gate possible:
-//! `scripts/check-model-drift` reads this object and compares each constant against the
+//! `scripts/check-model-drift.py` reads this object and compares each constant against the
 //! pinned model. It used to compare the Python module the same way and then the two
 //! clients against each other; with one client left, the two values no model states —
 //! `MICROVM_REGIONS` and `SIZE_CLASSES` — are compared against pinned literals in that
@@ -331,7 +331,7 @@ pub const HOOK_STATES: [&str; 2] = ["DISABLED", "ENABLED"];
 ///
 /// # Why the state enums live here now
 ///
-/// They were pinned against literals inside `scripts/check-model-drift`, which the script's own
+/// They were pinned against literals inside `scripts/check-model-drift.py`, which the script's own
 /// comment admitted: the gate verified the model against the *script*, with no reader in the
 /// client at all. Issue #24 named the consequence — a `MicrovmState` AWS adds fails the gate
 /// with no compile-time consequence for the polling loops in
@@ -1067,7 +1067,7 @@ mod tests {
     /// Every state set the client's loops branch on is a subset of the model's enum for it.
     ///
     /// **This is what moving the five state enums out of the drift script buys.** They were
-    /// pinned against literals inside `scripts/check-model-drift`, so a `MicrovmState` AWS
+    /// pinned against literals inside `scripts/check-model-drift.py`, so a `MicrovmState` AWS
     /// respelled failed the gate with no consequence for the code that branches on it (issue
     /// #24). With the sets here, the same respelling fails this test as well, and this test names
     /// the loop.

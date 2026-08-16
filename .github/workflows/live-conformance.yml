@@ -53,7 +53,7 @@ jobs:
       - uses: astral-sh/setup-uv@v7
         with:
           # See `ci.yml`'s `security` job: `conformance/run_rs.py` and
-          # `scripts/check-live-rates` are PEP 723 scripts carrying their own
+          # `scripts/check-live-rates.py` are PEP 723 scripts carrying their own
           # dependencies, so there is no lockfile a cache key could watch and
           # `auto` warns rather than caching.
           enable-cache: false
@@ -107,7 +107,7 @@ jobs:
       - name: pinned rates match the Pricing API
         env:
           AWS_REGION: ${{ inputs.region }}
-        run: ./scripts/check-live-rates
+        run: ./scripts/check-live-rates.py
 
       # `if: always()` on both cleanup steps: a failed suite is exactly when
       # resources are most likely to survive, so cleanup must not be skipped by
@@ -116,7 +116,7 @@ jobs:
         if: always()
         env:
           AWS_REGION: ${{ inputs.region }}
-        run: ./scripts/verify-clean
+        run: ./scripts/verify-clean.py
 
       - name: destroy the stack
         if: always() && inputs.destroy_after
@@ -131,4 +131,4 @@ jobs:
         if: always() && inputs.destroy_after
         env:
           AWS_REGION: ${{ inputs.region }}
-        run: ./scripts/verify-clean
+        run: ./scripts/verify-clean.py

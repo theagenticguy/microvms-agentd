@@ -1557,7 +1557,7 @@ def drive_teardown(
     **But naming is where the client's responsibility ends and this suite's begins, and
     it did not pick it up.** Measured 2026-08-15, once `mise run live` was fixed to run
     its leak check *after* the suite rather than beside it: five log groups from five
-    conformance runs, and `scripts/verify-clean` calls every one a leak — correctly, since
+    conformance runs, and `scripts/verify-clean.py` calls every one a leak — correctly, since
     a service-created group nothing owns is exactly what that script exists to find. So
     the two halves of one tier disagreed by construction. `mise run live` could not be
     green on a clean account no matter what the code did, and the only stable responses to

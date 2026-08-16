@@ -79,7 +79,7 @@ def main() -> int:
     print(f"license headers: {len(missing)} files are missing '{SPDX}':")
     for path in missing:
         print(f"  {path}")
-    print("run scripts/check-license-headers --fix")
+    print("run scripts/check-license-headers.py --fix")
     return 1
 
 

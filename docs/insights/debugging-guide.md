@@ -37,7 +37,7 @@ history lives in the four places above instead.
 | Exec came back with a killing signal rather than an exit code | A process was OOM-killed inside a living VM. Guest swap is absent (`SwapTotal: 0`), so pressure goes straight to the OOM killer with no paging phase. `minimumMemoryInMiB` picks a size class and the guest reports the class **peak** (4x the baseline), so pressure must be generated against what the guest reports | The exec result carries `signal` and `truncated`. In-guest: `dmesg` is readable with no extra privileges, and `/sys/fs/cgroup/memory.events` exposes `oom`, `oom_kill`, `oom_group_kill` — poll those rather than discovering the kill afterwards | `docs/PLATFORM.md:330-348`, `docs/PLATFORM.md:191-227`, `agentd/src/exec.rs:1184-1205` |
 | Output bytes are simply gone from a stream | `OutputGap` — the replay ring evicted them, or this subscriber lagged the live channel. Not retryable; the bytes do not come back. Classified `ERR_PLATFORM` because it is not the caller's argument, not the daemon refusing, and not transient | The stream emits an explicit `gap` event with `from`/`to` byte offsets. A cursor moves past delivered bytes and past a gap, never past an exit | `microvms-core/src/error.rs:265-267`, `microvms-core/src/error.rs:392-395`, `protocol/src/exec.rs:212-219`, `microvms-core/src/session/sse.rs:252-267` |
 | A long-running trial dies mid-flight with what looks like a dead daemon | An expired proxy token. The service caps a JWE at sixty minutes, shorter than a long agent run, and the resulting rejection is indistinguishable from a daemon that died | Minting happens inside the request path, and `DEFAULT_REFRESH_AFTER` is 30 minutes — **half** the ceiling, not 59 minutes, so a request in flight across the rollover still holds ~30 minutes of life. A mint failure is retryable on purpose so a throttle at minute thirty cannot kill a healthy trial | `docs/PLATFORM.md:457-471`, `microvms-core/src/session/proxy.rs:21-37`, `microvms-core/src/session/proxy.rs:62-67` |
-| `terraform destroy` reported success and the account is still billing | The service creates `/aws/lambda-microvms/<image-name>` itself, so Terraform never owns it and destroy leaves it behind. Separately, images refuse deletion while their VMs are still terminating, so one teardown pass is not enough | `scripts/verify-clean` asks the account directly rather than trusting teardown, and separates leak / standing / pending. `microvm ls` alarms on every run whose ledger has a non-empty `leaked` list | `docs/PLATFORM.md:152-158`, `scripts/verify-clean:6-26`, `microvms-cli/src/ledger.rs:11-22`, `microvms-cli/src/main.rs:216-243` |
+| `terraform destroy` reported success and the account is still billing | The service creates `/aws/lambda-microvms/<image-name>` itself, so Terraform never owns it and destroy leaves it behind. Separately, images refuse deletion while their VMs are still terminating, so one teardown pass is not enough | `scripts/verify-clean.py` asks the account directly rather than trusting teardown, and separates leak / standing / pending. `microvm ls` alarms on every run whose ledger has a non-empty `leaked` list | `docs/PLATFORM.md:152-158`, `scripts/verify-clean.py:6-26`, `microvms-cli/src/ledger.rs:11-22`, `microvms-cli/src/main.rs:216-243` |
 | A connection refused a second or two after the VM reached `RUNNING` | Expected, not a bug. The endpoint proxy path is not wired up the instant the state flips. Classified `Transport`, which is retryable because it says nothing about the daemon's state | Retry. If it persists past a few attempts, go back to the launch-died row and read `stateReason` | `microvms-core/src/error.rs:250-256` |
 | Raw TLS handshake bytes on the plaintext port; logs read like an attack | Something in the platform's path probes the port with TLS before bootstrap. `code 400, message Bad request version ("\x13\x01\x13\x02...")` is a ClientHello reaching a plaintext HTTP server | Harmless. The correct response is a 400 and a debug-level log, and it must not take the listener down | `docs/PLATFORM.md:443-455` |
 | Bootstrap replay answers 409 on a launch that is otherwise fine | Two different tokens, or a genuine conflict. An *identical* replay is answered 200 deliberately, because the platform may retry its own hook and a 409 there would fail a healthy launch | The daemon logs `bootstrap refused: a different token is already installed` for the real conflict and `identical bootstrap replay accepted` for the benign one | `agentd/src/routes.rs:200-215` |
@@ -58,7 +58,7 @@ history lives in the four places above instead.
 | Exit code in `$?` | The process. Fourteen rows, 0 through 13, append-only | The integer, then `Exit::row()`'s `meaning` for what to do next and `finding` for where it was measured. Thirteen distinct non-zero codes; no two rows share one | `microvms-cli/src/exit.rs:171-256`, `microvms-cli/src/exit.rs:55-66` |
 | Run ledger on disk | A file per invocation, written **before** each delete is attempted, and refused deletion while `leaked` is non-empty | `leaked` — the operator's to-do list. For a `CREATING` image and a service-created log group the identifier *is* the remedy; there is no second way to find them | `microvms-cli/src/ledger.rs:1-22`, `microvms-cli/src/ledger.rs:43-45` |
 | `microvm ls` | stdout grid | Rows marked as alarms and the trailing "N run(s), M with something still billing" | `microvms-cli/src/main.rs:216-243` |
-| `scripts/verify-clean` | stdout, exit 0 clean / 1 leaked | Three outcomes: **leak** (still billing, nothing intends to keep it), **standing** (the Terraform stack, possibly on purpose), **pending** (a delete in flight — re-run in a minute) | `scripts/verify-clean:6-26` |
+| `scripts/verify-clean.py` | stdout, exit 0 clean / 1 leaked | Three outcomes: **leak** (still billing, nothing intends to keep it), **standing** (the Terraform stack, possibly on purpose), **pending** (a delete in flight — re-run in a minute) | `scripts/verify-clean.py:6-26` |
 | `microvm doctor` | A **success** envelope with `ok: false` plus exit `ERR_PRECONDITION`. The check succeeded; it found what was wrong | `checks[]`, each with `name`, `ok`, `fatal`, `detail`, `remedy`. Advisory checks do not fail the run | `microvms-cli/src/commands/doctor.rs:59-79` |
 | Guest OOM counters | In-guest, no extra privileges needed | `dmesg`; `/sys/fs/cgroup/memory.events` → `oom`, `oom_kill`, `oom_group_kill`. Poll these rather than discovering a kill after the fact | `docs/PLATFORM.md:330-348` |
 
@@ -114,12 +114,12 @@ Step 4 onward costs money or minutes.
    it to delete one therefore names the group in `TeardownReport.undeleted` rather than
    removing it. Reporting success instead "would report a clean teardown over six accumulated
    log groups, which is how the leak was found in the first place." That naming is your last
-   chance to read the logs before `verify-clean --delete` removes them.
+   chance to read the logs before `scripts/verify-clean.py --delete` removes them.
    `microvms-core/src/sandbox.rs:231-236`, `microvms-core/src/sandbox.rs:298-303`
-10. **Before you walk away: `scripts/verify-clean`.** Teardown reporting success and the
+10. **Before you walk away: `scripts/verify-clean.py`.** Teardown reporting success and the
     account being clean are different questions, and the difference has cost this project
     twice. Expect to run `--delete` more than once, because an image refuses deletion while
-    its VM is still terminating. `scripts/verify-clean:6-26`
+    its VM is still terminating. `scripts/verify-clean.py:6-26`
 
 ## Known incident patterns
 
@@ -169,7 +169,7 @@ bodies, and in `.erpaval/solutions/`. The patterns below recur across that histo
   claimed a 16 KB `runHookPayload` ceiling. The real figure is 4096 bytes, a quarter of the
   claim. The error ran in the dangerous direction, telling a reader they could fit four
   times the secret material they actually can. The number was machine-readable in the
-  botocore service model the whole time. Mitigation: `scripts/check-model-drift`, wired into
+  botocore service model the whole time. Mitigation: `scripts/check-model-drift.py`, wired into
   `mise run check`, fails mechanically when a documented constraint no longer matches the
   shipped model. `docs/PLATFORM.md:54-101`
 - **Teardown succeeded and the account kept billing.** `terraform destroy` once reported nine
@@ -179,7 +179,7 @@ bodies, and in `.erpaval/solutions/`. The patterns below recur across that histo
   billed, because the prefix list did not know the `microvm-cli` name. A missing prefix
   converts an unknown into a false assurance, which is worse than having no checker.
   Mitigation: query the account independently of the code that did the cleanup, and keep the
-  prefix list complete. `scripts/verify-clean:6-26`, `scripts/verify-clean:39-50`
+  prefix list complete. `scripts/verify-clean.py:6-26`, `scripts/verify-clean.py:39-50`
 - **Silent until the disk is already full.** In anthropics/claude-code#59856, cited by number
   in source, a sandbox accumulated 121 never-collected session directories and filled two
   10 GB disks to 100%. The first symptom was `useradd: No space left on device`, and by that
