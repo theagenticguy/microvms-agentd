@@ -52,6 +52,9 @@ pub async fn doctor<O: std::io::Write, E: std::io::Write>(
             .clone()
             .unwrap_or_else(|| std::path::PathBuf::from("conformance/infra")),
     ));
+    // The managed bases, once credentials are known to resolve. Read-only, two free GETs, and
+    // the only place a caller can see what `--base-image-version` may be set to.
+    checks.extend(check_managed_bases(ctx).await);
     // The binary last, only because it is the one failure that costs a full build cycle rather
     // than a call — so it is the one a reader should still see after the others pass.
     checks.push(check_binary(args.binary.as_deref()));
@@ -144,6 +147,148 @@ async fn check_credentials<O: std::io::Write, E: std::io::Write>(ctx: &mut Ctx<'
             "`aws sso login`, or set AWS_PROFILE / AWS_ACCESS_KEY_ID",
         ),
     }
+}
+
+/// The managed base images AWS publishes, and the versions of the one this client builds on.
+///
+/// # Informational, and that word is doing work
+///
+/// `ManagedMicrovmImageSummary` carries an ARN and two timestamps and nothing else — no
+/// registry reference, no architecture, no working directory. A
+/// [`microvms_core::control::BaseImage`] needs the ARN *paired with* the Dockerfile `FROM` and
+/// with whether the image declares a `WORKDIR`, because `require_matching_from` compares a
+/// caller's Dockerfile against the first and `require_workdir` refuses inheritance on the
+/// second. Neither guard has an input from this listing, and the registry ref is not derivable
+/// from the ARN. So a base discovered here **cannot be built from**, and this reports rather
+/// than offers.
+///
+/// What it answers is the one question a caller cannot answer any other way: has AWS published
+/// a base this client does not know about, and which `--base-image-version` values are legal.
+/// The second half is the actionable one — an unpinned build floats on whatever the service
+/// defaults to, and that default has moved once already.
+///
+/// # Both checks are advisory
+///
+/// A listing that will not read is not a reason to fail `doctor`: nothing about a build depends
+/// on discovery succeeding, and the command's job is reporting what is wrong rather than adding
+/// a new way to be wrong. A base this client does not know is advisory for the same reason
+/// `check_region` is — AWS adds things faster than a constant is re-read, and the remedy is to
+/// look, not to stop.
+async fn check_managed_bases<O: std::io::Write, E: std::io::Write>(
+    ctx: &mut Ctx<'_, O, E>,
+) -> Vec<Check> {
+    let region = resolve_region(None, None, ctx.env).unwrap_or(Region::UsEast1);
+    let known = microvms_core::control::BaseImage::al2023();
+    let known_arn = known.arn(&region);
+
+    let Ok(plane) = ctx.seam.control_plane(region.clone()).await else {
+        // Already reported by the credentials check; a second failure line about the same
+        // cause is noise.
+        return vec![
+            Check::fail(
+                "managed-bases",
+                "credentials did not resolve, so the managed base listing was not read",
+                "see the credentials check above",
+            )
+            .advisory(),
+        ];
+    };
+
+    let mut checks = Vec::new();
+    match plane.managed_base_images().await {
+        Ok(bases) => {
+            let arns: Vec<&str> = bases.iter().map(|base| base.image_arn.as_str()).collect();
+            if arns.contains(&known_arn.as_str()) && arns.len() == 1 {
+                checks.push(Check::pass(
+                    "managed-bases",
+                    format!("{known_arn} is the only base AWS publishes in {region}"),
+                ));
+            } else if arns.contains(&known_arn.as_str()) {
+                // More than one, and the client knows one of them. Reported rather than
+                // offered: none of the others can construct a BaseImage, because the listing
+                // carries no registry reference to pair an ARN with.
+                checks.push(
+                    Check::fail(
+                        "managed-bases",
+                        format!(
+                            "AWS publishes {} bases in {region}; this client knows {known_arn}. \
+                             The others: {}",
+                            arns.len(),
+                            arns.iter()
+                                .filter(|arn| **arn != known_arn.as_str())
+                                .copied()
+                                .collect::<Vec<_>>()
+                                .join(", "),
+                        ),
+                        "informational only — ListManagedMicrovmImages returns no registry \
+                         reference and no WORKDIR, so a discovered base cannot be paired with a \
+                         Dockerfile FROM and cannot be built from through this client",
+                    )
+                    .advisory(),
+                );
+            } else {
+                checks.push(
+                    Check::fail(
+                        "managed-bases",
+                        format!(
+                            "AWS does not publish {known_arn} in {region}; it publishes {}",
+                            if arns.is_empty() {
+                                "nothing".to_string()
+                            } else {
+                                arns.join(", ")
+                            },
+                        ),
+                        "the base this client builds on is not in this region's listing — check \
+                         the region before the build",
+                    )
+                    .advisory(),
+                );
+            }
+        }
+        Err(error) => checks.push(
+            Check::fail(
+                "managed-bases",
+                format!("could not list the managed bases: {error}"),
+                "informational only; nothing about a build depends on this read",
+            )
+            .advisory(),
+        ),
+    }
+
+    match plane.managed_base_versions(&known_arn).await {
+        Ok(versions) if !versions.is_empty() => {
+            let names: Vec<&str> = versions
+                .iter()
+                .map(|version| version.image_version.as_str())
+                .collect();
+            checks.push(Check::pass(
+                "base-image-versions",
+                format!(
+                    "{}: {} — pass one to `build --base-image-version` to stop a build \
+                     floating on the service default",
+                    known.name,
+                    names.join(", "),
+                ),
+            ));
+        }
+        Ok(_) => checks.push(
+            Check::fail(
+                "base-image-versions",
+                format!("{known_arn} reports no versions at all"),
+                "a build will take the service default, which cannot then be recorded",
+            )
+            .advisory(),
+        ),
+        Err(error) => checks.push(
+            Check::fail(
+                "base-image-versions",
+                format!("could not list {}'s versions: {error}", known.name),
+                "informational only; an unpinned build still works, it just is not reproducible",
+            )
+            .advisory(),
+        ),
+    }
+    checks
 }
 
 /// The three Terraform outputs, each reported by name.

@@ -162,9 +162,19 @@ impl ControlPlane {
             artifact::require_matching_from(&request.base_image, dockerfile)?;
         }
 
+        // Pinned only when the caller asked for it, and refused locally when they asked for
+        // something the `Version` shape cannot carry — see `require_valid_version`. A blank
+        // or whitespace-bearing value here is a `ValidationException` raised *after* the
+        // artifact upload, which is the ordering this whole function is arranged to protect
+        // against.
+        if let Some(version) = request.base_image_version.as_deref() {
+            super::require_valid_version("baseImageVersion", version)?;
+        }
+
         let wire = ops::CreateMicrovmImageWire {
             name: request.name.clone(),
             base_image_arn: request.base_image.arn(&self.region),
+            base_image_version: request.base_image_version.clone(),
             build_role_arn: request.build_role_arn.clone(),
             code_artifact: ops::CodeArtifact {
                 uri: request.code_artifact_uri.clone(),
@@ -480,14 +490,55 @@ impl ControlPlane {
             .builds_of_version(&got.image_arn, &version.image_version)
             .await
         {
-            reasons.extend(
-                builds
-                    .iter()
-                    .filter(|build| build.state_reason.is_some() && build.build_state != "PENDING")
-                    .map(|build| format!("build {}", build.describe())),
-            );
+            for build in builds
+                .iter()
+                .filter(|build| build.state_reason.is_some() && build.build_state != "PENDING")
+            {
+                reasons.push(format!(
+                    "build {}",
+                    self.describe_build_deeply(&got.image_arn, &version.image_version, build)
+                        .await
+                ));
+            }
         }
         reasons
+    }
+
+    /// One failed build, described as fully as the service will say: the listing's line, or
+    /// `GetMicrovmImageBuild`'s richer one when that call answers.
+    ///
+    /// # What the extra call buys, and why it is worth one per failed build
+    ///
+    /// The listing already carries the `stateReason`, so this is not about the reason. It is
+    /// about `snapshotBuild`, which the listing has no member for and which is the **only**
+    /// size any operation in this model reports. On a real failure it comes back **partial** —
+    /// measured 2026-08-16 against a `FAILED` build, `codeInstallSizeInBytes` alone with no
+    /// memory and no disk snapshot — and that partial shape is itself the diagnosis: the build
+    /// installed 1.7 GB of code and then never produced a snapshot, which distinguishes "the
+    /// image was too big / the ready hook never answered" from "the Dockerfile failed before
+    /// anything was installed". It also names the `chipsetGeneration`, which matters because
+    /// one `CreateMicrovmImage` fans out into one build per generation and they can disagree.
+    ///
+    /// # Best effort, in the same sense the rest of this diagnosis is
+    ///
+    /// A `GetMicrovmImageBuild` that fails leaves the listing's own line in place rather than
+    /// dropping the build from the report or turning a build failure into a lookup error. That
+    /// is the rule [`Self::probe_stalled_build`] states at length: a diagnosis made on a
+    /// throttled call sends the reader after the wrong cause, and the reason the listing
+    /// already gave is not made less true by a second call failing.
+    async fn describe_build_deeply(
+        &self,
+        identifier: &str,
+        version: &str,
+        listed: &ops::MicrovmImageBuildSummaryWire,
+    ) -> String {
+        match self
+            .get_image_build(identifier, version, &listed.build_id)
+            .await
+        {
+            Ok(deeper) => deeper.describe(),
+            Err(_) => listed.describe(),
+        }
     }
 
     /// The version `latestFailedImageVersion` names, or the first version listed when the
@@ -519,6 +570,310 @@ impl ControlPlane {
                 return Some(hit);
             }
             next_token = Some(page.next_token?);
+        }
+    }
+
+    // ── build and version introspection ──────────────────────────────────────
+
+    /// `GetMicrovmImageBuild`: one build, with the snapshot sizes the listing does not carry.
+    ///
+    /// # What this adds over the listing, and it is not marginal
+    ///
+    /// `snapshotBuild` — the memory, code, and disk byte counts — is the **only** size any
+    /// operation in this model reports for anything the platform builds. `GetMicrovmImage`
+    /// carries none, `GetMicrovm` carries none, and both listings carry none, so a storage
+    /// estimate had nothing to multiply but the size class's baseline. These three figures are
+    /// what the snapshot read, write, and storage line items actually bill on.
+    ///
+    /// It also carries a `stateReason` at the same level the listing does, which is the level
+    /// that is populated on a real failure — the version's is null (docs/PLATFORM.md).
+    ///
+    /// `build_id` comes off [`ops::MicrovmImageBuildSummaryWire::build_id`], which the listing
+    /// already parses; nothing else in the API mints one.
+    pub async fn get_image_build(
+        &self,
+        identifier: &str,
+        version: &str,
+        build_id: &str,
+    ) -> Result<ops::GetImageBuildResponseWire, Error> {
+        let call = Call::get(
+            "GetMicrovmImageBuild",
+            paths::image_build(identifier, version, build_id),
+        );
+        let reply = send_with_retry(self.transport(), call).await?;
+        reply.json("GetMicrovmImageBuild")
+    }
+
+    /// `GetMicrovmImageVersion`: one version's whole configuration, its state, and its
+    /// availability status.
+    ///
+    /// # The only full config readback there is
+    ///
+    /// The response echoes the creation request: `baseImageArn` with the `baseImageVersion`
+    /// that was actually used, the `buildRoleArn`, the `codeArtifact` URI, the egress
+    /// connectors, the CPU configurations, and `resources` — which is where a built image's
+    /// size class lives, since `GetMicrovm` reports no memory figure at all. It is how a
+    /// caller who no longer holds the request finds out what an image was built with.
+    ///
+    /// `status` is the member that matters for a retire: `ACTIVE` means `RunMicrovm` will
+    /// launch this version, `INACTIVE` means it refuses. See
+    /// [`Self::set_image_version_status`].
+    ///
+    /// One call rather than a filtered `ListMicrovmImageVersions`, and the difference is not
+    /// only cost: a listing can page, so "find version X" is a loop that may read the whole
+    /// history, while this addresses the version directly and answers
+    /// `ResourceNotFoundException` when it is gone.
+    pub async fn get_image_version(
+        &self,
+        identifier: &str,
+        version: &str,
+    ) -> Result<ops::MicrovmImageVersionSummaryWire, Error> {
+        let call = Call::get(
+            "GetMicrovmImageVersion",
+            paths::image_version(identifier, version),
+        );
+        let reply = send_with_retry(self.transport(), call).await?;
+        reply.json("GetMicrovmImageVersion")
+    }
+
+    /// `UpdateMicrovmImageVersion`: set a version `ACTIVE` or `INACTIVE`.
+    ///
+    /// # The model's only non-destructive retire
+    ///
+    /// `DeleteMicrovmImageVersion` is the alternative and it is irreversible, cannot be
+    /// applied to an image's last version at all, and destroys the readback a post-mortem
+    /// needs. `INACTIVE` does none of that: `RunMicrovm` refuses to launch the version,
+    /// **already-running VMs keep running**, and [`Self::get_image_version`] still answers
+    /// with the whole configuration. So the rollback for a bad build is two calls that both
+    /// preserve evidence — set the new version INACTIVE, re-pin the launch to the old one —
+    /// rather than a delete.
+    ///
+    /// # Why the status is typed and the version is checked
+    ///
+    /// [`ops::VersionStatus`] has two variants, so `"INACTIVATE"` is a compile error rather
+    /// than a `ValidationException` on the only member this request has. The version string is
+    /// checked against the `Version` shape locally for the reason
+    /// [`super::require_valid_version`] gives: this call is made at the moment someone is
+    /// rolling back, which is when a failure about the request rather than about the version
+    /// is most expensive.
+    ///
+    /// Returns the readback, which carries the status the service now reports — so a caller
+    /// confirms the change rather than assuming the 200 meant it took.
+    pub async fn set_image_version_status(
+        &self,
+        identifier: &str,
+        version: &str,
+        status: ops::VersionStatus,
+    ) -> Result<ops::MicrovmImageVersionSummaryWire, Error> {
+        super::require_valid_version("imageVersion", version)?;
+
+        let wire = ops::UpdateImageVersionWire { status };
+        let call = Call::patch_json(
+            "UpdateMicrovmImageVersion",
+            paths::image_version(identifier, version),
+            &wire,
+        )?;
+        let reply = send_with_retry(self.transport(), call).await?;
+        let updated: ops::MicrovmImageVersionSummaryWire =
+            reply.json("UpdateMicrovmImageVersion")?;
+
+        // The readback is asserted rather than trusted, for the reason
+        // `ops::DeleteImageResponseWire` gives about a 2xx that reports a failure state: a
+        // request the service accepts and does not apply is indistinguishable from one it
+        // applied, and here the consequence is a version a caller believes is retired while
+        // `RunMicrovm` still launches it.
+        if updated.status != status.as_str() {
+            return Err(Error::new(
+                ErrorKind::Platform,
+                format!(
+                    "UpdateMicrovmImageVersion answered 2xx for version {version} of \
+                     {identifier} but read back status {} rather than the requested {status}. A \
+                     version that is still ACTIVE is one RunMicrovm will still launch, so \
+                     treating the 200 as the change having taken would leave a retired version \
+                     reachable.",
+                    updated.status,
+                ),
+            ));
+        }
+        Ok(updated)
+    }
+
+    /// `ListManagedMicrovmImageVersions`, read to its last page: the versions of a managed
+    /// base image, newest first as the service orders them.
+    ///
+    /// # What this is for
+    ///
+    /// [`ops::CreateMicrovmImageWire::base_image_version`] is how a build stops floating on
+    /// whatever the service currently defaults to, and this is the only operation that says
+    /// what the legal values are. The default has already moved once: `al2023-1` carried one
+    /// version in June and two by July (`"0"` and `"1"`, measured 2026-08-16), so every build
+    /// made before this existed recorded no base version and is not reproducible.
+    ///
+    /// # Every page, and an ARN rather than a name
+    ///
+    /// Every page for the reason the other listings give: a version on page two is still a
+    /// version, and a caller pinning "the newest" from a truncated page pins the wrong one.
+    ///
+    /// The identifier must be the base's **full ARN** — a bare `al2023-1` answers
+    /// `ValidationException: Invalid ARN format` (measured 2026-08-16) — so that is checked
+    /// here rather than at the wire, because the service's message names the value without
+    /// saying which member wanted an ARN or that
+    /// [`super::BaseImage::arn`] is what produces one.
+    pub async fn managed_base_versions(
+        &self,
+        base_image_arn: &str,
+    ) -> Result<Vec<ops::ManagedMicrovmImageVersionWire>, Error> {
+        if !base_image_arn.starts_with("arn:") {
+            return Err(Error::new(
+                ErrorKind::Precondition,
+                format!(
+                    "ListManagedMicrovmImageVersions needs the managed base's full ARN, not \
+                     {base_image_arn:?}. The service answers `ValidationException: Invalid ARN \
+                     format: {base_image_arn}` for a bare name (measured 2026-08-16), which \
+                     names the value without saying which member wanted an ARN. \
+                     `BaseImage::al2023().arn(region)` builds one — \
+                     arn:aws:lambda:{}:aws:microvm-image:{base_image_arn}.",
+                    self.region.as_str(),
+                ),
+            ));
+        }
+
+        let mut items = Vec::new();
+        let mut next_token: Option<String> = None;
+        loop {
+            let call = Call::get(
+                "ListManagedMicrovmImageVersions",
+                paths::managed_image_versions(base_image_arn, next_token.as_deref()),
+            );
+            let reply = send_with_retry(self.transport(), call).await?;
+            let page: ops::ListManagedVersionsResponseWire =
+                reply.json("ListManagedMicrovmImageVersions")?;
+            items.extend(page.items);
+            match page.next_token {
+                Some(token) => next_token = Some(token),
+                None => return Ok(items),
+            }
+        }
+    }
+
+    /// `ListManagedMicrovmImages`, read to its last page: the base images AWS publishes.
+    ///
+    /// # Informational only, and that is a limitation rather than a choice
+    ///
+    /// `ManagedMicrovmImageSummary` carries an ARN and two timestamps and **nothing else** —
+    /// no registry reference, no architecture, no working directory. A
+    /// [`super::BaseImage`] needs all three of ARN, Dockerfile `FROM`, and WORKDIR knowledge,
+    /// because `require_matching_from` compares a caller's Dockerfile against the `FROM` and
+    /// `require_workdir` refuses inheritance when the base declares none. Neither guard has an
+    /// input here, and the registry ref is not derivable from the ARN — `al2023-1` pairs with
+    /// `public.ecr.aws/amazonlinux/amazonlinux:2023-minimal` and nothing in the ARN says so.
+    ///
+    /// So a discovered base **cannot safely be built from**, and this exists to answer one
+    /// question: has AWS published a base this client does not know about? `microvm doctor`
+    /// reports it. Measured 2026-08-16, the answer is one item, so hardcoding `al2023-1`
+    /// currently misses nothing.
+    pub async fn managed_base_images(
+        &self,
+    ) -> Result<Vec<ops::ManagedMicrovmImageSummaryWire>, Error> {
+        let mut items = Vec::new();
+        let mut next_token: Option<String> = None;
+        loop {
+            let call = Call::get(
+                "ListManagedMicrovmImages",
+                paths::managed_microvm_images(next_token.as_deref()),
+            );
+            let reply = send_with_retry(self.transport(), call).await?;
+            let page: ops::ListManagedImagesResponseWire =
+                reply.json("ListManagedMicrovmImages")?;
+            items.extend(page.items);
+            match page.next_token {
+                Some(token) => next_token = Some(token),
+                None => return Ok(items),
+            }
+        }
+    }
+
+    /// `ListMicrovmImages`, read to its last page.
+    ///
+    /// # Why this is public where the private walkers are not
+    ///
+    /// [`Self::find_image_by_name`] sends `nameFilter` and answers one image, which is what a
+    /// resolver wants and is a different question from "what is in this account". The live tier
+    /// asks the second: `tests/live_versions.rs` walks the account looking for an image with a
+    /// version in a particular state, because *which* image that is is an account fact a test
+    /// must not hardcode. `microvm ls` deliberately does **not** use this — it reads the local
+    /// ledger, because the resources worth asking about are the ones a killed process never got
+    /// to report and no listing can attribute those back to a command.
+    pub async fn list_images(&self) -> Result<Vec<ops::MicrovmImageSummaryWire>, Error> {
+        let mut items = Vec::new();
+        let mut next_token: Option<String> = None;
+        loop {
+            let call = Call::get(
+                "ListMicrovmImages",
+                paths::microvm_images_list(None, next_token.as_deref()),
+            );
+            let reply = send_with_retry(self.transport(), call).await?;
+            let page: ops::ListImagesResponseWire = reply.json("ListMicrovmImages")?;
+            items.extend(page.items);
+            match page.next_token {
+                Some(token) => next_token = Some(token),
+                None => return Ok(items),
+            }
+        }
+    }
+
+    /// `ListMicrovmImageVersions`, read to its last page.
+    ///
+    /// A `Result` where the private [`Self::builds_of_version`] answers `Option`, and the
+    /// difference is the caller: the private one feeds a *diagnosis*, where a listing failure
+    /// must not become a wedge claim, and this one feeds a caller who asked about the versions
+    /// and needs to know if the answer is unavailable.
+    pub async fn list_image_versions(
+        &self,
+        identifier: &str,
+    ) -> Result<Vec<ops::MicrovmImageVersionSummaryWire>, Error> {
+        let mut items = Vec::new();
+        let mut next_token: Option<String> = None;
+        loop {
+            let call = Call::get(
+                "ListMicrovmImageVersions",
+                paths::image_versions(identifier, next_token.as_deref()),
+            );
+            let reply = send_with_retry(self.transport(), call).await?;
+            let page: ops::ListImageVersionsResponseWire =
+                reply.json("ListMicrovmImageVersions")?;
+            items.extend(page.items);
+            match page.next_token {
+                Some(token) => next_token = Some(token),
+                None => return Ok(items),
+            }
+        }
+    }
+
+    /// `ListMicrovmImageBuilds` for one version, read to its last page.
+    ///
+    /// The identifiers [`Self::get_image_build`] takes come from here: nothing else in the API
+    /// mints a `buildId`. See [`Self::list_image_versions`] on why this answers a `Result` where
+    /// the diagnosis path's walker answers an `Option`.
+    pub async fn list_image_builds(
+        &self,
+        identifier: &str,
+        version: &str,
+    ) -> Result<Vec<ops::MicrovmImageBuildSummaryWire>, Error> {
+        let mut items = Vec::new();
+        let mut next_token: Option<String> = None;
+        loop {
+            let call = Call::get(
+                "ListMicrovmImageBuilds",
+                paths::image_builds(identifier, version, next_token.as_deref()),
+            );
+            let reply = send_with_retry(self.transport(), call).await?;
+            let page: ops::ListImageBuildsResponseWire = reply.json("ListMicrovmImageBuilds")?;
+            items.extend(page.items);
+            match page.next_token {
+                Some(token) => next_token = Some(token),
+                None => return Ok(items),
+            }
         }
     }
 
@@ -1288,12 +1643,25 @@ mod tests {
     /// The failed build is on **page two** of the build listing, so this doubles as a
     /// pagination guard on the diagnosis path.
     ///
-    /// **Falsification** — three, all run 2026-08-15. (a) Drop the `failure_reasons` call
-    /// from `build_failure` and the message loses both reasons: the first two assertions go
-    /// red. (b) Stop following `nextToken` in `builds_of_version` (return `Some(builds)` in
-    /// the `Some(token)` arm) and only the version reason survives: the `no space left`
-    /// assertion goes red. (c) Drop `state_reason` from `MicrovmImageBuildSummaryWire` and
-    /// it does not compile.
+    /// # And now the build's own `GetMicrovmImageBuild`, for the sizes
+    ///
+    /// The listing's reason is not the whole of what the service will say. `GetMicrovmImageBuild`
+    /// adds `snapshotBuild`, and on a real failure it comes back **partial** — measured
+    /// 2026-08-16, a `FAILED` build answered `codeInstallSizeInBytes` alone with no memory and
+    /// no disk snapshot, which is a build that installed the code and then never produced a
+    /// snapshot. That distinguishes "the ready hook never answered" from "the Dockerfile broke
+    /// before installing anything", and the listing has no member for it. The generation is in
+    /// the line for the same reason: one create fans out per Graviton generation and they can
+    /// disagree.
+    ///
+    /// **Falsification** — (a) Drop the `failure_reasons` call from `build_failure` and the
+    /// message loses both reasons: the first two assertions go red. (b) Stop following
+    /// `nextToken` in `builds_of_version` (return `Some(builds)` in the `Some(token)` arm) and
+    /// only the version reason survives: the `no space left` assertion goes red. (c) Drop
+    /// `state_reason` from `MicrovmImageBuildSummaryWire` and it does not compile. (d) Replace
+    /// `describe_build_deeply` with `listed.describe()` and the size and generation assertions
+    /// go red while the reason ones still pass — which is what makes the extra call earn itself.
+    /// All four run.
     #[tokio::test]
     async fn a_failed_build_reports_the_reason_the_service_already_stated() {
         let (plane, fake, _) = planted();
@@ -1330,6 +1698,18 @@ mod tests {
                 &[("build-2", "FAILED", Some("no space left on device"))],
                 None,
             )),
+        )
+        // The per-build `GetMicrovmImageBuild`, answering the partial `snapshotBuild` a real
+        // failed build carries: code installed, no snapshot produced.
+        .answer(
+            "GetMicrovmImageBuild",
+            Answer::ok(fake::get_image_build_response(
+                "build-2",
+                "FAILED",
+                "4",
+                Some("no space left on device"),
+                Some(r#"{"codeInstallSizeInBytes": 1724940288}"#),
+            )),
         );
 
         let error = plane
@@ -1350,6 +1730,26 @@ mod tests {
         assert!(
             message.contains("build-2"),
             "the buildId is what GetMicrovmImageBuild takes, so it has to be named: {message}"
+        );
+        // The two things only `GetMicrovmImageBuild` can say. The size is the diagnosis a
+        // listing structurally cannot carry, and the generation is which of the fan-out's
+        // builds this was.
+        assert!(
+            message.contains("code 1724940288 bytes"),
+            "the snapshot size the listing has no member for must reach the message: {message}"
+        );
+        assert!(
+            message.contains("chipset generation 4"),
+            "one create fans out per generation, so the failing one has to be named: {message}"
+        );
+        assert!(
+            !message.contains("memory"),
+            "a size the service did not report must not be invented: {message}"
+        );
+        assert_eq!(
+            fake.call_count("GetMicrovmImageBuild"),
+            1,
+            "one call per failed build carrying a reason, not per listed build"
         );
         assert!(
             message.contains("The service stated the cause"),
@@ -1848,6 +2248,687 @@ mod tests {
             paths[0].contains("nameFilter=wanted-image") && !paths[0].contains("nextToken"),
             "the first request has the filter and no token: {}",
             paths[0]
+        );
+    }
+
+    // ── the four new operations ──────────────────────────────────────────────
+
+    /// **A real build failure carries no version-level reason, and the build's line is the
+    /// whole diagnosis.**
+    ///
+    /// Measured 2026-08-16 against a deliberately failing build (`RUN … && exit 42`, image
+    /// `microvm-cli-cpc-fail`): `GetMicrovmImageVersion` answered `state: FAILED, status:
+    /// INACTIVE` with **no `stateReason` member at all**, while both of the version's builds
+    /// carried `The container image build failed.` That confirms the entry in
+    /// docs/PLATFORM.md rather than merely restating it, and it is the case that decides how
+    /// the diagnosis has to be assembled: a message built only from the version's reason would
+    /// say nothing on a real failure.
+    ///
+    /// The fake's version here therefore carries **no** reason, unlike the sibling test above
+    /// — so the message must still name the cause, and it can only get it from the builds.
+    ///
+    /// **Falsification** — run 2026-08-16. Drop the build-level extension from
+    /// `failure_reasons` (keep only the version's reason) and the `stated no cause` assertion
+    /// goes red, because with no version reason there is nothing left.
+    #[tokio::test]
+    async fn a_failure_with_no_version_reason_still_names_the_cause_from_the_builds() {
+        let (plane, fake, _) = planted();
+        fake.answer(
+            "GetMicrovmImage",
+            Answer::ok(fake::get_image_response_failed(
+                "img",
+                "CREATE_FAILED",
+                "1.0",
+            )),
+        )
+        // `FAILED` / `INACTIVE` with no `stateReason` — the shape a real failure has.
+        .answer(
+            "ListMicrovmImageVersions",
+            Answer::ok(format!(
+                r#"{{"items": [{}]}}"#,
+                fake::get_image_version_response("1.0", "FAILED", "INACTIVE")
+            )),
+        )
+        // Both builds of the fan-out failed with the same reason, which is what a real one does.
+        .answer(
+            "ListMicrovmImageBuilds",
+            Answer::ok(fake::list_builds_page_with_reasons(
+                &[
+                    (
+                        "ad8dc894-df5e-499c-800c-89711db15f21",
+                        "FAILED",
+                        Some("The container image build failed."),
+                    ),
+                    (
+                        "fbf3cc24-baf7-4498-8f05-13de7c34f2a4",
+                        "FAILED",
+                        Some("The container image build failed."),
+                    ),
+                ],
+                None,
+            )),
+        )
+        // And `GetMicrovmImageBuild` on a real *container-build* failure carries **no**
+        // `snapshotBuild` at all — measured 2026-08-16. So the line has the reason and the
+        // generation and no sizes, which the renderer must handle without a dangling clause.
+        .answer(
+            "GetMicrovmImageBuild",
+            Answer::ok(fake::get_image_build_response(
+                "ad8dc894-df5e-499c-800c-89711db15f21",
+                "FAILED",
+                "4",
+                Some("The container image build failed."),
+                None,
+            )),
+        )
+        .answer(
+            "GetMicrovmImageBuild",
+            Answer::ok(fake::get_image_build_response(
+                "fbf3cc24-baf7-4498-8f05-13de7c34f2a4",
+                "FAILED",
+                "3",
+                Some("The container image build failed."),
+                None,
+            )),
+        );
+
+        let error = plane
+            .wait_for_image("arn:image", SizeClass::DEFAULT, WaitOpts::default())
+            .await
+            .expect_err("a failed build is a failure");
+        let message = error.to_string();
+        assert!(
+            message.contains("The service stated the cause"),
+            "the version carried no reason, so the builds have to supply it: {message}"
+        );
+        assert!(
+            !message.contains("stated no cause"),
+            "a message with build reasons must not claim there were none: {message}"
+        );
+        assert!(
+            message.contains("The container image build failed."),
+            "{message}"
+        );
+        // Both generations named, because one create fans out into one build per generation
+        // and a report naming only one hides a partial failure.
+        assert!(message.contains("chipset generation 4"), "{message}");
+        assert!(message.contains("chipset generation 3"), "{message}");
+        assert!(
+            !message.contains("bytes"),
+            "a container-build failure reports no snapshotBuild, so no size may be invented: \
+             {message}"
+        );
+        assert_eq!(
+            fake.call_count("GetMicrovmImageBuild"),
+            2,
+            "one per failed build, which is the fan-out's width"
+        );
+    }
+
+    /// A version-level reason, when the service does give one, still reaches the message —
+    /// and the version's `status` is read alongside its `state`.
+    ///
+    /// The pair with the test above: this is the case docs/PLATFORM.md records as *not* what a
+    /// real failure looks like, kept because a diagnosis that only worked when the version was
+    /// silent would break the moment AWS started populating the member.
+    #[tokio::test]
+    async fn a_version_level_reason_is_used_when_the_service_does_give_one() {
+        let (plane, fake, _) = planted();
+        fake.answer(
+            "GetMicrovmImage",
+            Answer::ok(fake::get_image_response_failed(
+                "img",
+                "CREATE_FAILED",
+                "2.0",
+            )),
+        )
+        .answer(
+            "ListMicrovmImageVersions",
+            Answer::ok(format!(
+                r#"{{"items": [{}]}}"#,
+                fake::get_image_version_response_with_reason(
+                    "2.0",
+                    "FAILED",
+                    "INACTIVE",
+                    "one or more builds failed",
+                )
+            )),
+        )
+        .answer(
+            "ListMicrovmImageBuilds",
+            Answer::ok(fake::list_builds_page_with_reasons(
+                &[("build-1", "FAILED", Some("no space left on device"))],
+                None,
+            )),
+        )
+        .answer(
+            "GetMicrovmImageBuild",
+            Answer::ok(fake::get_image_build_response(
+                "build-1",
+                "FAILED",
+                "4",
+                Some("no space left on device"),
+                Some(r#"{"codeInstallSizeInBytes": 1724940288}"#),
+            )),
+        );
+
+        let error = plane
+            .wait_for_image("arn:image", SizeClass::DEFAULT, WaitOpts::default())
+            .await
+            .expect_err("a failed build is a failure");
+        let message = error.to_string();
+        assert!(
+            message.contains("version 2.0 is FAILED because one or more builds failed"),
+            "the version's own reason has to survive: {message}"
+        );
+        assert!(
+            message.contains("no space left on device"),
+            "the build's reason is the specific one: {message}"
+        );
+        assert!(
+            message.contains("code 1724940288 bytes"),
+            "and the size only GetMicrovmImageBuild has: {message}"
+        );
+    }
+
+    /// `GetMicrovmImageBuild` lands on the model's path and method, and answers with the
+    /// snapshot sizes.
+    ///
+    /// The path is asserted as a literal rather than built from the helper, because the whole
+    /// content of the change is one extra segment and a helper shared with the code under test
+    /// would agree with a wrong helper.
+    ///
+    /// **Falsification** — run 2026-08-16. Change `paths::image_build` to append `/build/`
+    /// instead of `/builds/` and the path assertion goes red; the request would otherwise
+    /// succeed against a fake that keys on the operation name.
+    #[tokio::test]
+    async fn getting_one_build_emits_the_models_path_and_reads_the_snapshot_sizes() {
+        let (plane, fake, _) = planted();
+        fake.answer(
+            "GetMicrovmImageBuild",
+            Answer::ok(fake::get_image_build_response(
+                "build-abc",
+                "SUCCESSFUL",
+                "4",
+                None,
+                Some(
+                    r#"{"memorySnapshotSizeInBytes": 582238208,
+                        "codeInstallSizeInBytes": 2355486720,
+                        "diskSnapshotSizeInBytes": 23760896}"#,
+                ),
+            )),
+        );
+
+        let build = plane
+            .get_image_build("arn:image", "1.0", "build-abc")
+            .await
+            .expect("reads");
+        assert_eq!(build.build_state, "SUCCESSFUL");
+        assert_eq!(build.chipset_generation, "4");
+        let sizes = build.snapshot_build.expect("the sizes are why we called");
+        assert_eq!(sizes.memory_snapshot_size_in_bytes, Some(582_238_208));
+
+        let calls = fake.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].method, super::super::transport::Method::Get);
+        assert_eq!(
+            calls[0].path,
+            "/2025-09-09/microvm-images/arn%3Aimage/versions/1.0/builds/build-abc"
+        );
+        assert_eq!(calls[0].body, None, "a GET carries no body");
+    }
+
+    /// `GetMicrovmImageVersion` lands on the version path with a `GET`, and reads the
+    /// availability status.
+    ///
+    /// The same path a `DELETE` of the version uses, which is the model's own arrangement —
+    /// so the assertion that matters is the **method**: a `DELETE` here would destroy the
+    /// version this call exists to inspect.
+    ///
+    /// **Falsification** — run 2026-08-16. Build the call with `Call::delete` and the method
+    /// assertion goes red while the path assertion still passes, which is the whole reason both
+    /// are here.
+    #[tokio::test]
+    async fn getting_one_version_reads_it_with_a_get_on_the_delete_path() {
+        let (plane, fake, _) = planted();
+        fake.answer(
+            "GetMicrovmImageVersion",
+            Answer::ok(fake::get_image_version_response(
+                "2.0",
+                "SUCCESSFUL",
+                "INACTIVE",
+            )),
+        );
+
+        let version = plane
+            .get_image_version("arn:image", "2.0")
+            .await
+            .expect("reads");
+        assert_eq!(version.image_version, "2.0");
+        assert_eq!(version.status, "INACTIVE");
+        assert!(!version.is_active(), "INACTIVE will not launch");
+
+        let calls = fake.calls();
+        assert_eq!(
+            calls[0].method,
+            super::super::transport::Method::Get,
+            "a DELETE on this path destroys the version this call inspects"
+        );
+        assert_eq!(
+            calls[0].path,
+            "/2025-09-09/microvm-images/arn%3Aimage/versions/2.0"
+        );
+    }
+
+    /// **`UpdateMicrovmImageVersion` is a `PATCH` whose body is one member.**
+    ///
+    /// The method, the path, and the body's exact key set, because each is a separate way to
+    /// get the model's only non-destructive retire wrong: a `POST` reaches a route the service
+    /// does not declare, a path built from the listing carries a cursor, and a body echoing the
+    /// URI parameters sends members the shape does not have.
+    ///
+    /// **Falsification** — run 2026-08-16, three ways. (a) `Call::post_json` instead of
+    /// `patch_json`: the method assertion goes red. (b) Add `imageVersion` to
+    /// `UpdateImageVersionWire`: the exact-key-set assertion goes red. (c) Send
+    /// `VersionStatus::Active` while asking for `Inactive`: the body assertion goes red *and*
+    /// the readback check in `set_image_version_status` raises, which is the next test.
+    #[tokio::test]
+    async fn retiring_a_version_patches_one_member_onto_the_version_path() {
+        let (plane, fake, _) = planted();
+        fake.answer(
+            "UpdateMicrovmImageVersion",
+            Answer::ok(fake::get_image_version_response(
+                "2.0",
+                "SUCCESSFUL",
+                "INACTIVE",
+            )),
+        );
+
+        let updated = plane
+            .set_image_version_status("arn:image", "2.0", ops::VersionStatus::Inactive)
+            .await
+            .expect("the retire is accepted");
+        assert_eq!(updated.status, "INACTIVE");
+        assert!(!updated.is_active());
+        assert_eq!(
+            updated.state, "SUCCESSFUL",
+            "a retire does not change the build state: the version still built fine, it is \
+             just no longer launchable"
+        );
+
+        let calls = fake.calls();
+        assert_eq!(calls[0].method, super::super::transport::Method::Patch);
+        assert_eq!(
+            calls[0].path,
+            "/2025-09-09/microvm-images/arn%3Aimage/versions/2.0"
+        );
+        assert!(
+            !calls[0].path.contains('?'),
+            "the version path must carry no query member: {}",
+            calls[0].path
+        );
+
+        let body = fake.first_body("UpdateMicrovmImageVersion");
+        assert_eq!(body["status"], "INACTIVE");
+        assert_eq!(
+            body.as_object()
+                .expect("an object")
+                .keys()
+                .collect::<Vec<_>>(),
+            vec!["status"],
+            "imageIdentifier and imageVersion are uri-located: {body}"
+        );
+    }
+
+    /// **A 2xx whose readback disagrees with the request is a failure.**
+    ///
+    /// The same argument `ops::DeleteImageResponseWire` makes: a request the service accepts
+    /// and does not apply is indistinguishable from one it applied, and here the consequence is
+    /// a version the caller believes is retired while `RunMicrovm` still launches it. The
+    /// readback is the only thing that can tell the two apart.
+    ///
+    /// **Falsification** — run 2026-08-16. Drop the `updated.status != status.as_str()` check
+    /// from `set_image_version_status` and this reports `Ok` with an `ACTIVE` version, which is
+    /// exactly the silent failure it exists to prevent.
+    #[tokio::test]
+    async fn a_retire_that_reads_back_active_is_reported_as_a_failure() {
+        let (plane, fake, _) = planted();
+        fake.answer(
+            "UpdateMicrovmImageVersion",
+            // A 200 whose body still says ACTIVE.
+            Answer::ok(fake::get_image_version_response(
+                "2.0",
+                "SUCCESSFUL",
+                "ACTIVE",
+            )),
+        );
+
+        let error = plane
+            .set_image_version_status("arn:image", "2.0", ops::VersionStatus::Inactive)
+            .await
+            .expect_err("a version that is still ACTIVE is one RunMicrovm will still launch");
+        assert_eq!(error.kind(), ErrorKind::Platform);
+        let message = error.to_string();
+        assert!(message.contains("read back status ACTIVE"), "{message}");
+        assert!(message.contains("INACTIVE"), "{message}");
+        assert!(
+            message.contains("RunMicrovm will still launch"),
+            "the consequence has to be nameable: {message}"
+        );
+        assert_eq!(fake.call_count("UpdateMicrovmImageVersion"), 1);
+    }
+
+    /// A blank or whitespace-bearing version is refused **before** the call, on both the
+    /// retire path and the launch path.
+    ///
+    /// The `Version` shape is `min 1, max 2048, pattern [^\s]+`, and issue #24 lists
+    /// `NonBlankString` as the model's most-reused unguarded shape. The refusal is local
+    /// because a retire is what someone does while rolling back, and a `ValidationException`
+    /// about the request rather than about the version is the least useful failure available at
+    /// that moment.
+    ///
+    /// **Falsification** — run 2026-08-16. Delete the `require_valid_version` call from
+    /// `set_image_version_status` and the zero-call assertion goes red: the fake records a
+    /// `PATCH` to `/versions/` with an empty segment, which addresses nothing.
+    #[tokio::test]
+    async fn a_blank_or_whitespace_version_reaches_no_control_plane_call() {
+        for bad in ["", " ", "2.0\n", "a b", "\t2.0"] {
+            let (plane, fake, _) = planted();
+            let error = plane
+                .set_image_version_status("arn:image", bad, ops::VersionStatus::Inactive)
+                .await
+                .expect_err(&format!("{bad:?} is not a legal Version"));
+            assert_eq!(error.kind(), ErrorKind::InvalidArg, "{bad:?}: {error}");
+            assert_eq!(
+                fake.calls().len(),
+                0,
+                "{bad:?} must reach no control-plane call at all"
+            );
+        }
+    }
+
+    /// The version guard's three cases each get their own message, and none reaches the wire.
+    #[tokio::test]
+    async fn each_invalid_version_is_refused_locally_with_its_own_message() {
+        let (plane, fake, _) = planted();
+
+        let empty = plane
+            .set_image_version_status("arn:image", "", ops::VersionStatus::Inactive)
+            .await
+            .expect_err("min is 1");
+        assert_eq!(empty.kind(), ErrorKind::InvalidArg);
+        assert!(
+            empty.to_string().contains("Omit the member entirely"),
+            "an absent version and a blank one are different requests: {empty}"
+        );
+
+        let newline = plane
+            .set_image_version_status("arn:image", "2.0\n", ops::VersionStatus::Inactive)
+            .await
+            .expect_err("the pattern forbids whitespace anywhere");
+        let message = newline.to_string();
+        assert!(message.contains("whitespace"), "{message}");
+        assert!(
+            message.contains("trailing newline"),
+            "the plausible cause has to be named: {message}"
+        );
+
+        let long = plane
+            .set_image_version_status("arn:image", &"9".repeat(2049), ops::VersionStatus::Inactive)
+            .await
+            .expect_err("max is 2048");
+        assert!(long.to_string().contains("2049 characters"), "{long}");
+
+        assert_eq!(
+            fake.calls().len(),
+            0,
+            "no invalid version reaches the control plane"
+        );
+
+        // And a legal one does reach it, so the guard is a comparison rather than a blanket
+        // refusal.
+        fake.answer(
+            "UpdateMicrovmImageVersion",
+            Answer::ok(fake::get_image_version_response(
+                "2.0",
+                "SUCCESSFUL",
+                "INACTIVE",
+            )),
+        );
+        plane
+            .set_image_version_status("arn:image", "2.0", ops::VersionStatus::Inactive)
+            .await
+            .expect("2.0 is a legal Version");
+        assert_eq!(fake.call_count("UpdateMicrovmImageVersion"), 1);
+    }
+
+    /// **`ListManagedMicrovmImageVersions` reads every page**, and the second request carries
+    /// the first page's cursor.
+    ///
+    /// Every page for the reason the other listings give: a caller pinning "the newest" from a
+    /// truncated page pins the wrong one, and a base version is what a build's reproducibility
+    /// rests on.
+    ///
+    /// **Falsification** — run 2026-08-16. Replace the `Some(token)` arm with
+    /// `None => return Ok(items)` semantics (stop after page one) and this fails with 2 versions
+    /// instead of 3, and the page-two assertion goes red.
+    #[tokio::test]
+    async fn the_managed_version_listing_follows_next_token_to_the_last_page() {
+        let (plane, fake, _) = planted();
+        fake.answer(
+            "ListManagedMicrovmImageVersions",
+            Answer::ok(fake::list_managed_versions_page(
+                &["2", "1"],
+                Some("managed-page-2"),
+            )),
+        )
+        .answer(
+            "ListManagedMicrovmImageVersions",
+            Answer::ok(fake::list_managed_versions_page(&["0"], None)),
+        );
+
+        let versions = plane
+            .managed_base_versions("arn:aws:lambda:us-east-1:aws:microvm-image:al2023-1")
+            .await
+            .expect("lists");
+        assert_eq!(versions.len(), 3, "three versions across two pages");
+        let ids: Vec<&str> = versions
+            .iter()
+            .map(|version| version.image_version.as_str())
+            .collect();
+        assert_eq!(ids, ["2", "1", "0"]);
+        assert!(
+            ids.contains(&"0"),
+            "the page-two version is the oldest and would be the one a truncated read missed"
+        );
+
+        let paths: Vec<String> = fake
+            .calls()
+            .into_iter()
+            .filter(|call| call.operation == "ListManagedMicrovmImageVersions")
+            .map(|call| call.path)
+            .collect();
+        assert_eq!(paths.len(), 2);
+        assert!(
+            paths[0].starts_with("/2025-09-09/managed-microvm-images/"),
+            "the managed collection is its own route, not a filter on microvm-images: {}",
+            paths[0]
+        );
+        assert!(!paths[0].contains('?'), "{}", paths[0]);
+        assert!(
+            paths[1].contains("nextToken=managed-page-2"),
+            "the second request must carry the first page's token: {}",
+            paths[1]
+        );
+    }
+
+    /// A bare base-image name is refused **before** the call, naming the ARN the service wants.
+    ///
+    /// Measured 2026-08-16: `ListManagedMicrovmImageVersions --image-identifier al2023-1`
+    /// answers `ValidationException: Invalid ARN format: al2023-1`, which names the value
+    /// without saying which member wanted an ARN or that `BaseImage::arn` produces one. The
+    /// local refusal says both.
+    ///
+    /// **Falsification** — run 2026-08-16. Delete the `starts_with("arn:")` guard and the
+    /// zero-call assertion goes red: the request goes out and the service answers the message
+    /// above.
+    #[tokio::test]
+    async fn a_bare_managed_base_name_is_refused_before_the_call_naming_the_arn() {
+        let (plane, fake, _) = planted();
+        let error = plane
+            .managed_base_versions("al2023-1")
+            .await
+            .expect_err("the service wants a full ARN");
+        assert_eq!(error.kind(), ErrorKind::Precondition);
+        let message = error.to_string();
+        assert!(message.contains("Invalid ARN format"), "{message}");
+        assert!(
+            message.contains("arn:aws:lambda:us-east-1:aws:microvm-image:al2023-1"),
+            "the remedy has to be the ARN itself: {message}"
+        );
+        assert!(message.contains("BaseImage::al2023().arn"), "{message}");
+        assert_eq!(fake.calls().len(), 0, "nothing reached the control plane");
+
+        // And the ARN form does reach it.
+        fake.answer(
+            "ListManagedMicrovmImageVersions",
+            Answer::ok(fake::list_managed_versions_page(&["1", "0"], None)),
+        );
+        let versions = plane
+            .managed_base_versions(
+                &super::super::BaseImage::al2023().arn(&crate::region::Region::UsEast1),
+            )
+            .await
+            .expect("an ARN is accepted");
+        assert_eq!(versions.len(), 2);
+    }
+
+    /// `ListManagedMicrovmImages` reads every page too, and its items carry no registry
+    /// reference — which is why they are informational only.
+    ///
+    /// The absence is asserted through [`super::super::BaseImage`]: a discovered base has an
+    /// ARN and nothing that could fill `docker_ref` or `working_dir`, so
+    /// `require_matching_from` and `require_workdir` would both have to be skipped for one.
+    /// That is the comment in `ops::ManagedMicrovmImageSummaryWire`, made a test.
+    #[tokio::test]
+    async fn the_managed_image_listing_pages_and_its_items_cannot_build_a_base_image() {
+        let (plane, fake, _) = planted();
+        fake.answer(
+            "ListManagedMicrovmImages",
+            Answer::ok(fake::list_managed_images_page(
+                &["al2023-1"],
+                Some("managed-images-page-2"),
+            )),
+        )
+        .answer(
+            "ListManagedMicrovmImages",
+            Answer::ok(fake::list_managed_images_page(&["al2024-1"], None)),
+        );
+
+        let images = plane.managed_base_images().await.expect("lists");
+        assert_eq!(images.len(), 2, "both pages were read");
+        assert!(
+            images[1].image_arn.ends_with("al2024-1"),
+            "the page-two base is the one a caller checking for something new would want: {}",
+            images[1].image_arn
+        );
+
+        // No registry reference anywhere in what the service sent, so the pairing a
+        // `BaseImage` needs is not derivable from a discovered base.
+        let known = super::super::BaseImage::al2023();
+        for image in &images {
+            assert!(
+                !image.image_arn.contains("public.ecr.aws"),
+                "the ARN carries no registry ref: {}",
+                image.image_arn
+            );
+        }
+        assert_eq!(
+            known.docker_ref, "public.ecr.aws/amazonlinux/amazonlinux:2023-minimal",
+            "the paired ref is a compile-time constant precisely because discovery cannot \
+             supply it"
+        );
+
+        let paths = fake.paths();
+        assert_eq!(paths[0], "/2025-09-09/managed-microvm-images");
+        assert!(
+            paths[1].contains("nextToken=managed-images-page-2"),
+            "{}",
+            paths[1]
+        );
+    }
+
+    /// **`CreateMicrovmImage.baseImageVersion` reaches the wire when pinned**, and is absent
+    /// when it is not.
+    ///
+    /// Read off the emitted body rather than off the request struct, which is the assertion
+    /// that matters: a field on `CreateImageRequest` proves nothing about what got sent, and
+    /// this member had a field-shaped hole in the wire struct until now.
+    ///
+    /// **Falsification** — run 2026-08-16. Drop the assignment in `create_image` and the
+    /// pinned assertion goes red with `baseImageVersion` absent from the body.
+    #[tokio::test]
+    async fn a_pinned_base_image_version_reaches_the_create_body() {
+        let (plane, fake, _) = planted();
+        fake.answer(
+            "CreateMicrovmImage",
+            Answer::created(fake::create_image_response("img")),
+        );
+        let mut request = a_request();
+        request.base_image_version = Some("1".to_string());
+        plane.create_image(request).await.expect("creates");
+
+        let body = fake.first_body("CreateMicrovmImage");
+        assert_eq!(
+            body["baseImageVersion"], "1",
+            "the pinned base version has to reach the wire, or a build still floats: {body}"
+        );
+        // The ARN and the version are both sent: pinning does not replace the base.
+        assert_eq!(
+            body["baseImageArn"],
+            "arn:aws:lambda:us-east-1:aws:microvm-image:al2023-1"
+        );
+
+        // Unpinned emits nothing, so a caller who never touches the field sends what this
+        // client always sent.
+        let (plane, fake, _) = planted();
+        fake.answer(
+            "CreateMicrovmImage",
+            Answer::created(fake::create_image_response("img")),
+        );
+        plane.create_image(a_request()).await.expect("creates");
+        assert!(
+            fake.first_body("CreateMicrovmImage")
+                .get("baseImageVersion")
+                .is_none(),
+            "an absent member takes the service default; a blank one is refused"
+        );
+    }
+
+    /// An invalid `baseImageVersion` is refused **before** the artifact reaches the wire.
+    ///
+    /// The same ordering argument `require_valid_image_name` makes and the reason this guard is
+    /// local: the create call happens after the caller's artifact upload, so the service's
+    /// rejection costs them the upload first.
+    ///
+    /// **Falsification** — run 2026-08-16. Delete the `require_valid_version` call from
+    /// `create_image` and the zero-call assertion goes red.
+    #[tokio::test]
+    async fn an_invalid_base_image_version_is_refused_before_any_call() {
+        let (plane, fake, _) = planted();
+        let mut request = a_request();
+        request.base_image_version = Some("1 ".to_string());
+
+        let error = plane
+            .create_image(request)
+            .await
+            .expect_err("the Version pattern forbids whitespace");
+        assert_eq!(error.kind(), ErrorKind::InvalidArg);
+        assert!(error.to_string().contains("baseImageVersion"), "{error}");
+        assert_eq!(
+            fake.calls().len(),
+            0,
+            "nothing reached the control plane, so the caller did not pay for the upload first"
         );
     }
 

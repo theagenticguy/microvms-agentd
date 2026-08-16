@@ -317,6 +317,10 @@ async fn launch_and_exec<O: std::io::Write, E: std::io::Write>(
     let mut request = RunRequest::new()
         .with_image(image_identifier)
         .with_suspended_sec(args.suspended_sec);
+    // Pinned only when asked for, so an unpinned launch emits byte-for-byte the request this
+    // CLI always sent. Core refuses an illegal `Version` before the call, which is why nothing
+    // is validated here — a second check in the CLI would be a second message to keep right.
+    request.image_version = args.image_version.clone();
     request.execution_role_arn = ctx.infra.execution_role_arn.clone();
     request.max_idle_sec = args.max_idle_sec;
     request.max_duration_sec = args.max_duration_sec;
@@ -534,12 +538,15 @@ pub async fn build<O: std::io::Write, E: std::io::Write>(
     let sandbox = ctx.seam.open_sandbox(region, args.port).await?;
     let mut request = build_request_from(
         ctx,
-        &seed,
-        size,
-        &args.binary,
-        args.dockerfile.as_deref(),
-        args.repair_identity,
-        args.artifact_uri.as_deref(),
+        BuildSpec {
+            name: &seed,
+            size,
+            binary: &args.binary,
+            dockerfile: args.dockerfile.as_deref(),
+            repair_identity: args.repair_identity,
+            artifact_uri: args.artifact_uri.as_deref(),
+            base_image_version: args.base_image_version.as_deref(),
+        },
     )?;
 
     let name;
@@ -641,22 +648,56 @@ fn render_build(
     Rendered::ok(kind, data, lines.join("\n"), dense)
 }
 
+/// What a caller asks of one image build. See [`build_request_from`].
+///
+/// A struct rather than six parameters, and the same reason [`StartSpec`] gives applies with
+/// more force here: three of them are `Option`, two of the three are `Option<&str>`, and
+/// `build_request_from(ctx, name, size, binary, dockerfile, repair, uri, version)` is how an
+/// artifact URI ends up where a base version was meant. `run` and `build` fill it differently
+/// and the differences are the interesting part, so they are named at each call site rather
+/// than positional.
+struct BuildSpec<'a> {
+    /// The image name, which is also the token label and the derived artifact key.
+    pub name: &'a str,
+    pub size: microvms_core::SizeClass,
+    /// The aarch64 daemon binary to bake in as the image CMD.
+    pub binary: &'a std::path::Path,
+    /// A Dockerfile to use instead of the library's default. Its FROM must match the base.
+    pub dockerfile: Option<&'a std::path::Path>,
+    /// Whether to widen the guest so `sethostname` and the boot_id bind mount work.
+    pub repair_identity: bool,
+    /// Where the artifact already is, or `None` to derive a key under `--bucket`.
+    pub artifact_uri: Option<&'a str>,
+    /// `baseImageVersion`, or `None` to take whatever the service defaults to.
+    ///
+    /// **`run` always passes `None`, and the asymmetry with `build` is deliberate.** A pinned
+    /// base is a property of a durable artifact, and `run`'s build is the
+    /// build-and-throw-away shape whose image is deleted on the way out — so a flag there
+    /// would pin a base nothing could later read back. Someone who cares which base their
+    /// image sits on is running `microvm build`, whose image outlives the command.
+    pub base_image_version: Option<&'a str>,
+}
+
 /// The create request for `run`'s arguments.
-fn build_request<O: std::io::Write, E: std::io::Write>(
+fn build_request<'a, O: std::io::Write, E: std::io::Write>(
     ctx: &Ctx<'_, O, E>,
-    args: &RunArgs,
-    name: &str,
+    args: &'a RunArgs,
+    name: &'a str,
     size: microvms_core::SizeClass,
-    binary: &std::path::Path,
+    binary: &'a std::path::Path,
 ) -> Result<CreateImageRequest, Error> {
     build_request_from(
         ctx,
-        name,
-        size,
-        binary,
-        args.dockerfile.as_deref(),
-        args.repair_identity,
-        args.artifact_uri.as_deref(),
+        BuildSpec {
+            name,
+            size,
+            binary,
+            dockerfile: args.dockerfile.as_deref(),
+            repair_identity: args.repair_identity,
+            artifact_uri: args.artifact_uri.as_deref(),
+            // See the field: `run`'s image is thrown away, so there is nothing to pin for.
+            base_image_version: None,
+        },
     )
 }
 
@@ -666,13 +707,17 @@ fn build_request<O: std::io::Write, E: std::io::Write>(
 /// parser, so there is no point on this path where an off-table baseline could be written.
 fn build_request_from<O: std::io::Write, E: std::io::Write>(
     ctx: &Ctx<'_, O, E>,
-    name: &str,
-    size: microvms_core::SizeClass,
-    binary: &std::path::Path,
-    dockerfile: Option<&std::path::Path>,
-    repair_identity: bool,
-    artifact_uri: Option<&str>,
+    spec: BuildSpec<'_>,
 ) -> Result<CreateImageRequest, Error> {
+    let BuildSpec {
+        name,
+        size,
+        binary,
+        dockerfile,
+        repair_identity,
+        artifact_uri,
+        base_image_version,
+    } = spec;
     let bytes = std::fs::read(binary).map_err(|error| {
         Error::new(
             ErrorKind::Precondition,
@@ -705,6 +750,10 @@ fn build_request_from<O: std::io::Write, E: std::io::Write>(
     );
     request.size = size;
     request.repair_guest_identity = repair_identity;
+    // Pinned only when asked for. Core refuses an illegal `Version` before the artifact is
+    // uploaded, so there is no check here — the create call happens after the upload, and one
+    // message about it in one place is the whole point of the guard living in core.
+    request.base_image_version = base_image_version.map(str::to_string);
     // A *label* beside core's own per-attempt nonce, never a token. Core accepts no token at
     // all, which is what makes the wedge unwriteable rather than merely defaulted (TRAP-1).
     request.token_scope = Some(name.to_string());

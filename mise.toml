@@ -291,6 +291,34 @@ description = "The cursor encoding and the colon image ARN, against the real sig
 # `cargo test --workspace` stays green; this task is how they run.
 run = "cargo test -p microvms-core --test live_pagination -- --ignored --nocapture"
 
+[tasks."live:versions"]
+description = "The four version/build operations against the real service. Costs one short VM."
+# Same argument `live:paths` makes, plus two things a fake structurally cannot hold.
+#
+# `UpdateMicrovmImageVersion` is the only `PATCH` this client sends, so `Method::Patch` reaching
+# the SigV4 canonical request correctly is unexercised until a real signature is computed over
+# one — and a method the enum spells and the signer signs differently is refused in a way that
+# reads like bad credentials.
+#
+# And `INACTIVE` is only a retire if the *service* enforces it. A readback saying `INACTIVE` is
+# the service echoing a field back; the property the whole feature rests on is that `RunMicrovm`
+# then refuses, which nothing but the service can demonstrate. Measured 2026-08-16: it answers
+# **404 `No active version found for MicroVM image <arn> and version 1.0`**, for a pinned launch
+# and an unpinned one alike.
+#
+# NOT free, unlike `live:paths`, and the description says so because the cost is the reason
+# someone might not run it: the ACTIVE half of the round trip launches a real VM and terminates
+# it on the next line, about ten seconds of a 2 GB baseline. There is no cheaper way — a
+# `RunMicrovm` with the execution role omitted **succeeds** (the member is optional in the model
+# and the service means it, measured 2026-08-16 at the cost of one leaked VM), so there is no
+# incomplete launch that fails locally the way the bogus-ARN technique gives for other members.
+#
+# `--test-threads=1` because one of the four tests flips a version's status and restores it, and
+# a sibling reading the same version in parallel would see whichever half it happened to catch.
+# Ordered after `live:paths` in the aggregate below for the same reason `live:rates` goes after
+# the suite: this one spends money, so the free checks report first.
+run = "cargo test -p microvms-core --test live_versions -- --ignored --nocapture --test-threads=1"
+
 [tasks."live:rates"]
 description = "Fail if the pinned rate table no longer matches the AWS Pricing API"
 # The same argument as `schema:check`: a stale pinned artifact is worse than none,
@@ -418,6 +446,12 @@ trap verify_clean EXIT INT TERM
 # a URL member's encoding is wrong, so a signing bug is reported as a signing bug rather
 # than as a launch that could not resolve its image.
 mise run live:paths
+# After `live:paths` and before the suite. It writes — one version's status, flipped and
+# restored — and it launches one short VM, so it goes after the free member and before the
+# long one: a `PATCH` that will not sign should be reported in seconds rather than after a
+# four-minute build. Its own restore is on every exit path, so a failure here leaves the
+# version ACTIVE and the trap below still asks the account what leaked.
+mise run live:versions
 mise run live:conformance-rs
 mise run live:rates
 verify_clean

@@ -395,6 +395,24 @@ pub struct RunArgs {
     #[arg(long, value_name = "IDENTIFIER")]
     pub image: Option<String>,
 
+    /// Launch this exact image version instead of the image's latest active one.
+    ///
+    /// Omitted takes whatever `latestActiveImageVersion` is at the moment the call lands,
+    /// which is right for the ordinary case and wrong for the two that matter. A canary wants
+    /// the version it just built, not whatever became latest while it was starting. And a
+    /// rollback wants the known-good version, which "latest" cannot name once a bad version is
+    /// the latest one.
+    ///
+    /// A version the control plane has set INACTIVE refuses to launch when named here, which
+    /// is what makes a retire real rather than advisory. `microvm build` prints the version it
+    /// created, and it is on `run --keep`'s envelope as `imageVersion`.
+    ///
+    /// Checked against the model's `Version` shape before any call: empty, over 2048
+    /// characters, or containing whitespace anywhere is refused locally with the reason. A
+    /// version pasted from a terminal carries a trailing newline, which is that case.
+    #[arg(long, value_name = "VERSION")]
+    pub image_version: Option<String>,
+
     /// Where the build artifact already is, as an s3:// URI.
     ///
     /// microvms-core builds the artifact bytes and takes the URI, but does not upload — S3
@@ -513,6 +531,24 @@ pub struct BuildArgs {
     /// A Dockerfile to use instead of the library's default.
     #[arg(long)]
     pub dockerfile: Option<PathBuf>,
+
+    /// Pin the managed base image to one version instead of taking the service's default.
+    ///
+    /// Without this a build floats. The managed base's version list is not static —
+    /// `al2023-1` carried one version in June and two by July — so two builds of identical
+    /// inputs weeks apart can sit on different bases, and neither recorded which. The build
+    /// succeeds either way; the difference shows up in the guest.
+    ///
+    /// The legal values come from `ListManagedMicrovmImageVersions`, which `microvm doctor`
+    /// prints. They are **bare integers** for a managed base (`0`, `1`) where a custom image's
+    /// versions are `1.0`, and the value `GetMicrovmImageVersion` echoes back as
+    /// `baseImageVersion` is spelled a third way again — so a value from anywhere but that
+    /// listing does not belong here.
+    ///
+    /// Checked against the model's `Version` shape before the artifact is uploaded, because
+    /// the create call happens after the upload and the service's rejection would cost you it.
+    #[arg(long, value_name = "VERSION")]
+    pub base_image_version: Option<String>,
 
     /// Widen the guest so `sethostname` and the boot_id bind mount work.
     #[arg(long)]
@@ -1393,6 +1429,106 @@ mod tests {
             panic!("a run parses as a run");
         };
         assert!(args.launch_env.is_empty());
+    }
+
+    /// **`run --image-version` and `build --base-image-version` are free text, and each is on
+    /// exactly one command.**
+    ///
+    /// Free text rather than a closed set, and the asymmetry with `--memory` and `--region` is
+    /// the point: those two have domains this client *knows*, and a version's legal values are
+    /// an account fact only `ListManagedMicrovmImageVersions` can answer. A closed set here
+    /// would refuse a version AWS published this morning, which is the failure mode
+    /// `--unlisted-region` exists to avoid on the other flag. The constraint that *is* knowable
+    /// — the `Version` shape's `min 1 / max 2048 / [^\s]+` — is checked in `microvms-core`
+    /// before any call, so the CLI-5 property holds without a domain: no value this parser
+    /// accepts reaches the wire unchecked.
+    ///
+    /// One command each, deliberately. `run --base-image-version` does not exist because
+    /// `run`'s build is the build-and-throw-away shape whose image is deleted on the way out; a
+    /// pinned base is a property of a durable artifact, and `microvm build` is what makes one.
+    /// `build --image-version` does not exist because a build *creates* a version rather than
+    /// selecting one.
+    #[test]
+    fn the_two_version_flags_are_free_text_and_each_lives_on_one_command() {
+        let run = Cli::try_parse_from([
+            "microvm",
+            "run",
+            "--image",
+            "arn:aws:lambda:us-east-1:1:microvm-image:img",
+            "--image-version",
+            "2.0",
+        ])
+        .expect("run takes --image-version");
+        let Command::Run(args) = run.command else {
+            panic!("a run parses as a run");
+        };
+        assert_eq!(args.image_version.as_deref(), Some("2.0"));
+
+        let build = Cli::try_parse_from([
+            "microvm",
+            "build",
+            "/tmp/agentd",
+            "--base-image-version",
+            "1",
+        ])
+        .expect("build takes --base-image-version");
+        let Command::Build(args) = build.command else {
+            panic!("a build parses as a build");
+        };
+        assert_eq!(args.base_image_version.as_deref(), Some("1"));
+
+        // Absent by default on both, so a caller who never passes either sends what this CLI
+        // always sent.
+        let bare_run =
+            Cli::try_parse_from(["microvm", "run", "--image", "arn:img"]).expect("parses");
+        let Command::Run(args) = bare_run.command else {
+            panic!("a run parses as a run");
+        };
+        assert_eq!(args.image_version, None);
+        let bare_build = Cli::try_parse_from(["microvm", "build", "/tmp/agentd"]).expect("parses");
+        let Command::Build(args) = bare_build.command else {
+            panic!("a build parses as a build");
+        };
+        assert_eq!(args.base_image_version, None);
+
+        // Neither flag exists on the other command: a build creates a version rather than
+        // selecting one, and `run`'s build is thrown away.
+        assert!(
+            Cli::try_parse_from(["microvm", "build", "/tmp/agentd", "--image-version", "2.0"])
+                .is_err(),
+            "a build creates a version; it does not launch one"
+        );
+        assert!(
+            Cli::try_parse_from([
+                "microvm",
+                "run",
+                "--image",
+                "arn:img",
+                "--base-image-version",
+                "1"
+            ])
+            .is_err(),
+            "a pinned base belongs to a durable artifact, which `run`'s throwaway image is not"
+        );
+
+        // Free text, so the parser publishes no domain — and the version whose legality only
+        // the account knows still parses.
+        let odd = Cli::try_parse_from([
+            "microvm",
+            "run",
+            "--image",
+            "arn:img",
+            "--image-version",
+            "a-version-aws-published-this-morning",
+        ])
+        .expect("a version the client has never seen must still be expressible");
+        let Command::Run(args) = odd.command else {
+            panic!("a run parses as a run");
+        };
+        assert_eq!(
+            args.image_version.as_deref(),
+            Some("a-version-aws-published-this-morning")
+        );
     }
 
     /// `--user` and `--group` are numeric, because that is the protocol's type.

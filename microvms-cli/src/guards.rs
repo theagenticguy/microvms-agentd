@@ -206,6 +206,7 @@ fn aws_commands(binary: &std::path::Path) -> Vec<(&'static str, Command, Door)> 
             Command::Run(RunArgs {
                 binary: Some(binary.to_path_buf()),
                 image: None,
+                image_version: None,
                 artifact_uri: Some("s3://bucket/img.zip".into()),
                 exec: Some("true".into()),
                 name: Some("img".into()),
@@ -230,6 +231,7 @@ fn aws_commands(binary: &std::path::Path) -> Vec<(&'static str, Command, Door)> 
             "build",
             Command::Build(BuildArgs {
                 binary: binary.to_path_buf(),
+                base_image_version: None,
                 artifact_uri: Some("s3://bucket/img.zip".into()),
                 name: Some("img".into()),
                 memory: MemoryMib::Mib2048,
@@ -743,6 +745,7 @@ fn run_args_for_image(identifier: &str, state_dir: std::path::PathBuf) -> RunArg
     RunArgs {
         binary: None,
         image: Some(identifier.into()),
+        image_version: None,
         artifact_uri: None,
         exec: None,
         name: Some("img".into()),
@@ -1269,6 +1272,7 @@ async fn a_reuse_build_whose_hash_name_exists_skips_the_build_entirely() {
     };
     let command = Command::Build(BuildArgs {
         binary: binary.0.clone(),
+        base_image_version: None,
         artifact_uri: None,
         name: Some("coding-agents".into()),
         memory: MemoryMib::Mib2048,
@@ -1351,6 +1355,7 @@ async fn a_reuse_build_whose_hash_name_is_absent_builds_under_the_derived_name()
     };
     let command = Command::Build(BuildArgs {
         binary: binary.0.clone(),
+        base_image_version: None,
         artifact_uri: None,
         name: Some("coding-agents".into()),
         memory: MemoryMib::Mib2048,
@@ -1411,6 +1416,7 @@ async fn a_plain_build_never_lists_and_reports_reused_false() {
     };
     let command = Command::Build(BuildArgs {
         binary: binary.0.clone(),
+        base_image_version: None,
         artifact_uri: None,
         name: Some("img".into()),
         memory: MemoryMib::Mib2048,
@@ -1430,6 +1436,176 @@ async fn a_plain_build_never_lists_and_reports_reused_false() {
     );
     assert_eq!(rendered.data["reused"], false);
     assert_eq!(rendered.data["imageName"], "img");
+}
+
+/// **`build --base-image-version` reaches the `CreateMicrovmImage` body**, and its absence
+/// emits nothing.
+///
+/// Read off the emitted body rather than off `BuildArgs`, which is the whole point: a field on
+/// the args struct proves nothing about what got sent, and the wiring from flag to wire member
+/// runs through three hops — `BuildArgs`, `BuildSpec`, `CreateImageRequest` — any of which
+/// could drop it while every other test still passed.
+///
+/// **Guard proof.** Run 2026-08-16. Set `base_image_version: None` in `build`'s `BuildSpec`
+/// (the flag parsed, the spec ignores it) and the pinned assertion goes red with the member
+/// absent from the body; every other CLI test stays green, which is why this test exists.
+#[tokio::test]
+async fn a_pinned_base_image_version_reaches_the_create_body_from_the_build_flag() {
+    let binary = FakeBinary::new("pinned-base");
+    let transport = Arc::new(ScriptedTransport::new());
+    transport
+        .answer(
+            "CreateMicrovmImage",
+            201,
+            r#"{"imageArn": "arn:aws:lambda:us-east-1:123456789012:microvm-image:img",
+                 "name": "img", "state": "CREATING", "createdAt": 1754524800,
+                 "baseImageArn": "arn:aws:lambda:us-east-1:aws:microvm-image:al2023-1",
+                 "buildRoleArn": "arn:aws:iam::123456789012:role/build",
+                 "codeArtifact": {"uri": "s3://a-bucket/img.zip"},
+                 "imageVersion": "1"}"#,
+        )
+        .answer(
+            "GetMicrovmImage",
+            200,
+            r#"{"imageArn": "arn:aws:lambda:us-east-1:123456789012:microvm-image:img",
+                 "name": "img", "state": "CREATED", "createdAt": 1754524800}"#,
+        );
+
+    let seam = ScriptedSeam {
+        transport: Arc::clone(&transport),
+        clock: Arc::new(YieldingClock::default()),
+    };
+    let command = Command::Build(BuildArgs {
+        binary: binary.0.clone(),
+        // The managed base's versions are bare integers, measured 2026-08-16.
+        base_image_version: Some("1".into()),
+        artifact_uri: None,
+        name: Some("img".into()),
+        memory: MemoryMib::Mib2048,
+        dockerfile: None,
+        repair_identity: false,
+        reuse: false,
+        port: None,
+        region: region_flags(),
+        infra: InfraFlags::default(),
+    });
+    let (result, _) = dispatch_with(&seam, &command, full_infra()).await;
+    result.expect("builds");
+
+    let body = transport.first_body("CreateMicrovmImage");
+    assert_eq!(
+        body["baseImageVersion"], "1",
+        "the flag has to reach the wire, or a build still floats on the service default: {body}"
+    );
+    // Both are sent: pinning a version does not replace the base ARN.
+    assert_eq!(
+        body["baseImageArn"],
+        "arn:aws:lambda:us-east-1:aws:microvm-image:al2023-1"
+    );
+}
+
+/// **`run --image-version` reaches the `RunMicrovm` body**, and its absence emits nothing.
+///
+/// The absence half matters for compatibility: an unpinned `run` has to emit byte-for-byte the
+/// request this CLI always sent, so a `"imageVersion": null` on every launch would be a new
+/// member on a request that has worked for months.
+///
+/// **Guard proof.** Run 2026-08-16. Drop `request.image_version = args.image_version.clone()`
+/// from `launch_and_exec` and the pinned assertion goes red with the member absent; nothing
+/// else in the suite notices, which is the gap this test closes.
+#[tokio::test]
+async fn a_pinned_image_version_reaches_the_run_body_from_the_run_flag() {
+    let dir = TempDir::new("pinned-launch");
+    let transport = Arc::new(ScriptedTransport::new());
+    transport
+        .answer("RunMicrovm", 200, &microvm_body("PENDING"))
+        .answer("GetMicrovm", 200, &microvm_body("TERMINATED"))
+        .answer("TerminateMicrovm", 200, "{}")
+        .answer(
+            "CreateMicrovmAuthToken",
+            200,
+            r#"{"authToken": {"X-aws-proxy-auth": "opaque"}}"#,
+        )
+        .answer(
+            "ListMicrovmImageVersions",
+            200,
+            r#"{"items": [{
+                 "baseImageArn": "arn:aws:lambda:us-east-1:aws:microvm-image:al2023-1",
+                 "buildRoleArn": "arn:aws:iam::123456789012:role/build",
+                 "codeArtifact": {"uri": "s3://bucket/img.zip"},
+                 "imageArn": "arn:aws:lambda:us-east-1:123456789012:microvm-image:img",
+                 "imageVersion": "1", "state": "SUCCESSFUL", "status": "ACTIVE",
+                 "createdAt": 1754524800}]}"#,
+        )
+        .answer(
+            "DeleteMicrovmImage",
+            200,
+            r#"{"imageIdentifier": "arn:aws:lambda:us-east-1:123456789012:microvm-image:img",
+                 "state": "DELETING"}"#,
+        );
+
+    let seam = ScriptedSeam {
+        transport: Arc::clone(&transport),
+        clock: Arc::new(YieldingClock::default()),
+    };
+    let mut args = run_args_for_image(
+        "arn:aws:lambda:us-east-1:123456789012:microvm-image:img",
+        dir.0.clone(),
+    );
+    args.image_version = Some("2.0".into());
+    let command = Command::Run(args);
+    // The launch **fails**, and that is deliberate rather than incidental. `GetMicrovm` answers
+    // TERMINATED, so `wait_for_running` fails fast on TRAP-8 — which happens *after* `RunMicrovm`
+    // emitted the body this test reads and *before* a session is built. Answering RUNNING instead
+    // would send the CLI on to `wait_until_ready` against a daemon that does not exist, and that
+    // retries: measured 2026-08-16, the same test took **240 seconds**. The body is emitted either
+    // way, so the fast path is the honest one.
+    let (result, _) = dispatch_with(&seam, &command, full_infra()).await;
+    assert!(
+        result.is_err(),
+        "a VM that reports TERMINATED never reaches RUNNING, which is what makes this fast"
+    );
+
+    let body = transport.first_body("RunMicrovm");
+    assert_eq!(
+        body["imageVersion"], "2.0",
+        "a canary has to launch against the version it means to test: {body}"
+    );
+    assert_eq!(
+        body["imageIdentifier"], "arn:aws:lambda:us-east-1:123456789012:microvm-image:img",
+        "pinning a version does not replace the identifier"
+    );
+
+    // And an unpinned run emits nothing for the member.
+    let dir = TempDir::new("unpinned-launch");
+    let transport = Arc::new(ScriptedTransport::new());
+    transport
+        .answer("RunMicrovm", 200, &microvm_body("PENDING"))
+        .answer("GetMicrovm", 200, &microvm_body("TERMINATED"))
+        .answer("TerminateMicrovm", 200, "{}")
+        .answer(
+            "CreateMicrovmAuthToken",
+            200,
+            r#"{"authToken": {"X-aws-proxy-auth": "opaque"}}"#,
+        );
+    let seam = ScriptedSeam {
+        transport: Arc::clone(&transport),
+        clock: Arc::new(YieldingClock::default()),
+    };
+    let command = Command::Run(run_args_for_image(
+        "arn:aws:lambda:us-east-1:123456789012:microvm-image:img",
+        dir.0.clone(),
+    ));
+    let (result, _) = dispatch_with(&seam, &command, full_infra()).await;
+    assert!(result.is_err(), "TERMINATED before RUNNING, as above");
+    assert!(
+        transport
+            .first_body("RunMicrovm")
+            .get("imageVersion")
+            .is_none(),
+        "an unpinned run must send what this CLI always sent: {}",
+        transport.first_body("RunMicrovm")
+    );
 }
 
 // ── the attached surfaces, against a scripted daemon ─────────────────────────

@@ -66,7 +66,8 @@ pub struct Call {
     /// "no call named `CreateMicrovmShellAuthToken`", and matching that on a path is a
     /// substring test that a renamed route would slip past.
     pub operation: &'static str,
-    /// `GET`, `POST`, or `DELETE` — the three the model's `http` traits use.
+    /// `GET`, `POST`, `PATCH`, or `DELETE` — the four the model's `http` traits use for the
+    /// operations this client implements.
     pub method: Method,
     /// The path **after** the host, with the API version and every URI parameter already
     /// percent-encoded. Includes the query string when the operation has one.
@@ -75,14 +76,24 @@ pub struct Call {
     pub body: Option<Vec<u8>>,
 }
 
-/// The three HTTP methods the model's operations use.
+/// The HTTP methods the model's operations use.
 ///
 /// An enum so a call site cannot pass `"post"` and have the canonical request silently
 /// disagree with the wire method.
+///
+/// # `Patch` is one operation's, and only one
+///
+/// The model uses `PATCH` for exactly `UpdateMicrovmImageVersion` and `PUT` for exactly
+/// `UpdateMicrovmImage`. `Put` is deliberately absent: this client does not implement that
+/// operation, and a variant nothing constructs is a variant that suggests it does.
+/// `PATCH` is not interchangeable with `POST` here — a `POST` to the version path is a route
+/// the service does not declare, and the answer is a 404 that reads as a missing version
+/// rather than as a wrong method.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Method {
     Get,
     Post,
+    Patch,
     Delete,
 }
 
@@ -91,6 +102,7 @@ impl Method {
         match self {
             Method::Get => "GET",
             Method::Post => "POST",
+            Method::Patch => "PATCH",
             Method::Delete => "DELETE",
         }
     }
@@ -122,6 +134,32 @@ impl Call {
         Ok(Self {
             operation,
             method: Method::Post,
+            path: path.into(),
+            body: Some(body),
+        })
+    }
+
+    /// A `PATCH` carrying a serialized rest-json body.
+    ///
+    /// The same shape as [`Call::post_json`] and written beside it rather than folded into a
+    /// method-taking constructor, for the reason [`Method`]'s docs give: the method is part of
+    /// the route the model declares, and a `with_method(Method::Patch)` builder is one a call
+    /// site can forget to call. `UpdateMicrovmImageVersion` is the only operation that reaches
+    /// this.
+    pub fn patch_json<T: serde::Serialize>(
+        operation: &'static str,
+        path: impl Into<String>,
+        body: &T,
+    ) -> Result<Self, Error> {
+        let body = serde_json::to_vec(body).map_err(|error| {
+            Error::new(
+                ErrorKind::Unexpected,
+                format!("could not serialize the {operation} request body: {error}"),
+            )
+        })?;
+        Ok(Self {
+            operation,
+            method: Method::Patch,
             path: path.into(),
             body: Some(body),
         })
@@ -745,15 +783,64 @@ pub mod paths {
         format!("{path}?{}", query.join("&"))
     }
 
-    /// `DELETE /2025-09-09/microvm-images/{imageIdentifier}/versions/{imageVersion}`
+    /// `GET|PATCH|DELETE /2025-09-09/microvm-images/{imageIdentifier}/versions/{imageVersion}`
+    ///
+    /// One path for three operations, because the model gives them one `requestUri` and the
+    /// method is what distinguishes them: `GetMicrovmImageVersion` reads it,
+    /// `UpdateMicrovmImageVersion` patches it, `DeleteMicrovmImageVersion` deletes it. The
+    /// method lives on the [`Call`] rather than in three path functions, so a reader checking
+    /// this against `service-2.json` compares one string.
     ///
     /// Built from [`microvm_image`] rather than from [`image_versions`], because that one
-    /// now takes a cursor and a `DELETE` of one version must never carry a query member.
+    /// now takes a cursor and none of the three may carry a query member.
     pub fn image_version(image: &str, version: &str) -> String {
         format!(
             "{}/versions/{}",
             microvm_image(image),
             encode_segment(version)
+        )
+    }
+
+    /// `GET /2025-09-09/microvm-images/{imageIdentifier}/versions/{imageVersion}/builds/{buildId}`
+    ///
+    /// The list path plus one segment. `buildId` is percent-encoded like every other URI
+    /// parameter even though a real one is a UUID: the model types it `NonBlankString`, so it
+    /// is not the encoder's business to assume the shape of a value the service mints.
+    pub fn image_build(image: &str, version: &str, build_id: &str) -> String {
+        format!(
+            "{}/builds/{}",
+            image_version(image, version),
+            encode_segment(build_id)
+        )
+    }
+
+    /// `GET /2025-09-09/managed-microvm-images`, with the pagination cursor when there is one.
+    ///
+    /// A **different route** from [`microvm_images`], not a filter on it: the managed bases
+    /// live under `managed-microvm-images` and their summaries carry a different shape
+    /// (`ManagedMicrovmImageSummary`, three members). Reading the account's own image listing
+    /// would never return one.
+    pub fn managed_microvm_images(next_token: Option<&str>) -> String {
+        with_next_token(
+            format!("/{API_PATH_VERSION}/managed-microvm-images"),
+            next_token,
+        )
+    }
+
+    /// `GET /2025-09-09/managed-microvm-images/{imageIdentifier}/versions`, with the cursor.
+    ///
+    /// `imageIdentifier` here is the managed base's **full ARN**, not its name: measured
+    /// 2026-08-16, `al2023-1` alone answers `ValidationException: Invalid ARN format:
+    /// al2023-1`. That is why [`crate::control::BaseImage::arn`] is what the caller passes —
+    /// and why the wrapper refuses a non-ARN locally, since the rejection names the value
+    /// without saying which member wanted an ARN.
+    pub fn managed_image_versions(image: &str, next_token: Option<&str>) -> String {
+        with_next_token(
+            format!(
+                "/{API_PATH_VERSION}/managed-microvm-images/{}/versions",
+                encode_segment(image)
+            ),
+            next_token,
         )
     }
 
@@ -858,6 +945,22 @@ mod tests {
         assert_eq!(
             paths::image_builds("img", "1", None),
             "/2025-09-09/microvm-images/img/versions/1/builds"
+        );
+        assert_eq!(
+            paths::image_build("img", "1", "build-abc"),
+            "/2025-09-09/microvm-images/img/versions/1/builds/build-abc"
+        );
+        assert_eq!(
+            paths::managed_microvm_images(None),
+            "/2025-09-09/managed-microvm-images"
+        );
+        assert_eq!(
+            paths::managed_image_versions(
+                "arn:aws:lambda:us-east-1:aws:microvm-image:al2023-1",
+                None
+            ),
+            "/2025-09-09/managed-microvm-images/\
+             arn%3Aaws%3Alambda%3Aus-east-1%3Aaws%3Amicrovm-image%3Aal2023-1/versions"
         );
         assert_eq!(paths::microvms(), "/2025-09-09/microvms");
         assert_eq!(paths::microvms_list(None), "/2025-09-09/microvms");
@@ -981,6 +1084,70 @@ mod tests {
             !paths::image_versions("img", Some("t")).contains("maxResults"),
             "no production path names a page size: {}",
             paths::image_versions("img", Some("t"))
+        );
+    }
+
+    /// The **managed** routes are a different collection from the account's own, and their
+    /// cursor is encoded the same way.
+    ///
+    /// Asserted as its own case because the plausible mistake is treating the managed listing
+    /// as a filter on `microvm-images` — it is a separate `requestUri` in the model with a
+    /// different response shape, so a path built from [`paths::microvm_images`] would address
+    /// the account's images and answer 200 with the wrong items.
+    ///
+    /// **Falsification** — drop the `managed-` prefix from either function and the two
+    /// literals below go red while every request still succeeds against the real service,
+    /// which is exactly why these are literals transcribed from the model rather than a
+    /// shared template.
+    #[test]
+    fn the_managed_routes_are_their_own_collection_and_encode_their_cursor() {
+        assert!(
+            !paths::managed_microvm_images(None).contains('?'),
+            "an absent cursor emits no query member"
+        );
+        assert_eq!(
+            paths::managed_microvm_images(Some("a+b/c=")),
+            "/2025-09-09/managed-microvm-images?nextToken=a%2Bb%2Fc%3D"
+        );
+        assert_eq!(
+            paths::managed_image_versions("al2023-1", Some("a+b/c=")),
+            "/2025-09-09/managed-microvm-images/al2023-1/versions?nextToken=a%2Bb%2Fc%3D"
+        );
+
+        // Not a filter on the account's own listing: the two collections are different path
+        // segments, and reading one for the other answers 200 with the wrong items.
+        assert_ne!(
+            paths::managed_microvm_images(None),
+            paths::microvm_images_list(None, None)
+        );
+        assert!(
+            !paths::microvm_images().contains("managed"),
+            "the account's own collection must not acquire the managed prefix"
+        );
+    }
+
+    /// A `GET` of one build is the list path plus one encoded segment, and it carries no query
+    /// member.
+    ///
+    /// The `buildId` is percent-encoded even though a real one is a UUID: the model types it
+    /// `NonBlankString`, so the encoder does not get to assume the shape of a value the
+    /// service mints.
+    #[test]
+    fn one_builds_path_is_the_listing_plus_an_encoded_segment() {
+        let path = paths::image_build("img", "1", "4a4c5e30-811f-47fa-9893-260ea6a37a8f");
+        assert_eq!(
+            path,
+            "/2025-09-09/microvm-images/img/versions/1/builds/4a4c5e30-811f-47fa-9893-260ea6a37a8f"
+        );
+        assert!(!path.contains('?'), "{path}");
+        assert!(
+            path.starts_with(&paths::image_builds("img", "1", None)),
+            "the get path must extend the list path rather than be a second route: {path}"
+        );
+        // And an identifier with a separator in it cannot split into extra segments.
+        assert_eq!(
+            paths::image_build("img", "1", "a/b"),
+            "/2025-09-09/microvm-images/img/versions/1/builds/a%2Fb"
         );
     }
 
@@ -1267,11 +1434,73 @@ mod tests {
         assert_eq!(delete.method, Method::Delete);
     }
 
-    /// The three methods, spelled as the canonical request needs them: uppercase.
+    /// The methods, spelled as the canonical request needs them: uppercase.
     #[test]
-    fn the_methods_are_the_three_the_model_uses_spelled_uppercase() {
+    fn the_methods_are_the_ones_the_model_uses_spelled_uppercase() {
         assert_eq!(Method::Get.as_str(), "GET");
         assert_eq!(Method::Post.as_str(), "POST");
+        assert_eq!(Method::Patch.as_str(), "PATCH");
         assert_eq!(Method::Delete.as_str(), "DELETE");
+    }
+
+    /// A `PATCH` carries its serialized body and is **not** a `POST`.
+    ///
+    /// The distinction is load-bearing rather than cosmetic: `UpdateMicrovmImageVersion` is the
+    /// model's only `PATCH`, and a `POST` to the version path is a route the service does not
+    /// declare — so the failure would be a 404 that reads as a missing version rather than as a
+    /// wrong method. The body assertion is here too, because a `PATCH` whose body was dropped
+    /// would be a request with no `status` member at all.
+    ///
+    /// **Falsification** — set `method: Method::Post` in `patch_json` and the method assertion
+    /// goes red; the path and body assertions would still pass, which is why the method is
+    /// asserted separately.
+    #[test]
+    fn a_patch_carries_its_body_and_is_not_a_post() {
+        let call = Call::patch_json(
+            "UpdateMicrovmImageVersion",
+            paths::image_version("img", "2.0"),
+            &crate::control::ops::UpdateImageVersionWire {
+                status: crate::control::ops::VersionStatus::Inactive,
+            },
+        )
+        .expect("serialises");
+
+        assert_eq!(call.method, Method::Patch);
+        assert_ne!(
+            call.method,
+            Method::Post,
+            "a POST to the version path is a route the model does not declare"
+        );
+        assert_eq!(call.path, "/2025-09-09/microvm-images/img/versions/2.0");
+        assert_eq!(
+            call.body.as_deref(),
+            Some(&br#"{"status":"INACTIVE"}"#[..]),
+            "the one member the request has must reach the body"
+        );
+        assert_eq!(call.operation, "UpdateMicrovmImageVersion");
+    }
+
+    /// A `PATCH` gets signed like every other method, with the empty-payload rule not applying
+    /// because it has a body.
+    ///
+    /// Worth its own case because the signing path reads the method as a string for the
+    /// canonical request: a method the enum spells and the signer does not is a signature over
+    /// a different request than the one sent, which reads as bad credentials.
+    #[test]
+    fn a_patch_is_signed_with_its_method_in_the_canonical_request() {
+        let credentials =
+            aws_credential_types::Credentials::new("AKIDEXAMPLE", "secret", None, None, "test");
+        let mut request = http::Request::builder()
+            .method(Method::Patch.as_str())
+            .uri(
+                "https://lambda.us-east-1.amazonaws.com/2025-09-09/microvm-images/img/versions/2.0",
+            )
+            .header("content-type", "application/json")
+            .body(br#"{"status":"INACTIVE"}"#.to_vec())
+            .expect("builds");
+
+        sign_in_place(&mut request, &credentials, &Region::UsEast1).expect("signs");
+        assert_eq!(request.method().as_str(), "PATCH");
+        assert!(request.headers().contains_key("authorization"));
     }
 }

@@ -229,6 +229,25 @@ pub struct CreateImageRequest {
     pub name: String,
     /// The base image, pairing the `baseImageArn` with the Dockerfile `FROM`.
     pub base_image: BaseImage,
+    /// `baseImageVersion`, or `None` to take whatever the service currently defaults to.
+    ///
+    /// # Why pinning is worth a field
+    ///
+    /// Without it a build floats. The managed base's version list is not static — `al2023-1`
+    /// carried one version in June and two by July (`"0"` and `"1"`, measured 2026-08-16) — so
+    /// two builds of identical inputs weeks apart can sit on different bases, and neither
+    /// recorded which. That is a reproducibility hole with no local symptom: the build
+    /// succeeds either way, and the difference appears in the guest.
+    ///
+    /// `None` is the default and stays the default, because pinning without knowing the legal
+    /// values is how a caller pins to a version that has been withdrawn.
+    /// [`ControlPlane::managed_base_versions`] is what answers that, and the version strings
+    /// are **bare integers** for a managed base where a custom image's are `"1.0"` — the two
+    /// are not comparable, so a value from anywhere else does not belong here.
+    ///
+    /// Checked against the `Version` shape before the call, because the create happens after
+    /// the artifact upload.
+    pub base_image_version: Option<String>,
     /// The Dockerfile, or `None` for the derived default.
     ///
     /// A caller-supplied one is checked against `base_image`'s `docker_ref`: the two
@@ -296,6 +315,7 @@ impl CreateImageRequest {
         Self {
             name: name.into(),
             base_image: BaseImage::al2023(),
+            base_image_version: None,
             dockerfile: None,
             binary,
             code_artifact_uri: code_artifact_uri.into(),
@@ -320,6 +340,26 @@ impl CreateImageRequest {
 pub struct RunMicrovmRequest {
     /// The image ARN or ID to launch.
     pub image_identifier: String,
+    /// `imageVersion`, or `None` for the image's own latest active version.
+    ///
+    /// # The launch half of blue/green
+    ///
+    /// `None` is what this client always sent, and it means "whatever
+    /// `latestActiveImageVersion` is now" — which is right for the ordinary case and wrong for
+    /// the two that matter. A canary wants to launch against exactly the version it is
+    /// testing, not against whatever became latest while it was starting. And a rollback wants
+    /// to re-pin to the known-good version, which "latest" cannot express at all once a bad
+    /// version is the latest one.
+    ///
+    /// With [`ControlPlane::set_image_version_status`] the three moves compose: build v2,
+    /// canary-launch pinned to v2, and on failure set v2 INACTIVE and re-pin to v1. A version
+    /// set INACTIVE refuses to launch when pinned here, which is what makes the retire real
+    /// rather than advisory.
+    ///
+    /// Checked against the `Version` shape before the call — see
+    /// [`require_valid_version`] on why a rollback is the worst moment for a rejection about
+    /// the request.
+    pub image_version: Option<String>,
     /// The execution role. Optional in the model; every real launch needs one.
     pub execution_role_arn: Option<String>,
     /// The connectors to request, as intents (TRAP-4). Ingress is required for a session
@@ -349,6 +389,7 @@ impl RunMicrovmRequest {
     pub fn new(image_identifier: impl Into<String>, run_hook_payload: RunHookPayload) -> Self {
         Self {
             image_identifier: image_identifier.into(),
+            image_version: None,
             execution_role_arn: None,
             connectors: vec![ConnectorIntent::AllIngress],
             run_hook_payload,
@@ -366,6 +407,13 @@ impl RunMicrovmRequest {
         if !self.connectors.contains(&ConnectorIntent::Egress) {
             self.connectors.push(ConnectorIntent::Egress);
         }
+        self
+    }
+
+    /// Pins the launch to one `imageVersion`. See the field for why that matters.
+    #[must_use]
+    pub fn with_image_version(mut self, version: impl Into<String>) -> Self {
+        self.image_version = Some(version.into());
         self
     }
 }
@@ -387,6 +435,54 @@ pub fn require_duration_in_range(seconds: u32) -> Result<u32, Error> {
         crate::constants::MODEL_API_VERSION,
         crate::constants::MAX_DURATION_SEC,
     )))
+}
+
+/// Rejects a `Version`/`NonBlankString` value the service would reject.
+///
+/// # Why this one is checked locally when so many are not
+///
+/// The model's `Version` shape is `min: 1, max: 2048, pattern: [^\s]+`, and issue #24 lists
+/// `NonBlankString` as its most-reused unguarded shape. Two of the three constraints are ones
+/// botocore would not catch even if this client used it (`max` and `pattern` are outside
+/// `VALIDATED_METADATA_ATTRS`), and this client uses `aws-sigv4` plus `reqwest` and never
+/// touches botocore's validator at all.
+///
+/// What makes it worth a guard rather than a comment is *where* the two callers sit.
+/// `CreateMicrovmImage.baseImageVersion` is sent **after** the artifact upload, so the
+/// service's rejection costs the caller the upload — the same argument
+/// [`require_valid_image_name`] makes. And `RunMicrovm.imageVersion` is the pinned-launch
+/// half of a rollback: a blank there is a `ValidationException` at the moment someone is
+/// trying to re-pin away from a bad version, which is the worst possible time for the failure
+/// to be about the request rather than about the version.
+///
+/// The pattern is `[^\s]+` — **no whitespace anywhere**, not merely "not blank". A version
+/// copied out of a terminal with a trailing newline satisfies "non-empty" and fails the
+/// pattern, so the message names the character rather than saying the value is invalid.
+pub fn require_valid_version(member: &str, version: &str) -> Result<(), Error> {
+    let model = crate::constants::MODEL_API_VERSION;
+    if version.is_empty() {
+        return Err(Error::invalid_arg(format!(
+            "{member} is empty, but the Version shape requires at least 1 character (service \
+             model {model}). Omit the member entirely to let the service choose — an absent \
+             version and a blank one are different requests, and only the first is legal."
+        )));
+    }
+    if version.len() > crate::constants::MAX_VERSION_LEN {
+        return Err(Error::invalid_arg(format!(
+            "{member} is {} characters, over the Version ceiling of {} (service model {model}).",
+            version.len(),
+            crate::constants::MAX_VERSION_LEN,
+        )));
+    }
+    if let Some(found) = version.chars().find(char::is_ascii_whitespace) {
+        return Err(Error::invalid_arg(format!(
+            "{member} {version:?} contains whitespace ({found:?}), which the Version pattern \
+             {:?} forbids anywhere in the value (service model {model}). A version pasted from \
+             a terminal carries a trailing newline and looks fine; this is that.",
+            crate::constants::VERSION_PATTERN,
+        )));
+    }
+    Ok(())
 }
 
 /// Rejects an image name the service would reject, before the artifact upload.
@@ -641,6 +737,7 @@ mod tests {
         let CreateImageRequest {
             name: _,
             base_image: _,
+            base_image_version: _,
             dockerfile: _,
             binary: _,
             code_artifact_uri: _,
@@ -658,6 +755,7 @@ mod tests {
 
         let RunMicrovmRequest {
             image_identifier: _,
+            image_version: _,
             execution_role_arn: _,
             connectors: _,
             run_hook_payload: _,
@@ -690,6 +788,7 @@ mod tests {
     fn the_wire_types_token_field_is_crate_private_and_minted() {
         let wire = ops::RunMicrovmWire {
             image_identifier: "arn:image".to_string(),
+            image_version: None,
             execution_role_arn: None,
             ingress_network_connectors: Vec::new(),
             egress_network_connectors: None,

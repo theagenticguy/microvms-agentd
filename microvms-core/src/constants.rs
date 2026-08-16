@@ -71,6 +71,22 @@ pub const MAX_IMAGE_NAME_LEN: usize = 64;
 /// dependency because the character class is four ranges.
 pub const IMAGE_NAME_PATTERN: &str = "[a-zA-Z0-9-_]+";
 
+/// `Version.max`, which is also `NonBlankString.max`.
+///
+/// Checked by [`crate::control::require_valid_version`] on the two members this client sends
+/// as a `Version` — `CreateMicrovmImage.baseImageVersion` and `RunMicrovm.imageVersion`. Issue
+/// #24 named `NonBlankString` as the model's most-reused unguarded shape; these are the two
+/// places it is now guarded, and both are sent at a moment where the service's own rejection
+/// is expensive (after an artifact upload, or in the middle of a rollback).
+pub const MAX_VERSION_LEN: usize = 2048;
+
+/// `Version.pattern` — **no whitespace anywhere**, not merely "not blank".
+///
+/// Published as a string for the drift gate; the check is hand-rolled beside it for the reason
+/// [`IMAGE_NAME_PATTERN`] gives. A version copied out of a terminal carries a trailing newline
+/// and satisfies "non-empty" while failing this, which is why the refusal names the character.
+pub const VERSION_PATTERN: &str = "[^\\s]+";
+
 /// `RunMicrovmRequestMaximumDurationInSecondsInteger.max` — eight hours, and the hard
 /// ceiling on any single VM's life. A longer session needs a second VM, not a larger
 /// number.
@@ -100,8 +116,34 @@ pub const CAPABILITIES: [&str; 1] = ["ALL"];
 /// apply.
 pub const ARCHITECTURES: [&str; 1] = ["ARM_64"];
 
-/// `NetworkConnectorList.max`.
+/// `NetworkConnectorList.max` — the **VM-level** list, which `RunMicrovm` sends.
 pub const MAX_NETWORK_CONNECTORS: usize = 10;
+
+/// The **image-level** egress list's max, which is `1` and not `10`.
+///
+/// Six shapes in the model declare an image-level `egressNetworkConnectors` with
+/// `min: 0, max: 1` — `CreateMicrovmImageRequest`, `MicrovmImageVersionSummary`,
+/// `GetMicrovmImageVersionOutput`, `UpdateMicrovmImageVersionResponse`, and two more. The
+/// VM-level `NetworkConnectorList` above allows 10. Issue #24 named the hazard: reusing
+/// [`MAX_NETWORK_CONNECTORS`] for an image-level list is wrong by an order of magnitude, and
+/// wrong in the permissive direction, so the rejection would arrive from the service.
+///
+/// Pinned here rather than left as a comment because the version readback now deserializes
+/// that list ([`crate::control::ops::MicrovmImageVersionSummaryWire`]), so the two ceilings
+/// are both live in this crate and the drift gate can hold each against its own shape.
+pub const MAX_IMAGE_EGRESS_CONNECTORS: usize = 1;
+
+/// The `MicrovmImageVersionStatus` enum, in the model's order.
+///
+/// The values `UpdateMicrovmImageVersion` accepts and `GetMicrovmImageVersion` answers.
+/// Published so the drift gate compares them against the shape rather than against a literal
+/// inside the script — which is the gap the script's own comment admits for the five state
+/// enums, and this one is a request member, so a value the model dropped would be a call this
+/// client makes and the service refuses.
+///
+/// [`crate::control::ops::VersionStatus`] is the typed spelling; this array is what the gate
+/// reads, and the test at the bottom of that module asserts the two agree.
+pub const IMAGE_VERSION_STATUSES: [&str; 2] = ["ACTIVE", "INACTIVE"];
 
 /// `ResourcesList.max`.
 ///
@@ -179,6 +221,8 @@ pub fn as_json() -> Value {
         "MAX_RUN_HOOK_PAYLOAD_BYTES": MAX_RUN_HOOK_PAYLOAD_BYTES,
         "MAX_IMAGE_NAME_LEN": MAX_IMAGE_NAME_LEN,
         "IMAGE_NAME_PATTERN": IMAGE_NAME_PATTERN,
+        "MAX_VERSION_LEN": MAX_VERSION_LEN,
+        "VERSION_PATTERN": VERSION_PATTERN,
         "MAX_DURATION_SEC": MAX_DURATION_SEC,
         "MAX_MICROVM_HOOK_TIMEOUT_SEC": MAX_MICROVM_HOOK_TIMEOUT_SEC,
         "MAX_IMAGE_HOOK_TIMEOUT_SEC": MAX_IMAGE_HOOK_TIMEOUT_SEC,
@@ -186,6 +230,8 @@ pub fn as_json() -> Value {
         "CAPABILITIES": CAPABILITIES,
         "ARCHITECTURES": ARCHITECTURES,
         "MAX_NETWORK_CONNECTORS": MAX_NETWORK_CONNECTORS,
+        "MAX_IMAGE_EGRESS_CONNECTORS": MAX_IMAGE_EGRESS_CONNECTORS,
+        "IMAGE_VERSION_STATUSES": IMAGE_VERSION_STATUSES,
         "MAX_RESOURCES": MAX_RESOURCES,
         "MAX_CLIENT_TOKEN_LEN": MAX_CLIENT_TOKEN_LEN,
         "MODEL_IMAGE_READY_STATES": MODEL_IMAGE_READY_STATES,
@@ -231,21 +277,25 @@ mod tests {
                 "CAPABILITIES",
                 "DEAD_STATES",
                 "IMAGE_NAME_PATTERN",
+                "IMAGE_VERSION_STATUSES",
                 "MAX_CLIENT_TOKEN_LEN",
                 "MAX_DURATION_SEC",
                 "MAX_HOOK_PORT",
+                "MAX_IMAGE_EGRESS_CONNECTORS",
                 "MAX_IMAGE_HOOK_TIMEOUT_SEC",
                 "MAX_IMAGE_NAME_LEN",
                 "MAX_MICROVM_HOOK_TIMEOUT_SEC",
                 "MAX_NETWORK_CONNECTORS",
                 "MAX_RESOURCES",
                 "MAX_RUN_HOOK_PAYLOAD_BYTES",
+                "MAX_VERSION_LEN",
                 "MICROVM_REGIONS",
                 "MODEL_API_VERSION",
                 "MODEL_IMAGE_READY_STATES",
                 "SIZE_CLASSES",
                 "TERMINAL_STATES",
                 "TOLERATED_IMAGE_READY_STATES",
+                "VERSION_PATTERN",
             ]
         );
     }
@@ -260,6 +310,8 @@ mod tests {
         assert_eq!(emitted["MAX_RUN_HOOK_PAYLOAD_BYTES"], 4096);
         assert_eq!(emitted["MAX_IMAGE_NAME_LEN"], 64);
         assert_eq!(emitted["IMAGE_NAME_PATTERN"], "[a-zA-Z0-9-_]+");
+        assert_eq!(emitted["MAX_VERSION_LEN"], 2048);
+        assert_eq!(emitted["VERSION_PATTERN"], "[^\\s]+");
         assert_eq!(emitted["MAX_DURATION_SEC"], 28_800);
         assert_eq!(emitted["MAX_MICROVM_HOOK_TIMEOUT_SEC"], 60);
         assert_eq!(emitted["MAX_IMAGE_HOOK_TIMEOUT_SEC"], 3_600);
@@ -267,6 +319,13 @@ mod tests {
         assert_eq!(emitted["CAPABILITIES"], json!(["ALL"]));
         assert_eq!(emitted["ARCHITECTURES"], json!(["ARM_64"]));
         assert_eq!(emitted["MAX_NETWORK_CONNECTORS"], 10);
+        // 1, not 10. The image-level list and the VM-level one differ by an order of
+        // magnitude, and this is the assertion that says so in one place.
+        assert_eq!(emitted["MAX_IMAGE_EGRESS_CONNECTORS"], 1);
+        assert_eq!(
+            emitted["IMAGE_VERSION_STATUSES"],
+            json!(["ACTIVE", "INACTIVE"])
+        );
         assert_eq!(emitted["MAX_RESOURCES"], 1);
         assert_eq!(emitted["MAX_CLIENT_TOKEN_LEN"], 128);
         assert_eq!(
@@ -316,6 +375,55 @@ mod tests {
         assert!(
             !DEAD_STATES.contains(&"SUSPENDED"),
             "SUSPENDED is terminal but not dead: it is the state a resume is called from"
+        );
+    }
+
+    /// **Issue #24's wrong-by-10x hazard.** The two connector ceilings are different
+    /// numbers, and the image-level one is the smaller.
+    ///
+    /// Stated as an inequality rather than only as two literals above, because the failure
+    /// mode is a future edit that *unifies* them — "there is only one connector limit, delete
+    /// the duplicate" — and the permissive direction is the one that reaches the wire. A
+    /// caller who applied `MAX_NETWORK_CONNECTORS` to an image's `egressNetworkConnectors`
+    /// would accept ten and have the service refuse two.
+    #[test]
+    fn the_image_level_connector_ceiling_is_one_and_not_the_vm_levels_ten() {
+        assert_eq!(MAX_IMAGE_EGRESS_CONNECTORS, 1);
+        assert_eq!(MAX_NETWORK_CONNECTORS, 10);
+        // Read out of `as_json()` rather than compared as two `const`s, because clippy's
+        // `assertions_on_constants` is right that a `const < const` assertion is decided at
+        // compile time and proves nothing at runtime. Going through the emitted object makes it
+        // a real comparison — and it is the object the drift gate reads, so this asserts the
+        // published pair rather than two literals a reader could unify.
+        let emitted = as_json();
+        let image = emitted["MAX_IMAGE_EGRESS_CONNECTORS"]
+            .as_u64()
+            .expect("a number");
+        let vm = emitted["MAX_NETWORK_CONNECTORS"]
+            .as_u64()
+            .expect("a number");
+        assert!(
+            image < vm,
+            "collapsing the two would be permissive by 10x on the image-level list: \
+             {image} against {vm}"
+        );
+    }
+
+    /// The version statuses are exactly the two the model declares, spelled uppercase.
+    ///
+    /// The typed request-side spelling is checked against this array in
+    /// `crate::control::ops`, so the two cannot drift; here what is pinned is the pair itself
+    /// and the fact that neither is a lowercase or a past-tense variant of the other.
+    #[test]
+    fn the_two_version_statuses_are_active_and_inactive() {
+        assert_eq!(IMAGE_VERSION_STATUSES, ["ACTIVE", "INACTIVE"]);
+        for status in IMAGE_VERSION_STATUSES {
+            assert_eq!(status, status.to_uppercase(), "{status}");
+        }
+        assert!(
+            !IMAGE_VERSION_STATUSES.contains(&"DISABLED"),
+            "DISABLED is HookState's spelling, not this enum's — mixing them is a \
+             ValidationException on the only member the update request has"
         );
     }
 

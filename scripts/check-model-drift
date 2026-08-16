@@ -158,6 +158,8 @@ CONSTANT_NAMES = (
     "MAX_RUN_HOOK_PAYLOAD_BYTES",
     "MAX_IMAGE_NAME_LEN",
     "IMAGE_NAME_PATTERN",
+    "MAX_VERSION_LEN",
+    "VERSION_PATTERN",
     "MAX_DURATION_SEC",
     "MAX_MICROVM_HOOK_TIMEOUT_SEC",
     "MAX_IMAGE_HOOK_TIMEOUT_SEC",
@@ -165,6 +167,8 @@ CONSTANT_NAMES = (
     "CAPABILITIES",
     "ARCHITECTURES",
     "MAX_NETWORK_CONNECTORS",
+    "MAX_IMAGE_EGRESS_CONNECTORS",
+    "IMAGE_VERSION_STATUSES",
     "MAX_RESOURCES",
     "MAX_CLIENT_TOKEN_LEN",
     "MODEL_IMAGE_READY_STATES",
@@ -191,6 +195,11 @@ UNORDERED_NAMES = frozenset(
         "TERMINAL_STATES",
         "DEAD_STATES",
         "MICROVM_REGIONS",
+        # The `MicrovmImageVersionStatus` enum. Sorted, because the code that reads it does a
+        # membership test against a wire string — and the two values happen to be in the same
+        # order the model lists them, so an unsorted comparison would pass today and become a
+        # false failure the day AWS reorders the enum without changing it.
+        "IMAGE_VERSION_STATUSES",
     }
 )
 
@@ -511,6 +520,42 @@ def check(src: Source, model: dict[str, Any]) -> Checker:
     c.bound("ImageName max length", "ImageName", "max", src.get("MAX_IMAGE_NAME_LEN"))
     c.pattern("ImageName pattern", "ImageName", src.get("IMAGE_NAME_PATTERN"))
 
+    # The `Version` shape, which `CreateMicrovmImage.baseImageVersion` and
+    # `RunMicrovm.imageVersion` both use. Issue #24 named `NonBlankString` — the same
+    # `min 1 / max 2048 / [^\s]+` triple — as the model's most-reused unguarded shape, and
+    # these two members are where the client now guards it. Both are checked against
+    # `Version` rather than `NonBlankString`, because that is the shape the two request
+    # members actually name; the two shapes are identical today and checking the wrong one
+    # would pass while pinning nothing about the members in question.
+    c.bound("Version max length", "Version", "max", src.get("MAX_VERSION_LEN"))
+    c.bound("Version min length", "Version", "min", 1)
+    c.pattern("Version pattern", "Version", src.get("VERSION_PATTERN"))
+    # And `NonBlankString`, held against the same two values from the other direction. It is
+    # what `GetMicrovmImageBuild`'s `buildId` and `imageVersion` URI members use, so the
+    # client's one guard covers both shapes only for as long as they agree — and this is
+    # the line that notices when they stop.
+    c.bound(
+        "NonBlankString max length (same guard)",
+        "NonBlankString",
+        "max",
+        src.get("MAX_VERSION_LEN"),
+    )
+    c.pattern(
+        "NonBlankString pattern (same guard)",
+        "NonBlankString",
+        src.get("VERSION_PATTERN"),
+    )
+
+    # The two values `UpdateMicrovmImageVersion` accepts. A request enum, so a value the model
+    # dropped is a call this client makes and the service refuses — which is why this is
+    # checked against the shape rather than against a literal in this file, unlike the five
+    # state enums below.
+    c.enum(
+        "MicrovmImageVersionStatus enum",
+        "MicrovmImageVersionStatus",
+        src.get("IMAGE_VERSION_STATUSES"),
+    )
+
     # The eight-hour ceiling on a VM's life.
     c.bound(
         "maximumDurationInSeconds max",
@@ -547,6 +592,56 @@ def check(src: Source, model: dict[str, Any]) -> Checker:
         src.get("MAX_NETWORK_CONNECTORS"),
     )
     c.bound("ResourcesList max", "ResourcesList", "max", src.get("MAX_RESOURCES"))
+
+    # **Issue #24's wrong-by-10x hazard, pinned.** The image-level egress lists are `max 1`
+    # where the VM-level `NetworkConnectorList` above is `max 10`, and the client's only
+    # connector guard used to be the 10. Reusing it for an image-level list would be wrong by
+    # an order of magnitude in the permissive direction.
+    #
+    # All seven shapes separately rather than one representative, for the reason the six hook
+    # timeouts get seven lines: they are seven shapes in the model and AWS can move one without
+    # moving its siblings, which is exactly the drift a single check would hide.
+    for shape in (
+        "CreateMicrovmImageRequestEgressNetworkConnectorsList",
+        "CreateMicrovmImageResponseEgressNetworkConnectorsList",
+        "GetMicrovmImageVersionOutputEgressNetworkConnectorsList",
+        "MicrovmImageVersionSummaryEgressNetworkConnectorsList",
+        "UpdateMicrovmImageRequestEgressNetworkConnectorsList",
+        "UpdateMicrovmImageResponseEgressNetworkConnectorsList",
+        "UpdateMicrovmImageVersionResponseEgressNetworkConnectorsList",
+    ):
+        c.bound(
+            f"{shape} max",
+            shape,
+            "max",
+            src.get("MAX_IMAGE_EGRESS_CONNECTORS"),
+        )
+    # And the inequality itself, so an edit that collapsed the two constants fails here as well
+    # as in the crate's own test. Held against a literal `True` rather than against a shape,
+    # because "these two model values differ" is a fact about the model that no single shape
+    # states.
+    c.record(
+        "image-level egress max < VM-level NetworkConnectorList max",
+        src.get("MAX_IMAGE_EGRESS_CONNECTORS") < src.get("MAX_NETWORK_CONNECTORS"),
+        True,
+        note="collapsing the two constants is permissive by 10x on the image-level list",
+        sides=(src.label, "required"),
+    )
+
+    # The paginated listings' page-size bounds. The two managed ones are new call sites and
+    # their `maxResults` is `1..=50` like every other listing's — checked because the client
+    # sends no page size on any production path, so a bound that moved would be invisible until
+    # something did.
+    for shape in (
+        "ListManagedMicrovmImagesInputMaxResultsInteger",
+        "ListManagedMicrovmImageVersionsInputMaxResultsInteger",
+        "ListMicrovmImageBuildsInputMaxResultsInteger",
+        "ListMicrovmImageVersionsInputMaxResultsInteger",
+        "ListMicrovmImagesRequestMaxResultsInteger",
+        "ListMicrovmsRequestMaxResultsInteger",
+    ):
+        c.bound(f"{shape} max", shape, "max", MAX_LIST_PAGE_SIZE)
+        c.bound(f"{shape} min", shape, "min", 1)
     c.bound("EnvironmentVariableMap max", "EnvironmentVariableMap", "max", MAX_ENVIRONMENT_VARIABLES)
     c.pattern("RoleArn pattern", "RoleArn", ROLE_ARN_PATTERN)
 
@@ -668,6 +763,14 @@ BUILD_STATES = ("PENDING", "IN_PROGRESS", "SUCCESSFUL", "FAILED")
 CHIPSETS = ("GRAVITON",)
 MAX_ENVIRONMENT_VARIABLES = 50
 MIN_IDLE_DURATION_SEC = 60
+#: Every paginated listing's `maxResults` ceiling, all six identical today.
+#:
+#: Held here rather than in `microvms-core`'s constants because no production path sends a page
+#: size at all: `paths::image_versions_paged` is the one function that can, its only caller is
+#: `tests/live_pagination.rs`, and it clamps to `1..=50` against a literal in `transport.rs`. So
+#: the client's copy of this bound is a clamp in a test-only path, and the honest thing is to pin
+#: the model's value here rather than to publish a constant nothing production reads.
+MAX_LIST_PAGE_SIZE = 50
 ROLE_ARN_PATTERN = r"arn:aws[a-z\-]*:iam::[0-9]{12}:role/?[a-zA-Z_0-9+=,.@\-_/]+"
 IDEMPOTENCY_TOKEN_MEMBERS = (
     "CreateMicrovmImageRequest.clientToken",
