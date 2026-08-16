@@ -72,17 +72,67 @@ fn core_version() -> &'static str {
     microvms_core::VERSION
 }
 
+// ── why this is a `mod` and not a `fn` ──────────────────────────────────────────────
+//
+// A plain comment rather than a doc comment, and that is load-bearing here: a `#[pymodule]`
+// doc comment becomes the module's Python `__doc__`, so it is what `help(microvms)` prints
+// and what heads the generated `microvms.pyi`. This paragraph is for a reader of this file,
+// not for a caller at a REPL, so it stays out of the docstring. The one line below is the
+// docstring, and it is deliberately the whole of it.
+//
+// This was `fn microvms(module: &Bound<'_, PyModule>)` with a chain of `register(module)?`
+// calls. Both forms build the identical module at runtime — the 198 tests that passed before
+// this changed pass after it, unaltered. What differs is what pyo3 can *say* about the module
+// afterwards.
+//
+// `#[pyclass]` and `#[pyfunction]` emit introspection records under
+// `pyo3/experimental-inspect` either way, so the classes were always describable. The
+// module's *membership* is not: `add_class::<T>()` is a call made at import time, and a macro
+// cannot see the result of a function it does not run. pyo3 therefore records the `fn` form as
+// `{"incomplete":true,"members":[]}`, and `maturin generate-stubs` over that blob emits six
+// lines whose entire content is `def __getattr__(name: str) -> Incomplete` — a stub that types
+// every name as `Any`, shipped beside a `py.typed` marker promising a checker the opposite.
+// The declarative form lists its members in the attribute, so the macro knows all 33 of them
+// (26 classes and 7 functions) and the generated stub is the real surface.
+//
+// The cost is that membership is declared in one place instead of in seven `register`
+// functions, which is why those are gone rather than merely unused. The benefit is that
+// `microvms.pyi` is a function of this file, and `mise run stubs:check` fails when the two
+// disagree.
+//
+// The exceptions stay imperative in `init` below, and not by preference: `create_exception!`
+// builds its type at runtime rather than through the `#[pyclass]` macro, so there is no record
+// for `#[pymodule_export]` to carry and no way to declare them here. `./scripts/generate-py-stubs`
+// reads them out of the built module instead.
 /// The MicroVMs client, as Python sees it.
 #[pymodule]
-fn microvms(module: &Bound<'_, PyModule>) -> PyResult<()> {
-    module.add("__version__", microvms_core::VERSION)?;
-    module.add_function(wrap_pyfunction!(core_version, module)?)?;
-    errors::register(module)?;
-    region::register(module)?;
-    hooks::register(module)?;
-    cost::register(module)?;
-    exec::register(module)?;
-    session::register(module)?;
-    sandbox::register(module)?;
-    Ok(())
+mod microvms {
+    #[pymodule_export]
+    use super::core_version;
+    #[pymodule_export]
+    use super::cost::{
+        PyAmount, PyCostReport, PyDuration, PyEstimatedUsd, PyLineItem, PyRateTable,
+        PyResidencyComparison, PySizeClass, PyTotal, PyUnpriced, build_unpriced_reason,
+        compare_residency, cost_constants, estimate_run, run_report,
+    };
+    #[pymodule_export]
+    use super::exec::{
+        ExecStream, PyExecHandle, PyExecResult, PyExit, PyGap, PyOutputChunk, PyStdinAck,
+    };
+    #[pymodule_export]
+    use super::hooks::{PyBuildHookTimeout, PyRunHookTimeout};
+    #[pymodule_export]
+    use super::region::PyRegion;
+    #[pymodule_export]
+    use super::sandbox::{PyBaseImage, PyImage, PySandbox, PyTeardownReport};
+    #[pymodule_export]
+    use super::session::{PyHealth, PySession, session_constants};
+
+    #[pymodule_init]
+    fn init(module: &pyo3::Bound<'_, pyo3::types::PyModule>) -> pyo3::PyResult<()> {
+        use pyo3::types::PyModuleMethods;
+        module.add("__version__", microvms_core::VERSION)?;
+        super::errors::register(module)?;
+        Ok(())
+    }
 }

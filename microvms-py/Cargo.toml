@@ -47,3 +47,18 @@ tokio = { version = "1.53", features = ["rt-multi-thread", "sync", "time"] }
 # `for_each_event_async` drives the same state machine through an `AsyncFnMut`,
 # and both of those are std — so `src/exec.rs` advances the stream with nothing
 # but this crate's own dependencies. Retired 2026-08-09.
+
+[features]
+# Off by default, and on only for `mise run stubs`. `pyo3/experimental-inspect` makes
+# the macros emit an extra `_PYO3_INTROSPECTION_*` symbol per class, method, and
+# function, which is the data `maturin generate-stubs` reads back out of the compiled
+# cdylib to write `python/microvms/__init__.pyi`. Nothing at runtime reads those
+# symbols, so the shipped wheel is built without the feature and carries none of them —
+# the stub is a build-time artifact of the same source, not a payload.
+#
+# A feature rather than an unconditional dependency feature because "experimental" is
+# pyo3's own word for it: the introspection format is explicitly unstable across pyo3
+# releases. Behind a flag, a pyo3 bump that changes the format breaks `stubs:check` (a
+# gate that names the command to run) instead of breaking the wheel every caller
+# installs.
+stubs = ["pyo3/experimental-inspect"]
