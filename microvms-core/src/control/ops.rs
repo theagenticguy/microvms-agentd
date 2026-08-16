@@ -111,39 +111,90 @@ pub struct Resources {
 }
 
 /// `Hooks`.
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Hooks {
+    /// `HooksPortInteger`, `min: 1`. Checked by [`crate::control::require_valid_port`] before the
+    /// block is built — a `hooks.port` of 0 is an image with no reachable hook endpoint.
     pub port: u16,
     pub microvm_hooks: MicrovmHooks,
     pub microvm_image_hooks: MicrovmImageHooks,
 }
 
+/// `HookState`, the model's two values.
+///
+/// # A typed enum rather than a validated `String`, and why this one and not the response states
+///
+/// This is the same trade [`VersionStatus`] makes and the reasoning is the same shape. A
+/// response enum must stay a `String` — a third value AWS adds has to parse rather than fail,
+/// which is what [`MicrovmImageBuildSummaryWire::architecture`] documents. `HookState` on the
+/// request side is only ever **serialized**, so narrowing it costs nothing and buys the thing a
+/// two-value enum buys: `"ENABLE"`, `"Enabled"`, and `"ACTIVE"` become compile errors instead of
+/// a `ValidationException`.
+///
+/// It is worth more here than on any other member, because it appears **six times** on one
+/// request. Issue #24 measured what was there before: six `String` fields with `"ENABLED"`
+/// hardcoded as a `const &str` local to `hooks_block`, so no constant named either value and a
+/// typo in one of the six was a rejected `CreateMicrovmImage` — after the artifact upload.
+///
+/// # `Deserialize` too, unlike [`VersionStatus`]
+///
+/// Because a `MicrovmHooks` block is a **request** shape in this module and the tests parse
+/// model-spelled JSON into it (the honest-fake rule). Deriving `Deserialize` on a two-variant
+/// enum means an unknown state fails that parse, which is correct for a shape nothing reads off
+/// a real response — and `MicrovmImageVersionSummaryWire` deliberately does not read a hooks
+/// block at all, for measured reasons that type records.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum HookState {
+    /// The platform does not call this hook.
+    #[serde(rename = "DISABLED")]
+    Disabled,
+    /// The platform calls this hook and waits for it. What this client always sends.
+    #[serde(rename = "ENABLED")]
+    Enabled,
+}
+
+impl HookState {
+    /// The wire spelling, which is also what a diagnostic prints.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            HookState::Disabled => "DISABLED",
+            HookState::Enabled => "ENABLED",
+        }
+    }
+}
+
+impl std::fmt::Display for HookState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// `MicrovmHooks` — the family that caps at 60 seconds.
 ///
-/// The `HookState` members are `String` holding `ENABLED`/`DISABLED`; the timeouts are
-/// built from [`crate::hooks::RunHookTimeout`] before they get here, which is where the
-/// ceiling is enforced.
-#[derive(Clone, Debug, Deserialize, Serialize)]
+/// The state members are [`HookState`], so neither value can be misspelled at a call site; the
+/// timeouts are built from [`crate::hooks::RunHookTimeout`] before they get here, which is where
+/// the ceiling is enforced.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MicrovmHooks {
-    pub run: String,
+    pub run: HookState,
     pub run_timeout_in_seconds: u32,
-    pub resume: String,
+    pub resume: HookState,
     pub resume_timeout_in_seconds: u32,
-    pub suspend: String,
+    pub suspend: HookState,
     pub suspend_timeout_in_seconds: u32,
-    pub terminate: String,
+    pub terminate: HookState,
     pub terminate_timeout_in_seconds: u32,
 }
 
 /// `MicrovmImageHooks` — the build family, capping at 3600 seconds.
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MicrovmImageHooks {
-    pub ready: String,
+    pub ready: HookState,
     pub ready_timeout_in_seconds: u32,
-    pub validate: String,
+    pub validate: HookState,
     pub validate_timeout_in_seconds: u32,
 }
 
@@ -203,8 +254,10 @@ pub struct RunMicrovmWire {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct IdlePolicy {
-    /// `min: 60`, one of the few constraints botocore enforces locally, so there is
-    /// deliberately no guard for it here.
+    /// `min: 60`, checked by [`crate::control::require_idle_duration`] before the launch.
+    ///
+    /// The comment here used to say botocore enforced this one locally, so no guard was needed.
+    /// Botocore does; this client does not use it. See that function for the whole account.
     pub max_idle_duration_seconds: u32,
     pub suspended_duration_seconds: u32,
     pub auto_resume_enabled: bool,
@@ -1360,19 +1413,19 @@ mod tests {
             hooks: Hooks {
                 port: 9000,
                 microvm_hooks: MicrovmHooks {
-                    run: "ENABLED".to_string(),
+                    run: HookState::Enabled,
                     run_timeout_in_seconds: 30,
-                    resume: "ENABLED".to_string(),
+                    resume: HookState::Enabled,
                     resume_timeout_in_seconds: 30,
-                    suspend: "ENABLED".to_string(),
+                    suspend: HookState::Enabled,
                     suspend_timeout_in_seconds: 30,
-                    terminate: "ENABLED".to_string(),
+                    terminate: HookState::Enabled,
                     terminate_timeout_in_seconds: 30,
                 },
                 microvm_image_hooks: MicrovmImageHooks {
-                    ready: "ENABLED".to_string(),
+                    ready: HookState::Enabled,
                     ready_timeout_in_seconds: 300,
-                    validate: "ENABLED".to_string(),
+                    validate: HookState::Enabled,
                     validate_timeout_in_seconds: 300,
                 },
             },
@@ -1399,6 +1452,23 @@ mod tests {
         assert_eq!(value["additionalOsCapabilities"][0], "ALL");
         assert_eq!(value["clientToken"], "create-img-0011223344556677");
         assert!(!object.contains_key("tags"), "an absent tag map is omitted");
+
+        // **Issue #24's wrong-by-10x hazard is closed by absence on this shape.** The model gives
+        // `CreateMicrovmImageRequest` an `egressNetworkConnectors` with `max: 1` — a tenth of the
+        // VM-level list's — and this wire type has no such field, so the client cannot send one at
+        // all. That is why `MAX_IMAGE_EGRESS_CONNECTORS` guards nothing: there is nothing to guard.
+        //
+        // Asserted here, on the serialized object, rather than left as a comment. The hazard is a
+        // future edit that adds the member and reuses `MAX_NETWORK_CONNECTORS` — permissive by an
+        // order of magnitude, in a request whose rejection lands after the artifact upload. This
+        // line is what makes adding the member a visible diff against a test that says the bound is
+        // 1: whoever adds it has to delete this assertion and will read why while doing it.
+        assert!(
+            !object.contains_key("egressNetworkConnectors"),
+            "the client sends no image-level egress list. If you are adding one, the ceiling is \
+             MAX_IMAGE_EGRESS_CONNECTORS (1), NOT MAX_NETWORK_CONNECTORS (10) — the two differ by \
+             10x and the permissive direction is the one that reaches the wire."
+        );
     }
 
     /// `additionalOsCapabilities` is **absent** rather than `[]` when identity repair was
@@ -1782,6 +1852,11 @@ mod tests {
             .expect("one connector");
         assert_eq!(egress.len(), 1);
         assert!(egress.len() <= crate::constants::MAX_IMAGE_EGRESS_CONNECTORS);
+        assert!(
+            egress.len() < crate::constants::MAX_NETWORK_CONNECTORS,
+            "the two ceilings are different numbers; see the constants test that holds the \
+             inequality"
+        );
 
         assert_eq!(parsed.state_reason, None, "a successful version has none");
         assert_eq!(parsed.updated_at, Some(1_755_150_629.117));
@@ -2173,19 +2248,19 @@ mod tests {
             hooks: Hooks {
                 port: 9000,
                 microvm_hooks: MicrovmHooks {
-                    run: "ENABLED".to_string(),
+                    run: HookState::Enabled,
                     run_timeout_in_seconds: 30,
-                    resume: "ENABLED".to_string(),
+                    resume: HookState::Enabled,
                     resume_timeout_in_seconds: 30,
-                    suspend: "ENABLED".to_string(),
+                    suspend: HookState::Enabled,
                     suspend_timeout_in_seconds: 30,
-                    terminate: "ENABLED".to_string(),
+                    terminate: HookState::Enabled,
                     terminate_timeout_in_seconds: 30,
                 },
                 microvm_image_hooks: MicrovmImageHooks {
-                    ready: "ENABLED".to_string(),
+                    ready: HookState::Enabled,
                     ready_timeout_in_seconds: 300,
-                    validate: "ENABLED".to_string(),
+                    validate: HookState::Enabled,
                     validate_timeout_in_seconds: 300,
                 },
             },

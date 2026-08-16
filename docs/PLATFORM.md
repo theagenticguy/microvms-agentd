@@ -61,7 +61,7 @@ traffic was ever forwarded, the failure is invisible from outside the VM, and th
 VM is gone before you can look inside it. Read `GetMicrovm`'s `stateReason` first
 when a launch dies young.
 
-## The `runHookPayload` ceiling is 4096 bytes, and the service model states it
+## The `runHookPayload` ceiling is 4096 bytes, and the service model states it twice, differently
 
 Measured 2026-08-07, us-east-1, API version `2025-09-09`. The real ceiling is 4096
 bytes. `STRATEGY.md` asserted a 16 KB `runHookPayload` and `TRUST.md` repeated it
@@ -69,6 +69,27 @@ while flagging it as unmeasured, so the documented figure was four times the rea
 one. Because the error overstated the limit, a reader planning from it would try to
 fit four times the secret material that actually fits. Both files were corrected
 2026-08-07.
+
+### Where the 16 KB figure came from: the model itself
+
+This is worth stating plainly, because it makes the bug reproducible by someone doing the
+right thing. `service-2.json` for API version `2025-09-09` carries **both** numbers. The
+member's documentation string reads:
+
+> Per-MicroVM initialization data delivered as the request body of the /run lifecycle hook.
+> Use to pass tenant-specific configuration such as session IDs or secret references.
+> **Maximum: 16,384 bytes.**
+
+while the shape that member names, `RunMicrovmRequestRunHookPayloadString`, declares
+`{"max": 4096, "min": 0}`. The shape is what the service validates against, as the bracket
+below shows. So a reader who checks the model's prose rather than its shape reproduces the
+4x error and can cite the model while doing it.
+
+Both figures are now pinned in `microvms-core/src/constants.rs` —
+`MAX_RUN_HOOK_PAYLOAD_BYTES` and `DOCUMENTED_RUN_HOOK_PAYLOAD_BYTES` — and the drift gate
+compares the second against the model's actual documentation string. When AWS fixes the
+prose, that check goes red and the warning can be deleted; until then the wrong number has
+a name, so a commit "correcting" 4096 to 16384 fails a test instead of looking plausible.
 
 The boundary was bracketed from both sides by calling `RunMicrovm` with a deliberately
 bogus `imageIdentifier`, so nothing could be created and nothing was billed:

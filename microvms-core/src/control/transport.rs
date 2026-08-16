@@ -326,10 +326,13 @@ pub fn classify_failure(operation: &str, reply: &Reply) -> Error {
     let (kind, explanation) = match reply.status {
         400 => (
             ErrorKind::Platform,
-            "ValidationException — the service refused a value. Every max, pattern, and enum \
-             constraint is checked locally before the call for exactly this reason (botocore's \
-             VALIDATED_METADATA_ATTRS covers only required and min), so reaching this status means \
-             a constraint this client does not yet check."
+            "ValidationException — the service refused a value. Every constraint the pinned \
+             service model states on a member this client sends is checked locally before the \
+             call — min as well as max, pattern, and enum, because nothing else validates a \
+             request here: this client signs with aws-sigv4 and sends with reqwest, so botocore's \
+             VALIDATED_METADATA_ATTRS never applies to it. So reaching this status means a \
+             constraint this client does not yet check, and closing it is a guard in \
+             microvms-core/src/control plus a line in scripts/check-model-drift."
                 .to_string(),
         ),
         402 => (

@@ -375,10 +375,12 @@ mod tests {
     fn an_empty_scope_still_mints_a_usable_token() {
         let token = create_token("");
         assert_eq!(token, format!("create--{}", &token[8..]));
-        // The clientToken shapes state `min: 1`, which is one of the constraints botocore
-        // *does* enforce — so an empty token would be refused before the wire rather than
-        // silently sent. The verb and nonce alone are 23 characters, so the real assertion
-        // is that the empty label did not collapse the whole token.
+        // The clientToken shapes state `min: 1`, and nothing outside this crate would catch a
+        // violation of it — the note here used to say botocore enforces `min` locally, which is
+        // true of botocore and irrelevant to a client that signs with `aws-sigv4` and sends with
+        // `reqwest` (issue #24). What makes the constraint unreachable is not a guard but the
+        // minter: the verb and the nonce alone are 23 characters, so the empty label cannot
+        // collapse the token, and that is what the assertion below says.
         assert_eq!(
             token.len(),
             "create".len() + 2 + TOKEN_NONCE_HEX_LEN,

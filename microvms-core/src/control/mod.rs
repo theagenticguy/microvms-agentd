@@ -43,6 +43,34 @@
 //! `VALIDATED_METADATA_ATTRS` is `{required, min, document, union}` — `max`, `pattern`,
 //! and `enum` violations go to the wire — so every guard in this module is load-bearing
 //! rather than belt-and-braces, and "the SDK validates the model already" was never true.
+//!
+//! # And "botocore validates `min`" was never true *of this client*
+//!
+//! The sentence above is about `max`, `pattern`, and `enum`, and for a while it left `min`
+//! implicitly exempt: `min` **is** in `VALIDATED_METADATA_ATTRS`, so a `min` violation really is
+//! refused before the wire — by botocore. This client does not use botocore. It signs with
+//! `aws-sigv4` and sends with `reqwest`, and `validate.py` is nowhere in the dependency graph.
+//! That reasoning came from the deleted Python client, where it held, and it did not survive the
+//! port; issue #24 measured the consequence, `maxIdleDurationSeconds: 59` on the wire.
+//!
+//! So the rule is simpler than it was: **every constraint the model states on a member this
+//! client sends is enforced by this module or by nothing.** The guards below are the whole of it:
+//!
+//! * [`require_valid_image_name`] — `ImageName` (1..=64, `[a-zA-Z0-9-_]+`).
+//! * [`require_duration_in_range`] — `maximumDurationInSeconds` (1..=28800).
+//! * [`require_valid_version`] — `Version` (1..=2048, `[^\s]+`).
+//! * [`require_non_blank`] — `NonBlankString`, the model's most-reused shape.
+//! * [`require_valid_identifier`] — `MicrovmIdentifier`/`MicrovmImageIdentifier` (1..=256).
+//! * [`require_valid_role_arn`] — `RoleArn` (20..=2048, plus the twelve-digit account).
+//! * [`require_valid_port`] — `PortNumber`/`HooksPortInteger` (`min: 1`; 0 is not a port).
+//! * [`require_idle_duration`] — `maxIdleDurationSeconds` (`min: 60`).
+//! * [`require_valid_tags`] — `TagKey`/`TagValue`, two ceilings and two minima.
+//!
+//! Three constraints are closed by a **type** rather than by a function, which is the stronger
+//! form: [`RunHookPayload`] cannot hold over 4096 bytes, [`ops::VersionStatus`] and
+//! [`ops::HookState`] cannot spell a value the enum does not have, and
+//! [`connector::ConnectorIntent`] cannot name a connector the platform does not publish. A
+//! constraint the type system enforces cannot be forgotten at a call site.
 
 pub mod artifact;
 pub mod connector;
@@ -182,10 +210,31 @@ impl ControlPlane {
     }
 
     /// Sets the agent port the hooks block and the proxy token name.
-    #[must_use]
-    pub fn with_port(mut self, port: u16) -> Self {
+    ///
+    /// # Why this is fallible where every other builder method is not
+    ///
+    /// Because `port` is the one value on this type that the model bounds, and 0 is a value a
+    /// caller reaches for on purpose. `PortNumber` and `HooksPortInteger` are both `min: 1`;
+    /// `u16` closes the ceiling and nothing closed the floor, so before this returned a `Result`
+    /// the port set here landed in two places on the wire — `hooks.port` on every
+    /// `CreateMicrovmImage` built through the plane, and `allowedPorts: [{"port": 0}]` on every
+    /// token it minted (issue #24).
+    ///
+    /// Both of those are guarded at the call itself as well ([`require_valid_port`] in
+    /// [`ControlPlane::create_image`] and in [`ControlPlane::mint_auth_token_for`]), so the
+    /// constraint would be closed without this. It is fallible anyway because the two refusals
+    /// arrive a long way from the mistake: the create one after an artifact upload, and the mint
+    /// one at the moment a session needs a credential. Refusing here means `--port 0` fails
+    /// before a control plane is even usable, which is the difference between "that port is not
+    /// legal" and "your launch failed".
+    ///
+    /// Zero rather than the ceiling is what this actually catches, and it is not a typo case: 0
+    /// is what "let the kernel choose" means to a listener, so it is the value a caller passes
+    /// when they have a socket they have not bound yet.
+    pub fn with_port(mut self, port: u16) -> Result<Self, Error> {
+        require_valid_port("port", port)?;
         self.port = port;
-        self
+        Ok(self)
     }
 
     /// The region every ARN in a request is derived for.
@@ -369,10 +418,17 @@ pub struct RunMicrovmRequest {
     pub run_hook_payload: RunHookPayload,
     /// `maximumDurationInSeconds`, checked against 1..=28800 when the request is sent.
     pub max_duration_sec: u32,
-    /// `idlePolicy.maxIdleDurationSeconds`. The model's `min: 60` is one botocore does
-    /// enforce, so there is deliberately no local guard for it.
+    /// `idlePolicy.maxIdleDurationSeconds`, checked against the model's `min: 60` before the call.
+    ///
+    /// This comment used to say the guard was deliberately absent, because `min` is one of the four
+    /// keys botocore's `VALIDATED_METADATA_ATTRS` enforces locally. True of botocore, and this
+    /// client never touches it — see [`require_idle_duration`]. `59` reached the wire.
     pub max_idle_sec: u32,
     /// `idlePolicy.suspendedDurationSeconds`.
+    ///
+    /// The model's `min` is **0**, so every `u32` satisfies it and there is no guard — an absence
+    /// with a reason rather than an oversight, and the drift gate pins the 0 so a future floor is
+    /// noticed. Its ceiling is unstated.
     ///
     /// This value exists **only in the request** — the client is the only party that can
     /// name the window it asked for, which is what STATE-12's refusal rests on.
@@ -485,6 +541,310 @@ pub fn require_valid_version(member: &str, version: &str) -> Result<(), Error> {
     Ok(())
 }
 
+/// Rejects a `NonBlankString` value the service would reject.
+///
+/// # The model's most-reused shape, and the three members this client sends
+///
+/// `NonBlankString` is `min: 1, max: 2048, pattern: [^\s]+` and 45 members name it. Most are
+/// responses; the three this client puts on the wire are `CodeArtifact.uri`,
+/// `CreateMicrovmImage.baseImageArn`, and `ListMicrovmImages.nameFilter`, and issue #24 named
+/// all three as reachable with no guard.
+///
+/// Each of the three fails in its own expensive way. `codeArtifact.uri` and `baseImageArn` ride
+/// on the create call, which happens **after** the artifact upload — the ordering
+/// [`ControlPlane::create_image`] is arranged around, so a rejection about either costs the
+/// caller the upload. `nameFilter` is worse in a quieter way: it goes in the **query string**,
+/// so a blank one is a `nameFilter=` that either 400s or silently filters differently from what
+/// was meant, and [`ControlPlane::find_image_by_name`] is the resolver a launch depends on.
+///
+/// # `[^\s]+` forbids whitespace *anywhere*
+///
+/// Not merely "not blank". An S3 URI pasted from a console with a trailing newline satisfies
+/// "non-empty" and fails the pattern, which is why the message names the character it found
+/// rather than saying the value is invalid. The same reading [`require_valid_version`] documents
+/// for `Version`, which is the identical constraint triple on a different shape.
+///
+/// A separate function from [`require_valid_version`] even though the two shapes agree today,
+/// for the reason [`crate::constants::MAX_NON_BLANK_LEN`] gives: they are two shapes, AWS can
+/// move one, and one guard serving both would silently stop being about whichever moved.
+pub fn require_non_blank(member: &str, value: &str) -> Result<(), Error> {
+    let model = crate::constants::MODEL_API_VERSION;
+    if value.is_empty() {
+        return Err(Error::invalid_arg(format!(
+            "{member} is empty, but the NonBlankString shape requires at least 1 character \
+             (service model {model}). The shape's own documentation reads 'a string which is not \
+             empty or blank (only whitespace)'."
+        )));
+    }
+    if value.len() > crate::constants::MAX_NON_BLANK_LEN {
+        return Err(Error::invalid_arg(format!(
+            "{member} is {} characters, over the NonBlankString ceiling of {} (service model \
+             {model}).",
+            value.len(),
+            crate::constants::MAX_NON_BLANK_LEN,
+        )));
+    }
+    if let Some(found) = value.chars().find(char::is_ascii_whitespace) {
+        return Err(Error::invalid_arg(format!(
+            "{member} {value:?} contains whitespace ({found:?}), which the NonBlankString \
+             pattern {:?} forbids anywhere in the value (service model {model}). A URI pasted \
+             from a console carries a trailing newline and looks fine; this is that.",
+            crate::constants::NON_BLANK_PATTERN,
+        )));
+    }
+    Ok(())
+}
+
+/// Rejects a `MicrovmIdentifier`/`MicrovmImageIdentifier` the service would reject.
+///
+/// # Twelve members across every implemented operation
+///
+/// Both shapes are `min: 1, max: 256`, and between them they bound the identifier on
+/// `GetMicrovm`, `SuspendMicrovm`, `ResumeMicrovm`, `TerminateMicrovm`,
+/// `CreateMicrovmAuthToken`, `GetMicrovmImage`, `DeleteMicrovmImage`,
+/// `DeleteMicrovmImageVersion`, `GetMicrovmImageVersion`, `UpdateMicrovmImageVersion`,
+/// `GetMicrovmImageBuild`, the three listings, and `RunMicrovm.imageIdentifier`. Issue #24
+/// counted six implemented operations for each shape; every one of them is guarded here.
+///
+/// # An empty identifier is the case that pays for this
+///
+/// Ten of those members are **URI parameters**, and an empty one does not produce a validation
+/// error about a blank field: it collapses the path. `GET /2025-09-09/microvms/` addresses the
+/// *listing*, not a VM, so an empty id sent to `get_microvm` asks a different question and can
+/// get a 200 back for it — and `DELETE` on a collapsed path is worse. That failure mode is
+/// invisible in the service's answer, which is the strongest argument for a local refusal
+/// anywhere in this module.
+///
+/// # The model contradicts itself, and this is the side that can be guarded
+///
+/// `MicrovmImageArn` permits 2048 and is what the service *answers* with, so the model allows a
+/// legal response value that is an illegal request value — see
+/// [`crate::constants::MAX_IDENTIFIER_LEN`] for the whole account. The message says so, because
+/// a caller who hit it by echoing an ARN back is looking at a service inconsistency rather than
+/// at their own mistake, and telling them "shorten it" would be useless advice about a value
+/// they did not choose.
+pub fn require_valid_identifier(member: &str, identifier: &str) -> Result<(), Error> {
+    let model = crate::constants::MODEL_API_VERSION;
+    if identifier.is_empty() {
+        return Err(Error::invalid_arg(format!(
+            "{member} is empty, but the identifier shapes require at least 1 character (service \
+             model {model}). An empty identifier is not refused as a blank field — most of these \
+             are URI parameters, so it collapses the path onto the collection: \
+             `/microvms/` is the listing rather than one VM, and a request that addresses the \
+             wrong resource can succeed."
+        )));
+    }
+    if identifier.len() > crate::constants::MAX_IDENTIFIER_LEN {
+        return Err(Error::invalid_arg(format!(
+            "{member} is {} characters, over the {} the MicrovmIdentifier and \
+             MicrovmImageIdentifier shapes allow (service model {model}). Note the model \
+             disagrees with itself here: MicrovmImageArn permits {}, and that is the shape the \
+             service answers with on GetMicrovm's imageArn — so if this value came back from a \
+             response rather than being chosen here, it is a service-side inconsistency worth \
+             reporting rather than a length to shorten.",
+            identifier.len(),
+            crate::constants::MAX_IDENTIFIER_LEN,
+            crate::constants::MAX_IMAGE_ARN_LEN,
+        )));
+    }
+    Ok(())
+}
+
+/// Rejects a `RoleArn` the service would reject, before the artifact upload.
+///
+/// # Why the build role in particular
+///
+/// `CreateMicrovmImage.buildRoleArn` is sent on the create call, and the create call happens
+/// **after** the caller has uploaded the artifact. So the service's rejection of a malformed
+/// role ARN arrives having already cost the upload, which is the exact ordering
+/// [`ControlPlane::create_image`] exists to protect against and the reason issue #24 singled
+/// this member out. `RunMicrovm.executionRoleArn` is cheaper to get wrong but wrong in a
+/// confusing place: it is optional in the model, so a malformed one is a `ValidationException`
+/// on a member a caller may not know is being filled from their infra config.
+///
+/// # Three constraints, three messages
+///
+/// `min: 20`, `max: 2048`, and the pattern. They get separate messages because the pattern's
+/// wording ("this does not look like an IAM role ARN") is unhelpful for a value that is merely
+/// 3000 characters, and the length wording is unhelpful for a role *name* — which is the most
+/// common mistake and is short.
+///
+/// See [`crate::constants::is_valid_role_arn`] for what the structural check decides. It cannot
+/// tell you the role exists or grants the right log permissions; those are the failures that
+/// actually happen most and none of them is knowable without IAM.
+pub fn require_valid_role_arn(member: &str, arn: &str) -> Result<(), Error> {
+    let model = crate::constants::MODEL_API_VERSION;
+    if arn.len() < crate::constants::MIN_ROLE_ARN_LEN {
+        return Err(Error::invalid_arg(format!(
+            "{member} {arn:?} is {} characters, under the RoleArn minimum of {} (service model \
+             {model}). A value this short is almost always a role *name* where the ARN was \
+             wanted — `arn:aws:iam::<12-digit-account>:role/{arn}` is the shape.",
+            arn.len(),
+            crate::constants::MIN_ROLE_ARN_LEN,
+        )));
+    }
+    if arn.len() > crate::constants::MAX_ROLE_ARN_LEN {
+        return Err(Error::invalid_arg(format!(
+            "{member} is {} characters, over the RoleArn ceiling of {} (service model {model}).",
+            arn.len(),
+            crate::constants::MAX_ROLE_ARN_LEN,
+        )));
+    }
+    if !crate::constants::is_valid_role_arn(arn) {
+        return Err(Error::invalid_arg(format!(
+            "{member} {arn:?} does not match the RoleArn pattern {:?} (service model {model}). \
+             It wants `arn:aws:iam::` then **exactly twelve digits** of account id then `:role/` \
+             and a name — so the three things this catches are a role name passed as an ARN, an \
+             ARN for some other service, and an account id with a digit dropped. Rejected here \
+             rather than by AWS because for buildRoleArn the create call happens *after* the \
+             artifact upload, so the service's answer costs you the upload first. Whether the \
+             role exists and grants logs on {}/* is not checkable locally and is still the \
+             service's answer to give.",
+            crate::constants::ROLE_ARN_PATTERN,
+            image::BUILD_LOG_GROUP_PREFIX,
+        )));
+    }
+    Ok(())
+}
+
+/// Rejects a port the `PortNumber` or `HooksPortInteger` shapes would reject. **Minimum 1.**
+///
+/// # Port 0 is representable and means something else
+///
+/// Zero is what "let the kernel pick a port" means to a listener, so it is the value a caller
+/// reaches for when they do not have a port yet — and issue #24 measured that
+/// [`ControlPlane::with_port`]`(0)` was representable and produced `allowedPorts: [{"port": 0}]`
+/// on the wire, plus a `hooks.port` of 0 on every image built through that plane. Neither is a
+/// port the platform can forward to.
+///
+/// # There is no ceiling check here, and that is the type's doing rather than an omission
+///
+/// `PortNumber.max` and `HooksPortInteger.max` are both 65535, which is `u16::MAX` — so a `max`
+/// branch against the constant would be `port > u16::MAX`, a comparison that is false for every
+/// input. Clippy's `absurd_extreme_comparisons` says so, and it is right for the reason
+/// [`ControlPlane::create_image`] gives about the absent `hooks.port` check: a branch no input can
+/// reach reads as protection, appears in a coverage report as protection, and no test can make it
+/// fire.
+///
+/// The ceiling is still *pinned* — [`crate::constants::MAX_PORT`] is in the drift gate, and
+/// `the_port_floor_is_one_and_the_ceiling_is_what_a_u16_holds` asserts the equality with
+/// `u16::MAX` that makes this reasoning valid. If AWS ever lowers the ceiling below 65535 the gate
+/// goes red, that test goes red, and a real branch belongs here.
+pub fn require_valid_port(member: &str, port: u16) -> Result<(), Error> {
+    if port >= crate::constants::MIN_PORT {
+        return Ok(());
+    }
+    Err(Error::invalid_arg(format!(
+        "{member} is {port}, under the PortNumber minimum of {} (service model {}). Port 0 means \
+         'let the kernel choose' to a listener and is not a port the platform can forward to — a \
+         proxy token minted for it authorizes nothing, and an image whose hooks block names it has \
+         no reachable hook endpoint. Name the port the daemon actually listens on \
+         ({DEFAULT_AGENT_PORT} by default).",
+        crate::constants::MIN_PORT,
+        crate::constants::MODEL_API_VERSION,
+    )))
+}
+
+/// Rejects an `idlePolicy.maxIdleDurationSeconds` under the model's `min: 60`.
+///
+/// # The exemption this replaces was inherited from a client that no longer exists
+///
+/// [`RunMicrovmRequest::max_idle_sec`] and `constants.rs` both used to say there was
+/// deliberately no guard here, because `min` is one of the four keys in botocore's
+/// `VALIDATED_METADATA_ATTRS` and botocore therefore refuses it locally with a clear message.
+/// The premise is true and the conclusion does not apply: this client never touches botocore.
+/// `ControlPlane` signs with `aws-sigv4` and sends with `reqwest`, so `validate.py` is not on
+/// the path, and issue #24 measured `max_idle_sec: 59` reaching the wire.
+///
+/// It is the one place in this module where the *reason* for having no guard was wrong rather
+/// than the number, which is worth saying because the same reasoning would exempt every `min` in
+/// the model — `Version`'s, `NonBlankString`'s, the identifiers', `allowedPorts`'s. All of them
+/// are now guarded, and none of them by botocore.
+///
+/// No maximum, because the model states none. The bound that actually ends a VM's life is
+/// `maximumDurationInSeconds` ([`require_duration_in_range`]).
+pub fn require_idle_duration(seconds: u32) -> Result<(), Error> {
+    if seconds >= crate::constants::MIN_IDLE_DURATION_SEC {
+        return Ok(());
+    }
+    Err(Error::invalid_arg(format!(
+        "idlePolicy.maxIdleDurationSeconds={seconds} is under the minimum of {} (service model \
+         {}). This used to be documented as a constraint botocore enforced locally, which was \
+         true of the deleted Python client and never of this one — it signs with aws-sigv4 and \
+         sends with reqwest, so nothing validates a request before the wire except this crate.",
+        crate::constants::MIN_IDLE_DURATION_SEC,
+        crate::constants::MODEL_API_VERSION,
+    )))
+}
+
+/// Rejects a tag map the service would reject, naming the key and the half that failed.
+///
+/// # Sent since tags existed, checked by nothing
+///
+/// [`CreateImageRequest::tags`] goes straight onto `CreateMicrovmImage.tags` and was never
+/// validated (issue #24). Same ordering argument as everything else on that call: the rejection
+/// lands after the artifact upload.
+///
+/// # The key and the value have different rules, so the message says which
+///
+/// `TagKey` is `min: 1, max: 128`; `TagValue` is `min: 0, max: 256`. So an empty **value** is
+/// legal and an empty **key** is not, and the ceilings differ by 2x. They share one pattern.
+/// Every message here names the offending key, because a caller applying a dozen tags from a
+/// config file needs to know which one — a message that only said "a tag is invalid" would send
+/// them to read all twelve.
+///
+/// The key is quoted in the message even when the key itself is the problem, which is the
+/// deliberate choice: a key with a stray newline or a zero-width character in it is
+/// indistinguishable from a good one until it is printed with `{:?}`.
+pub fn require_valid_tags(tags: &std::collections::BTreeMap<String, String>) -> Result<(), Error> {
+    let model = crate::constants::MODEL_API_VERSION;
+    for (key, value) in tags {
+        if key.is_empty() {
+            return Err(Error::invalid_arg(format!(
+                "a tag key is empty, but TagKey requires at least 1 character (service model \
+                 {model}). Note TagValue's minimum is 0, so an empty tag *value* is legal and an \
+                 empty key is not."
+            )));
+        }
+        if key.len() > crate::constants::MAX_TAG_KEY_LEN {
+            return Err(Error::invalid_arg(format!(
+                "the tag key {key:?} is {} characters, over the TagKey ceiling of {} (service \
+                 model {model}). TagValue allows {}, so the two halves are not \
+                 interchangeable.",
+                key.len(),
+                crate::constants::MAX_TAG_KEY_LEN,
+                crate::constants::MAX_TAG_VALUE_LEN,
+            )));
+        }
+        if !crate::constants::is_valid_tag_component(key) {
+            return Err(Error::invalid_arg(format!(
+                "the tag key {key:?} has a character outside the TagKey pattern {:?} (service \
+                 model {model}). Letters, digits, separators, and `_ . : / = + - @` — spaces and \
+                 non-Latin scripts are fine, commas and `#` and `%` are not, and neither is a \
+                 newline (it is a control character, not a separator).",
+                crate::constants::TAG_COMPONENT_PATTERN,
+            )));
+        }
+        if value.len() > crate::constants::MAX_TAG_VALUE_LEN {
+            return Err(Error::invalid_arg(format!(
+                "the value of tag {key:?} is {} characters, over the TagValue ceiling of {} \
+                 (service model {model}).",
+                value.len(),
+                crate::constants::MAX_TAG_VALUE_LEN,
+            )));
+        }
+        if !crate::constants::is_valid_tag_component(value) {
+            return Err(Error::invalid_arg(format!(
+                "the value of tag {key:?} has a character outside the TagValue pattern {:?} \
+                 (service model {model}). It is the same character set the key takes; the value \
+                 differs only in allowing an empty string.",
+                crate::constants::TAG_COMPONENT_PATTERN,
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Rejects an image name the service would reject, before the artifact upload.
 ///
 /// The three cases get their own messages because the pattern message ("no dots, no
@@ -526,24 +886,28 @@ pub fn require_valid_image_name(name: &str) -> Result<(), Error> {
 ///
 /// The two timeouts are separate types, so the 60x gap cannot be crossed by passing one
 /// number twice — see [`crate::hooks`].
+/// `ENABLED` is [`ops::HookState::Enabled`] rather than a `&str` local, which is issue #24's
+/// point about this function: the literal appeared six times with no constant naming either
+/// value, so a typo in one of the six was a `ValidationException` on a create call made after
+/// the artifact upload. It is now a compile error.
 pub fn hooks_block(port: u16, run: RunHookTimeout, build: BuildHookTimeout) -> ops::Hooks {
-    const ENABLED: &str = "ENABLED";
+    const ENABLED: ops::HookState = ops::HookState::Enabled;
     ops::Hooks {
         port,
         microvm_hooks: ops::MicrovmHooks {
-            run: ENABLED.to_string(),
+            run: ENABLED,
             run_timeout_in_seconds: run.as_secs(),
-            resume: ENABLED.to_string(),
+            resume: ENABLED,
             resume_timeout_in_seconds: run.as_secs(),
-            suspend: ENABLED.to_string(),
+            suspend: ENABLED,
             suspend_timeout_in_seconds: run.as_secs(),
-            terminate: ENABLED.to_string(),
+            terminate: ENABLED,
             terminate_timeout_in_seconds: run.as_secs(),
         },
         microvm_image_hooks: ops::MicrovmImageHooks {
-            ready: ENABLED.to_string(),
+            ready: ENABLED,
             ready_timeout_in_seconds: build.as_secs(),
-            validate: ENABLED.to_string(),
+            validate: ENABLED,
             validate_timeout_in_seconds: build.as_secs(),
         },
     }
@@ -642,14 +1006,18 @@ mod tests {
 
         assert_eq!(hooks.port, 9000);
         for state in [
-            &hooks.microvm_hooks.run,
-            &hooks.microvm_hooks.resume,
-            &hooks.microvm_hooks.suspend,
-            &hooks.microvm_hooks.terminate,
-            &hooks.microvm_image_hooks.ready,
-            &hooks.microvm_image_hooks.validate,
+            hooks.microvm_hooks.run,
+            hooks.microvm_hooks.resume,
+            hooks.microvm_hooks.suspend,
+            hooks.microvm_hooks.terminate,
+            hooks.microvm_image_hooks.ready,
+            hooks.microvm_image_hooks.validate,
         ] {
-            assert_eq!(state, "ENABLED", "all six hooks are served");
+            assert_eq!(state, ops::HookState::Enabled, "all six hooks are served");
+            // The wire spelling too, against a literal: the variant name and the string the
+            // service reads are two different things, and `HookState::Enabled` rendering as
+            // anything but `ENABLED` is a rejected create on six fields at once.
+            assert_eq!(state.as_str(), "ENABLED");
         }
 
         assert_eq!(hooks.microvm_hooks.run_timeout_in_seconds, 45);
@@ -723,7 +1091,10 @@ mod tests {
         );
         assert_eq!(plane.port(), DEFAULT_AGENT_PORT);
         assert_eq!(plane.port(), 9000);
-        assert_eq!(plane.with_port(8080).port(), 8080);
+        assert_eq!(
+            plane.with_port(8080).expect("8080 is a legal port").port(),
+            8080
+        );
     }
 
     /// **TRAP-1, the compile surface.** No public request type has a field that could carry
@@ -809,5 +1180,346 @@ mod tests {
             token::run_token("arn:image"),
             "two mints of the same scope differ, which is the property the narrowing protects"
         );
+    }
+
+    // ── issue #24's guards, at the message level ─────────────────────────────
+    //
+    // Each of these asserts the *refusal and its wording*; the zero-call proofs live beside
+    // the operations they protect, in `image.rs` and `microvm.rs`, because only there can a
+    // test observe that no control-plane call happened.
+
+    /// The three `NonBlankString` rejections each explain their own case, and the pattern one
+    /// names the character it found.
+    ///
+    /// The whitespace message has to name the character, because the whole class of failure this
+    /// catches is a value that *looks* right: a URI or a filter pasted out of a console carries a
+    /// trailing newline, satisfies "non-empty", and fails the pattern.
+    ///
+    /// **Guard proof.** Delete the `is_empty` branch and the blank case returns `Ok`; delete the
+    /// whitespace branch and the `"s3://b/k\n"` case does.
+    #[test]
+    fn each_non_blank_rejection_explains_its_own_case() {
+        let blank = require_non_blank("codeArtifact.uri", "").expect_err("min is 1");
+        assert_eq!(blank.kind(), ErrorKind::InvalidArg);
+        assert!(
+            blank.to_string().contains("at least 1 character"),
+            "{blank}"
+        );
+        assert!(
+            blank.to_string().contains("NonBlankString"),
+            "the shape has to be named: {blank}"
+        );
+
+        let long = require_non_blank("baseImageArn", &"a".repeat(2049)).expect_err("max is 2048");
+        let message = long.to_string();
+        assert!(message.contains("2049 characters"), "{message}");
+        assert!(message.contains("ceiling of 2048"), "{message}");
+
+        let newline = require_non_blank("codeArtifact.uri", "s3://bucket/key.zip\n")
+            .expect_err("whitespace anywhere is refused");
+        let message = newline.to_string();
+        assert!(
+            message.contains(r"'\n'"),
+            "the message must name the character it found: {message}"
+        );
+        assert!(message.contains("trailing newline"), "{message}");
+
+        // Whitespace in the middle, not only at the end: `[^\s]+` forbids it anywhere.
+        let inner =
+            require_non_blank("nameFilter", "coding agents").expect_err("an inner space too");
+        assert!(
+            inner.to_string().contains("anywhere in the value"),
+            "{inner}"
+        );
+
+        // And the legal values pass, so the guard is not refusing everything.
+        require_non_blank("codeArtifact.uri", "s3://bucket/agentd.zip").expect("a real URI");
+        require_non_blank(
+            "baseImageArn",
+            "arn:aws:lambda:us-east-1:aws:microvm-image:al2023-1",
+        )
+        .expect("a real base ARN");
+        require_non_blank("nameFilter", "coding-agents").expect("a real filter");
+        require_non_blank("imageVersion", &"9".repeat(2048)).expect("2048 is the ceiling");
+    }
+
+    /// The identifier guard's two cases, and the over-long one names the model's own
+    /// contradiction rather than telling the caller to shorten a value they may not have chosen.
+    ///
+    /// The empty message is the one that carries the reason this guard exists at all: ten of the
+    /// twelve members are URI parameters, so an empty one collapses the path onto the collection
+    /// and addresses the wrong resource — which the service can answer 200 to.
+    ///
+    /// **Guard proof.** Delete the `is_empty` branch and the blank case returns `Ok`; drop the
+    /// `MicrovmImageArn` clause and the assertion on `2048` goes red.
+    #[test]
+    fn the_identifier_guard_names_the_collapsed_path_and_the_models_contradiction() {
+        let blank = require_valid_identifier("microvmIdentifier", "").expect_err("min is 1");
+        assert_eq!(blank.kind(), ErrorKind::InvalidArg);
+        let message = blank.to_string();
+        assert!(message.contains("at least 1 character"), "{message}");
+        assert!(
+            message.contains("collapses the path"),
+            "the reason an empty URI parameter is dangerous has to be in the message: {message}"
+        );
+
+        let long =
+            require_valid_identifier("imageIdentifier", &"a".repeat(257)).expect_err("max is 256");
+        let message = long.to_string();
+        assert!(message.contains("257 characters"), "{message}");
+        assert!(message.contains("256"), "{message}");
+        assert!(
+            message.contains("MicrovmImageArn permits 2048"),
+            "the model's own contradiction has to be named, or the advice is 'shorten a value \
+             the service gave you': {message}"
+        );
+
+        require_valid_identifier(
+            "imageIdentifier",
+            "arn:aws:lambda:us-east-1:1:microvm-image:i",
+        )
+        .expect("a real ARN");
+        require_valid_identifier("microvmIdentifier", "mvm-abc123").expect("a real id");
+        require_valid_identifier("imageIdentifier", &"a".repeat(256)).expect("256 is the ceiling");
+    }
+
+    /// The role-ARN guard's three cases, and the short one guesses the actual mistake.
+    ///
+    /// A value under 20 characters is almost always a role *name*, so the message renders the ARN
+    /// the caller probably meant rather than restating the bound. That is the difference between
+    /// a diagnostic and a validation error.
+    ///
+    /// **Guard proof.** Delete the `is_valid_role_arn` branch and the eleven-digit case returns
+    /// `Ok` — which is the case nothing else catches.
+    #[test]
+    fn the_role_arn_guard_guesses_the_mistake_a_short_value_is() {
+        let name = require_valid_role_arn("buildRoleArn", "build-role").expect_err("min is 20");
+        assert_eq!(name.kind(), ErrorKind::InvalidArg);
+        let message = name.to_string();
+        assert!(message.contains("role *name*"), "{message}");
+        assert!(
+            message.contains("arn:aws:iam::<12-digit-account>:role/build-role"),
+            "the message renders the ARN they probably meant: {message}"
+        );
+
+        let long = require_valid_role_arn(
+            "executionRoleArn",
+            &format!("arn:aws:iam::123456789012:role/{}", "a".repeat(2048)),
+        )
+        .expect_err("max is 2048");
+        assert!(long.to_string().contains("ceiling of 2048"), "{long}");
+
+        // Eleven digits, which is the case no eyeball and no other check catches.
+        let eleven = require_valid_role_arn("buildRoleArn", "arn:aws:iam::12345678901:role/build")
+            .expect_err("the account id is eleven digits");
+        let message = eleven.to_string();
+        assert!(
+            message.contains("exactly twelve digits"),
+            "the digit count is the whole value of this check: {message}"
+        );
+        assert!(
+            message.contains("after* the artifact upload"),
+            "the reason to check locally is the cost: {message}"
+        );
+        assert!(
+            message.contains("/aws/lambda-microvms/*"),
+            "and the message says what is still the service's answer to give: {message}"
+        );
+
+        require_valid_role_arn(
+            "buildRoleArn",
+            "arn:aws:iam::392583147479:role/bonk-sandbox-microvm-build",
+        )
+        .expect("the conformance account's real build role");
+    }
+
+    /// The port guard refuses 0 and says what 0 means, because 0 is not a typo.
+    ///
+    /// The ceiling branch cannot fire from a `u16` call site — `MAX_PORT` is `u16::MAX` — so what
+    /// is asserted here is the floor and the two legal boundaries.
+    ///
+    /// **Guard proof.** Change the comparison to `port < 0` (or delete the branch) and the zero
+    /// case returns `Ok`.
+    #[test]
+    fn the_port_guard_refuses_zero_and_says_what_zero_means() {
+        let zero = require_valid_port("allowedPorts[].port", 0).expect_err("min is 1");
+        assert_eq!(zero.kind(), ErrorKind::InvalidArg);
+        let message = zero.to_string();
+        assert!(
+            message.contains("let the kernel choose"),
+            "0 is a value a caller passes on purpose, so the message has to say why it is not a \
+             port: {message}"
+        );
+        assert!(
+            message.contains("authorizes nothing"),
+            "the proxy-token consequence: {message}"
+        );
+        assert!(message.contains("9000"), "the default is named: {message}");
+
+        require_valid_port("port", 1).expect("1 is the minimum");
+        require_valid_port("port", 9000).expect("the agent port");
+        require_valid_port("port", 65_535).expect("65535 is the ceiling");
+    }
+
+    /// The idle-duration guard refuses 59 and says the botocore reasoning did not transfer.
+    ///
+    /// The message names the wrong premise on purpose. The exemption was not a wrong number, it
+    /// was a correct fact about a client that no longer exists — and a reader who deletes this
+    /// guard will do it by reasoning that `min` is validated locally, which is exactly the
+    /// sentence the message answers.
+    ///
+    /// **Guard proof.** Delete the call in `run_microvm` and the zero-call test in `microvm.rs`
+    /// goes red; invert the comparison here and 600 is refused while 59 passes.
+    #[test]
+    fn the_idle_guard_refuses_fifty_nine_and_names_the_premise_that_did_not_transfer() {
+        let under = require_idle_duration(59).expect_err("min is 60");
+        assert_eq!(under.kind(), ErrorKind::InvalidArg);
+        let message = under.to_string();
+        assert!(message.contains("59"), "{message}");
+        assert!(message.contains("minimum of 60"), "{message}");
+        assert!(
+            message.contains("botocore"),
+            "the message has to name the premise, because the premise is what was wrong: \
+             {message}"
+        );
+        assert!(
+            message.contains("aws-sigv4"),
+            "and say what this client actually does instead: {message}"
+        );
+
+        require_idle_duration(60).expect("60 is the minimum");
+        require_idle_duration(600).expect("the default");
+        // No maximum in the model, and the client adds none.
+        require_idle_duration(u32::MAX).expect("the model states no ceiling");
+    }
+
+    /// Every tag rejection names the offending key, and the key and the value keep their
+    /// different rules.
+    ///
+    /// The two asymmetries are the content of this test: an empty value is legal and an empty key
+    /// is not, and the ceilings are 128 against 256. A guard that used one rule for both would
+    /// pass a 200-character key or refuse a 200-character value, and neither is what the service
+    /// does.
+    ///
+    /// **Guard proof.** Use `MAX_TAG_KEY_LEN` for the value branch and the 256-character-value
+    /// case fails; drop the `key` from any message and the assertion naming it goes red.
+    #[test]
+    fn every_tag_rejection_names_the_key_and_the_two_halves_keep_their_own_rules() {
+        use std::collections::BTreeMap;
+
+        let one = |key: &str, value: &str| {
+            let mut tags = BTreeMap::new();
+            tags.insert(key.to_string(), value.to_string());
+            tags
+        };
+
+        // An empty **value** is legal. TagValue's min is 0.
+        require_valid_tags(&one("owner", "")).expect("an empty tag value is legal");
+        // An empty **key** is not. TagKey's min is 1.
+        let blank = require_valid_tags(&one("", "conformance")).expect_err("TagKey min is 1");
+        assert_eq!(blank.kind(), ErrorKind::InvalidArg);
+        assert!(
+            blank.to_string().contains("TagValue's minimum is 0"),
+            "the asymmetry is the thing to say: {blank}"
+        );
+
+        // The two ceilings differ by 2x, and a 256-character *value* is legal.
+        require_valid_tags(&one("owner", &"v".repeat(256))).expect("TagValue max is 256");
+        let long_value = require_valid_tags(&one("owner", &"v".repeat(257)))
+            .expect_err("257 is one past TagValue");
+        assert!(long_value.to_string().contains("\"owner\""), "{long_value}");
+        assert!(
+            long_value.to_string().contains("257 characters"),
+            "{long_value}"
+        );
+
+        require_valid_tags(&one(&"k".repeat(128), "v")).expect("TagKey max is 128");
+        let long_key =
+            require_valid_tags(&one(&"k".repeat(129), "v")).expect_err("129 is one past TagKey");
+        let message = long_key.to_string();
+        assert!(message.contains("129 characters"), "{message}");
+        assert!(
+            message.contains("TagValue allows 256"),
+            "the message says the two halves are not interchangeable: {message}"
+        );
+
+        // The pattern, both halves, with the key named either way.
+        let bad_key = require_valid_tags(&one("cost,centre", "x")).expect_err("a comma");
+        let message = bad_key.to_string();
+        assert!(message.contains("\"cost,centre\""), "{message}");
+        assert!(
+            message.contains("commas and `#` and `%` are not"),
+            "{message}"
+        );
+
+        let bad_value = require_valid_tags(&one("owner", "50%")).expect_err("a percent");
+        let message = bad_value.to_string();
+        assert!(
+            message.contains("the value of tag \"owner\""),
+            "the message says which half as well as which key: {message}"
+        );
+
+        // A newline in a key: legal-looking, and the reason keys are printed with `{:?}`.
+        let newline = require_valid_tags(&one("owner\n", "x")).expect_err("a control character");
+        assert!(
+            newline.to_string().contains(r#""owner\n""#),
+            "a key with a stray newline is indistinguishable from a good one until it is quoted: \
+             {newline}"
+        );
+
+        // And a realistic tag set passes, including a space and a non-Latin key.
+        let mut real = BTreeMap::new();
+        real.insert("owner".to_string(), "conformance".to_string());
+        real.insert("cost centre".to_string(), "team/agents".to_string());
+        real.insert("所有者".to_string(), "らいす".to_string());
+        real.insert("empty".to_string(), String::new());
+        require_valid_tags(&real).expect("a realistic tag set");
+
+        // An empty map is not a tag problem, and `create_image` omits the member entirely.
+        require_valid_tags(&BTreeMap::new()).expect("no tags is not an invalid tag");
+    }
+
+    /// **Issue #24's `HookState` half.** The two values are named by a type, so neither can be
+    /// misspelled, and the block this client sends is six `Enabled`s.
+    ///
+    /// The wire spellings are asserted against literals rather than derived from the variant
+    /// names, because the variant name and the string the service reads are two different things
+    /// — the same reason `ops::VersionStatus` does it that way.
+    ///
+    /// **Guard proof.** Change `HookState::Enabled`'s rename to `"ENABLE"` and this fails on the
+    /// serialization assertion; add a third variant and the `HOOK_STATES` comparison fails.
+    #[test]
+    fn the_hook_state_enum_is_the_models_two_values_and_nothing_else() {
+        assert_eq!(ops::HookState::Disabled.as_str(), "DISABLED");
+        assert_eq!(ops::HookState::Enabled.as_str(), "ENABLED");
+        assert_eq!(ops::HookState::Enabled.to_string(), "ENABLED");
+
+        // Through serde, which is what actually reaches the wire — `as_str` could be right while
+        // the `rename` is wrong.
+        assert_eq!(
+            serde_json::to_value(ops::HookState::Enabled).expect("serialises"),
+            serde_json::json!("ENABLED")
+        );
+        assert_eq!(
+            serde_json::to_value(ops::HookState::Disabled).expect("serialises"),
+            serde_json::json!("DISABLED")
+        );
+
+        // The typed spelling and the drift gate's array agree, or one of them is checking
+        // something the other does not send.
+        let spelled = [ops::HookState::Disabled, ops::HookState::Enabled];
+        let mut wire: Vec<&str> = spelled.iter().map(|state| state.as_str()).collect();
+        wire.sort_unstable();
+        let mut pinned = crate::constants::HOOK_STATES.to_vec();
+        pinned.sort_unstable();
+        assert_eq!(wire, pinned);
+
+        // And the misspellings a `String` field allowed are now parse failures on the way in,
+        // which is the closest an inline test gets to asserting they are compile errors on the
+        // way out.
+        for typo in ["\"ENABLE\"", "\"Enabled\"", "\"ACTIVE\"", "\"enabled\""] {
+            serde_json::from_str::<ops::HookState>(typo)
+                .expect_err(&format!("{typo} is not a HookState"));
+        }
     }
 }

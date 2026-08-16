@@ -171,6 +171,26 @@ impl ControlPlane {
             super::require_valid_version("baseImageVersion", version)?;
         }
 
+        // Every remaining member the model constrains, in the order the request lists them.
+        // Each one is here for the same reason `require_valid_image_name` above is: this call
+        // happens *after* the caller's artifact upload, so a rejection the service raises has
+        // already cost them the upload. Issue #24 listed all four as reachable with no guard.
+        //
+        // `baseImageArn` is derived from `BaseImage` and the region, so it cannot be blank
+        // today — checked anyway, because `BaseImage` is a public type with public fields and
+        // a caller can construct one with an empty `name`, which renders an ARN this client
+        // built and the service refuses.
+        // `hooks.port` is deliberately **not** checked here. `ControlPlane::port` is private and
+        // `with_port` is its only setter, and that setter refuses 0 against
+        // `HooksPortInteger.min` — so a plane whose port is illegal cannot exist and a check here
+        // would be a branch no input can reach. An unfalsifiable guard is worse than none: it
+        // reads as protection and no test can make it fire. See
+        // `the_hooks_port_that_reaches_the_wire_is_legal_by_construction`.
+        super::require_valid_role_arn("buildRoleArn", &request.build_role_arn)?;
+        super::require_non_blank("codeArtifact.uri", &request.code_artifact_uri)?;
+        super::require_non_blank("baseImageArn", &request.base_image.arn(&self.region))?;
+        super::require_valid_tags(&request.tags)?;
+
         let wire = ops::CreateMicrovmImageWire {
             name: request.name.clone(),
             base_image_arn: request.base_image.arn(&self.region),
@@ -242,6 +262,10 @@ impl ControlPlane {
         size: SizeClass,
         opts: WaitOpts,
     ) -> Result<Image, Error> {
+        // Before the loop rather than inside it: an empty identifier would collapse the URI
+        // onto the collection and poll the *listing* until the deadline, which is a 45-minute
+        // timeout about a resource nobody addressed. See `require_valid_identifier`.
+        super::require_valid_identifier("imageIdentifier", identifier)?;
         let started = self.clock().elapsed();
         let mut probed = false;
 
@@ -596,6 +620,12 @@ impl ControlPlane {
         version: &str,
         build_id: &str,
     ) -> Result<ops::GetImageBuildResponseWire, Error> {
+        super::require_valid_identifier("imageIdentifier", identifier)?;
+        // Both URI members are `NonBlankString`, not `Version` — `GetMicrovmImageBuild` is the
+        // one operation where `imageVersion` names the reused shape rather than the version one,
+        // and the two are identical today. Checked as what the model says they are.
+        super::require_non_blank("imageVersion", version)?;
+        super::require_non_blank("buildId", build_id)?;
         let call = Call::get(
             "GetMicrovmImageBuild",
             paths::image_build(identifier, version, build_id),
@@ -628,6 +658,8 @@ impl ControlPlane {
         identifier: &str,
         version: &str,
     ) -> Result<ops::MicrovmImageVersionSummaryWire, Error> {
+        super::require_valid_identifier("imageIdentifier", identifier)?;
+        super::require_non_blank("imageVersion", version)?;
         let call = Call::get(
             "GetMicrovmImageVersion",
             paths::image_version(identifier, version),
@@ -665,6 +697,7 @@ impl ControlPlane {
         version: &str,
         status: ops::VersionStatus,
     ) -> Result<ops::MicrovmImageVersionSummaryWire, Error> {
+        super::require_valid_identifier("imageIdentifier", identifier)?;
         super::require_valid_version("imageVersion", version)?;
 
         let wire = ops::UpdateImageVersionWire { status };
@@ -723,6 +756,11 @@ impl ControlPlane {
         &self,
         base_image_arn: &str,
     ) -> Result<Vec<ops::ManagedMicrovmImageVersionWire>, Error> {
+        // The shape bound first, then the ARN precondition. Order matters only for the empty
+        // case: `""` is not an ARN either, and "needs the full ARN, not \"\"" is a less useful
+        // message than the identifier guard's account of what an empty URI parameter does to the
+        // path.
+        super::require_valid_identifier("imageIdentifier", base_image_arn)?;
         if !base_image_arn.starts_with("arn:") {
             return Err(Error::new(
                 ErrorKind::Precondition,
@@ -832,6 +870,7 @@ impl ControlPlane {
         &self,
         identifier: &str,
     ) -> Result<Vec<ops::MicrovmImageVersionSummaryWire>, Error> {
+        super::require_valid_identifier("imageIdentifier", identifier)?;
         let mut items = Vec::new();
         let mut next_token: Option<String> = None;
         loop {
@@ -860,6 +899,8 @@ impl ControlPlane {
         identifier: &str,
         version: &str,
     ) -> Result<Vec<ops::MicrovmImageBuildSummaryWire>, Error> {
+        super::require_valid_identifier("imageIdentifier", identifier)?;
+        super::require_non_blank("imageVersion", version)?;
         let mut items = Vec::new();
         let mut next_token: Option<String> = None;
         loop {
@@ -897,6 +938,12 @@ impl ControlPlane {
         &self,
         name: &str,
     ) -> Result<Option<ops::MicrovmImageSummaryWire>, Error> {
+        // `nameFilter` is a `NonBlankString` **querystring** member, which is the reason a blank
+        // one is worth refusing rather than letting through: it does not fail as a missing field,
+        // it goes out as `?nameFilter=` and either 400s or filters differently from what was
+        // meant. This function is the resolver a launch depends on, so a silently different
+        // filter is a launch against the wrong image.
+        super::require_non_blank("nameFilter", name)?;
         let mut next_token: Option<String> = None;
         loop {
             let call = Call::get(
@@ -983,7 +1030,18 @@ impl ControlPlane {
     /// Returns `true` when the image was deleted, `false` when every attempt failed. It
     /// does not raise, because the caller is a teardown path and the original failure is
     /// the one worth reading.
+    ///
+    /// # The identifier check is here rather than in [`Self::try_delete_image`]
+    ///
+    /// Inside the attempt it would be re-decided on every retry, which for the default twenty
+    /// attempts is nineteen backoff sleeps over a value that cannot become valid. Before the loop
+    /// it costs one comparison and zero calls. The refusal is a `false` rather than an `Err`
+    /// because this function's whole contract is that it does not raise into a teardown path —
+    /// and `false` from here is honest: no image was deleted.
     pub async fn delete_image(&self, identifier: &str, attempts: u32, backoff: Duration) -> bool {
+        if super::require_valid_identifier("imageIdentifier", identifier).is_err() {
+            return false;
+        }
         for attempt in 0..attempts.max(1) {
             if attempt > 0 {
                 self.clock().sleep(backoff).await;
@@ -2958,5 +3016,333 @@ mod tests {
             "a different Dockerfile is a different image identity"
         );
         assert_eq!(fake.calls().len(), 0, "hashing is local");
+    }
+
+    // ── issue #24's guards on the create path, proved by the call count ──────
+
+    /// **Every constrained member of `CreateMicrovmImage` is refused with zero calls.**
+    ///
+    /// One table rather than five tests, because the assertion is identical for each and the
+    /// thing worth reading is the *list*: these are the members issue #24 named as reachable with
+    /// no guard, and the create call is the one that happens after the caller's artifact upload.
+    /// A row here is a member whose rejection no longer costs an upload.
+    ///
+    /// The zero-call assertion is the load-bearing one. `expect_err` alone would pass for a
+    /// request the *service* refused, which is what was happening before; `fake.calls().len() ==
+    /// 0` is what says the refusal was local.
+    ///
+    /// **Guard proof** — run 2026-08-16, one row at a time. Delete
+    /// `require_valid_role_arn("buildRoleArn", …)` from `create_image` and the buildRoleArn rows
+    /// go red on the call count (the fake answers `CreateMicrovmImage`, so the launch *succeeds*
+    /// and the count is 1 rather than 0). Same for `require_non_blank` and the two URI rows,
+    /// `require_valid_tags` and the four tag rows, and `require_valid_port` and the port row.
+    #[tokio::test]
+    async fn every_constrained_create_member_is_refused_with_zero_control_plane_calls() {
+        /// What to break, and the substring the message must carry.
+        type Mutate = fn(&mut CreateImageRequest);
+        let rows: [(&str, Mutate, &str); 12] = [
+            // `buildRoleArn` — the member issue #24 called out, because its rejection lands
+            // after the upload.
+            //
+            // Two bare-name rows on either side of the 20-character minimum, which is where the
+            // guard's two messages divide: a short name gets the "you probably meant this ARN"
+            // one, and a *long* bare name — which the account's real role names are, at 26
+            // characters — falls through to the pattern message instead. Both are the same
+            // mistake, so both are covered.
+            (
+                "a short build role name",
+                |request| {
+                    request.build_role_arn = "build-role".to_string();
+                },
+                "role *name*",
+            ),
+            (
+                "a long build role name, past the 20-character floor",
+                |request| {
+                    request.build_role_arn = "bonk-sandbox-microvm-build".to_string();
+                },
+                "a role name passed as an ARN",
+            ),
+            (
+                "a build role with eleven account digits",
+                |request| {
+                    request.build_role_arn = "arn:aws:iam::12345678901:role/build".to_string();
+                },
+                "exactly twelve digits",
+            ),
+            (
+                "a build role that is a function ARN",
+                |request| {
+                    request.build_role_arn =
+                        "arn:aws:lambda:us-east-1:123456789012:function:handler".to_string();
+                },
+                "RoleArn pattern",
+            ),
+            (
+                "an empty build role",
+                |request| {
+                    request.build_role_arn = String::new();
+                },
+                "RoleArn minimum",
+            ),
+            // `codeArtifact.uri` — `NonBlankString`.
+            (
+                "a blank artifact URI",
+                |request| {
+                    request.code_artifact_uri = String::new();
+                },
+                "codeArtifact.uri is empty",
+            ),
+            (
+                "an artifact URI with a trailing newline",
+                |request| {
+                    request.code_artifact_uri = "s3://bucket/agentd.zip\n".to_string();
+                },
+                "contains whitespace",
+            ),
+            // `baseImageArn` — derived from `BaseImage` and the region, and `BaseImage`'s fields
+            // are `pub`. Whitespace rather than an empty name, and the difference is the point:
+            // an *empty* name still renders `arn:aws:lambda:us-east-1:aws:microvm-image:`, which
+            // is non-blank, so `require_non_blank`'s min-1 branch is structurally unreachable for
+            // this member. The whitespace branch is the one that fires, and it fires on the case
+            // that actually happens — a base image name with a space in it, from a config file or
+            // a copy-paste.
+            (
+                "a base image name with a space in it",
+                |request| {
+                    request.base_image.name = "al2023 1".to_string();
+                },
+                "baseImageArn",
+            ),
+            // `tags` — sent since tags existed, checked by nothing.
+            (
+                "an empty tag key",
+                |request| {
+                    request
+                        .tags
+                        .insert(String::new(), "conformance".to_string());
+                },
+                "TagKey requires at least 1 character",
+            ),
+            (
+                "a 129-character tag key",
+                |request| {
+                    request.tags.insert("k".repeat(129), "v".to_string());
+                },
+                "over the TagKey ceiling",
+            ),
+            (
+                "a tag key with a comma",
+                |request| {
+                    request
+                        .tags
+                        .insert("cost,centre".to_string(), "v".to_string());
+                },
+                "outside the TagKey pattern",
+            ),
+            (
+                "a 257-character tag value",
+                |request| {
+                    request.tags.insert("owner".to_string(), "v".repeat(257));
+                },
+                "over the TagValue ceiling",
+            ),
+        ];
+
+        for (label, mutate, expected) in rows {
+            let (plane, fake, _) = planted();
+            // Answered on purpose: if the guard were missing, the call would *succeed* and the
+            // count would be 1. A fake with nothing queued would fail the call for the wrong
+            // reason and the test would pass while proving nothing.
+            fake.answer(
+                "CreateMicrovmImage",
+                Answer::created(fake::create_image_response("agentd-conformance")),
+            );
+
+            let mut request = a_request();
+            mutate(&mut request);
+            let error = plane
+                .create_image(request)
+                .await
+                .expect_err(&format!("{label} must be refused"));
+            assert_eq!(error.kind(), ErrorKind::InvalidArg, "{label}");
+            assert!(
+                error.to_string().contains(expected),
+                "{label}: the message must contain {expected:?}, got {error}"
+            );
+            assert_eq!(
+                fake.calls().len(),
+                0,
+                "{label}: the request was refused locally, so the caller did not pay for the \
+                 artifact upload first — and the fake had an answer queued, so a missing guard \
+                 would show as calls: 1 rather than as a different failure"
+            );
+        }
+
+        // The control case, and it is not decoration: every row above would also pass if
+        // `create_image` refused *everything*, and a guard that refuses every request is a
+        // guard nobody notices is wrong until a build fails.
+        let (plane, fake, _) = planted();
+        fake.answer(
+            "CreateMicrovmImage",
+            Answer::created(fake::create_image_response("agentd-conformance")),
+        );
+        let mut good = a_request();
+        good.tags
+            .insert("cost centre".to_string(), "team/agents".to_string());
+        good.tags.insert("empty".to_string(), String::new());
+        good.build_role_arn =
+            "arn:aws:iam::392583147479:role/bonk-sandbox-microvm-build".to_string();
+        plane
+            .create_image(good)
+            .await
+            .expect("a realistic request with a space in a tag key and an empty tag value");
+        assert_eq!(fake.call_count("CreateMicrovmImage"), 1);
+    }
+
+    /// The `hooks.port` bound is enforced at [`ControlPlane::with_port`] and **nowhere on the
+    /// create path**, and that is a deliberate absence rather than a gap.
+    ///
+    /// `port` is a private field and `with_port` is its only setter, so a `ControlPlane` whose
+    /// port is 0 cannot exist — [`ControlPlane::with_transport`] takes the default. A
+    /// `require_valid_port("hooks.port", self.port)` inside `create_image` would therefore be a
+    /// branch no input can reach, which is worse than no branch: it reads as a guard, it appears
+    /// in a coverage report as a guard, and no test can make it fire. The discipline this repo
+    /// holds is that a guard must be falsifiable, so the check lives at the one place the value
+    /// can be wrong.
+    ///
+    /// What this test asserts is the property that makes the absence safe: the port on the plane
+    /// is legal by construction, so the `hooks.port` that reaches the wire is too.
+    ///
+    /// **Guard proof.** Make `with_port` infallible again — drop the `require_valid_port` call and
+    /// return `Self` — and the first assertion here goes red, as does
+    /// `the_port_guard_refuses_zero_and_says_what_zero_means` in `control/mod.rs`.
+    #[tokio::test]
+    async fn the_hooks_port_that_reaches_the_wire_is_legal_by_construction() {
+        let (plane, fake, _) = planted();
+        assert!(
+            plane.with_port(0).is_err(),
+            "with_port is the only setter for the field hooks.port is read from, so refusing 0 \
+             here is what makes a zero hooks.port unrepresentable"
+        );
+
+        let (plane, fake2, _) = planted();
+        let _ = fake;
+        fake2.answer(
+            "CreateMicrovmImage",
+            Answer::created(fake::create_image_response("agentd-conformance")),
+        );
+        plane
+            .with_port(9000)
+            .expect("9000 is legal")
+            .create_image(a_request())
+            .await
+            .expect("a legal port builds");
+        assert_eq!(
+            fake2.first_body("CreateMicrovmImage")["hooks"]["port"],
+            9000,
+            "and the port that was set is the port on the wire"
+        );
+    }
+
+    /// **The identifier guard on every image operation, proved by the call count.**
+    ///
+    /// Ten of the twelve identifier members are URI parameters, and an empty one does not fail as
+    /// a blank field — it collapses the path onto the collection. So `GetMicrovmImage` with an
+    /// empty identifier is a request against the *listing*, and `DeleteMicrovmImage` with one is
+    /// a delete against it. Those are the requests this proves are never sent.
+    ///
+    /// Every operation in one test, because the assertion is the same and the value is the
+    /// coverage: issue #24 counted six implemented operations per identifier shape, and this is
+    /// the enumeration.
+    ///
+    /// **Guard proof** — run 2026-08-16. Delete `require_valid_identifier` from any one of these
+    /// and its assertion goes red with `calls: 1` (or, for `wait_for_image`, a poll loop against
+    /// the listing).
+    #[tokio::test]
+    async fn no_image_operation_sends_an_empty_or_over_long_identifier() {
+        for bad in ["", &"a".repeat(257)] {
+            let (plane, fake, _) = planted();
+
+            plane
+                .get_image_version(bad, "1.0")
+                .await
+                .expect_err("GetMicrovmImageVersion");
+            plane
+                .get_image_build(bad, "1.0", "build-1")
+                .await
+                .expect_err("GetMicrovmImageBuild");
+            plane
+                .set_image_version_status(bad, "1.0", ops::VersionStatus::Inactive)
+                .await
+                .expect_err("UpdateMicrovmImageVersion");
+            plane
+                .list_image_versions(bad)
+                .await
+                .expect_err("ListMicrovmImageVersions");
+            plane
+                .list_image_builds(bad, "1.0")
+                .await
+                .expect_err("ListMicrovmImageBuilds");
+            plane
+                .wait_for_image(bad, SizeClass::DEFAULT, WaitOpts::default())
+                .await
+                .expect_err("GetMicrovmImage, in a loop");
+            plane
+                .managed_base_versions(bad)
+                .await
+                .expect_err("ListManagedMicrovmImageVersions");
+            assert!(
+                !plane.delete_image(bad, 20, Duration::from_secs(15)).await,
+                "delete_image answers false rather than raising, because it is a teardown path"
+            );
+
+            assert_eq!(
+                fake.calls().len(),
+                0,
+                "eight operations refused {bad:?} locally; an empty URI parameter would have \
+                 addressed the collection instead of the resource, and the service can answer \
+                 200 to that"
+            );
+        }
+    }
+
+    /// The `NonBlankString` URI and querystring members on the image operations, same proof.
+    ///
+    /// `nameFilter` is the one that is not a URI parameter, and it is the one worth having: it
+    /// goes out as `?nameFilter=` and either 400s or filters differently from what was meant,
+    /// and `find_image_by_name` is the resolver a launch depends on.
+    ///
+    /// **Guard proof.** Delete `require_non_blank("nameFilter", name)` and the `find_image_by_name`
+    /// row goes red with `calls: 1` — a listing was read with a blank filter.
+    #[tokio::test]
+    async fn no_image_operation_sends_a_blank_version_build_id_or_name_filter() {
+        for bad in ["", " ", "1.0\n", &"9".repeat(2049)] {
+            let (plane, fake, _) = planted();
+
+            plane
+                .get_image_version("arn:image", bad)
+                .await
+                .expect_err("imageVersion");
+            plane
+                .get_image_build("arn:image", bad, "build-1")
+                .await
+                .expect_err("imageVersion");
+            plane
+                .get_image_build("arn:image", "1.0", bad)
+                .await
+                .expect_err("buildId");
+            plane
+                .list_image_builds("arn:image", bad)
+                .await
+                .expect_err("imageVersion");
+            plane.find_image_by_name(bad).await.expect_err("nameFilter");
+
+            assert_eq!(
+                fake.calls().len(),
+                0,
+                "five NonBlankString members refused {bad:?} locally"
+            );
+        }
     }
 }
