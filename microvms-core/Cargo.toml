@@ -31,7 +31,7 @@ protocol = { path = "../protocol" }
 thiserror = "2.0.19"
 # `constants::as_json` is the drift gate's second source (TRAP-12), so serde is a
 # runtime dependency of this crate rather than a test convenience: the CLI dumps
-# that value and `scripts/check-model-drift` compares it against the pinned
+# that value and `scripts/check-model-drift.py` compares it against the pinned
 # service model.
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

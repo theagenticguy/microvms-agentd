@@ -23,7 +23,7 @@ The table ranks each artifact by what it would cost to recover the file's conten
 | --- | --- | --- | --- |
 | `docs/PLATFORM.md` | 22 sections of measured service behavior, 17 carrying an explicit measurement date | No | Live AWS runs, one build-and-run cycle per trap |
 | `microvms-core/src/cost.rs` (rate table) | us-east-1 rates read 2026-08-07, plus the regional-spread reasoning | No | AWS Pricing API fetch + reconciliation |
-| `scripts/check-model-drift` (pinned constants) | `PINNED_REGIONS`, `PINNED_SIZE_CLASSES` — the only second reader left | No | Re-measurement; no service model states either value |
+| `scripts/check-model-drift.py` (pinned constants) | `PINNED_REGIONS`, `PINNED_SIZE_CLASSES` — the only second reader left | No | Re-measurement; no service model states either value |
 | `spec/core.symspec.json` | 51 approved EARS requirements, 13 of them `TRAP-*` | Partly | Re-derivable only if PLATFORM.md survives |
 | `docs/TRUST.md` | The trust boundary contract, implementable without this project | Partly | Re-argued from PLATFORM.md, not from source |
 | `conformance/` | The live-run harness that produced the measurements | Yes | It is code; but it is how everything above was obtained |
@@ -38,7 +38,7 @@ The three artifacts with the highest recovery cost are described in more detail 
   `runHookPayload` ceiling is 4096 bytes. Two other docs had asserted 16 KB, and that overstated
   ceiling would lead a reader to plan for four times the secret material the platform actually accepts.
 
-- **`scripts/check-model-drift`** holds `PINNED_REGIONS` and `PINNED_SIZE_CLASSES` as deliberate
+- **`scripts/check-model-drift.py`** holds `PINNED_REGIONS` and `PINNED_SIZE_CLASSES` as deliberate
   hand-maintained copies. The script's own header explains why. Those two values used to be verified by
   comparing the Python client against the Rust client. The Python client was deleted after the Rust
   port went green, and no AWS service model states either value. The pinned literals replace the
@@ -51,7 +51,7 @@ The three artifacts with the highest recovery cost are described in more detail 
   low, produced by quoting storage per GB-hour while the table holds per GB-month. The rates also vary
   by region. eu-west-1 runs 5.3% over us-east-1 on compute and 19% on snapshot storage, so a Tokyo
   caller reading the us-east-1 rates understates their snapshot write bill by 22.6%. Only us-east-1 is
-  pinned, and `scripts/check-live-rates` is the check that catches the table going stale.
+  pinned, and `scripts/check-live-rates.py` is the check that catches the table going stale.
 
 ## Read first
 
@@ -81,11 +81,11 @@ equivalent risks attach to specific files:
 
 - `docs/PLATFORM.md` — the only record of the project's live-service measurements. Treat every edit
   as a measurement change that requires a new dated run, not as prose cleanup.
-- `scripts/check-model-drift` — `PINNED_REGIONS` and `PINNED_SIZE_CLASSES` lost their cross-client
+- `scripts/check-model-drift.py` — `PINNED_REGIONS` and `PINNED_SIZE_CLASSES` lost their cross-client
   reader when the Python client was deleted. Port any change to both sides in the same commit, as the
   file instructs.
 - `microvms-core/src/cost.rs` — a hand-pinned us-east-1 rate table that has already drifted once.
-  Keep `scripts/check-live-rates` in CI so staleness surfaces as a CI failure rather than a wrong
+  Keep `scripts/check-live-rates.py` in CI so staleness surfaces as a CI failure rather than a wrong
   cost estimate.
 - `spec/core.symspec.json` — 51 requirements in one file with no second copy. Its `TRAP-*` entries
   are only as good as the PLATFORM.md sections they encode, so change the two together.

@@ -64,8 +64,8 @@ are the `microvm` CLI and the `microvms-py` / `microvms-js` bindings.
 
 ```bash
 uvx ruff check conformance scripts && uvx ruff format --check conformance scripts
-./conformance/run_rs.py --self-test    # the live suite's offline half. Free.
-./scripts/check-live-rates --twin-only # the pinned rate tables agree. Offline, free.
+./conformance/run_rs.py --self-test       # the live suite's offline half. Free.
+./scripts/check-live-rates.py --twin-only # the pinned rate tables agree. Offline, free.
 ```
 
 Requirements verification (Node ≥ 22):

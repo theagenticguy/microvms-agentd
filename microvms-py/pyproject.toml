@@ -37,7 +37,7 @@ manifest-path = "Cargo.toml"
 # `requires` already pins — packages both files exactly as 1.14.1 does. So typing the
 # bindings needed no build-system change at all. The one thing that *does* want a newer
 # maturin is `generate-stubs`, which is where the committed stub comes from, and that runs
-# through `uvx maturin@1.14.1` inside `./scripts/generate-py-stubs` — a developer tool, not
+# through `uvx maturin@1.14.1` inside `./scripts/generate-py-stubs.py` — a developer tool, not
 # a build requirement. Pinning the floor to 1.14 would force every builder of this wheel to
 # fetch a newer maturin to gain nothing at build time.
 

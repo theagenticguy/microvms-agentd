@@ -11,7 +11,7 @@ why a pure `cargo`-based import graph would understate the blast radius:
 - **Three of the eight surfaces below are coupled to a consumer through string matching rather than
   through the type system.** `constants::as_json()` is read by a Python script that looks its keys
   up by name (`microvms-core/src/constants.rs:40`); `pinned_rates()`'s decimal literals are parsed
-  out of the Rust source by another Python script (`scripts/check-live-rates:147`); the conformance
+  out of the Rust source by another Python script (`scripts/check-live-rates.py:147`); the conformance
   oracle asserts on `WireKind`'s rendered strings (`conformance/run_rs.py:190`). When one of those
   couplings changes, compilation still succeeds, and the corresponding check silently stops
   comparing.
@@ -169,7 +169,7 @@ breaking change even though the compiler accepts it. The module's own docs state
 
 | Downstream | Type | Touch on change | Citation |
 | --- | --- | --- | --- |
-| `scripts/check-model-drift` | config | yes | reads the object via `cargo run -q -p microvms-cli -- constants --emit-json` (`:92 RUST_SOURCE_ARGV`); a renamed key still compiles, but it makes the check stop comparing (`constants.rs:40`) |
+| `scripts/check-model-drift.py` | config | yes | reads the object via `cargo run -q -p microvms-cli -- constants --emit-json` (`:92 RUST_SOURCE_ARGV`); a renamed key still compiles, but it makes the check stop comparing (`constants.rs:40`) |
 | `.github/workflows/ci.yml` | config | no | `:222` runs the drift script as the `drift` job; `mise.toml:185` is the local twin |
 | `microvms-cli/src/commands/local.rs` | direct import | yes | `:217` calls `as_json()`; `:223` prints the *bare* object as the one non-envelope stdout write in the binary |
 | `microvms-core/src/control/mod.rs` | direct import | yes | `:379` checks `MAX_DURATION_SEC`; `:404`/`:413` check `MAX_IMAGE_NAME_LEN` and `is_valid_image_name`; `:397` names `MODEL_API_VERSION` in the refusal |
@@ -221,7 +221,7 @@ directly. The table is the only place any of the twenty numbers appears
 | `microvms-cli/src/commands/cost.rs` | direct import | likely | `:31` converts the flag to a class |
 | `microvms-cli/src/render.rs` | direct import | no | 7 references, all in `#[cfg(test)]` from `:388` — the rendering takes a report, not a class |
 | `microvms-js/src/sandbox.rs`, `microvms-py/src/sandbox.rs` | direct import | likely | the build/launch entry points take an optional size |
-| `scripts/check-model-drift` | config | yes | `:222 PINNED_SIZE_CLASSES` is a deliberate literal twin; `:622` compares it against the emitted `SIZE_CLASSES` |
+| `scripts/check-model-drift.py` | config | yes | `:222 PINNED_SIZE_CLASSES` is a deliberate literal twin; `:622` compares it against the emitted `SIZE_CLASSES` |
 | `microvms-core/src/constants.rs` | direct import | yes | `:199` flattens every row into the drift gate's JSON payload |
 | `microvms-cli/tests/manifest.rs` | test | yes | the published `--memory` domain is asserted against the table |
 | `microvms-py/tests/test_smoke.py`, `microvms-js/__test__/smoke.mjs` | test | yes | `test_smoke.py:362` and `smoke.mjs:303` assert 1500 is refused; `:368` / `:312` assert every documented baseline round-trips |
@@ -269,7 +269,7 @@ the set, and the two botocore calls that look like substitutes disagree with eac
 | `microvms-cli/src/commands/doctor.rs` | direct import | yes | `:118` lists the supported names; `:134` falls back to `Region::UsEast1` |
 | `microvms-core/src/control/connector.rs`, `control/microvm.rs`, `control/artifact.rs`, `control/image.rs`, `sandbox.rs` | direct import | likely | 2-8 references each |
 | `microvms-js/src/sandbox.rs`, `microvms-py/src/sandbox.rs` | direct import | likely | `create`/`new` takes a `Region` object rather than a string, which is what keeps the closure S1 |
-| `scripts/check-model-drift` | config | yes | `:210 PINNED_REGIONS` is the deliberate literal twin; `:611` compares it against the emitted list |
+| `scripts/check-model-drift.py` | config | yes | `:210 PINNED_REGIONS` is the deliberate literal twin; `:611` compares it against the emitted list |
 | `microvms-core/src/constants.rs` | direct import | yes | `:46` imports it; `:195` publishes it in the gate's payload |
 | `microvms-cli/src/guards.rs` | test | likely | 10 references; the injected seams are region-parameterized (`:80`, `:664`) |
 | `microvms-py/tests/test_smoke.py`, `microvms-js/__test__/smoke.mjs` | test | yes | `test_smoke.py:280` and `smoke.mjs:249` assert the five names; both assert `eu-central-1` is refused (`:271` / `:233`) |
@@ -304,7 +304,7 @@ are exactly two ways to obtain a table (`microvms-core/src/cost.rs:44`).
 
 | Downstream | Type | Touch on change | Citation |
 | --- | --- | --- | --- |
-| `scripts/check-live-rates` | config | yes | `:120 PINNED` restates all five figures; `:132 TWIN_PATH` and `:133 TWIN_FN` point at `pinned_rates`, and `verify_twin` (`:147`) parses the `dec!()` literals out of the Rust source |
+| `scripts/check-live-rates.py` | config | yes | `:120 PINNED` restates all five figures; `:132 TWIN_PATH` and `:133 TWIN_FN` point at `pinned_rates`, and `verify_twin` (`:147`) parses the `dec!()` literals out of the Rust source |
 | `microvms-cli/src/commands/cost.rs` | direct import | yes | `:16` imports it; `:32` is the `cost` command's table |
 | `microvms-py/src/cost.rs` | direct import | yes | `:572 PyRateTable`; `:588 pinned()` is the only pinned door, and there is deliberately no rates-taking constructor (`:582`) |
 | `microvms-js/src/cost.rs` | direct import | yes | `:499 RateTable`; `:512 pinned()`; `:915`/`:975`/`:997` default to it when no table is passed |
@@ -319,7 +319,7 @@ are exactly two ways to obtain a table (`microvms-core/src/cost.rs:44`).
 ### Blast-radius notes
 
 - **Renaming `pinned_rates` breaks the twin check by name, not by compilation.**
-  `scripts/check-live-rates:133` finds the function by the literal string `"pub fn pinned_rates()"`,
+  `scripts/check-live-rates.py:133` finds the function by the literal string `"pub fn pinned_rates()"`,
   and `:179` is the error it raises when it cannot. That error carries an explicit instruction to
   repoint `TWIN_FN` rather than delete the check. The script's pinned figures are a deliberate
   second copy (`:115`), because a drift check that imported the values it checks would compare a

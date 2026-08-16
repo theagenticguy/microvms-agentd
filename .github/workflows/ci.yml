@@ -138,7 +138,7 @@ jobs:
           tar -xzf bl.tgz betterleaks
           ./betterleaks git .
       - name: license headers
-        run: ./scripts/check-license-headers
+        run: ./scripts/check-license-headers.py
       # The LICENSE file itself, and the crate manifests agreeing with it. Not a
       # dependency-license audit (every dep is permissive today and cargo-deny
       # would be the tool when that matters); this asserts the repo's own claim
@@ -229,7 +229,7 @@ jobs:
       # plus two pinned literals of its own for the region list and the sizing
       # table — the values no model states, which lost their cross-client reader
       # when the Python client was deleted.
-      - run: ./scripts/check-model-drift
+      - run: ./scripts/check-model-drift.py
 
       # Every Python file, linted here rather than in a job of its own. `conformance/run_rs.py`
       # is the live suite's driver and the `scripts/` gates are this job's own tooling, so the
@@ -238,12 +238,13 @@ jobs:
       #
       # `.` rather than `conformance scripts`, and the coverage guard ahead of it, because these
       # two lines had the same defect `mise run lint` did: ruff discovers Python by extension, so
-      # `scripts` — six extensionless PEP 723 gates — contributed nothing, and both lines passed
-      # over one file while reading as though they covered two directories. `ruff.toml`'s
-      # `extend-include` is the fix and `check-lint-coverage` is what keeps it honest; the config
-      # is also what makes this job and `mise run lint` provably the same check rather than two
-      # path lists that agree today.
-      - run: ./scripts/check-lint-coverage
+      # `scripts` — seven extensionless PEP 723 gates at the time — contributed nothing, and both
+      # lines passed over one file while reading as though they covered two directories. The gates
+      # are now named `scripts/*.py`, which is what makes them ordinary Python to ruff and to
+      # `check-license-headers.py` alike (issue #32), and `check-lint-coverage.py` is what keeps
+      # that honest. A single `.` on both sides is also what makes this job and `mise run lint`
+      # provably the same check rather than two path lists that agree today.
+      - run: ./scripts/check-lint-coverage.py
       - run: uvx ruff check .
       - run: uvx ruff format --check .
 
@@ -285,7 +286,7 @@ jobs:
       # leave a caller unchecked — it leaves them confidently wrong, with an editor
       # approving a call that raises `AttributeError`.
       - name: python stub is not stale
-        run: ./scripts/generate-py-stubs --check
+        run: ./scripts/generate-py-stubs.py --check
       # The typed consumer, against the stub as a *caller* gets it: built into a wheel,
       # installed into a throwaway venv, and checked from outside the repo's own layout. A
       # check against the source tree would pass on a stub that never made it into the

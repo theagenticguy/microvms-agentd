@@ -20,7 +20,7 @@ git history) was the discovery instrument: it found and
 closed fifteen client-side API traps, measured the platform's pricing and
 lifecycle semantics, and encoded cost-reporting honesty rules. All of that is now
 settled and pinned — in `docs/PLATFORM.md` (every claim dated and measured), in
-`scripts/check-model-drift` (33 constraints bound to the botocore service model),
+`scripts/check-model-drift.py` (33 constraints bound to the botocore service model),
 and in `spec/core.symspec.json` (the formal spec for what you are building, with
 a state model and reachability-proved lifecycle properties). Your job is a
 translation of settled semantics into a stronger type system, not a
@@ -123,9 +123,9 @@ Traps with measured semantics to preserve (details in PLATFORM.md):
   is proven against real AWS. Add a `conformance/run_rs.py` variant (or a flag)
   that drives the Rust CLI through the same 56 checks. Live runs are authorized
   via the EC2 instance profile; keep the Terraform stack applied; run
-  `scripts/verify-clean` after every live session and treat its prefix list as
+  `scripts/verify-clean.py` after every live session and treat its prefix list as
   a correctness condition if you add new resource names.
-- **drift**: `scripts/check-model-drift` must learn to read the Rust constants
+- **drift**: `scripts/check-model-drift.py` must learn to read the Rust constants
   too (or a small `--emit-json` on the CLI that exposes them for checking).
   `mise run check` is the definition of done; `mise run live` is the billable
   tier and needs no hook.

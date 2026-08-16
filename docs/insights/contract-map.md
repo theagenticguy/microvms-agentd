@@ -186,15 +186,15 @@ diff rather than a consumer discovering it.
 ## The botocore service model as wire contract
 
 **Producer:** botocore's shipped `lambda-microvms` `2025-09-09` service model, resolved through the
-package rather than by path (`scripts/check-model-drift:106-145`)
+package rather than by path (`scripts/check-model-drift.py:106-145`)
 
 **Consumer(s):**
 
 - `microvms-core/src/constants.rs:176-209` — `as_json()`, the 19 constants the client hardcodes.
-- `scripts/check-model-drift:441-629` — `check()`, every constraint compared by name.
+- `scripts/check-model-drift.py:441-629` — `check()`, every constraint compared by name.
 - `microvms-cli` `constants --emit-json` — the subprocess the gate reads
-  (`scripts/check-model-drift:94-103`, `:296-331`).
-- `.github/workflows/ci.yml:222` — `./scripts/check-model-drift`.
+  (`scripts/check-model-drift.py:94-103`, `:296-331`).
+- `.github/workflows/ci.yml:222` — `./scripts/check-model-drift.py`.
 - `mise.toml:157` — the `model:check` task, in `check`'s dependency list at `mise.toml:205`.
 
 **Shape:**
@@ -226,14 +226,14 @@ CONSTANT_NAMES = (
 **Assumptions consumers make:**
 
 - The key set is a **closed set in both directions**. A missing name exits naming the constant
-  (`scripts/check-model-drift:256-265`), because "a renamed constant does not fail compilation in
+  (`scripts/check-model-drift.py:256-265`), because "a renamed constant does not fail compilation in
   either language — it makes this comparison stop happening, and a check that stops happening reports
   clean". An *extra* key exits too (`:353-361`), because a constant in the dump with no comparison
   written for it looks covered when it is not.
 - The API version is checked before anything is compared, and a mismatch is a hard stop rather than
   one drift line among many. Comparing a constraint against a different model version says nothing
-  about the model the client actually targets (`scripts/check-model-drift:742-751`).
-- An absent model is a `SystemExit`, never a skip (`scripts/check-model-drift:114-127`), and there is
+  about the model the client actually targets (`scripts/check-model-drift.py:742-751`).
+- An absent model is a `SystemExit`, never a skip (`scripts/check-model-drift.py:114-127`), and there is
   no `--skip-rust` flag any more because skipping the only client would leave the gate comparing
   nothing (`:724-727`).
 - Two values the model states nothing about are compared against literals in the script itself:
@@ -244,20 +244,20 @@ CONSTANT_NAMES = (
   not send the reader to the wrong file (`:610-627`, mechanism at `:417-423`).
 - The six hook-timeout shapes are checked **separately**, not one per family, because they are six
   shapes in the model and AWS can move one without moving its siblings
-  (`scripts/check-model-drift:522-539`).
+  (`scripts/check-model-drift.py:522-539`).
 - `SIZE_CLASSES` is deliberately excluded from the sorted-before-comparison set. Its order is
   meaningful (smallest baseline first), so sorting it would hide a reordering that matters
-  (`scripts/check-model-drift:180-184`).
+  (`scripts/check-model-drift.py:180-184`).
 - The uncovered list has found a real bug. It named `RunMicrovmRequestClientTokenString` as
   unbound, and checking it found that `run`'s token exceeded 128 characters for a legal 64-character
   image name in the longest-named region. The token defaults its scope to a full image ARN, so the
-  launch would have failed on a field the caller never set (`scripts/check-model-drift:576-580`).
+  launch would have failed on a field the caller never set (`scripts/check-model-drift.py:576-580`).
 
 **Drift risk:** The gate reports **33 constraints** compared and 37 constrained shapes it binds
-nothing to (measured by running `./scripts/check-model-drift` on 2026-08-09). A new AWS constraint
+nothing to (measured by running `./scripts/check-model-drift.py` on 2026-08-09). A new AWS constraint
 lands in that uncovered list, which is printed but is not a failure. Mitigation: read the uncovered
 list (with `--verbose` for the stated value) when bumping botocore, since that list is the answer
-to "what did this not check" (`scripts/check-model-drift:679-691`).
+to "what did this not check" (`scripts/check-model-drift.py:679-691`).
 
 ## The CLI envelope — `apiVersion` 1 and `data.kind`
 
@@ -491,10 +491,10 @@ first and let the compiler point at the one site, then port to both bindings in 
 
 **Consumer(s):**
 
-- `scripts/check-live-rates:118-129` — `PINNED`, the deliberate second copy.
-- `scripts/check-live-rates:147-212` — `verify_twin`, which reads the Rust literals as text.
-- `scripts/check-live-rates:537-556` — `check_drift`, the pinned table against the live Pricing API.
-- `.github/workflows/live-conformance.yml:111` — `./scripts/check-live-rates`.
+- `scripts/check-live-rates.py:118-129` — `PINNED`, the deliberate second copy.
+- `scripts/check-live-rates.py:147-212` — `verify_twin`, which reads the Rust literals as text.
+- `scripts/check-live-rates.py:537-556` — `check_drift`, the pinned table against the live Pricing API.
+- `.github/workflows/live-conformance.yml:111` — `./scripts/check-live-rates.py`.
 - `mise.toml:256-275` — the `live:rates` task, in `live`'s dependency list at `mise.toml:305`.
 - `docs/PLATFORM.md` "What actually costs money" — the third copy, prose
   (`microvms-core/src/cost.rs:990-996`).
@@ -540,41 +540,41 @@ PINNED: dict[str, Decimal] = {
 - The duplication is deliberate: "a drift check that imported the values it checks
   would compare a table against itself and pass by construction. Two independent readers is the same
   pattern this repo's harbor-harvest sibling uses for its tool/library twins — port a change to both,
-  never unify them" (`scripts/check-live-rates:111-117`).
+  never unify them" (`scripts/check-live-rates.py:111-117`).
 - `verify_twin` reads Rust **as text** rather than shelling out to `microvm cost --json`. The
   envelope carries *amounts*, not rates, so the CLI path would have to divide a line item by its
   quantity. Under that arrangement, a change in the cost arithmetic (baseline swapped for peak, a
   retention floor applied where it was not) "would surface here as a rate that drifted. That is a
-  true failure reported against the wrong file" (`scripts/check-live-rates:150-159`).
+  true failure reported against the wrong file" (`scripts/check-live-rates.py:150-159`).
 - The cost of that trade is accepted explicitly. A reformat of `pinned_rates()` breaks the read, and
   that failure is an exit 1 naming the field it could not find rather than a silent pass
-  (`scripts/check-live-rates:160-164`).
+  (`scripts/check-live-rates.py:160-164`).
 - `TWIN_FIELDS` is an explicit map even though the names are identical today, so a Rust-side rename is
   a failure that names the field rather than a comparison that quietly stops happening
-  (`scripts/check-live-rates:135-144`).
+  (`scripts/check-live-rates.py:135-144`).
 - The twin check runs **first on every path**, including `--twin-only`. A pinned figure that
   disagrees with its twin is already wrong whatever the API says, and finding out before the fetch
-  keeps a two-table problem from reading as a one-table one (`scripts/check-live-rates:605-616`).
+  keeps a two-table problem from reading as a one-table one (`scripts/check-live-rates.py:605-616`).
 - The drift tolerance is 0.5%, which matches the rounding in the pinned figures. The pinned snapshot
   rates are three-significant-figure roundings of ten-digit API figures, so a tighter tolerance
   would report drift on a table that is correct, and a check that always fires is a check nobody
-  reads (`scripts/check-live-rates:491-495`).
+  reads (`scripts/check-live-rates.py:491-495`).
 - `relative` has no zero guard on purpose. A pinned rate of zero would mean the table claims a
   billable line item is free, and a `ZeroDivisionError` is a better outcome than a drift report that
-  quietly skipped it (`scripts/check-live-rates:519-522`).
+  quietly skipped it (`scripts/check-live-rates.py:519-522`).
 - Every line is reported, drifted or not, because a check that printed only its findings could not be
   told apart from one whose credentials silently failed over to zero line items
-  (`scripts/check-live-rates:502-506`).
+  (`scripts/check-live-rates.py:502-506`).
 - There is no `--region` flag. One pinned table exists and it is us-east-1, and a flag that fetched
   some other region and compared it against itself would pass by construction
-  (`scripts/check-live-rates:587-589`).
+  (`scripts/check-live-rates.py:587-589`).
 - A missing ARM rate **raises** rather than substituting the x86 sibling, which is 17.9% higher. The
   hand-pinned table used the ARM figure "correctly but by luck", and a fallback "would overstate
   every estimate by 17.9% and look entirely healthy doing it"
-  (`scripts/check-live-rates:16-21`, enforced at `:408-442`).
+  (`scripts/check-live-rates.py:16-21`, enforced at `:408-442`).
 
 **Drift risk:** The check covers five rates, confirmed by running
-`./scripts/check-live-rates --twin-only`
+`./scripts/check-live-rates.py --twin-only`
 (`twin ok: 5 pinned rate(s) agree with microvms-core/src/cost.rs`, 2026-08-09). A sixth rate added to
 `RateTable` would not be compared until it is added to `PINNED` and `TWIN_FIELDS`. Mitigation: the
 gate prints `twin ok: N pinned rate(s)`, so an unchanged N after the table grows is visible in the
@@ -728,7 +728,7 @@ dependency list because it needs a node path in someone's home directory (`mise.
   added to `Config` and not to `limits` ships undiscoverable.
 - **`microvms-core/src/constants.rs:176-209` `as_json()` ↔ `microvm constants --emit-json`** — the
   CLI prints the object verbatim, which is what makes the drift gate's source a function of the
-  `pub const`s rather than a parse (`scripts/check-model-drift:296-305`).
+  `pub const`s rather than a parse (`scripts/check-model-drift.py:296-305`).
 - **`microvms-cli/src/exit.rs` `EXIT_TABLE` ↔ the process exit code ↔ the manifest** — three readers
   of one table; CLI-3 is the claim that the first two agree, cross-checked at
   `conformance/run_rs.py:281-298`.
@@ -741,12 +741,12 @@ dependency list because it needs a node path in someone's home directory (`mise.
 - **`RunHookEnvelope`'s camelCase key ↔ the platform's wrapper** — `runHookPayload`, not
   `run_hook_payload`; the wrong spelling terminates the VM with a 400 before any traffic is forwarded
   (`protocol/src/hook.rs:19-23`), pinned at `agentd/src/schema.rs:842-850`.
-- **`scripts/check-live-rates:85-91` `MICROVM_REGIONS` ↔ `microvms-core`'s** — a literal copy used
+- **`scripts/check-live-rates.py:85-91` `MICROVM_REGIONS` ↔ `microvms-core`'s** — a literal copy used
   only to *write* an error, never to refuse, so the cost of it being stale is one misleading
-  sentence; `scripts/check-model-drift` is what holds it equal (`scripts/check-live-rates:79-84`).
+  sentence; `scripts/check-model-drift.py` is what holds it equal (`scripts/check-live-rates.py:79-84`).
 - **`HOURS_PER_MONTH` = 730, in two places** — `microvms-core/src/cost.rs` and
-  `scripts/check-live-rates:98-101`; "two conventions for the same month is how the pinned table came
-  to be 1.37% low" (`scripts/check-live-rates:30-33`).
+  `scripts/check-live-rates.py:98-101`; "two conventions for the same month is how the pinned table came
+  to be 1.37% low" (`scripts/check-live-rates.py:30-33`).
 - **`BASE_IMAGE_REFS` ↔ the Dockerfile `FROM` ↔ `baseImageArn`** — the pairing is a map rather than
   two loose literals because `microvms-core` refuses a Dockerfile whose `FROM` disagrees with the
   create call's `baseImageArn` (`conformance/run_rs.py:139-153`).

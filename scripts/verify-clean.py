@@ -3,6 +3,7 @@
 # requires-python = ">=3.11"
 # dependencies = ["boto3>=1.40"]
 # ///
+# SPDX-License-Identifier: Apache-2.0
 """Ask the account what this project left behind, rather than trusting teardown.
 
 Teardown reporting success and the account being clean are different questions,

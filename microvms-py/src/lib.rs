@@ -102,7 +102,7 @@ fn core_version() -> &'static str {
 //
 // The exceptions stay imperative in `init` below, and not by preference: `create_exception!`
 // builds its type at runtime rather than through the `#[pyclass]` macro, so there is no record
-// for `#[pymodule_export]` to carry and no way to declare them here. `./scripts/generate-py-stubs`
+// for `#[pymodule_export]` to carry and no way to declare them here. `./scripts/generate-py-stubs.py`
 // reads them out of the built module instead.
 /// The MicroVMs client, as Python sees it.
 #[pymodule]

@@ -28,7 +28,7 @@ pre-commit:
       run: betterleaks git . --staged
 
     - name: license headers
-      run: ./scripts/check-license-headers
+      run: ./scripts/check-license-headers.py
       glob: "*.{rs,py}"
 
 pre-push:

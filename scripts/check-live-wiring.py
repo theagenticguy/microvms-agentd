@@ -48,8 +48,8 @@ it green and red. A textual assertion would keep passing against a body that had
 working, which is the failure mode this whole file exists to answer.
 
 Usage:
-    scripts/check-live-wiring                 # the guard. Offline, free
-    scripts/check-live-wiring --marker-path   # print the marker path, for `live` to use
+    scripts/check-live-wiring.py                 # the guard. Offline, free
+    scripts/check-live-wiring.py --marker-path   # print the marker path, for `live` to use
 """
 
 from __future__ import annotations
@@ -265,9 +265,15 @@ def harness(at: Path) -> None:
     )
     # The body shells out to this script for the marker path, so the harness needs a copy
     # at the same relative path rather than a stub — the real one is what `live` calls.
+    #
+    # The name comes from `__file__` rather than a literal, because a literal is a second
+    # place this file's own name is written and it went stale the first time the name
+    # changed: renaming the gates to `*.py` left `"check-live-wiring"` here, and the copy
+    # step then raised `FileNotFoundError` on a path that no longer existed. Deriving it
+    # means a rename cannot desync the two again.
     (at / "scripts").mkdir(exist_ok=True)
-    mine = repo() / "scripts" / "check-live-wiring"
-    copy = at / "scripts" / "check-live-wiring"
+    mine = Path(__file__).resolve()
+    copy = at / "scripts" / mine.name
     copy.write_bytes(mine.read_bytes())
     copy.chmod(0o755)
     (at / "mise.toml").write_text(

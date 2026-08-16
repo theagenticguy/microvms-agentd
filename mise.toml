@@ -41,10 +41,10 @@ AGENTD_TARGET = "aarch64-unknown-linux-musl"
 [tasks.fmt]
 description = "Format everything (writes)"
 # `ruff format .` rather than a path list, and the whole repo rather than four named
-# directories, because `ruff.toml` now carries the discovery. See `[tasks.lint]` below for
-# the trap that made the list necessary and the `extend-include` that retired it — this
-# line has to stay the same shape as the `--check` one there, or `fmt` would leave work
-# for `lint` to find.
+# directories, because `ruff.toml` now carries the discovery. See `[tasks.lint]` below for the
+# trap that made the list necessary and the `.py` rename that retired it — this line has to
+# stay the same shape as the `--check` one there, or `fmt` would leave work for `lint` to
+# find.
 run = [
   "cargo fmt --all",
   "ruff format .",
@@ -58,34 +58,33 @@ description = "Format check + clippy + ruff, no writes"
 # whole life not linting most of the repo.
 #
 # ruff discovers files by **extension** when it walks a directory, and every gate in
-# `scripts/` is an extensionless PEP 723 script with a `uv run --script` shebang. So
-# `ruff check scripts` reported "No Python files found under the given path(s)" as a
-# *warning* and exited 0: measured, the two ruff lines here were reading
-# `conformance/run_rs.py` and nothing else, for as long as they had existed. That is a gate
-# passing over an empty set, which is the failure mode `check-model-drift`'s own header
-# warns about, and it was hiding real findings — naming one script explicitly surfaced F401s
-# in it immediately.
+# `scripts/` *used to be* an extensionless PEP 723 script. So `ruff check scripts` reported
+# "No Python files found under the given path(s)" as a *warning* and exited 0: measured, the
+# two ruff lines here were reading `conformance/run_rs.py` and nothing else, for as long as
+# they had existed. That is a gate passing over an empty set, which is the failure mode
+# `check-model-drift`'s own header warns about, and it was hiding real findings — naming one
+# script explicitly surfaced F401s in it immediately.
 #
-# The list this replaces was that naming, and it worked for exactly the files someone
-# remembered. `ruff.toml`'s `extend-include = ["scripts/*"]` is the structural version: a new
-# script under `scripts/` is linted the day it lands, with nobody editing this file. The
-# config states the rule set, the two target-version floors, and the one generated artifact
-# the formatter skips, each with its reason.
+# Two fixes were tried, and the second is why this comment is shorter than it was. Naming each
+# script here worked for exactly the files someone remembered. `ruff.toml`'s
+# `extend-include = ["scripts/*"]` was structural but taught only ruff — the same blindness
+# then turned up in `check-license-headers.py`, which enumerates `git ls-files "*.rs" "*.py"`
+# and so had never seen the scripts either (issue #32). The gates are now named
+# `scripts/*.py`, which every extension-based enumerator in this repo already understands, and
+# `extend-include` is gone. They keep their shebangs and their executable bit, so
+# `./scripts/check-model-drift.py` is still a direct invocation.
 #
-# `./scripts/check-lint-coverage` is the guard over that, and it is a separate gate on
-# purpose: a config that stops matching goes quiet the same way the original bug did, and
-# `ruff check .` would still print "All checks passed!" over nothing. It compares ruff's own
-# `--show-files` answer against every tracked file that is Python by extension or by shebang,
-# and names any shortfall. Offline, free, milliseconds. Proven able to fail by pointing it at
-# an empty directory, which is the original defect reproduced deliberately.
-#
-# Nothing named individually any more, and the previous "deliberately not named yet" pass is
-# done: the five other `scripts/` gates and all eight `microvms-py/tests` files are in, with
-# their import sorting and formatting fixed here.
+# `./scripts/check-lint-coverage.py` is the guard over that, and it is a separate gate on
+# purpose: `ruff check .` would still print "All checks passed!" over nothing. It compares
+# ruff's own `--show-files` answer against every tracked file that is Python by extension
+# **or by shebang**, and names any shortfall. That shebang half is what enforces the rename
+# rather than merely recommending it: a new extensionless script under `scripts/` is reported
+# by name as unlinted, measured. Offline, free, milliseconds. Proven able to fail by pointing
+# it at an empty directory, which is the original defect reproduced deliberately.
 run = [
   "cargo fmt --all -- --check",
   "cargo clippy --all-targets -- -D warnings",
-  "./scripts/check-lint-coverage",
+  "./scripts/check-lint-coverage.py",
   "ruff check .",
   "ruff format --check .",
   "terraform -chdir=conformance/infra fmt -check",
@@ -104,7 +103,7 @@ run = [
   # wolf gets --no-verify'd. WARNING and ERROR still fail the run.
   "semgrep scan --config p/rust --config p/secrets --severity WARNING --severity ERROR --error --quiet --metrics=off protocol/src agentd/src model/src microvms-core/src microvms-cli/src microvms-py/src microvms-js/src",
   "betterleaks git .",
-  "./scripts/check-license-headers",
+  "./scripts/check-license-headers.py",
 ]
 
 [tasks.sbom]
@@ -149,7 +148,7 @@ run = "cargo test --all"
 #
 # Every one of them is linted by `fmt` and `lint`, which is newly true rather than restated:
 # eighteen files are what `ruff.toml` reaches now, against the one file the two ruff lines
-# used to see. `./scripts/check-lint-coverage` prints the count on every run, which is what
+# used to see. `./scripts/check-lint-coverage.py` prints the count on every run, which is what
 # keeps this number from drifting the way the live-suite counts above did.
 
 [tasks.schema]
@@ -165,7 +164,7 @@ run = "cargo run -q -p agentd --bin schema -- --check"
 
 [tasks.stubs]
 description = "Regenerate microvms-py/microvms.pyi from the pyo3 surface"
-run = "./scripts/generate-py-stubs"
+run = "./scripts/generate-py-stubs.py"
 
 [tasks."stubs:check"]
 description = "Fail if the committed Python stub no longer matches the pyo3 surface"
@@ -183,7 +182,7 @@ description = "Fail if the committed Python stub no longer matches the pyo3 surf
 # credentials, no money, so it costs what a lint costs. It does build `microvms-py` twice —
 # once for maturin's introspection pass, once for the importable cdylib the exception
 # hierarchy is read out of — and both are incremental builds `test` has already warmed.
-run = "./scripts/generate-py-stubs --check"
+run = "./scripts/generate-py-stubs.py --check"
 
 [tasks.spec]
 description = "agentd.symspec.json consistency via symspec 0.1.0 + Z3"
@@ -245,7 +244,7 @@ description = "Fail if a hardcoded API constraint no longer matches botocore's s
 # value nobody ships and report agreement. Measured 2026-08-08: 0.4s warm, against 0.006s
 # for the built binary, which is nothing beside the rest of `check`. `--rust-binary` exists
 # for anyone who wants that trade knowingly.
-run = "./scripts/check-model-drift"
+run = "./scripts/check-model-drift.py"
 
 [tasks.build]
 description = "Release build for the shipping target"
@@ -276,7 +275,7 @@ description = "Fail if the live tier's own wiring is wrong. Offline and free"
 # `live:` prefixed but deliberately NOT in `live`'s own dependency list: a guard over the
 # tier's wiring belongs in the gate that runs every time, not in the tier it describes,
 # which runs when someone decides to spend money.
-run = "./scripts/check-live-wiring"
+run = "./scripts/check-live-wiring.py"
 
 [tasks.check]
 description = "The full local gate — the definition of done"
@@ -400,9 +399,9 @@ description = "Fail if the pinned rate table no longer matches the AWS Pricing A
 # client's `pricing` module and that client is now git history. The pinned figures are
 # inlined there as literals — a deliberate second copy of `microvms-core`'s
 # `pinned_rates()`, since a drift check that imported the values it checks would compare
-# a table against itself. `scripts/check-live-rates --twin-only` runs that cross-check
+# a table against itself. `scripts/check-live-rates.py --twin-only` runs that cross-check
 # alone, offline and free, and it also runs first on this path.
-run = "./scripts/check-live-rates"
+run = "./scripts/check-live-rates.py"
 
 [tasks."live:verify-clean"]
 description = "Ask the account what leaked, rather than trusting teardown"
@@ -414,7 +413,7 @@ description = "Ask the account what leaked, rather than trusting teardown"
 # body for why the sequencing had to move out of `depends` entirely. This task stays a
 # plain one so `mise run live:verify-clean` remains the bare "what is in my account right
 # now" question, which is what someone reaches for after an interrupted run.
-run = "./scripts/verify-clean"
+run = "./scripts/verify-clean.py"
 
 [tasks.live]
 description = "Every live suite, then an independent leak check. BILLABLE."
@@ -520,7 +519,7 @@ mise run live:conformance-rs
 mise run live:rates
 verify_clean
 
-git rev-parse HEAD > "$(./scripts/check-live-wiring --marker-path)"
+git rev-parse HEAD > "$(./scripts/check-live-wiring.py --marker-path)"
 echo 'recorded this commit as live-verified'
 """
 

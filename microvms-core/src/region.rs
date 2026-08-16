@@ -67,7 +67,7 @@ pub enum Region {
 /// `MICROVM_REGIONS` is documented in.
 ///
 /// Not model-backed and it cannot be: see the module docs. `constants::as_json`
-/// publishes this set so `scripts/check-model-drift` can compare the Rust and
+/// publishes this set so `scripts/check-model-drift.py` can compare the Rust and
 /// Python clients against each other, which is the only check available for a value
 /// no service model states.
 pub const MICROVM_REGIONS: [Region; 5] = [

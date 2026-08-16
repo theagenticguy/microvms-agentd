@@ -335,7 +335,7 @@ The command takes no flags and always emits JSON, because the only consumer that
 microvm constants [OPTIONS]
 ```
 
-Emits every service constraint this client believes, for the drift gate that `scripts/check-model-drift` runs against the pinned botocore model.
+Emits every service constraint this client believes, for the drift gate that `scripts/check-model-drift.py` runs against the pinned botocore model.
 
 `microvms-cli/src/commands/local.rs:214`
 

@@ -204,7 +204,7 @@ pub fn manifest<O: std::io::Write, E: std::io::Write>(
 /// Emits every service constraint this client believes (TRAP-12).
 ///
 /// `microvms_core::constants::as_json()` verbatim, keyed as `sandbox.py` names them, so
-/// `scripts/check-model-drift` can compare it against the pinned botocore model *and* against
+/// `scripts/check-model-drift.py` can compare it against the pinned botocore model *and* against
 /// the Python client's own constants — which is the only check available for a value no API
 /// answers, like the region list.
 ///
@@ -384,7 +384,7 @@ mod tests {
 
     /// `constants` emits the bare object as its text rendering, keyed for the drift gate.
     ///
-    /// The keys are the coupling: `scripts/check-model-drift` looks them up by name, and a
+    /// The keys are the coupling: `scripts/check-model-drift.py` looks them up by name, and a
     /// rename makes it report nothing disagreed — which is worse than a crash.
     #[test]
     fn constants_emits_the_object_the_drift_gate_reads() {
