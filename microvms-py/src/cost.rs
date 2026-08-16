@@ -1121,23 +1121,3 @@ pub(crate) fn cost_constants<'py>(py: Python<'py>) -> PyResult<Bound<'py, PyDict
     dict.set_item("sizeClasses", sizes)?;
     Ok(dict)
 }
-
-/// Registers every cost type and function on the module.
-pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
-    module.add_class::<PyDuration>()?;
-    module.add_class::<PyEstimatedUsd>()?;
-    module.add_class::<PyUnpriced>()?;
-    module.add_class::<PyAmount>()?;
-    module.add_class::<PyLineItem>()?;
-    module.add_class::<PyTotal>()?;
-    module.add_class::<PySizeClass>()?;
-    module.add_class::<PyRateTable>()?;
-    module.add_class::<PyCostReport>()?;
-    module.add_class::<PyResidencyComparison>()?;
-    module.add_function(wrap_pyfunction!(run_report, module)?)?;
-    module.add_function(wrap_pyfunction!(estimate_run, module)?)?;
-    module.add_function(wrap_pyfunction!(compare_residency, module)?)?;
-    module.add_function(wrap_pyfunction!(build_unpriced_reason, module)?)?;
-    module.add_function(wrap_pyfunction!(cost_constants, module)?)?;
-    Ok(())
-}

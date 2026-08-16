@@ -267,6 +267,38 @@ jobs:
           uvx maturin@1.14 develop -m microvms-py/Cargo.toml
           uv pip install pytest
           pytest microvms-py/tests -q
+      # The committed `.pyi` against the crate it describes. Here rather than in the
+      # `rust` job beside `schema:check`, because this is where a Python toolchain already
+      # exists: the gate needs `uvx maturin generate-stubs` and an interpreter to introspect
+      # against, and the `rust` matrix has neither.
+      #
+      # Worse than a stale schema when it drifts, which is why it is a gate and not a
+      # convention: `py.typed` ships in the wheel beside the stub, so a stale stub does not
+      # leave a caller unchecked — it leaves them confidently wrong, with an editor
+      # approving a call that raises `AttributeError`.
+      - name: python stub is not stale
+        run: ./scripts/generate-py-stubs --check
+      # The typed consumer, against the stub as a *caller* gets it: built into a wheel,
+      # installed into a throwaway venv, and checked from outside the repo's own layout. A
+      # check against the source tree would pass on a stub that never made it into the
+      # wheel, which is the failure `py.typed` makes invisible.
+      #
+      # `ty` rather than mypy or pyright: it is Astral's checker, so it arrives through the
+      # `uvx` already in this job with no node runtime and no second package manager, and it
+      # reads `py.typed` and `.pyi` by the same PEP 561 rules. Proven able to fail — five
+      # deliberate breakages of `typed_usage.py` are recorded in this commit's message.
+      #
+      # Pinned exactly, unlike the `uvx` tools above, and for a reason the version number
+      # states: `ty` is pre-1.0 (0.0.72 here) and pre-release checkers add diagnostics
+      # between patch releases. A floating pin would turn someone else's release into a red
+      # build on a commit that changed nothing — the same argument `setup-uv`'s comment
+      # makes, reaching the opposite conclusion because there is no rolling major to track.
+      - name: typed consumer checks against the built wheel
+        run: |
+          uvx maturin@1.14 build -m microvms-py/Cargo.toml -o dist-wheel
+          uv venv .venv-typed
+          uv pip install --python .venv-typed/bin/python dist-wheel/*.whl
+          uvx ty@0.0.72 check --python .venv-typed microvms-py/examples/typed_usage.py
       - name: node binding tests
         run: |
           npx -y -p @napi-rs/cli@3 napi build --manifest-path Cargo.toml --package microvms-js --platform --output-dir . --cwd microvms-js

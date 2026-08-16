@@ -16,7 +16,7 @@ Category vocabulary is closed: `marker`, `wrong abstraction`, `error handling`, 
 
 ## Ranked register
 
-The register now has nine rows, re-ranked after the second sweep. The eight rows that closed are listed in [what closed](#what-the-second-sweep-closed) below with the evidence for each. They are kept because deleting closed rows would lose the record of what each remedy actually cost.
+The register now has ten rows. Nine are the post-second-sweep set; row 10 arrived with the Python type stubs, and it records what typing the *Python* binding revealed about the Node one — not drift, which `napi build` makes impossible for an uncommitted artifact, but the absence of any consumer that proves the generated types are usable. The eight rows that closed are listed in [what closed](#what-the-second-sweep-closed) below with the evidence for each. They are kept because deleting closed rows would lose the record of what each remedy actually cost.
 
 | Rank | Debt item | Category | Cost to fix | Citation |
 | --- | --- | --- | --- | --- |
@@ -29,6 +29,7 @@ The register now has nine rows, re-ranked after the second sweep. The eight rows
 | 7 | The 34 `cli.py:<line>` citations across the Rust tree still point into a file only reachable at `c4d396e^`, and the line numbers are still historical. Mitigated rather than closed — see the closed list — and the residue is deliberate: a citation rewritten to a live file would be a claim about code that does not exist. | dead code adjacent | S | `microvms-cli/src/render.rs` (10 such citations, anchored at `:53`), `docs/CLI-COVERAGE-PLAN.md:97`, `mise.toml:106-112` |
 | 8 | `Results.skipped` and the `skip()` primitive have no live caller in the conformance suite; they survive on purpose, exercised only by `--self-test`, because "a suite that removed its own ability to report a skip is a suite whose next gap is silent". | dead code adjacent | S | `conformance/run_rs.py:70-74`, `conformance/run_rs.py:492-506`, `conformance/run_rs.py:2106` |
 | 9 | `docs/CLI-COVERAGE-PLAN.md` survives as a plan whose numbers are wrong twice over — banner-marked history, kept for the reasoning. Retained deliberately; the live figure is now derived by the suite rather than written down. | dead code adjacent | S | `docs/CLI-COVERAGE-PLAN.md:1-19` |
+| 10 | Nothing in this repo type-checks against `microvms-js/index.d.ts`. The Node suite is six `.mjs` files and there is no `tsconfig.json`, so the 1,075-line declaration file napi-rs generates is shipped for downstream TypeScript consumers and read by no gate here. **Not a drift row, and that distinction is the point**: `index.d.ts` is gitignored beside the `.node` addon and the generated `index.js`, and `napi build` rewrites all three before every test run local and CI, so it cannot go stale the way a committed artifact can. What is unverified is whether the types it generates are *usable* — the Python side answers that question with `microvms-py/examples/typed_usage.py` under `ty`, and the Node side has no equivalent. The fix is a `tsconfig.json` and one typed `.mts` consumer, not a regenerate-and-diff gate, which would compare a file against a copy of itself. | missing tests | S | `.gitignore:20-22`, `microvms-js/package.json:6`, `.github/workflows/ci.yml:270-273`, absence of any `tsconfig.json` |
 
 ## What the second sweep closed
 

@@ -603,11 +603,3 @@ pub(crate) fn session_constants<'py>(py: Python<'py>) -> PyResult<Bound<'py, PyD
     )?;
     Ok(dict)
 }
-
-/// Registers the session surface on the module.
-pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
-    module.add_class::<PySession>()?;
-    module.add_class::<PyHealth>()?;
-    module.add_function(wrap_pyfunction!(session_constants, module)?)?;
-    Ok(())
-}

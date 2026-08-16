@@ -173,8 +173,24 @@ The same lifecycle is available as a library, with the same defaults and the
 same guardrails:
 
 - **Rust**: `microvms-core`; the CLI is a thin layer over it.
-- **Python**: `microvms-py`, built with maturin.
-- **Node**: `microvms-js`, built with napi-rs.
+- **Python**: `microvms-py`, built with maturin. Typed: the wheel ships
+  `microvms/__init__.pyi` and a PEP 561 `py.typed`, so mypy, pyright, and `ty`
+  see the real signatures and the Rust doc comments rather than `Any`.
+- **Node**: `microvms-js`, built with napi-rs. Typed: `napi build` writes
+  `index.d.ts` beside the addon.
+
+Both stubs are generated from the Rust source, never hand-written, so the trap
+closures are visible to a type checker and not only at runtime: a dollar amount
+is a `str` a checker refuses to add, `Duration` has no constructor that omits
+provenance, and the two hook timeouts are unrelated classes rather than two
+ints. `microvms-py/examples/typed_usage.py` is the consumer those guarantees are
+checked against.
+
+Neither stub can go stale unnoticed. `mise run stubs:check` regenerates the
+Python stub and fails on any difference, naming `mise run stubs` as the fix, and
+it runs in `mise run check` and in CI. Node's `index.d.ts` needs no such gate
+because it is not committed at all — it is gitignored and `napi build`
+regenerates it before every test run, local and CI.
 
 See [docs/reference/public-api.md](docs/reference/public-api.md) for the
 surface.
