@@ -629,15 +629,3 @@ impl PyExecHandle {
 pub(crate) fn seconds(value: f64) -> Result<Duration, microvms_core::Error> {
     microvms_core::cost::duration_of_secs_f64(value)
 }
-
-/// Registers the exec surface on the module.
-pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
-    module.add_class::<PyExecHandle>()?;
-    module.add_class::<PyExecResult>()?;
-    module.add_class::<PyStdinAck>()?;
-    module.add_class::<PyOutputChunk>()?;
-    module.add_class::<PyGap>()?;
-    module.add_class::<PyExit>()?;
-    module.add_class::<ExecStream>()?;
-    Ok(())
-}

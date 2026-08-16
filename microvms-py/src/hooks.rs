@@ -115,10 +115,3 @@ impl PyBuildHookTimeout {
         format!("BuildHookTimeout({})", self.inner.as_secs())
     }
 }
-
-/// Registers both timeout classes on the module.
-pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
-    module.add_class::<PyRunHookTimeout>()?;
-    module.add_class::<PyBuildHookTimeout>()?;
-    Ok(())
-}

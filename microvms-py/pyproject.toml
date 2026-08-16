@@ -26,6 +26,21 @@ manifest-path = "Cargo.toml"
 # `abi3-py39` in Cargo.toml is what makes one wheel load on 3.9 and newer; nothing
 # here needs to restate it.
 
+# No `include` for `microvms.pyi` or `py.typed`, and no raised floor for either.
+# maturin finds a `<module-name>.pyi` beside the manifest by itself — it logs "Found type
+# stub file at microvms.pyi" — and when it does, it lays the wheel out as a *package*:
+# `microvms/__init__.pyi`, `microvms/py.typed`, and a generated `microvms/__init__.py`
+# re-exporting the extension. Naming either file in `include` would ship a second copy at
+# the wheel root, where no checker looks.
+#
+# Verified against the floor rather than assumed: `maturin 1.9.4` — the version this
+# `requires` already pins — packages both files exactly as 1.14.1 does. So typing the
+# bindings needed no build-system change at all. The one thing that *does* want a newer
+# maturin is `generate-stubs`, which is where the committed stub comes from, and that runs
+# through `uvx maturin@1.14.1` inside `./scripts/generate-py-stubs` — a developer tool, not
+# a build requirement. Pinning the floor to 1.14 would force every builder of this wheel to
+# fetch a newer maturin to gain nothing at build time.
+
 # No `[dependency-groups]`, and that is a measured omission rather than a
 # preference: `maturin develop --uv` runs `uv pip install --group` relative to the
 # *invocation* directory, so with a group declared here the command fails from the

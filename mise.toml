@@ -42,17 +42,33 @@ AGENTD_TARGET = "aarch64-unknown-linux-musl"
 description = "Format everything (writes)"
 run = [
   "cargo fmt --all",
-  "ruff format conformance scripts",
+  "ruff format conformance scripts scripts/generate-py-stubs microvms-py/examples microvms-py/tests/test_stubs.py",
   "terraform -chdir=conformance/infra fmt",
 ]
 
 [tasks.lint]
 description = "Format check + clippy + ruff, no writes"
+# `scripts/generate-py-stubs` is named on its own even though `scripts` is already in the
+# list, and that is not redundancy. ruff discovers files by **extension** when it walks a
+# directory, and every gate in `scripts/` is an extensionless PEP 723 script with a
+# `uv run --script` shebang — so `ruff check scripts` reports "No Python files found under
+# the given path(s)" as a *warning* and exits 0. Measured here: the two existing ruff lines
+# have been linting `conformance/run_rs.py` and nothing else. Naming the file directly is
+# what makes ruff read it (it found real F401s in this one that way).
+#
+# The rest of `scripts/` is deliberately not named yet: those four gates predate this
+# change, and reformatting 80 KB of unrelated tooling to satisfy a lint is a diff that
+# buries the change it travels with. `scripts` stays in the list so the directory is already
+# there when someone does that pass.
+#
+# `microvms-py/tests/test_stubs.py` rather than `microvms-py/tests`, for the same reason:
+# the seven test files that were there before this commit are not ruff-formatted (they were
+# never in scope), and bringing them in is its own commit.
 run = [
   "cargo fmt --all -- --check",
   "cargo clippy --all-targets -- -D warnings",
-  "ruff check conformance scripts",
-  "ruff format --check conformance scripts",
+  "ruff check conformance scripts scripts/generate-py-stubs microvms-py/examples microvms-py/tests/test_stubs.py",
+  "ruff format --check conformance scripts scripts/generate-py-stubs microvms-py/examples microvms-py/tests/test_stubs.py",
   "terraform -chdir=conformance/infra fmt -check",
 ]
 
@@ -121,6 +137,28 @@ description = "Fail if the committed schema no longer matches what is served"
 # is generated, and a diff never reveals that it describes a protocol nobody
 # serves.
 run = "cargo run -q -p agentd --bin schema -- --check"
+
+[tasks.stubs]
+description = "Regenerate microvms-py/microvms.pyi from the pyo3 surface"
+run = "./scripts/generate-py-stubs"
+
+[tasks."stubs:check"]
+description = "Fail if the committed Python stub no longer matches the pyo3 surface"
+# `schema:check`'s argument, pointed at the binding rather than at the wire.
+#
+# The stale case is *worse* here than it is for the schema, because `py.typed` ships in the
+# wheel beside the stub. That marker is a promise to a type checker that this package is
+# typed, so a stub describing a surface the crate no longer has does not degrade to
+# "unchecked" — it degrades to confidently wrong, approving in an editor a call that raises
+# `AttributeError` when it runs. The crate shipped no stub and no marker at all until this
+# landed, which is why the gate arrives in the same commit as the artifact rather than after
+# it.
+#
+# In `check` rather than left to CI, for the reason `model:check` gives: no network, no
+# credentials, no money, so it costs what a lint costs. It does build `microvms-py` twice —
+# once for maturin's introspection pass, once for the importable cdylib the exception
+# hierarchy is read out of — and both are incremental builds `test` has already warmed.
+run = "./scripts/generate-py-stubs --check"
 
 [tasks.spec]
 description = "agentd.symspec.json consistency via symspec 0.1.0 + Z3"
@@ -222,6 +260,7 @@ depends = [
   "security",
   "test",
   "schema:check",
+  "stubs:check",
   "model:check",
   "live:check",
   "build",

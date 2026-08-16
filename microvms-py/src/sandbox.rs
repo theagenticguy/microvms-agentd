@@ -778,12 +778,3 @@ impl PySandbox {
         })
     }
 }
-
-/// Registers the sandbox surface on the module.
-pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
-    module.add_class::<PySandbox>()?;
-    module.add_class::<PyImage>()?;
-    module.add_class::<PyBaseImage>()?;
-    module.add_class::<PyTeardownReport>()?;
-    Ok(())
-}

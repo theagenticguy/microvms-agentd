@@ -13,6 +13,13 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 *.egg-info/
+# The wheel and venv the typed-consumer gate builds. `microvms-py/microvms.pyi` is the one
+# generated Python artifact that IS committed — it is the thing the drift gate compares
+# against — but the wheel built to prove it reaches a checker through PEP 561 is scratch,
+# and a 200 MB debug wheel is not something to offer a reviewer.
+dist-wheel/
+.venv-typed/
+.venv-bindings/
 # The napi-rs build outputs. `napi build --platform` writes the compiled addon plus a
 # generated loader and type declarations beside `package.json`; all three are derived from
 # `microvms-js/src/` and are rebuilt by `npm run build`, so committing them would commit one
