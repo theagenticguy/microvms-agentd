@@ -188,7 +188,11 @@ impl CoreSeam for AwsSeam {
         Box::pin(async move {
             let mut plane = ControlPlane::new(region).await?;
             if let Some(port) = port {
-                plane = plane.with_port(port);
+                // `?` rather than a check in the CLI: `--port 0` is refused by core against the
+                // model's `min: 1`, and a second message here would be a second message to keep
+                // right. Still zero control-plane calls — `ControlPlane::new` only resolves
+                // credentials.
+                plane = plane.with_port(port)?;
             }
             Ok(Sandbox::with_control_plane(plane))
         })
@@ -204,7 +208,7 @@ impl CoreSeam for AwsSeam {
             // attached session mints proxy tokens exactly as a launched one does (TRAP-9).
             let mut plane = ControlPlane::new(region).await?;
             if let Some(port) = attach.port {
-                plane = plane.with_port(port);
+                plane = plane.with_port(port)?;
             }
             let port = plane.port();
             let minter = Arc::new(PlaneMinter {
