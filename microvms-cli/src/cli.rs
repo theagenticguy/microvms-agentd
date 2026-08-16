@@ -211,8 +211,10 @@ pub enum Command {
     /// Emit every service constraint this client believes, for the drift gate.
     ///
     /// TRAP-12's second source. `scripts/check-model-drift` compares this against the pinned
-    /// botocore model and against the Python client's own constants, which is the only check
-    /// available for a value no API answers.
+    /// botocore model, and against its own pinned literals for the two values no model shape
+    /// states — the region list and the sizing table, which is the only check available for a
+    /// value no API answers. (It compared against the Python client's constants too, until that
+    /// client became git history.)
     Constants(ConstantsArgs),
 
     /// Print the Dockerfile stanza that wraps any base image with agentd.

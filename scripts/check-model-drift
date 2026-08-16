@@ -156,10 +156,24 @@ def load_model() -> tuple[dict[str, Any], Path]:
 CONSTANT_NAMES = (
     "MODEL_API_VERSION",
     "MAX_RUN_HOOK_PAYLOAD_BYTES",
+    "DOCUMENTED_RUN_HOOK_PAYLOAD_BYTES",
     "MAX_IMAGE_NAME_LEN",
     "IMAGE_NAME_PATTERN",
     "MAX_VERSION_LEN",
     "VERSION_PATTERN",
+    "MAX_NON_BLANK_LEN",
+    "NON_BLANK_PATTERN",
+    "MAX_IDENTIFIER_LEN",
+    "MAX_IMAGE_ARN_LEN",
+    "MAX_TAG_KEY_LEN",
+    "MAX_TAG_VALUE_LEN",
+    "TAG_COMPONENT_PATTERN",
+    "MIN_ROLE_ARN_LEN",
+    "MAX_ROLE_ARN_LEN",
+    "ROLE_ARN_PATTERN",
+    "MIN_PORT",
+    "MAX_PORT",
+    "MIN_IDLE_DURATION_SEC",
     "MAX_DURATION_SEC",
     "MAX_MICROVM_HOOK_TIMEOUT_SEC",
     "MAX_IMAGE_HOOK_TIMEOUT_SEC",
@@ -169,6 +183,16 @@ CONSTANT_NAMES = (
     "MAX_NETWORK_CONNECTORS",
     "MAX_IMAGE_EGRESS_CONNECTORS",
     "IMAGE_VERSION_STATUSES",
+    "HOOK_STATES",
+    # The five state enums, which used to be literals in this file. See the block where
+    # `MICROVM_STATES` and friends were defined for the whole argument; the short version is
+    # that pinning them here meant the gate verified the model against the script with no
+    # reader in the client, so a respelled state failed the gate and nothing else.
+    "MICROVM_STATES",
+    "IMAGE_STATES",
+    "IMAGE_VERSION_STATES",
+    "BUILD_STATES",
+    "CHIPSETS",
     "MAX_RESOURCES",
     "MAX_CLIENT_TOKEN_LEN",
     "MODEL_IMAGE_READY_STATES",
@@ -200,6 +224,16 @@ UNORDERED_NAMES = frozenset(
         # order the model lists them, so an unsorted comparison would pass today and become a
         # false failure the day AWS reorders the enum without changing it.
         "IMAGE_VERSION_STATUSES",
+        # The other five enums, for the same reason. Every consumer of these does a membership
+        # test — `TERMINAL_STATES.contains(&state)`, `Image::is_ready`, the subset assertions in
+        # `constants.rs` — so an order difference is not a disagreement, and an unsorted
+        # comparison would turn an AWS reordering into a false drift report.
+        "HOOK_STATES",
+        "MICROVM_STATES",
+        "IMAGE_STATES",
+        "IMAGE_VERSION_STATES",
+        "BUILD_STATES",
+        "CHIPSETS",
     }
 )
 
@@ -468,6 +502,43 @@ def check(src: Source, model: dict[str, Any]) -> Checker:
         src.get("MAX_RUN_HOOK_PAYLOAD_BYTES"),
     )
 
+    # And the other half of that bug, which is in the model itself. Issue #24 asked for the
+    # 16 KB claim to be pinned beside the constant so nobody "corrects" 4096 from the model's
+    # prose — this is the comparison that makes the claim checked rather than merely mentioned.
+    #
+    # Read out of the **documentation string** rather than out of a shape, because that is
+    # where the wrong number lives: `RunMicrovmRequest.runHookPayload`'s docs say "Maximum:
+    # 16,384 bytes" while the shape it names says `max: 4096`. So the model contradicts itself,
+    # and the client's two constants record both sides.
+    #
+    # A substring test rather than a parse, because AWS's prose is prose: the figure is written
+    # with a comma and embedded in a sentence, and a regex over it would be a second thing to
+    # keep right. What matters is that the claim is still there — the day it is fixed, this line
+    # goes red and `DOCUMENTED_RUN_HOOK_PAYLOAD_BYTES` and its warning should be deleted.
+    documented = src.get("DOCUMENTED_RUN_HOOK_PAYLOAD_BYTES")
+    payload_docs = (
+        model["shapes"]["RunMicrovmRequest"]["members"]["runHookPayload"]
+        .get("documentation", "")
+    )
+    c.record(
+        "runHookPayload documentation still claims the wrong ceiling",
+        f"{documented:,}",
+        f"{documented:,}" if f"{documented:,}" in payload_docs else payload_docs,
+        note=(
+            "the model's own prose is 4x its shape; the client pins both so the shape is not "
+            "'corrected' from the prose"
+        ),
+        sides=("client's DOCUMENTED_RUN_HOOK_PAYLOAD_BYTES", "model's doc string"),
+    )
+    # And the relationship, so the two constants cannot be collapsed into one.
+    c.record(
+        "documented runHookPayload ceiling > the shape's",
+        documented > src.get("MAX_RUN_HOOK_PAYLOAD_BYTES"),
+        True,
+        note="wrong in the permissive direction, which is why it is the dangerous one",
+        sides=(src.label, "required"),
+    )
+
     # ARM64-only is machine-checkable, not folklore.
     c.enum("Architecture enum", "Architecture", src.get("ARCHITECTURES"))
     # Why `build_image` takes `repair_guest_identity: bool` and not a capability list:
@@ -476,11 +547,37 @@ def check(src: Source, model: dict[str, Any]) -> Checker:
 
     # The state machines the client's polling loops branch on. A state added to the
     # model that no loop knows is a VM this client waits out rather than reports.
-    c.enum("MicrovmState enum", "MicrovmState", MICROVM_STATES)
-    c.enum("MicrovmImageState enum", "MicrovmImageState", IMAGE_STATES)
-    c.enum("MicrovmImageVersionState enum", "MicrovmImageVersionState", IMAGE_VERSION_STATES)
-    c.enum("BuildState enum", "BuildState", BUILD_STATES)
-    c.enum("Chipset enum", "Chipset", CHIPSETS)
+    #
+    # Read from the **client** now, where these five were literals in this file until issue #24.
+    # The old shape was the gap the previous comment here admitted: the gate compared the model
+    # against this script, so a `MicrovmState` AWS respelled failed the gate and had no
+    # compile-time or test-time consequence for `control/microvm.rs`'s polling loops — the
+    # failure and the blindness were unrelated facts. With the sets in `microvms-core`,
+    # `constants.rs`'s `every_state_set_the_polling_loops_use_is_a_subset_of_the_models_enum`
+    # goes red on the same change and names the loop.
+    #
+    # It does not make a new state a compile error. A wire string cannot be exhaustively
+    # matched, and narrowing a *response* enum is the mistake `ops.rs` documents at length. What
+    # it buys is a reader.
+    c.enum("MicrovmState enum", "MicrovmState", src.get("MICROVM_STATES"))
+    c.enum("MicrovmImageState enum", "MicrovmImageState", src.get("IMAGE_STATES"))
+    c.enum(
+        "MicrovmImageVersionState enum",
+        "MicrovmImageVersionState",
+        src.get("IMAGE_VERSION_STATES"),
+    )
+    c.enum("BuildState enum", "BuildState", src.get("BUILD_STATES"))
+    # `Chipset` was the one issue #24 called "drift-checked but deserialized nowhere". It is
+    # deserialized now — `MicrovmImageBuildSummaryWire.chipset` and
+    # `GetImageBuildResponseWire.chipset` both read it, added by the build-introspection work
+    # that put the model's five missing required members on those two shapes.
+    c.enum("Chipset enum", "Chipset", src.get("CHIPSETS"))
+    # `HookState`, which is a **request** enum on six members of every `CreateMicrovmImage` —
+    # so a value the model dropped is a call this client makes and the service refuses, six
+    # fields at once. It was `"ENABLED"` as a `&str` local with no constant naming either value
+    # (issue #24); `ops::HookState` is the typed spelling now and this array is what the gate
+    # reads.
+    c.enum("HookState enum", "HookState", src.get("HOOK_STATES"))
 
     # Terminal-state sets are subsets rather than equalities, so they get their own
     # comparison: the check is that every member is a real state, which is what
@@ -530,26 +627,79 @@ def check(src: Source, model: dict[str, Any]) -> Checker:
     c.bound("Version max length", "Version", "max", src.get("MAX_VERSION_LEN"))
     c.bound("Version min length", "Version", "min", 1)
     c.pattern("Version pattern", "Version", src.get("VERSION_PATTERN"))
-    # And `NonBlankString`, held against the same two values from the other direction. It is
-    # what `GetMicrovmImageBuild`'s `buildId` and `imageVersion` URI members use, so the
-    # client's one guard covers both shapes only for as long as they agree — and this is
-    # the line that notices when they stop.
-    c.bound(
-        "NonBlankString max length (same guard)",
-        "NonBlankString",
-        "max",
-        src.get("MAX_VERSION_LEN"),
-    )
-    c.pattern(
-        "NonBlankString pattern (same guard)",
-        "NonBlankString",
-        src.get("VERSION_PATTERN"),
+    # And `NonBlankString`, which now has its **own** two constants rather than borrowing
+    # `Version`'s. The previous shape here checked `MAX_VERSION_LEN` against both shapes and
+    # said so in the label ("same guard"), which was honest while one guard covered both — but
+    # it meant the day AWS moved one, the gate would report drift naming a constant that was
+    # right for the other shape. Two constants, two comparisons, and
+    # `the_version_and_non_blank_shapes_agree_today_and_are_still_two_constants` in the crate is
+    # what says they agree.
+    #
+    # The client sends `CodeArtifact.uri`, `CreateMicrovmImage.baseImageArn`, and
+    # `ListMicrovmImages.nameFilter` as this shape, plus `GetMicrovmImageBuild`'s `buildId` and
+    # `imageVersion` URI members. `require_non_blank` is the guard.
+    c.bound("NonBlankString max length", "NonBlankString", "max", src.get("MAX_NON_BLANK_LEN"))
+    c.bound("NonBlankString min length", "NonBlankString", "min", 1)
+    c.pattern("NonBlankString pattern", "NonBlankString", src.get("NON_BLANK_PATTERN"))
+
+    # The two identifier shapes, and the contradiction between them. Twelve URI, body, and
+    # querystring members across every implemented operation; `require_valid_identifier` is the
+    # guard, and it refuses above 256 on the request side.
+    for shape in ("MicrovmIdentifier", "MicrovmImageIdentifier"):
+        c.bound(f"{shape} max length", shape, "max", src.get("MAX_IDENTIFIER_LEN"))
+        c.bound(f"{shape} min length", shape, "min", 1)
+    # `MicrovmImageArn` is a **response** shape — `GetMicrovmResponse.imageArn` and two siblings
+    # — so nothing is guarded against it. It is pinned because the *relationship* is the finding:
+    # the model permits a 2048-character ARN in a response that is illegal as a request
+    # identifier. If AWS ever narrows this to 256 the contradiction is gone, and this line plus
+    # `constants.rs`'s `a_legal_image_arn_can_be_longer_than_a_legal_identifier` are what would
+    # say so.
+    c.bound("MicrovmImageArn max length", "MicrovmImageArn", "max", src.get("MAX_IMAGE_ARN_LEN"))
+    c.record(
+        "MicrovmImageArn max > MicrovmImageIdentifier max (the model's own contradiction)",
+        src.get("MAX_IMAGE_ARN_LEN") > src.get("MAX_IDENTIFIER_LEN"),
+        True,
+        note="a legal response value can be an illegal request value; the client refuses on the request side",
+        sides=(src.label, "required"),
     )
 
+    # Tags, sent on every `CreateMicrovmImage` that carries any and checked by nothing until
+    # issue #24. The key and the value are two shapes with two ceilings and two minima, sharing
+    # one pattern — `require_valid_tags` names which half failed for exactly that reason.
+    c.bound("TagKey max length", "TagKey", "max", src.get("MAX_TAG_KEY_LEN"))
+    c.bound("TagKey min length", "TagKey", "min", 1)
+    c.bound("TagValue max length", "TagValue", "max", src.get("MAX_TAG_VALUE_LEN"))
+    # 0, not 1. An empty tag *value* is legal where an empty key is not, and a guard that used
+    # one rule for both would refuse a legal request.
+    c.bound("TagValue min length", "TagValue", "min", 0)
+    # One pattern, both shapes, checked separately: they are two shapes and the client's one
+    # matcher covers both only for as long as they agree.
+    for shape in ("TagKey", "TagValue"):
+        c.pattern(f"{shape} pattern", shape, src.get("TAG_COMPONENT_PATTERN"))
+
+    # `RoleArn`. The pattern was already pinned here, against a literal in this file — moved to
+    # the client because there is a matcher for it now (`is_valid_role_arn`), so the value has a
+    # reader. `buildRoleArn` is the member issue #24 named: its rejection lands after the
+    # artifact upload.
+    c.bound("RoleArn min length", "RoleArn", "min", src.get("MIN_ROLE_ARN_LEN"))
+    c.bound("RoleArn max length", "RoleArn", "max", src.get("MAX_ROLE_ARN_LEN"))
+    c.pattern("RoleArn pattern", "RoleArn", src.get("ROLE_ARN_PATTERN"))
+
+    # `PortNumber`, which bounds `PortSpecification.port` and both ends of a `PortRange`. The
+    # min is the live half — `u16` closes the ceiling — and `with_port(0)` was representable.
+    c.bound("PortNumber min", "PortNumber", "min", src.get("MIN_PORT"))
+    c.bound("PortNumber max", "PortNumber", "max", src.get("MAX_PORT"))
+    # `HooksPortInteger`'s min, checked here where only its max was before. Same reason every
+    # other min is now checked: this client does not use botocore, so a `min` is enforced by the
+    # crate or by nothing.
+    c.bound("hooks.port min", "HooksPortInteger", "min", src.get("MIN_PORT"))
+    # `allowedPorts` is `min: 1` on the list itself, which `mint_auth_token_for` refuses. Held
+    # against a literal because the client's refusal is an emptiness check rather than a
+    # published bound.
+    c.bound("allowedPorts min items", "ListOfPortSpecification", "min", 1)
+
     # The two values `UpdateMicrovmImageVersion` accepts. A request enum, so a value the model
-    # dropped is a call this client makes and the service refuses — which is why this is
-    # checked against the shape rather than against a literal in this file, unlike the five
-    # state enums below.
+    # dropped is a call this client makes and the service refuses.
     c.enum(
         "MicrovmImageVersionStatus enum",
         "MicrovmImageVersionStatus",
@@ -643,16 +793,30 @@ def check(src: Source, model: dict[str, Any]) -> Checker:
         c.bound(f"{shape} max", shape, "max", MAX_LIST_PAGE_SIZE)
         c.bound(f"{shape} min", shape, "min", 1)
     c.bound("EnvironmentVariableMap max", "EnvironmentVariableMap", "max", MAX_ENVIRONMENT_VARIABLES)
-    c.pattern("RoleArn pattern", "RoleArn", ROLE_ARN_PATTERN)
 
-    # `min: 60` with no max, and the one constraint here botocore *does* enforce
-    # locally — so the client adds no check for it and this comparison exists only to
-    # notice if that stops being true.
+    # `min: 60` with no max. This comment used to say it was "the one constraint here botocore
+    # *does* enforce locally — so the client adds no check for it", and that was the exemption
+    # issue #24 dismantled: the premise is true of botocore and the conclusion does not apply,
+    # because `microvms-core` signs with `aws-sigv4` and sends with `reqwest` and never touches
+    # `validate.py`. It was inherited from the deleted Python client, where it held. Measured:
+    # `max_idle_sec: 59` reached the wire.
+    #
+    # So it is read from the client now rather than from a literal here, and
+    # `require_idle_duration` is the guard.
     c.bound(
         "idlePolicy.maxIdleDurationSeconds min",
         "IdlePolicyMaxIdleDurationSecondsInteger",
         "min",
-        MIN_IDLE_DURATION_SEC,
+        src.get("MIN_IDLE_DURATION_SEC"),
+    )
+    # `suspendedDurationSeconds` is `min: 0`, which is why there is no guard for it: every `u32`
+    # satisfies it. Pinned so a future tightening is noticed — if AWS gives this a floor, a
+    # `suspended_sec` this client sends today becomes a rejected launch.
+    c.bound(
+        "idlePolicy.suspendedDurationSeconds min",
+        "IdlePolicySuspendedDurationSecondsInteger",
+        "min",
+        0,
     )
 
     # The most expensive incident this repo has had came from not knowing these are
@@ -738,31 +902,16 @@ def check(src: Source, model: dict[str, Any]) -> Checker:
 #: model is how we learn the model moved. Keeping them here rather than dropping
 #: them is the difference between a checker that covers what we use and one that
 #: covers what the service states.
-MICROVM_STATES = ("PENDING", "RUNNING", "SUSPENDING", "SUSPENDED", "TERMINATING", "TERMINATED")
-IMAGE_STATES = (
-    "CREATING",
-    "CREATED",
-    "CREATE_FAILED",
-    "UPDATING",
-    "UPDATED",
-    "UPDATE_FAILED",
-    "DELETING",
-    "DELETE_FAILED",
-    "DELETED",
-)
-IMAGE_VERSION_STATES = (
-    "PENDING",
-    "IN_PROGRESS",
-    "SUCCESSFUL",
-    "FAILED",
-    "DELETING",
-    "DELETED",
-    "DELETE_FAILED",
-)
-BUILD_STATES = ("PENDING", "IN_PROGRESS", "SUCCESSFUL", "FAILED")
-CHIPSETS = ("GRAVITON",)
+#
+# Six names left this block for issue #24: the five state enums and `MIN_IDLE_DURATION_SEC`.
+# They were the ones this comment's own caveat applied worst to — a literal here made the gate
+# compare the model against *this script*, with no reader in the client at all, so a respelled
+# `MicrovmState` failed the gate and had no consequence for the polling loops that branch on
+# states. They live in `microvms-core/src/constants.rs` now, where a subset assertion names the
+# loop. `ROLE_ARN_PATTERN` went the same way once there was a matcher to read it.
+#
+# What is left here is genuinely unbound by the client, and each one says why at its use site.
 MAX_ENVIRONMENT_VARIABLES = 50
-MIN_IDLE_DURATION_SEC = 60
 #: Every paginated listing's `maxResults` ceiling, all six identical today.
 #:
 #: Held here rather than in `microvms-core`'s constants because no production path sends a page
@@ -771,7 +920,6 @@ MIN_IDLE_DURATION_SEC = 60
 #: the client's copy of this bound is a clamp in a test-only path, and the honest thing is to pin
 #: the model's value here rather than to publish a constant nothing production reads.
 MAX_LIST_PAGE_SIZE = 50
-ROLE_ARN_PATTERN = r"arn:aws[a-z\-]*:iam::[0-9]{12}:role/?[a-zA-Z_0-9+=,.@\-_/]+"
 IDEMPOTENCY_TOKEN_MEMBERS = (
     "CreateMicrovmImageRequest.clientToken",
     "RunMicrovmRequest.clientToken",

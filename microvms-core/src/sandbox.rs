@@ -1385,6 +1385,79 @@ mod tests {
         assert!(sandbox.microvm().is_none());
     }
 
+    /// **Issue #24's guards reach through `Sandbox`, which is the layer both bindings use.**
+    ///
+    /// `microvms-py`'s `run` and `microvms-js`'s `run` both build a [`RunRequest`] and hand it to
+    /// [`Sandbox::run`], which fills a `RunMicrovmRequest` and calls
+    /// [`crate::control::ControlPlane::run_microvm`]. So the guards there cover the bindings — but
+    /// "cover" is a claim about a call chain, and a chain is what a refactor breaks. This asserts
+    /// it at the layer the bindings actually enter, so a `Sandbox::run` that stopped delegating
+    /// (or a binding-side default that bypassed the request type) fails a test rather than shipping
+    /// an unguarded surface to Python and Node.
+    ///
+    /// `max_idle_sec` is the case that matters most here, because it is a plain `u32` keyword
+    /// argument on both bindings with no type narrowing it: `sandbox.run(max_idle_sec=59)` is what
+    /// a Python caller writes, and before this it reached the wire.
+    ///
+    /// **Guard proof.** Delete `require_idle_duration` from `run_microvm` and the idle row goes red
+    /// on the call count; delete `require_valid_role_arn` and the role row does. Neither guard is in
+    /// this file, which is the point — the test is about the chain.
+    #[tokio::test]
+    async fn the_bindings_layer_refuses_an_illegal_launch_with_zero_calls() {
+        let cases: [(&str, RunRequest, &str); 3] = [
+            (
+                "max_idle_sec=59, which is what a Python keyword argument passes",
+                RunRequest {
+                    max_idle_sec: 59,
+                    ..RunRequest::new().with_image("arn:image")
+                },
+                "maxIdleDurationSeconds",
+            ),
+            (
+                "an execution role that is a bare name",
+                RunRequest {
+                    execution_role_arn: Some("execution-role".to_string()),
+                    ..RunRequest::new().with_image("arn:image")
+                },
+                "role *name*",
+            ),
+            (
+                "a pinned version with a trailing newline",
+                RunRequest::new()
+                    .with_image("arn:image")
+                    .with_image_version("2.0\n"),
+                "contains whitespace",
+            ),
+        ];
+
+        for (label, request, expected) in cases {
+            let (mut sandbox, recorder, _) = planted();
+            // The launch answered, so a missing guard is a *successful* launch — a real VM and a
+            // real bill — rather than a different failure.
+            answer_launch(&recorder);
+
+            // `expect_err` needs the Ok type to be `Debug`, and `run` answers `&mut Session`
+            // (which is not) — so the discriminant is matched instead. That is also the more
+            // honest assertion: it says the launch produced no session at all.
+            let Err(error) = sandbox.run(request).await else {
+                panic!("{label} must be refused");
+            };
+            assert_eq!(error.kind(), ErrorKind::InvalidArg, "{label}");
+            assert!(
+                error.to_string().contains(expected),
+                "{label}: wanted {expected:?}, got {error}"
+            );
+            assert_eq!(
+                recorder.calls().len(),
+                0,
+                "{label}: the refusal has to be local, because a launch that reached AWS costs a \
+                 VM and a bill"
+            );
+            assert_eq!(sandbox.lifecycle(), Lifecycle::Pending);
+            assert!(sandbox.microvm().is_none());
+        }
+    }
+
     /// A launch whose VM dies during startup leaves the token **not** installed, because
     /// the run hook is what delivers it and a dead VM ran no hook.
     ///

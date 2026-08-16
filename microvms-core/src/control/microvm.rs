@@ -354,12 +354,23 @@ impl ControlPlane {
     /// here, and the connectors are derived from intents (TRAP-4). The `clientToken` is
     /// minted from a label (TRAP-1).
     pub async fn run_microvm(&self, request: RunMicrovmRequest) -> Result<Microvm, Error> {
+        super::require_valid_identifier("imageIdentifier", &request.image_identifier)?;
         super::require_duration_in_range(request.max_duration_sec)?;
+        // `min: 60` on `IdlePolicyMaxIdleDurationSecondsInteger`. There used to be no guard for
+        // this on the grounds that botocore enforces `min` locally — true of the deleted Python
+        // client and never of this one. See `super::require_idle_duration`.
+        super::require_idle_duration(request.max_idle_sec)?;
         // Checked before the wire because a pinned launch is what a rollback does, and a
         // `ValidationException` on the member rather than on the version is the least useful
         // failure available at that moment. See `super::require_valid_version`.
         if let Some(version) = request.image_version.as_deref() {
             super::require_valid_version("imageVersion", version)?;
+        }
+        // `RoleArn` — optional in the model, and every real launch has one. A malformed value
+        // here is a `ValidationException` on a member the caller may not know is being filled
+        // from their infra config, so the refusal names it.
+        if let Some(role) = request.execution_role_arn.as_deref() {
+            super::require_valid_role_arn("executionRoleArn", role)?;
         }
 
         // Ingress and egress go in separate members, so they are split by intent rather
@@ -489,7 +500,13 @@ impl ControlPlane {
     }
 
     /// `GetMicrovm`.
+    ///
+    /// `microvmIdentifier` is a URI parameter, so an empty one collapses the path onto the
+    /// listing and asks a different question — see [`super::require_valid_identifier`]. This is
+    /// the read every wait loop makes, so the check also covers
+    /// [`Self::wait_for_state`] and everything built on it.
     pub async fn get_microvm(&self, id: &str) -> Result<Microvm, Error> {
+        super::require_valid_identifier("microvmIdentifier", id)?;
         let call = Call::get("GetMicrovm", paths::microvm(id));
         let reply = send_with_retry(self.transport(), call).await?;
         let got: ops::MicrovmResponseWire = reply.json("GetMicrovm")?;
@@ -522,6 +539,7 @@ impl ControlPlane {
 
     /// `SuspendMicrovm`. Freezes the VM; the caller waits for SUSPENDED.
     pub async fn suspend(&self, id: &str) -> Result<(), Error> {
+        super::require_valid_identifier("microvmIdentifier", id)?;
         let call = Call::post_empty("SuspendMicrovm", paths::suspend(id));
         send_with_retry(self.transport(), call).await?;
         Ok(())
@@ -529,13 +547,21 @@ impl ControlPlane {
 
     /// `ResumeMicrovm`. Thaws the VM; no token re-delivery and no re-bootstrap.
     pub async fn resume(&self, id: &str) -> Result<(), Error> {
+        super::require_valid_identifier("microvmIdentifier", id)?;
         let call = Call::post_empty("ResumeMicrovm", paths::resume(id));
         send_with_retry(self.transport(), call).await?;
         Ok(())
     }
 
     /// `TerminateMicrovm`.
+    ///
+    /// The identifier check matters most on this one, and for a reason the others do not share:
+    /// the path is `DELETE /microvms/{microvmIdentifier}`, so an empty identifier is a `DELETE`
+    /// addressed at the **collection**. There is no operation on that path and the service
+    /// refuses it, but "send a delete at the fleet and rely on the service to refuse" is not a
+    /// thing to leave to the service.
     pub async fn terminate(&self, id: &str) -> Result<(), Error> {
+        super::require_valid_identifier("microvmIdentifier", id)?;
         let call = Call::delete("TerminateMicrovm", paths::microvm(id));
         send_with_retry(self.transport(), call).await?;
         Ok(())
@@ -574,6 +600,7 @@ impl ControlPlane {
         id: &str,
         ports: &[ops::PortSpecification],
     ) -> Result<ProxyToken, Error> {
+        super::require_valid_identifier("microvmIdentifier", id)?;
         if ports.is_empty() {
             // The model declares `min: 1` on `allowedPorts`, so an empty list is a
             // round-trip that comes back as a validation error naming a member the caller
@@ -584,6 +611,26 @@ impl ControlPlane {
                  Name the ports this token is for — the agent port plus any workload port \
                  reached through the endpoint.",
             ));
+        }
+        // `PortNumber` is `min: 1`, and the value that reaches here as a 0 is not a typo — it is
+        // a caller who took `ControlPlane::with_port(0)`'s default port, or who passed a
+        // `SocketAddr`'s port before binding. A token minted for port 0 authorizes nothing, and
+        // the proxy's refusal is `403 Access to port denied`, which reads like the token being
+        // wrong rather than its scope being empty (measured 2026-08-15, see
+        // `ops::PortSpecification`). Both ends of a range are checked, because `PortRange`'s two
+        // members name the same shape and a range starting at 0 is the same defect.
+        for spec in ports {
+            match spec {
+                ops::PortSpecification::One { port } => {
+                    super::require_valid_port("allowedPorts[].port", *port)?;
+                }
+                ops::PortSpecification::Range { range } => {
+                    super::require_valid_port("allowedPorts[].range.startPort", range.start_port)?;
+                    super::require_valid_port("allowedPorts[].range.endPort", range.end_port)?;
+                }
+                // `allPorts` names no number, so there is nothing to bound.
+                ops::PortSpecification::All { .. } => {}
+            }
         }
         let wire = ops::CreateAuthTokenWire {
             expiration_in_minutes: MAX_TOKEN_MINUTES,
@@ -1388,7 +1435,8 @@ mod tests {
         let fake = Arc::new(FakeControlPlane::new());
         let plane =
             ControlPlane::with_transport(fake.clone(), Region::UsEast1, Arc::new(TestClock::new()))
-                .with_port(8080);
+                .with_port(8080)
+                .expect("8080 is a legal port");
         fake.answer(
             "CreateMicrovmAuthToken",
             Answer::ok(fake::auth_token_response("t")),
@@ -1645,5 +1693,317 @@ mod tests {
             3,
             "two failures then a success"
         );
+    }
+
+    // ── issue #24's guards on the launch and lifecycle paths ─────────────────
+
+    /// **`max_idle_sec: 59` no longer reaches the wire.**
+    ///
+    /// The measurement issue #24 made, turned into a test. The exemption it replaces was not a
+    /// wrong number — it was a correct fact about botocore's `VALIDATED_METADATA_ATTRS` applied to
+    /// a client that does not use botocore, so `IdlePolicy.maxIdleDurationSeconds` was the one
+    /// constraint in the model with a *reason* for having no guard rather than an oversight.
+    ///
+    /// The fake has `RunMicrovm` answered, so a missing guard shows as a launch that **succeeded**
+    /// with 59 on the wire rather than as some other failure. That is what makes the zero-call
+    /// assertion the load-bearing one.
+    ///
+    /// **Guard proof** — run 2026-08-16. Delete `require_idle_duration` from `run_microvm` and
+    /// this fails on `expect_err`, with the fake recording `RunMicrovm` once and
+    /// `idlePolicy.maxIdleDurationSeconds: 59` in its body.
+    #[tokio::test]
+    async fn an_under_minimum_idle_duration_reaches_no_control_plane_call() {
+        for under in [0, 1, 59] {
+            let (plane, fake, _) = planted();
+            fake.answer(
+                "RunMicrovm",
+                Answer::ok(fake::microvm_response("PENDING", None)),
+            );
+
+            let payload = RunHookPayload::for_agent_token("token").expect("fits");
+            let mut request = RunMicrovmRequest::new("arn:image", payload);
+            request.max_idle_sec = under;
+
+            let error = plane
+                .run_microvm(request)
+                .await
+                .expect_err("the model's min is 60");
+            assert_eq!(error.kind(), ErrorKind::InvalidArg);
+            let message = error.to_string();
+            assert!(message.contains("maxIdleDurationSeconds"), "{message}");
+            assert!(message.contains(&under.to_string()), "{message}");
+            assert_eq!(
+                fake.calls().len(),
+                0,
+                "{under} was refused locally; before this guard it was serialized and sent"
+            );
+        }
+
+        // 60 exactly does launch, so the boundary is inclusive and the guard is not refusing
+        // every idle window.
+        let (plane, fake, _) = planted();
+        fake.answer(
+            "RunMicrovm",
+            Answer::ok(fake::microvm_response("PENDING", None)),
+        );
+        let payload = RunHookPayload::for_agent_token("token").expect("fits");
+        let mut request = RunMicrovmRequest::new("arn:image", payload);
+        request.max_idle_sec = 60;
+        plane.run_microvm(request).await.expect("60 is the minimum");
+        assert_eq!(
+            fake.first_body("RunMicrovm")["idlePolicy"]["maxIdleDurationSeconds"],
+            60
+        );
+    }
+
+    /// **The launch's `executionRoleArn` and `imageIdentifier`, refused before the call.**
+    ///
+    /// `executionRoleArn` is filled from an infra config on every real launch — the CLI reads it
+    /// out of `MICROVM_EXECUTION_ROLE_ARN` — so a malformed one is a `ValidationException` about a
+    /// member the caller never typed. Naming it locally is the whole difference.
+    ///
+    /// **Guard proof** — run 2026-08-16. Delete `require_valid_role_arn("executionRoleArn", …)`
+    /// and the role rows launch successfully with the bad ARN on the wire; delete
+    /// `require_valid_identifier` and the identifier rows do.
+    #[tokio::test]
+    async fn a_malformed_launch_role_or_identifier_reaches_no_control_plane_call() {
+        /// What to break, aliased for the reason clippy's `type_complexity` gives — and the same
+        /// alias `image.rs`'s create-path table uses, so the two read alike.
+        type Mutate = fn(&mut RunMicrovmRequest);
+        let rows: [(&str, Mutate, &str); 6] = [
+            (
+                "an execution role that is a bare name",
+                |request| {
+                    request.execution_role_arn = Some("execution-role".to_string());
+                },
+                "role *name*",
+            ),
+            (
+                "an execution role with eleven account digits",
+                |request| {
+                    request.execution_role_arn =
+                        Some("arn:aws:iam::12345678901:role/exec".to_string());
+                },
+                "exactly twelve digits",
+            ),
+            (
+                "an execution role that is a function ARN",
+                |request| {
+                    request.execution_role_arn =
+                        Some("arn:aws:lambda:us-east-1:123456789012:function:h".to_string());
+                },
+                "RoleArn pattern",
+            ),
+            (
+                "an empty image identifier",
+                |request| {
+                    request.image_identifier = String::new();
+                },
+                "collapses the path",
+            ),
+            (
+                "a 257-character image identifier",
+                |request| {
+                    request.image_identifier = "a".repeat(257);
+                },
+                "MicrovmImageArn permits 2048",
+            ),
+            (
+                "an image version with a newline",
+                |request| {
+                    request.image_version = Some("2.0\n".to_string());
+                },
+                "contains whitespace",
+            ),
+        ];
+
+        for (label, mutate, expected) in rows {
+            let (plane, fake, _) = planted();
+            fake.answer(
+                "RunMicrovm",
+                Answer::ok(fake::microvm_response("PENDING", None)),
+            );
+
+            let payload = RunHookPayload::for_agent_token("token").expect("fits");
+            let mut request = RunMicrovmRequest::new("arn:image", payload);
+            mutate(&mut request);
+
+            let error = plane
+                .run_microvm(request)
+                .await
+                .expect_err(&format!("{label} must be refused"));
+            assert_eq!(error.kind(), ErrorKind::InvalidArg, "{label}");
+            assert!(
+                error.to_string().contains(expected),
+                "{label}: wanted {expected:?}, got {error}"
+            );
+            assert_eq!(fake.calls().len(), 0, "{label}");
+        }
+
+        // The control case: a launch carrying a real execution role, a pinned version, and the
+        // account's actual ARN shape goes through.
+        let (plane, fake, _) = planted();
+        fake.answer(
+            "RunMicrovm",
+            Answer::ok(fake::microvm_response("PENDING", None)),
+        );
+        let payload = RunHookPayload::for_agent_token("token").expect("fits");
+        let mut request = RunMicrovmRequest::new(
+            "arn:aws:lambda:us-east-1:392583147479:microvm-image:agentd-conformance",
+            payload,
+        );
+        request.execution_role_arn =
+            Some("arn:aws:iam::392583147479:role/bonk-sandbox-microvm-execution".to_string());
+        request.image_version = Some("1.0".to_string());
+        plane
+            .run_microvm(request)
+            .await
+            .expect("a realistic pinned launch with a real execution role");
+        assert_eq!(fake.call_count("RunMicrovm"), 1);
+    }
+
+    /// **The `microvmIdentifier` guard on every lifecycle operation, proved by the call count.**
+    ///
+    /// `TerminateMicrovm` is the one worth reading twice. Its path is
+    /// `DELETE /microvms/{microvmIdentifier}`, so an empty identifier is a `DELETE` addressed at
+    /// the fleet collection. The service has no operation there and refuses it, but "send a delete
+    /// at the collection and trust the service" is not a thing to leave to the service.
+    ///
+    /// **Guard proof** — run 2026-08-16. Delete `require_valid_identifier` from any one of the
+    /// five and its assertion goes red with `calls: 1`.
+    #[tokio::test]
+    async fn no_lifecycle_operation_sends_an_empty_or_over_long_microvm_identifier() {
+        for bad in ["", &"a".repeat(257)] {
+            let (plane, fake, _) = planted();
+            // Every operation answered, so a missing guard is a *successful* call rather than a
+            // different failure.
+            fake.answer(
+                "GetMicrovm",
+                Answer::ok(fake::microvm_response("RUNNING", None)),
+            );
+            fake.answer("SuspendMicrovm", Answer::ok("{}"));
+            fake.answer("ResumeMicrovm", Answer::ok("{}"));
+            fake.answer("TerminateMicrovm", Answer::ok("{}"));
+            fake.answer(
+                "CreateMicrovmAuthToken",
+                Answer::ok(fake::auth_token_response("t")),
+            );
+
+            plane.get_microvm(bad).await.expect_err("GetMicrovm");
+            plane.suspend(bad).await.expect_err("SuspendMicrovm");
+            plane.resume(bad).await.expect_err("ResumeMicrovm");
+            plane.terminate(bad).await.expect_err("TerminateMicrovm");
+            plane
+                .mint_auth_token(bad)
+                .await
+                .expect_err("CreateMicrovmAuthToken");
+            plane
+                .wait_for_running(bad, WaitOpts::for_launch())
+                .await
+                .expect_err("GetMicrovm, in a loop");
+
+            assert_eq!(
+                fake.calls().len(),
+                0,
+                "six operations refused {bad:?} locally. An empty identifier on the terminate \
+                 path is a DELETE addressed at the collection."
+            );
+        }
+    }
+
+    /// **Issue #24's `PortNumber` half: a token is never minted for port 0.**
+    ///
+    /// The measurement that makes this worth a guard rather than a comment is in
+    /// [`ops::PortSpecification`]: a token whose `allowedPorts` does not cover the port a request
+    /// names is refused with **403 `Access to port denied`**, and on the WebSocket path it is close
+    /// code 1006 with no reason. So a token minted for port 0 authorizes nothing and fails in a
+    /// way that reads like a bad credential rather than like an empty scope.
+    ///
+    /// Both ends of a range are checked as well as the single-port form, because `PortRange`'s two
+    /// members name the same shape and a range starting at 0 is the same defect.
+    ///
+    /// **Guard proof** — run 2026-08-16. Delete the `for spec in ports` loop from
+    /// `mint_auth_token_for` and all three rows mint successfully with `{"port": 0}` or
+    /// `{"range": {"startPort": 0, …}}` on the wire.
+    #[tokio::test]
+    async fn no_proxy_token_is_minted_for_port_zero() {
+        let rows: [(&str, ops::PortSpecification, &str); 3] = [
+            (
+                "a single port of 0",
+                ops::PortSpecification::port(0),
+                "allowedPorts[].port",
+            ),
+            (
+                "a range starting at 0",
+                ops::PortSpecification::range(0, 9000),
+                "allowedPorts[].range.startPort",
+            ),
+            (
+                "a range ending at 0",
+                ops::PortSpecification::range(0, 0),
+                "allowedPorts[].range.startPort",
+            ),
+        ];
+
+        for (label, spec, member) in rows {
+            let (plane, fake, _) = planted();
+            fake.answer(
+                "CreateMicrovmAuthToken",
+                Answer::ok(fake::auth_token_response("t")),
+            );
+
+            let error = plane
+                .mint_auth_token_for("mvm-1", &[spec])
+                .await
+                .expect_err(&format!("{label} must be refused"));
+            assert_eq!(error.kind(), ErrorKind::InvalidArg, "{label}");
+            let message = error.to_string();
+            assert!(message.contains(member), "{label}: {message}");
+            assert!(
+                message.contains("authorizes nothing"),
+                "{label}: the 403 consequence has to be in the message: {message}"
+            );
+            assert_eq!(fake.calls().len(), 0, "{label}");
+        }
+
+        // A zero port among legal ones is still refused: the check is per-entry, not on the
+        // first. A token minted with `[{port: 9000}, {port: 0}]` would look scoped correctly and
+        // carry a member the service refuses the whole request over.
+        let (plane, fake, _) = planted();
+        fake.answer(
+            "CreateMicrovmAuthToken",
+            Answer::ok(fake::auth_token_response("t")),
+        );
+        plane
+            .mint_auth_token_for(
+                "mvm-1",
+                &[
+                    ops::PortSpecification::port(9000),
+                    ops::PortSpecification::port(0),
+                ],
+            )
+            .await
+            .expect_err("every entry is checked, not the first");
+        assert_eq!(fake.calls().len(), 0);
+
+        // And the three legal forms mint, including `allPorts` — which names no number, so there
+        // is nothing to bound and the guard must not refuse it.
+        for legal in [
+            ops::PortSpecification::port(1),
+            ops::PortSpecification::port(65_535),
+            ops::PortSpecification::range(1, 65_535),
+            ops::PortSpecification::all(),
+        ] {
+            let (plane, fake, _) = planted();
+            fake.answer(
+                "CreateMicrovmAuthToken",
+                Answer::ok(fake::auth_token_response("t")),
+            );
+            plane
+                .mint_auth_token_for("mvm-1", &[legal])
+                .await
+                .expect("a legal port specification mints");
+            assert_eq!(fake.call_count("CreateMicrovmAuthToken"), 1);
+        }
     }
 }
