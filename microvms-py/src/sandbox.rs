@@ -563,6 +563,7 @@ impl PySandbox {
     #[pyo3(signature = (
         *,
         image_identifier=None,
+        image_version=None,
         execution_role_arn=None,
         agent_token=None,
         launch_env=None,
@@ -583,6 +584,13 @@ impl PySandbox {
         &self,
         py: Python<'_>,
         image_identifier: Option<String>,
+        // `image_version` pins the launch to one `imageVersion` rather than taking the
+        // image's latest active one. That is what makes a canary launch against the version
+        // it means to test, and it is the half of a rollback that re-points at the
+        // known-good build; a version the control plane has set INACTIVE refuses to launch
+        // when named here. Not a doc comment: a doc comment on a function parameter is a
+        // compile error.
+        image_version: Option<String>,
         execution_role_arn: Option<String>,
         agent_token: Option<String>,
         // `launch_env` is the base environment for every exec in the launched VM,
@@ -606,6 +614,7 @@ impl PySandbox {
         let defaults = RunRequest::new();
         let request = RunRequest {
             image_identifier,
+            image_version,
             execution_role_arn,
             agent_token,
             launch_env: launch_env.unwrap_or(defaults.launch_env),

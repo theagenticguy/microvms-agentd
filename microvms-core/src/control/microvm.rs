@@ -355,6 +355,12 @@ impl ControlPlane {
     /// minted from a label (TRAP-1).
     pub async fn run_microvm(&self, request: RunMicrovmRequest) -> Result<Microvm, Error> {
         super::require_duration_in_range(request.max_duration_sec)?;
+        // Checked before the wire because a pinned launch is what a rollback does, and a
+        // `ValidationException` on the member rather than on the version is the least useful
+        // failure available at that moment. See `super::require_valid_version`.
+        if let Some(version) = request.image_version.as_deref() {
+            super::require_valid_version("imageVersion", version)?;
+        }
 
         // Ingress and egress go in separate members, so they are split by intent rather
         // than concatenated into one list.
@@ -383,6 +389,7 @@ impl ControlPlane {
 
         let wire = ops::RunMicrovmWire {
             image_identifier: request.image_identifier.clone(),
+            image_version: request.image_version.clone(),
             execution_role_arn: request.execution_role_arn.clone(),
             ingress_network_connectors: ingress,
             // Absent rather than empty: omitting egress is how you get no outbound network.
@@ -889,6 +896,82 @@ mod tests {
             "omitting egress is the whole mechanism: {body}"
         );
         assert!(body.get("ingressNetworkConnectors").is_some());
+    }
+
+    /// **A pinned `imageVersion` reaches the wire, and an unpinned launch omits the member.**
+    ///
+    /// The absence half is the one that matters for compatibility: an unpinned launch has to
+    /// emit byte-for-byte what this client always sent, so a `"imageVersion": null` on every
+    /// launch would be a new member on a request that has worked for months. The presence half
+    /// is what makes a canary a canary — the launch goes against the version named rather than
+    /// against whatever became latest while it was starting.
+    ///
+    /// **Falsification** — run 2026-08-16. Drop the `image_version` assignment in
+    /// `run_microvm` and the pinned assertion goes red with the member absent; remove
+    /// `skip_serializing_if` from the wire field and the absence assertion goes red with a
+    /// `null`.
+    #[tokio::test]
+    async fn a_pinned_launch_version_reaches_the_wire_and_an_unpinned_one_omits_the_member() {
+        let (plane, fake, _) = planted();
+        fake.answer(
+            "RunMicrovm",
+            Answer::ok(fake::microvm_response("PENDING", None)),
+        );
+        let payload = RunHookPayload::for_agent_token("token").expect("fits");
+        plane
+            .run_microvm(RunMicrovmRequest::new("arn:image", payload).with_image_version("2.0"))
+            .await
+            .expect("launches");
+
+        let body = fake.first_body("RunMicrovm");
+        assert_eq!(body["imageVersion"], "2.0");
+        assert_eq!(
+            body["imageIdentifier"], "arn:image",
+            "pinning a version does not replace the identifier; both are sent"
+        );
+
+        let (plane, fake, _) = planted();
+        fake.answer(
+            "RunMicrovm",
+            Answer::ok(fake::microvm_response("PENDING", None)),
+        );
+        let payload = RunHookPayload::for_agent_token("token").expect("fits");
+        plane
+            .run_microvm(RunMicrovmRequest::new("arn:image", payload))
+            .await
+            .expect("launches");
+        assert!(
+            fake.first_body("RunMicrovm").get("imageVersion").is_none(),
+            "an unpinned launch must send what this client always sent: {}",
+            fake.first_body("RunMicrovm")
+        );
+    }
+
+    /// An invalid `imageVersion` is refused before any call — including on the launch path,
+    /// which is where a rollback happens.
+    ///
+    /// A `ValidationException` about the request rather than about the version, arriving at the
+    /// moment someone is re-pinning away from a bad build, is the least useful failure
+    /// available. So the `Version` shape's three constraints are checked here.
+    ///
+    /// **Falsification** — run 2026-08-16. Delete the `require_valid_version` call from
+    /// `run_microvm` and the zero-call assertion goes red.
+    #[tokio::test]
+    async fn an_invalid_launch_version_reaches_no_control_plane_call() {
+        for bad in ["", "2.0\n", "a b"] {
+            let (plane, fake, _) = planted();
+            let payload = RunHookPayload::for_agent_token("token").expect("fits");
+            let error = plane
+                .run_microvm(RunMicrovmRequest::new("arn:image", payload).with_image_version(bad))
+                .await
+                .expect_err(&format!("{bad:?} is not a legal Version"));
+            assert_eq!(error.kind(), ErrorKind::InvalidArg, "{bad:?}");
+            assert!(
+                error.to_string().contains("imageVersion"),
+                "{bad:?}: {error}"
+            );
+            assert_eq!(fake.calls().len(), 0, "{bad:?} must not reach the wire");
+        }
     }
 
     /// The connectors reaching the wire are ARNs, never bare names — a bare name is rejected

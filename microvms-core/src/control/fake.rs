@@ -432,6 +432,20 @@ pub fn list_versions_page(versions: &[&str], next_token: Option<&str>) -> String
 /// One `MicrovmImageVersionSummary`, in the model's spelling. `state`, not `buildState` —
 /// the asymmetry with the build summary is the whole trap.
 fn version_item(version: &str, state: &str, extra: &str) -> String {
+    version_item_with_status(version, state, "ACTIVE", extra)
+}
+
+/// One `MicrovmImageVersionSummary` in `state` with an explicit availability `status`.
+///
+/// The `status` parameter is what a retire test needs: `INACTIVE` is the value
+/// `UpdateMicrovmImageVersion` sets and the value a readback has to be able to disagree
+/// with, and a fake that always answered `ACTIVE` would make the readback assertion in
+/// `set_image_version_status` unfalsifiable.
+///
+/// Every one of the model's eight required members is present, `status` included, because
+/// [`super::ops::MicrovmImageVersionSummaryWire`] now requires all eight — a fake that
+/// omitted one would fail to parse, which is the honest-fake rule doing its job.
+fn version_item_with_status(version: &str, state: &str, status: &str, extra: &str) -> String {
     format!(
         r#"{{
             "baseImageArn": "arn:aws:lambda:us-east-1:aws:microvm-image:al2023-1",
@@ -440,10 +454,123 @@ fn version_item(version: &str, state: &str, extra: &str) -> String {
             "imageArn": "arn:aws:lambda:us-east-1:123456789012:microvm-image:img",
             "imageVersion": "{version}",
             "state": "{state}",
-            "status": "ACTIVE",
+            "status": "{status}",
             "createdAt": 1754524800{extra}
         }}"#
     )
+}
+
+/// `GetMicrovmImageVersionOutput` / `UpdateMicrovmImageVersionResponse` for one version.
+///
+/// The two operations answer the same shape as the listing's item, which is why one literal
+/// serves all three — the model declares them member-for-member identical. The response is
+/// the item alone rather than wrapped in `items`, which is the one difference between a get
+/// and a list and the one a wrong deserializer would get wrong.
+pub fn get_image_version_response(version: &str, state: &str, status: &str) -> String {
+    version_item_with_status(version, state, status, "")
+}
+
+/// The same, with a version-level `stateReason` — the member measured **null** on real
+/// failures, kept parametric so a test can assert either way.
+pub fn get_image_version_response_with_reason(
+    version: &str,
+    state: &str,
+    status: &str,
+    state_reason: &str,
+) -> String {
+    version_item_with_status(
+        version,
+        state,
+        status,
+        &format!(r#", "stateReason": {}"#, json_string(state_reason)),
+    )
+}
+
+/// `GetMicrovmImageBuildOutput`: the summary's members plus `snapshotBuild`.
+///
+/// `snapshot_build` is the raw JSON fragment rather than three numbers, so a test can seed
+/// the **partial** shape a real failed build answers with — measured 2026-08-16, a `FAILED`
+/// build carried `codeInstallSizeInBytes` alone. A helper taking three `u64`s could not
+/// express that, and the partial shape is the diagnosis.
+pub fn get_image_build_response(
+    build_id: &str,
+    build_state: &str,
+    generation: &str,
+    state_reason: Option<&str>,
+    snapshot_build: Option<&str>,
+) -> String {
+    let reason = match state_reason {
+        Some(reason) => format!(r#", "stateReason": {}"#, json_string(reason)),
+        None => String::new(),
+    };
+    let sizes = match snapshot_build {
+        Some(fragment) => format!(r#", "snapshotBuild": {fragment}"#),
+        None => String::new(),
+    };
+    format!(
+        r#"{{
+            "imageArn": "arn:aws:lambda:us-east-1:123456789012:microvm-image:img",
+            "imageVersion": "1",
+            "buildId": "{build_id}",
+            "buildState": "{build_state}",
+            "architecture": "ARM_64",
+            "chipset": "GRAVITON",
+            "chipsetGeneration": "{generation}",
+            "createdAt": 1754524800{reason}{sizes}
+        }}"#
+    )
+}
+
+/// `ListManagedMicrovmImageVersionsOutput`: `(imageVersion)` strings and an optional cursor.
+///
+/// The version strings are **bare integers** here because that is what the managed base
+/// answers — `"0"` and `"1"`, measured 2026-08-16 — where a custom image's are `"1.0"`. A
+/// fake that used the custom spelling would let a client that parsed one format look correct.
+pub fn list_managed_versions_page(versions: &[&str], next_token: Option<&str>) -> String {
+    let items: Vec<String> = versions
+        .iter()
+        .map(|version| {
+            format!(
+                r#"{{
+                    "imageArn": "arn:aws:lambda:us-east-1:aws:microvm-image:al2023-1",
+                    "imageVersion": "{version}",
+                    "createdAt": 1750000000,
+                    "updatedAt": 1753000000
+                }}"#
+            )
+        })
+        .collect();
+    let token = match next_token {
+        Some(token) => format!(r#", "nextToken": {}"#, json_string(token)),
+        None => String::new(),
+    };
+    format!(r#"{{"items": [{}]{token}}}"#, items.join(", "))
+}
+
+/// `ListManagedMicrovmImagesOutput`: an ARN and two timestamps per item, which is **all** the
+/// model declares on `ManagedMicrovmImageSummary`.
+///
+/// No `name`, no `architecture`, no registry reference — the poverty of this shape is why a
+/// discovered base cannot construct a `BaseImage`, and a fake that invented a `dockerRef`
+/// would make the limitation look like an oversight in the client.
+pub fn list_managed_images_page(names: &[&str], next_token: Option<&str>) -> String {
+    let items: Vec<String> = names
+        .iter()
+        .map(|name| {
+            format!(
+                r#"{{
+                    "imageArn": "arn:aws:lambda:us-east-1:aws:microvm-image:{name}",
+                    "createdAt": 1750000000,
+                    "updatedAt": 1753000000
+                }}"#
+            )
+        })
+        .collect();
+    let token = match next_token {
+        Some(token) => format!(r#", "nextToken": {}"#, json_string(token)),
+        None => String::new(),
+    };
+    format!(r#"{{"items": [{}]{token}}}"#, items.join(", "))
 }
 
 /// `ListMicrovmImageBuildsOutput` whose builds are all in `build_state`.

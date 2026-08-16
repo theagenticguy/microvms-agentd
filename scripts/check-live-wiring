@@ -74,6 +74,7 @@ MEMBER_EXIT_VARS: dict[str, str] = {
     "live:rates": "RATES_EXIT",
     "live:verify-clean": "CLEAN_EXIT",
     "live:paths": "PATHS_EXIT",
+    "live:versions": "VERSIONS_EXIT",
 }
 
 

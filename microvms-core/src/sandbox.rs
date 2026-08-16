@@ -146,6 +146,16 @@ impl std::fmt::Display for Lifecycle {
 pub struct RunRequest {
     /// The image to launch, or `None` for the one [`Sandbox::build_image`] built.
     pub image_identifier: Option<String>,
+    /// `imageVersion`, or `None` for the image's own latest active version.
+    ///
+    /// Pinning is what makes a canary a canary: without it a launch takes whatever version is
+    /// latest at the moment the call lands, which is not necessarily the one the caller just
+    /// built. Paired with [`crate::control::ControlPlane::set_image_version_status`] it is also
+    /// the rollback — set the bad version INACTIVE, re-pin here to the good one — and a version
+    /// set INACTIVE refuses to launch when named here.
+    ///
+    /// See [`crate::control::RunMicrovmRequest::image_version`], which this forwards to.
+    pub image_version: Option<String>,
     /// The execution role. Optional in the model; every real launch needs one.
     pub execution_role_arn: Option<String>,
     /// The bearer token the daemon will accept, or `None` to mint one.
@@ -184,6 +194,7 @@ impl Default for RunRequest {
     fn default() -> Self {
         Self {
             image_identifier: None,
+            image_version: None,
             execution_role_arn: None,
             agent_token: None,
             launch_env: std::collections::HashMap::new(),
@@ -216,6 +227,13 @@ impl RunRequest {
     #[must_use]
     pub fn with_egress(mut self) -> Self {
         self.egress = true;
+        self
+    }
+
+    /// Pins the launch to one `imageVersion`. See the field for why.
+    #[must_use]
+    pub fn with_image_version(mut self, version: impl Into<String>) -> Self {
+        self.image_version = Some(version.into());
         self
     }
 
@@ -576,6 +594,29 @@ impl Sandbox {
         self.control.artifact_content_hash_for(request)
     }
 
+    /// The versions of a managed base image, for pinning
+    /// [`CreateImageRequest::base_image_version`].
+    ///
+    /// A read-only delegation to [`crate::control::ControlPlane::managed_base_versions`], on
+    /// this type for the reason [`Self::resolve_image_arn`] gives: it touches none of the five
+    /// state-machine variables, because a question about AWS's published bases is not a
+    /// question about this VM's lifecycle.
+    pub async fn managed_base_versions(
+        &self,
+        base_image_arn: &str,
+    ) -> Result<Vec<crate::control::ops::ManagedMicrovmImageVersionWire>, Error> {
+        self.control.managed_base_versions(base_image_arn).await
+    }
+
+    /// One version's configuration, state, and availability status. Read-only.
+    pub async fn image_version(
+        &self,
+        identifier: &str,
+        version: &str,
+    ) -> Result<crate::control::ops::MicrovmImageVersionSummaryWire, Error> {
+        self.control.get_image_version(identifier, version).await
+    }
+
     // ── run (STATE-1, STATE-2, STATE-3) ──────────────────────────────────────
 
     /// Launches a MicroVM, waits for RUNNING, and returns its session.
@@ -631,6 +672,7 @@ impl Sandbox {
         let payload = RunHookPayload::for_launch(&agent_token, &request.launch_env)?;
 
         let mut wire = RunMicrovmRequest::new(&identifier, payload);
+        wire.image_version = request.image_version.clone();
         wire.execution_role_arn = request.execution_role_arn.clone();
         wire.max_idle_sec = request.max_idle_sec;
         wire.suspended_sec = request.suspended_sec;
@@ -1258,6 +1300,49 @@ mod tests {
             "https://gateway.example"
         );
         assert_eq!(inner["env"]["PATH"], "/usr/local/bin:/usr/bin:/bin");
+    }
+
+    /// **A pinned `imageVersion` reaches the wire through the sandbox**, and an unpinned
+    /// launch omits the member entirely.
+    ///
+    /// This is the layer a caller actually uses, so the forwarding is what needs asserting:
+    /// [`RunRequest::image_version`] is a field on a struct and proves nothing about the
+    /// emitted body until it is read off the wire member.
+    ///
+    /// **Falsification** — run 2026-08-16. Drop `wire.image_version = ...` from `run` and the
+    /// pinned assertion goes red with the member absent, while every other launch test still
+    /// passes — which is why this one is here.
+    #[tokio::test]
+    async fn a_pinned_image_version_is_forwarded_to_the_launch_request() {
+        let (mut sandbox, recorder, _) = planted();
+        answer_launch(&recorder);
+        sandbox
+            .run(
+                RunRequest::new()
+                    .with_image("arn:image")
+                    .with_image_version("2.0"),
+            )
+            .await
+            .expect("launches");
+        assert_eq!(
+            recorder.first_body("RunMicrovm")["imageVersion"],
+            "2.0",
+            "a canary has to launch against the version it means to test"
+        );
+
+        let (mut sandbox, recorder, _) = planted();
+        answer_launch(&recorder);
+        sandbox
+            .run(RunRequest::new().with_image("arn:image"))
+            .await
+            .expect("launches");
+        assert!(
+            recorder
+                .first_body("RunMicrovm")
+                .get("imageVersion")
+                .is_none(),
+            "an unpinned launch sends what this client always sent"
+        );
     }
 
     /// **The local refusal, with zero control-plane calls.**

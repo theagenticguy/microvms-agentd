@@ -1210,3 +1210,96 @@ us-east-1 rates ($0.0000276944 per vCPU-second and $0.0000036667 per GB-second, 
 4500 vCPU-seconds plus 9000 GB-seconds), plus $0.0031 for one 2 GB snapshot read: about
 **$0.16**. Wall-clock time is the whole cost of this measurement, and it cannot be
 shortened, because the thing being measured is a one-hour boundary.
+
+## `INACTIVE` is a real retire: `RunMicrovm` refuses the version, pinned or not
+
+Measured 2026-08-16, us-east-1, API version `2025-09-09`, on a purpose-built image
+(`microvm-cli-cpc-ok`) whose only version was `1.0`.
+
+`UpdateMicrovmImageVersion` is a `PATCH` to
+`/2025-09-09/microvm-images/{imageIdentifier}/versions/{imageVersion}` whose body is one
+member, `status`, taking `ACTIVE` or `INACTIVE`. It is the model's only non-destructive way
+to take a version out of service — `DeleteMicrovmImageVersion` is the alternative, and it is
+irreversible, refuses an image's last version, and destroys the readback a post-mortem needs.
+
+The status is enforced, and that is the whole finding. With version `1.0` set `INACTIVE`:
+
+| request | answer |
+| --- | --- |
+| `RunMicrovm --image-version 1.0` | **404** `No active version found for MicroVM image <arn> and version 1.0` |
+| `RunMicrovm` with no version at all | **404** `No active version found for MicroVM image <arn>` |
+| `GetMicrovmImageVersion` | 200, `state: SUCCESSFUL`, `status: INACTIVE` |
+| set back to `ACTIVE`, then `RunMicrovm --image-version 1.0` | launches |
+
+Three things follow. The refusal is a `ResourceNotFoundException` rather than a
+`ConflictException` or a validation error, so a caller reading the code alone would think the
+image had been deleted — the *message* is what distinguishes them, and it names the version.
+An **unpinned** launch is refused too when no version is active, so retiring an image's only
+version takes the whole image out of service rather than falling back. And `state` and `status`
+are genuinely separate fields: the retired version stayed `SUCCESSFUL`, so a client reading
+`state` alone cannot tell a retired version from a live one.
+
+Retiring and restoring cost nothing and took under a second each. Existing VMs were not
+checked against a retire in this measurement; the model documents `INACTIVE` as blocking new
+launches only, and nothing observed contradicts that.
+
+## A launch with no `executionRoleArn` **succeeds**, so there is no free `RunMicrovm` probe
+
+Measured 2026-08-16, us-east-1, at the cost of one leaked MicroVM.
+
+The technique this file records for bracketing `runHookPayload` — make one field invalid in a
+way that fails later than the constraint under test, then read which error comes back — has no
+`RunMicrovm` equivalent that omits the execution role. `executionRoleArn` is optional in the
+model and the service means it: a `RunMicrovm` carrying an image, a payload, and an ingress
+connector but **no execution role** was accepted and created
+`microvm-337c4bb6-d1f1-3540-ab7a-29cec8120d16`, which had to be terminated by hand.
+
+So a test that wants to know how `RunMicrovm` answers something must expect to create a VM.
+`microvms-core/tests/live_versions.rs` does exactly that and terminates on the next line; the
+bogus-`imageIdentifier` technique still works for members validated before the image is
+resolved, but "leave a required-looking field out" is not one of them.
+
+## `GetMicrovmImageBuild`'s `snapshotBuild` is absent on a container-build failure and partial on a hook timeout
+
+Measured 2026-08-16, us-east-1, across three builds of two deliberately failing images and one
+successful one. The shape of `snapshotBuild` is itself a diagnosis, and it has three forms:
+
+| build outcome | `snapshotBuild` |
+| --- | --- |
+| `SUCCESSFUL` | all three members: `memorySnapshotSizeInBytes` 574869504, `codeInstallSizeInBytes` 214093824, `diskSnapshotSizeInBytes` 23474176 |
+| `FAILED`, ready hook timed out (`bonk-sandbox-v4`) | **`codeInstallSizeInBytes` alone**, 1724940288 |
+| `FAILED`, `RUN … && exit 42` (`microvm-cli-cpc-fail`) | **member absent entirely** |
+
+That distinguishes two failures a `stateReason` cannot. `The container image build failed.`
+with no `snapshotBuild` is a Dockerfile that broke before anything was installed. `Ready hook
+invocation timed out after PT5M` with a `codeInstallSizeInBytes` and no snapshots is 1.7 GB of
+code installed and then a daemon that never became ready — which points at the daemon rather
+than at the build. A client that defaulted the absent members to `0` would erase the
+distinction, which is why all three are `Option` in `microvms-core`.
+
+Both failing images produced **two** failed builds, one per Graviton generation (4 and 3), with
+identical reasons. So a diagnostic should expect a list, and the fan-out means a partially
+failed image — one generation succeeding, the other not — is a state to expect.
+
+## `baseImageVersion` is accepted, validated, and normalised on the way back
+
+Measured 2026-08-16, us-east-1. `CreateMicrovmImage` takes a `baseImageVersion` and the three
+things it does with one are each worth knowing.
+
+It is **validated before anything is created**. `--base-image-version 999` against `al2023-1`
+answers `400 ValidationException: No managed MicroVM Image with arn <base-arn> and version 999
+is available`, and `GetMicrovmImage` on the name afterwards answers
+`ResourceNotFoundException` — so a bogus pin costs the artifact upload and creates no image.
+That makes it a cheap way to enumerate what the base accepts, though
+`ListManagedMicrovmImageVersions` answers the same question for free.
+
+It is **normalised**. A build pinned with `baseImageVersion: "1"` reads back
+`baseImageVersion: "1.0"` from `GetMicrovmImageVersion`. So there are now three spellings of a
+base version in play: `"0"` and `"1"` from `ListManagedMicrovmImageVersions`, `"1.0"` echoed by
+the version readback, and `"1.0"`-style versions on custom images. The echoed value cannot be
+fed back into a request and cannot be compared against the managed listing's strings.
+
+And it is **recorded**, which is the point. An unpinned build also reports a
+`baseImageVersion` on its version readback, so the value is not evidence that a pin happened —
+what pinning buys is that two builds weeks apart sit on the same base rather than on whatever
+the default has moved to.

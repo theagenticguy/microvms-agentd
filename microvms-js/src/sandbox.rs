@@ -280,6 +280,13 @@ impl BuildImageOptions {
 pub struct RunOptions {
     /// The image to launch, or omitted for the one `buildImage` built.
     pub image_identifier: Option<String>,
+    /// `imageVersion`, or omitted for the image's own latest active version.
+    ///
+    /// Pinning is what makes a canary launch against the version it means to test rather than
+    /// against whatever became latest while it was starting, and it is the half of a rollback
+    /// that re-points at the known-good build. A version the control plane has set INACTIVE
+    /// refuses to launch when named here.
+    pub image_version: Option<String>,
     /// The execution role. Optional in the model; every real launch needs one.
     pub execution_role_arn: Option<String>,
     /// The bearer token the daemon will accept, or omitted to mint one.
@@ -511,6 +518,7 @@ impl Sandbox {
         // in step.
         let request = RunRequest {
             image_identifier: options.image_identifier,
+            image_version: options.image_version,
             execution_role_arn: options.execution_role_arn,
             agent_token: options.agent_token,
             launch_env: options.launch_env.unwrap_or(defaults.launch_env),
