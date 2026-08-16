@@ -63,7 +63,10 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import os
 import re
+import shlex
+import shutil
 import subprocess
 import sys
 import tomllib
@@ -135,6 +138,28 @@ def python_surface() -> tuple[set[Path], list[Path]]:
     return expected, intruders
 
 
+def ruff_command() -> list[str]:
+    """How to invoke ruff here, which is not the same answer in every environment.
+
+    `ruff` is on PATH under mise, which is how `mise run lint` reaches it. CI installs
+    nothing and calls `uvx ruff`, so a bare `ruff` there is a `FileNotFoundError` and this
+    gate fails on its own tooling rather than on the coverage it exists to check. Measured:
+    that is exactly how it first failed in CI. `RUFF` overrides both, so a caller pinning a
+    version gets the version they pinned.
+    """
+    override = os.environ.get("RUFF")
+    if override:
+        return shlex.split(override)
+    if shutil.which("ruff"):
+        return ["ruff"]
+    if shutil.which("uvx"):
+        return ["uvx", "ruff"]
+    raise SystemExit(
+        "check-lint-coverage: no ruff found. Install it (mise install), or set RUFF to how "
+        "to run it (for example RUFF='uvx ruff@0.15.22')."
+    )
+
+
 def inspected(root: str) -> set[Path]:
     """What `ruff check` says it would read under `root`, relative to the repo.
 
@@ -142,7 +167,7 @@ def inspected(root: str) -> set[Path]:
     its own settings tables, which is not the Python surface this gate is about.
     """
     out = subprocess.run(
-        ["ruff", "check", "--show-files", root],
+        [*ruff_command(), "check", "--show-files", root],
         capture_output=True,
         text=True,
         check=True,
@@ -175,7 +200,7 @@ def format_excluded() -> set[Path]:
 def format_inspected(root: str) -> int:
     """How many files `ruff format --check` looked at, off its own summary line."""
     out = subprocess.run(
-        ["ruff", "format", "--check", root],
+        [*ruff_command(), "format", "--check", root],
         capture_output=True,
         text=True,
         cwd=REPO,
