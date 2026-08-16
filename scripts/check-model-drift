@@ -436,7 +436,9 @@ class Checker:
 
     def enum(self, label: str, shape: str, ours: Iterable[str]) -> None:
         self.touched.add(shape)
-        self.record(label, tuple(sorted(ours)), tuple(sorted(self.shape(shape)["enum"])))
+        self.record(
+            label, tuple(sorted(ours)), tuple(sorted(self.shape(shape)["enum"]))
+        )
 
     def bound(self, label: str, shape: str, key: str, ours: Any) -> None:
         self.touched.add(shape)
@@ -478,7 +480,11 @@ def check(src: Source, model: dict[str, Any]) -> Checker:
     # model that no loop knows is a VM this client waits out rather than reports.
     c.enum("MicrovmState enum", "MicrovmState", MICROVM_STATES)
     c.enum("MicrovmImageState enum", "MicrovmImageState", IMAGE_STATES)
-    c.enum("MicrovmImageVersionState enum", "MicrovmImageVersionState", IMAGE_VERSION_STATES)
+    c.enum(
+        "MicrovmImageVersionState enum",
+        "MicrovmImageVersionState",
+        IMAGE_VERSION_STATES,
+    )
     c.enum("BuildState enum", "BuildState", BUILD_STATES)
     c.enum("Chipset enum", "Chipset", CHIPSETS)
 
@@ -491,7 +497,9 @@ def check(src: Source, model: dict[str, Any]) -> Checker:
         ("DEAD_STATES ⊆ MicrovmState", src.get("DEAD_STATES")),
     ):
         unknown = sorted(set(ours) - model_states)
-        c.record(label, unknown, [], note="states our code branches on that the model omits")
+        c.record(
+            label, unknown, [], note="states our code branches on that the model omits"
+        )
 
     # `IMAGE_READY_STATES` deliberately carries two spellings the enum does not have
     # (`ACTIVE`, `AVAILABLE`), kept for older API versions. So the model-derived half
@@ -642,7 +650,12 @@ def check(src: Source, model: dict[str, Any]) -> Checker:
     ):
         c.bound(f"{shape} max", shape, "max", MAX_LIST_PAGE_SIZE)
         c.bound(f"{shape} min", shape, "min", 1)
-    c.bound("EnvironmentVariableMap max", "EnvironmentVariableMap", "max", MAX_ENVIRONMENT_VARIABLES)
+    c.bound(
+        "EnvironmentVariableMap max",
+        "EnvironmentVariableMap",
+        "max",
+        MAX_ENVIRONMENT_VARIABLES,
+    )
     c.pattern("RoleArn pattern", "RoleArn", ROLE_ARN_PATTERN)
 
     # `min: 60` with no max, and the one constraint here botocore *does* enforce
@@ -665,7 +678,9 @@ def check(src: Source, model: dict[str, Any]) -> Checker:
         for member, spec in body.get("members", {}).items()
         if spec.get("idempotencyToken")
     }
-    c.record("idempotencyToken members", sorted(IDEMPOTENCY_TOKEN_MEMBERS), sorted(found))
+    c.record(
+        "idempotencyToken members", sorted(IDEMPOTENCY_TOKEN_MEMBERS), sorted(found)
+    )
 
     # All three token shapes, separately. This one earned its place: the coverage
     # report below named `RunMicrovmRequestClientTokenString` as unbound, and checking
@@ -738,7 +753,14 @@ def check(src: Source, model: dict[str, Any]) -> Checker:
 #: model is how we learn the model moved. Keeping them here rather than dropping
 #: them is the difference between a checker that covers what we use and one that
 #: covers what the service states.
-MICROVM_STATES = ("PENDING", "RUNNING", "SUSPENDING", "SUSPENDED", "TERMINATING", "TERMINATED")
+MICROVM_STATES = (
+    "PENDING",
+    "RUNNING",
+    "SUSPENDING",
+    "SUSPENDED",
+    "TERMINATING",
+    "TERMINATED",
+)
 IMAGE_STATES = (
     "CREATING",
     "CREATED",
@@ -882,7 +904,9 @@ def main() -> int:
     if args.verbose:
         for name in missing:
             body = model["shapes"][name]
-            stated = {k: v for k, v in body.items() if k in ("enum", "min", "max", "pattern")}
+            stated = {
+                k: v for k, v in body.items() if k in ("enum", "min", "max", "pattern")
+            }
             print(f"  -- {name} {stated}")
     else:
         print(f"  {', '.join(missing[:8])}{', ...' if len(missing) > 8 else ''}")
@@ -894,9 +918,13 @@ def main() -> int:
     )
 
     if drifted:
-        print(f"\n{len(drifted)} constraint(s) drifted. Either the model moved, one of our")
+        print(
+            f"\n{len(drifted)} constraint(s) drifted. Either the model moved, one of our"
+        )
         print("values was wrong, or a value the model cannot state disagrees with this")
-        print("script's pinned copy of it. Read the model, fix the constant, and re-measure")
+        print(
+            "script's pinned copy of it. Read the model, fix the constant, and re-measure"
+        )
         print("if it is a ceiling.")
         return 1
     print(

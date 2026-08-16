@@ -22,8 +22,9 @@ from __future__ import annotations
 import ast
 from pathlib import Path
 
-import microvms
 import pytest
+
+import microvms
 
 STUB = Path(__file__).resolve().parent.parent / "microvms.pyi"
 

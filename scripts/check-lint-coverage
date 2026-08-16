@@ -1,0 +1,255 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = []
+# ///
+# SPDX-License-Identifier: Apache-2.0
+"""Assert the ruff gate is looking at every Python file, rather than at none of them.
+
+The defect this exists for is not a lint finding, it is a lint gate that passed over an
+empty set. `mise run lint` ran `ruff check conformance scripts` for the whole life of that
+line, and `scripts/` contributed nothing to it: ruff discovers Python by **extension** when
+it walks a directory, every gate in `scripts/` is an extensionless PEP 723 script, so ruff
+warned "No Python files found under the given path(s)" and exited 0. Green tick, zero files.
+That is the shape `scripts/check-model-drift`'s own header names — "a green tick over three
+silent checks is the failure mode" — and it hid real findings, since the first script to be
+named explicitly turned out to have unused imports in it.
+
+`ruff.toml`'s `extend-include = ["scripts/*"]` is the fix. This is the guard *over* the fix,
+and it is separate for a reason: a config that stops matching fails the same silent way the
+original bug did. `ruff check .` would still print "All checks passed!" over nothing.
+
+So this compares two independently derived answers to "what is the Python in this repo":
+
+  **expected** — every tracked file that is Python, read off git. That is `*.py` and `*.pyi`
+  by extension, plus every tracked file whose first line is a `python` or `uv run` shebang,
+  which is what makes the extensionless gates visible without naming any of them. A new
+  script under `scripts/` joins this set by existing.
+
+  **actual** — `ruff check --show-files`, which is ruff reporting the files it would
+  inspect under its own configuration.
+
+Any file in the first set and not the second is the bug, by name. The count is reported
+either way, because a file count beside a passing gate is the line that would have made the
+original defect obvious to a reader.
+
+Three further assertions, each about a way the comparison itself could go quiet:
+
+  1. `expected` must not be empty. Two derived sets agreeing on nothing is not agreement.
+     `MIN_EXPECTED` is a floor on the *enumerator*, not on the repo — it fires when git
+     answers nothing (wrong directory, a broken checkout), not when a file is deleted.
+  2. The formatter is counted separately from the linter, because `ruff format` resolves its
+     own `exclude` and can therefore go blind over a file the linter still reads. Its
+     inspected count comes off the summary line it prints, and the deliberately unformatted
+     files are read out of `ruff.toml` rather than repeated here. What this catches is
+     format-side blindness the config does not account for; **widening** `[format] exclude`
+     lowers both sides and passes, by design — that is a config edit visible in a diff, and
+     `ruff.toml` is where each entry states its reason.
+  3. A tracked file under `scripts/` with a non-Python shebang is reported as its own
+     finding. `extend-include = ["scripts/*"]` claims everything in that directory is
+     Python; a shell helper dropped there would otherwise be reported as a wall of syntax
+     errors that name the symptom and not the cause.
+
+Usage:
+    scripts/check-lint-coverage           # the guard. Offline, free, milliseconds
+    scripts/check-lint-coverage --root D  # hand ruff a different path; the expected set
+                                          # still comes from the repo. This is how the
+                                          # gate is proven able to fail: point it at a
+                                          # directory with no Python and it reports every
+                                          # expected file as unseen, which is exactly the
+                                          # original defect reproduced on purpose.
+"""
+
+from __future__ import annotations
+
+import argparse
+import re
+import subprocess
+import sys
+import tomllib
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parent.parent
+CONFIG = REPO / "ruff.toml"
+
+#: A floor on the enumerator, not on the repo. See assertion 1 in the docstring: this
+#: number exists so that `git ls-files` answering nothing is a failure rather than a
+#: vacuous pass, and it is deliberately well below the real count so that deleting a file
+#: does not require editing it. The name-by-name comparison is what catches a shortfall.
+MIN_EXPECTED = 8
+
+#: Matches the interpreter line on the PEP 723 gates (`#!/usr/bin/env -S uv run --script`)
+#: and on a plain `#!/usr/bin/env python3`. Read from the file rather than inferred from the
+#: directory, so a shell script in `scripts/` is classified as what it is.
+PY_SHEBANG = re.compile(r"^#!.*(?:\bpython|\buv\s+run\b)")
+
+#: `ruff format --check`'s summary: "N files would be reformatted, M files already
+#: formatted", either half alone, and the singular "1 file". The two numbers sum to what
+#: the formatter inspected, which is the only count it reports.
+#:
+#: A floor rather than an equality, because that sum is version-dependent and legitimately
+#: larger than the Python surface: ruff 0.16 formats Python inside Markdown fences, so it
+#: reports 66 files over this repo's 25 `docs/*.md` and 3 workflows where 0.15.22 reports 17.
+#: More is not a defect. Fewer than the expected Python is.
+FORMAT_TALLY = re.compile(r"(\d+) files? (?:would be reformatted|already formatted)")
+
+
+def tracked() -> list[Path]:
+    """Every tracked path, as `git ls-files` gives them: relative to the repo root."""
+    out = subprocess.run(
+        ["git", "ls-files"],
+        capture_output=True,
+        text=True,
+        check=True,
+        cwd=REPO,
+    )
+    return [Path(line) for line in out.stdout.splitlines() if line]
+
+
+def first_line(path: Path) -> str:
+    try:
+        with (REPO / path).open("rb") as handle:
+            return handle.readline().decode("utf-8", "replace").rstrip("\n")
+    except OSError:
+        # A tracked path that is not readable here (a submodule stub, a broken symlink) is
+        # not something ruff would read either, so it is not a shortfall.
+        return ""
+
+
+def python_surface() -> tuple[set[Path], list[Path]]:
+    """The expected Python set, and the `scripts/` files that are not Python.
+
+    Extension first, shebang second. The shebang pass is what reaches the extensionless
+    gates, and it is the half that makes this set grow by itself.
+    """
+    expected: set[Path] = set()
+    intruders: list[Path] = []
+    for path in tracked():
+        if path.suffix in {".py", ".pyi"}:
+            expected.add(path)
+            continue
+        if PY_SHEBANG.match(first_line(path)):
+            expected.add(path)
+        elif path.parent == Path("scripts"):
+            intruders.append(path)
+    return expected, intruders
+
+
+def inspected(root: str) -> set[Path]:
+    """What `ruff check` says it would read under `root`, relative to the repo.
+
+    `.toml` is dropped: ruff lists `pyproject.toml` and `ruff.toml` here because it lints
+    its own settings tables, which is not the Python surface this gate is about.
+    """
+    out = subprocess.run(
+        ["ruff", "check", "--show-files", root],
+        capture_output=True,
+        text=True,
+        check=True,
+        cwd=REPO,
+    )
+    files: set[Path] = set()
+    for line in out.stdout.splitlines():
+        if not line:
+            continue
+        path = Path(line)
+        if path.suffix == ".toml":
+            continue
+        files.add(path.relative_to(REPO) if path.is_absolute() else path)
+    return files
+
+
+def format_excluded() -> set[Path]:
+    """`[format] exclude` from `ruff.toml`, read rather than restated.
+
+    Repeating the list here would let the two drift, and a coverage gate that disagrees
+    with the config about what is deliberately skipped reports the config as a defect.
+    """
+    if not CONFIG.is_file():
+        return set()
+    with CONFIG.open("rb") as handle:
+        settings = tomllib.load(handle)
+    return {Path(p) for p in settings.get("format", {}).get("exclude", [])}
+
+
+def format_inspected(root: str) -> int:
+    """How many files `ruff format --check` looked at, off its own summary line."""
+    out = subprocess.run(
+        ["ruff", "format", "--check", root],
+        capture_output=True,
+        text=True,
+        cwd=REPO,
+    )
+    # Exit code 1 here means "would reformat", which is a lint finding for `mise run lint`
+    # to report and not this gate's subject. The counts are on stdout either way.
+    return sum(int(n) for n in FORMAT_TALLY.findall(out.stdout))
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--root",
+        default=".",
+        help="the path handed to ruff (default '.'); the expected set always comes"
+        " from the repo, so a root with no Python fails loudly",
+    )
+    args = parser.parse_args()
+
+    expected, intruders = python_surface()
+    findings: list[str] = []
+
+    if len(expected) < MIN_EXPECTED:
+        findings.append(
+            f"the enumerator found only {len(expected)} Python files in the repo,"
+            f" below the floor of {MIN_EXPECTED}. `git ls-files` answering (almost)"
+            " nothing makes every comparison below vacuous, so this is a failure"
+            " rather than a clean run."
+        )
+
+    seen = inspected(args.root)
+    unseen = sorted(expected - seen)
+    if unseen:
+        findings.append(
+            f"ruff inspects {len(seen)} files under '{args.root}' and the repo has"
+            f" {len(expected)}. {len(unseen)} Python files are NOT linted:\n"
+            + "\n".join(f"    {path}" for path in unseen)
+            + "\n  An extensionless script needs `extend-include` in ruff.toml to match it."
+            " That is the defect this gate exists for: ruff exits 0 over files it never"
+            " opened."
+        )
+
+    want_formatted = len(expected - format_excluded())
+    got_formatted = format_inspected(args.root)
+    if got_formatted < want_formatted:
+        findings.append(
+            f"ruff format inspects {got_formatted} files under '{args.root}', and"
+            f" {want_formatted} are expected ({len(expected)} Python files less the"
+            " ones `[format] exclude` names). The formatter resolves its own excludes,"
+            " so it can go blind while the linter still reads the file."
+        )
+
+    if intruders:
+        findings.append(
+            "these tracked files under scripts/ have no Python shebang, and"
+            ' `extend-include = ["scripts/*"]` will hand them to ruff as Python:\n'
+            + "\n".join(f"    {path}" for path in intruders)
+            + "\n  Either move the file out of scripts/, or add it to `exclude` in"
+            " ruff.toml with the reason — the same rule .trivyignore.yaml states, that"
+            " an ignore without a reason is a finding someone silenced."
+        )
+
+    if findings:
+        print("lint coverage: FAILED", file=sys.stderr)
+        for finding in findings:
+            print(f"  {finding}", file=sys.stderr)
+        return 1
+
+    print(
+        f"lint coverage: ruff lints all {len(expected)} Python files"
+        f" ({len(expected) - want_formatted} excluded from the formatter by name)"
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

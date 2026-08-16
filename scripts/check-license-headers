@@ -44,7 +44,11 @@ def insertion_point(lines: list[str], path: Path) -> int:
     at = 0
     if lines and lines[0].startswith("#!"):
         at = 1
-    if path.suffix == ".py" and at < len(lines) and lines[at].startswith("# /// script"):
+    if (
+        path.suffix == ".py"
+        and at < len(lines)
+        and lines[at].startswith("# /// script")
+    ):
         while at < len(lines) and lines[at] != "# ///":
             at += 1
         at += 1  # past the closing marker
@@ -63,7 +67,9 @@ def main() -> int:
     apply = "--fix" in sys.argv[1:]
     missing = [p for p in tracked_sources() if not has_spdx(p)]
     if not missing:
-        print(f"license headers: all {len(tracked_sources())} tracked source files carry the SPDX line")
+        print(
+            f"license headers: all {len(tracked_sources())} tracked source files carry the SPDX line"
+        )
         return 0
     if apply:
         for path in missing:

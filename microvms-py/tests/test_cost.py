@@ -46,7 +46,9 @@ def measured_report() -> microvms.CostReport:
 # -- the report's line items --------------------------------------------------
 
 
-def test_a_running_phase_bills_two_lines_because_vcpu_and_memory_are_priced_apart() -> None:
+def test_a_running_phase_bills_two_lines_because_vcpu_and_memory_are_priced_apart() -> (
+    None
+):
     """COST-5 plus the rate table's own `bills_vcpu_and_memory_separately`.
 
     One `running` line would be the mistake: the pricing page prices vCPU-seconds and
@@ -138,7 +140,9 @@ def test_a_lower_bound_carries_one_reason_per_unpriced_line_in_report_order() ->
     ]
 
 
-def test_priced_and_unpriced_partition_the_items_with_nothing_in_both_or_neither() -> None:
+def test_priced_and_unpriced_partition_the_items_with_nothing_in_both_or_neither() -> (
+    None
+):
     """A partition, so no line is double-counted into the floor or dropped from it."""
     report = measured_report()
     assert len(report.priced) + len(report.unpriced) == len(report.items)
@@ -184,7 +188,9 @@ def test_by_phase_selects_exactly_the_items_carrying_that_phase() -> None:
     assert sorted(regrouped) == sorted(item.phase for item in report.items)
 
 
-def test_an_unknown_phase_is_refused_by_the_core_and_the_message_offers_the_set() -> None:
+def test_an_unknown_phase_is_refused_by_the_core_and_the_message_offers_the_set() -> (
+    None
+):
     """The refusal names every phase, so a typo is self-correcting.
 
     The offered list is built from `CostPhase::ALL` in the core rather than written into the
@@ -330,7 +336,9 @@ def test_a_complete_report_has_an_exact_total_with_no_reasons() -> None:
 # -- provenance ---------------------------------------------------------------
 
 
-def test_a_measured_report_is_fully_measured_only_when_every_duration_was_timed() -> None:
+def test_a_measured_report_is_fully_measured_only_when_every_duration_was_timed() -> (
+    None
+):
     """`fully_measured` is an `all`, not an `any`.
 
     The default `image_retained` is a documented one-week minimum nobody timed, so a report
@@ -404,7 +412,9 @@ def test_a_plan_and_a_measured_run_over_the_same_seconds_cost_the_same() -> None
 # -- the rate table -----------------------------------------------------------
 
 
-def test_a_zero_length_run_costs_nothing_rather_than_rounding_up_to_an_increment() -> None:
+def test_a_zero_length_run_costs_nothing_rather_than_rounding_up_to_an_increment() -> (
+    None
+):
     """`minimum_billing_increment_sec` is `None` — not published, not one second.
 
     Inventing an increment would overcharge every short exec, and the figure a caller would
@@ -449,7 +459,9 @@ def test_a_fresh_table_reports_no_staleness_and_the_report_agrees_with_it() -> N
     assert (report.staleness is None) == (report.rates.age_days() <= stale_after)
 
 
-def test_the_minimum_retention_is_a_week_and_the_constants_agree_with_the_table() -> None:
+def test_the_minimum_retention_is_a_week_and_the_constants_agree_with_the_table() -> (
+    None
+):
     """One figure, reachable two ways, and they have to match.
 
     Snapshot storage bills at least this long however briefly the snapshot exists, so a
@@ -466,7 +478,9 @@ def test_the_minimum_retention_is_a_week_and_the_constants_agree_with_the_table(
 # -- size classes: the closed set --------------------------------------------
 
 
-def test_the_five_size_classes_are_the_documented_baselines_and_burst_four_times() -> None:
+def test_the_five_size_classes_are_the_documented_baselines_and_burst_four_times() -> (
+    None
+):
     """The table, asserted as the *relationship* rather than as ten numbers.
 
     Every class bursts to 4x its baseline in both memory and vCPU. Stating that as a ratio is
@@ -498,7 +512,9 @@ def test_the_default_class_is_the_middle_one_rather_than_the_smallest() -> None:
 
 
 @pytest.mark.parametrize("mib", [0, 511, 513, 1500, 3072, 8193, 16384])
-def test_an_off_table_baseline_is_refused_for_every_plausible_near_miss(mib: int) -> None:
+def test_an_off_table_baseline_is_refused_for_every_plausible_near_miss(
+    mib: int,
+) -> None:
     """TRAP-10 across the range, not just at 1500.
 
     Each of these is a figure someone types: a doubling that overshot the table, a round number
@@ -530,7 +546,9 @@ def test_a_bigger_class_costs_strictly_more_for_the_same_wall_time() -> None:
         for size in microvms.SizeClass.all()
     ]
     assert totals == sorted(totals)
-    assert len(set(totals)) == len(totals), "two classes cost the same, so one is mispaired"
+    assert len(set(totals)) == len(totals), (
+        "two classes cost the same, so one is mispaired"
+    )
 
 
 # -- the residency comparison ------------------------------------------------
@@ -592,7 +610,9 @@ def test_the_break_even_hold_is_exactly_where_the_two_sides_cost_the_same() -> N
     )
 
 
-def test_the_break_even_hold_is_a_property_of_the_rates_and_not_of_the_hold_or_cycles() -> None:
+def test_the_break_even_hold_is_a_property_of_the_rates_and_not_of_the_hold_or_cycles() -> (
+    None
+):
     """One cycle's break-even, whatever the comparison it is read off.
 
     Measured, and initially assumed otherwise: the figure answers "how long must *a* suspension
@@ -610,7 +630,9 @@ def test_the_break_even_hold_is_a_property_of_the_rates_and_not_of_the_hold_or_c
     # A bigger class pays more per cycle *and* more per running second, so the threshold is a
     # real function of the class rather than a constant.
     assert (
-        microvms.compare_residency(microvms.SizeClass.all()[0], 86400.0, 1).break_even_seconds()
+        microvms.compare_residency(
+            microvms.SizeClass.all()[0], 86400.0, 1
+        ).break_even_seconds()
         != baseline
     )
 
@@ -628,9 +650,11 @@ def test_more_cycles_raise_the_suspended_total_and_narrow_the_ratio() -> None:
     assert ten.cycles == 10
     per_cycle = Decimal(one.per_cycle().amount)
     assert Decimal(ten.per_cycle().amount) == per_cycle
-    assert Decimal(ten.suspended.total.floor.amount) - Decimal(
-        one.suspended.total.floor.amount
-    ) == per_cycle * 9
+    assert (
+        Decimal(ten.suspended.total.floor.amount)
+        - Decimal(one.suspended.total.floor.amount)
+        == per_cycle * 9
+    )
     # The running side is untouched — it never suspends — so only the ratio moves.
     assert ten.running.total.floor.amount == one.running.total.floor.amount
     assert Decimal(ten.ratio) < Decimal(one.ratio)
@@ -701,7 +725,9 @@ def test_the_two_provenances_are_the_only_ones_a_duration_can_report() -> None:
     assert microvms.Duration.projected(1.0).provenance == published[1]
 
 
-@pytest.mark.parametrize("seconds", [-0.001, -1.0, float("nan"), float("inf"), float("-inf")])
+@pytest.mark.parametrize(
+    "seconds", [-0.001, -1.0, float("nan"), float("inf"), float("-inf")]
+)
 def test_a_duration_refuses_every_unrepresentable_figure_at_both_constructors(
     seconds: float,
 ) -> None:
