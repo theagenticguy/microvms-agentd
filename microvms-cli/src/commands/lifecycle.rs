@@ -300,6 +300,9 @@ async fn launch_and_exec<O: std::io::Write, E: std::io::Write>(
             let binary = args.binary.as_ref().expect("checked by the caller");
             ctx.out.progress(&format!("building image {name} ({size})"));
             let request = build_request(ctx, args, name, size, binary)?;
+            // Before the upload, so a request core itself would refuse costs zero transport
+            // calls — the guards inside `build_image` run after the S3 PUT (issue #47).
+            sandbox.preflight(&request)?;
             upload_artifact(ctx, sandbox, &request).await?;
             let image = sandbox.build_image(request).await?;
             let identifier = image.identifier.clone();
@@ -591,6 +594,9 @@ pub async fn build<O: std::io::Write, E: std::io::Write>(
 
     let mut sandbox = sandbox;
     ctx.out.progress(&format!("building image {name} ({size})"));
+    // Before the upload, for the reason `run`'s build arm gives: a locally-refused request
+    // must cost zero transport calls (issue #47).
+    sandbox.preflight(&request)?;
     upload_artifact(ctx, &sandbox, &request).await?;
     let image = sandbox.build_image(request).await?;
     Ok(render_build(

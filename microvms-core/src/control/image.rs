@@ -146,55 +146,16 @@ impl ControlPlane {
     ///
     /// Order matters and is the same order the Python client uses for the same reason: the
     /// create call happens *after* the artifact upload, so a rejection the service raises
-    /// costs the caller the upload first. Everything checkable is checked here.
+    /// costs the caller the upload first. Everything checkable is checked here — and the
+    /// checks are [`Self::preflight`], so an uploading caller can run the same list before
+    /// the upload and pay nothing for a request this client itself refuses.
     ///
     /// The artifact is built here too, but **not** uploaded — S3 is not in this crate's
     /// dependency set, so [`CreateImageRequest::code_artifact_uri`] is where the caller
     /// says they have already put it. [`ControlPlane::build_artifact_for`] produces the
     /// bytes to upload.
     pub async fn create_image(&self, request: CreateImageRequest) -> Result<Image, Error> {
-        super::require_valid_image_name(&request.name)?;
-
-        if request.inherit_workdir {
-            artifact::require_workdir(&request.base_image, request.dockerfile.as_deref())?;
-        }
-        if let Some(dockerfile) = request.dockerfile.as_deref() {
-            artifact::require_matching_from(&request.base_image, dockerfile)?;
-            artifact::require_matching_agentd_port(self.port, dockerfile)?;
-            artifact::require_keepalive_under_idle_timeout(
-                crate::session::exec::DEFAULT_STREAM_IDLE_TIMEOUT,
-                dockerfile,
-            )?;
-        }
-
-        // Pinned only when the caller asked for it, and refused locally when they asked for
-        // something the `Version` shape cannot carry — see `require_valid_version`. A blank
-        // or whitespace-bearing value here is a `ValidationException` raised *after* the
-        // artifact upload, which is the ordering this whole function is arranged to protect
-        // against.
-        if let Some(version) = request.base_image_version.as_deref() {
-            super::require_valid_version("baseImageVersion", version)?;
-        }
-
-        // Every remaining member the model constrains, in the order the request lists them.
-        // Each one is here for the same reason `require_valid_image_name` above is: this call
-        // happens *after* the caller's artifact upload, so a rejection the service raises has
-        // already cost them the upload. Issue #24 listed all four as reachable with no guard.
-        //
-        // `baseImageArn` is derived from `BaseImage` and the region, so it cannot be blank
-        // today — checked anyway, because `BaseImage` is a public type with public fields and
-        // a caller can construct one with an empty `name`, which renders an ARN this client
-        // built and the service refuses.
-        // `hooks.port` is deliberately **not** checked here. `ControlPlane::port` is private and
-        // `with_port` is its only setter, and that setter refuses 0 against
-        // `HooksPortInteger.min` — so a plane whose port is illegal cannot exist and a check here
-        // would be a branch no input can reach. An unfalsifiable guard is worse than none: it
-        // reads as protection and no test can make it fire. See
-        // `the_hooks_port_that_reaches_the_wire_is_legal_by_construction`.
-        super::require_valid_role_arn("buildRoleArn", &request.build_role_arn)?;
-        super::require_non_blank("codeArtifact.uri", &request.code_artifact_uri)?;
-        super::require_non_blank("baseImageArn", &request.base_image.arn(&self.region))?;
-        super::require_valid_tags(&request.tags)?;
+        self.preflight(&request)?;
 
         let wire = ops::CreateMicrovmImageWire {
             name: request.name.clone(),
@@ -240,6 +201,68 @@ impl ControlPlane {
             state: created.state,
             size: request.size,
         })
+    }
+
+    /// Every local guard [`Self::create_image`] runs, callable **before** the artifact upload.
+    ///
+    /// # One list of guards, reachable from before the upload
+    ///
+    /// The guards below are pure functions of the request — no call, no credential — and
+    /// `create_image` runs them before its own wire call. But `create_image` runs *after*
+    /// the caller's artifact upload, so from inside it a locally-refusable request has
+    /// already cost the caller the S3 PUT (issue #47). This method is the same list,
+    /// extracted so an uploading caller invokes it first and the list cannot drift between
+    /// call sites — `create_image` delegates here rather than keeping its own copy.
+    ///
+    /// A caller who skips it loses nothing but the upload: `create_image` still refuses
+    /// before the wire.
+    pub fn preflight(&self, request: &CreateImageRequest) -> Result<(), Error> {
+        super::require_valid_image_name(&request.name)?;
+
+        if request.inherit_workdir {
+            artifact::require_workdir(&request.base_image, request.dockerfile.as_deref())?;
+        }
+        if let Some(dockerfile) = request.dockerfile.as_deref() {
+            artifact::require_matching_from(&request.base_image, dockerfile)?;
+            artifact::require_matching_agentd_port(self.port, dockerfile)?;
+            artifact::require_keepalive_under_idle_timeout(
+                crate::session::exec::DEFAULT_STREAM_IDLE_TIMEOUT,
+                dockerfile,
+            )?;
+            // The artifact carries the daemon unconditionally; a Dockerfile that never runs
+            // it builds cleanly and fails as a run-hook timeout naming nothing (issue #46).
+            artifact::require_daemon_cmd(dockerfile)?;
+        }
+
+        // Pinned only when the caller asked for it, and refused locally when they asked for
+        // something the `Version` shape cannot carry — see `require_valid_version`. A blank
+        // or whitespace-bearing value here is a `ValidationException` raised *after* the
+        // artifact upload, which is the ordering this whole function is arranged to protect
+        // against.
+        if let Some(version) = request.base_image_version.as_deref() {
+            super::require_valid_version("baseImageVersion", version)?;
+        }
+
+        // Every remaining member the model constrains, in the order the request lists them.
+        // Each one is here for the same reason `require_valid_image_name` above is: the
+        // create call happens *after* the caller's artifact upload, so a rejection the
+        // service raises has already cost them the upload. Issue #24 listed all four as
+        // reachable with no guard.
+        //
+        // `baseImageArn` is derived from `BaseImage` and the region, so it cannot be blank
+        // today — checked anyway, because `BaseImage` is a public type with public fields and
+        // a caller can construct one with an empty `name`, which renders an ARN this client
+        // built and the service refuses.
+        // `hooks.port` is deliberately **not** checked here. `ControlPlane::port` is private and
+        // `with_port` is its only setter, and that setter refuses 0 against
+        // `HooksPortInteger.min` — so a plane whose port is illegal cannot exist and a check here
+        // would be a branch no input can reach. An unfalsifiable guard is worse than none: it
+        // reads as protection and no test can make it fire. See
+        // `the_hooks_port_that_reaches_the_wire_is_legal_by_construction`.
+        super::require_valid_role_arn("buildRoleArn", &request.build_role_arn)?;
+        super::require_non_blank("codeArtifact.uri", &request.code_artifact_uri)?;
+        super::require_non_blank("baseImageArn", &request.base_image.arn(&self.region))?;
+        super::require_valid_tags(&request.tags)
     }
 
     /// The artifact bytes to upload to [`CreateImageRequest::code_artifact_uri`].
@@ -1307,6 +1330,92 @@ mod tests {
         assert_eq!(error.kind(), ErrorKind::InvalidArg);
         assert!(error.to_string().contains("ubuntu:24.04"), "{error}");
         assert_eq!(fake.calls().len(), 0);
+    }
+
+    /// **Issue #46 at the create boundary.** A Dockerfile that never runs the daemon — no
+    /// `CMD`, or an `ENTRYPOINT` that swallows it — is refused before any call, like every
+    /// other agreement guard.
+    ///
+    /// **Falsification** — run 2026-08-17. Delete the `require_daemon_cmd` call from
+    /// `preflight` and both halves go red with the create having reached the fake.
+    #[tokio::test]
+    async fn a_dockerfile_that_never_runs_the_daemon_is_refused_before_any_call() {
+        for dockerfile in [
+            // No CMD: the base's default process runs instead of the daemon.
+            "FROM public.ecr.aws/amazonlinux/amazonlinux:2023-minimal\nCOPY agentd /agentd\n",
+            // A non-empty ENTRYPOINT: the CMD becomes its arguments.
+            "FROM public.ecr.aws/amazonlinux/amazonlinux:2023-minimal\n\
+             ENTRYPOINT [\"/bin/sh\", \"-c\"]\nCMD [\"/agentd\"]\n",
+        ] {
+            let (plane, fake, _) = planted();
+            let mut request = a_request();
+            request.dockerfile = Some(dockerfile.to_string());
+
+            let error = plane.create_image(request).await.expect_err("refused");
+            assert_eq!(error.kind(), ErrorKind::InvalidArg, "{dockerfile}");
+            assert!(
+                error.to_string().contains("run-hook timeout"),
+                "the symptom the reader would otherwise chase has to be named: {error}"
+            );
+            assert_eq!(fake.calls().len(), 0, "nothing reached the control plane");
+        }
+    }
+
+    /// **Issue #47's contract, stated at the library boundary.** `preflight` and
+    /// `create_image` refuse the same request for the same reason, with zero calls — which
+    /// is what lets an uploading caller run the list before paying for the upload.
+    ///
+    /// Asserted over every guard family `preflight` carries, not just the Dockerfile ones,
+    /// because the extraction's risk is a guard left behind in `create_image` where the
+    /// pre-upload caller never sees it.
+    #[tokio::test]
+    async fn preflight_and_create_image_refuse_identically_with_zero_calls() {
+        type Breakage = Box<dyn Fn(&mut CreateImageRequest)>;
+        let broken: [(&str, Breakage); 5] = [
+            ("an invalid name", Box::new(|r| r.name = "my.image".into())),
+            (
+                "a mismatched FROM",
+                Box::new(|r| r.dockerfile = Some("FROM ubuntu:24.04\nCMD [\"/agentd\"]\n".into())),
+            ),
+            (
+                "a Dockerfile with no CMD",
+                Box::new(|r| {
+                    r.dockerfile =
+                        Some("FROM public.ecr.aws/amazonlinux/amazonlinux:2023-minimal\n".into());
+                }),
+            ),
+            (
+                "a blank base version",
+                Box::new(|r| r.base_image_version = Some("  ".into())),
+            ),
+            (
+                "a blank build role",
+                Box::new(|r| r.build_role_arn = String::new()),
+            ),
+        ];
+
+        for (label, break_it) in broken {
+            let (plane, fake, _) = planted();
+            let mut request = a_request();
+            break_it(&mut request);
+
+            let from_preflight = plane.preflight(&request).expect_err(label).to_string();
+            let from_create = plane
+                .create_image(request)
+                .await
+                .expect_err(label)
+                .to_string();
+            assert_eq!(
+                from_preflight, from_create,
+                "{label}: one list of guards, not two that can drift"
+            );
+            assert_eq!(fake.calls().len(), 0, "{label}: zero calls either way");
+        }
+
+        // And the request every other test builds passes preflight, so the guard list is
+        // refusing the breakage rather than the baseline.
+        let (plane, _, _) = planted();
+        plane.preflight(&a_request()).expect("the baseline passes");
     }
 
     /// The hook timeouts reach the wire in their own families, so a build-sized value

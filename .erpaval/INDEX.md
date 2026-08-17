@@ -20,6 +20,7 @@ lessons before starting work.
 - [Capture subprocess output through pipes, not temp files, when grandchildren matter](solutions/best-practices/pipes-not-tempfiles-for-subprocess-output.md) — pgid before wait, concurrent drain, no `pre_exec` for demotion
 - [A struct that carries a credential never derives Debug](solutions/best-practices/credential-structs-never-derive-debug.md) — hand-written redaction + per-type guard test; audit the class, not the instance
 - [Golden figures come from running the oracle, never from the plan](solutions/best-practices/run-the-oracle-never-rederive-goldens.md) — the plan's ~1357s vs the oracle's 1371.29s; pin executed output verbatim
+- [An ordering defect is invisible to every test that only watches the guard](solutions/best-practices/ordering-defects-need-their-own-recorder-channel.md) — give the side effect its own recorder and assert absence; never git-checkout over uncommitted work to undo a falsification break
 
 ### test-failures
 - [A confinement property that only checks the filesystem measures nothing](solutions/test-failures/proptest-and-dst-tiers-need-verdict-assertions.md) — assert the verdict, not just containment; vacuous model properties
@@ -27,6 +28,9 @@ lessons before starting work.
 - [Four ways a guard passed against broken code in one session](solutions/test-failures/guards-that-passed-against-broken-code.md) — unpinned compile_fail, expiry-vs-margin fakes, uniform draws, oracle-contradicting assertions, fakes more forgiving than the real parser
 
 ## Recent additions
+
+- 2026-08-17 (session-bf11b1): the ordering-defect recorder channel, from closing
+  issues #46/#47 (preflight before upload; CMD/ENTRYPOINT guard) in PR #49.
 
 - 2026-08-17 (session-053b88): the absent-value asymmetry, from closing issue #35
   and sweeping for the fourth agreement pair.
