@@ -439,6 +439,86 @@ pub fn require_keepalive_under_idle_timeout(
     )))
 }
 
+/// The value of a Dockerfile's last `ENTRYPOINT`, or `None` when it sets none.
+///
+/// Last rather than first for the reason [`dockerfile_agentd_port`] gives: a later
+/// instruction of the same name wins at build time, so the last one is what the container
+/// runs. The value is the raw rest of the line — this scan finds a disagreement, it does
+/// not parse Dockerfile syntax.
+pub fn dockerfile_entrypoint(dockerfile: &str) -> Option<&str> {
+    last_instruction_value(dockerfile, "ENTRYPOINT")
+}
+
+/// The value of a Dockerfile's last `CMD`, or `None` when it sets none.
+pub fn dockerfile_cmd(dockerfile: &str) -> Option<&str> {
+    last_instruction_value(dockerfile, "CMD")
+}
+
+/// The rest of the last line whose first word is `keyword`, trimmed, or `None`.
+fn last_instruction_value<'a>(dockerfile: &'a str, keyword: &str) -> Option<&'a str> {
+    let mut found = None;
+    for line in dockerfile.lines() {
+        let trimmed = line.trim_start();
+        let Some(first) = trimmed.split_whitespace().next() else {
+            continue;
+        };
+        if first.eq_ignore_ascii_case(keyword) {
+            found = Some(trimmed[first.len()..].trim());
+        }
+    }
+    found
+}
+
+/// Whether an instruction value is the empty exec form — `[]`, with any spacing.
+fn is_empty_exec_form(value: &str) -> bool {
+    let mut meaningful = value.chars().filter(|c| !c.is_whitespace());
+    meaningful.next() == Some('[') && meaningful.next() == Some(']') && meaningful.next().is_none()
+}
+
+/// Rejects a Dockerfile whose image would never run the daemon: no `CMD`, or an
+/// `ENTRYPOINT` that swallows it.
+///
+/// The artifact unconditionally carries the daemon as entry `agentd` ([`build_artifact`]),
+/// and the deployment invariant is `ENTRYPOINT []` plus `CMD ["/agentd"]` — see
+/// [`default_dockerfile`]. A caller Dockerfile with no `CMD` runs the base's own default
+/// instead, and a non-empty `ENTRYPOINT` turns any `CMD` into that entrypoint's arguments
+/// rather than the process. Either way the daemon never starts, the build-time
+/// `ready`/`validate` hooks go unanswered, and the image lands in `CREATE_FAILED` — or the
+/// launch dies as a run-hook timeout — with nothing naming `CMD`, `ENTRYPOINT`, or the
+/// artifact entry.
+///
+/// Weak-form on purpose: it does **not** check that the `CMD` names a path anything was
+/// copied to. That would be Dockerfile interpretation rather than agreement checking, and
+/// the two mistakes people actually make are the two refused here. The unenforceable half —
+/// a base image that starts its own background process before bootstrap — stays with
+/// whoever builds the image (`docs/PROTOCOL.md`, "Trust boundary").
+pub fn require_daemon_cmd(dockerfile: &str) -> Result<(), Error> {
+    if let Some(entrypoint) = dockerfile_entrypoint(dockerfile)
+        && !is_empty_exec_form(entrypoint)
+    {
+        return Err(Error::invalid_arg(format!(
+            "the Dockerfile sets ENTRYPOINT {entrypoint}, which makes any CMD its arguments \
+             rather than the container's process — so the daemon this client uploads never \
+             starts. The build succeeds anyway: the ready/validate hooks just go unanswered \
+             and the image fails as CREATE_FAILED, or the launch dies as a run-hook timeout, \
+             and neither symptom names ENTRYPOINT. Set `ENTRYPOINT []` alongside \
+             `CMD [\"/agentd\"]`, or build with default_dockerfile, which sets both."
+        )));
+    }
+    match dockerfile_cmd(dockerfile) {
+        Some(cmd) if !cmd.is_empty() && !is_empty_exec_form(cmd) => Ok(()),
+        _ => Err(Error::invalid_arg(
+            "the Dockerfile has no CMD, so the container runs the base image's default \
+             process and the daemon this client uploads never starts. The build succeeds \
+             anyway: the ready/validate hooks just go unanswered and the image fails as \
+             CREATE_FAILED, or the launch dies as a run-hook timeout, and neither symptom \
+             names CMD. Add `ENTRYPOINT []` and `CMD [\"/agentd\"]`, or build with \
+             default_dockerfile, which sets both."
+                .to_string(),
+        )),
+    }
+}
+
 /// Rejects a Dockerfile whose `FROM` is not the selected base image.
 ///
 /// The build runs the Dockerfile *on top of* the base named in `baseImageArn`, so the two
@@ -830,6 +910,67 @@ mod tests {
             ),
         )
         .expect("the derived Dockerfile sets no keepalive");
+    }
+
+    /// **Issue #46, both refusable halves.** A Dockerfile with no `CMD` builds an image
+    /// that runs the base's default process; a non-empty `ENTRYPOINT` turns the `CMD` into
+    /// its arguments. Either way the daemon the artifact carries never starts, and the
+    /// failure surfaces as `CREATE_FAILED` or a run-hook timeout naming neither
+    /// instruction — so the message must name both the instruction and that symptom.
+    #[test]
+    fn a_dockerfile_that_never_runs_the_daemon_is_refused_naming_the_symptom() {
+        // No CMD at all: the base's default applies, which is not /agentd.
+        let error = require_daemon_cmd(
+            "FROM public.ecr.aws/amazonlinux/amazonlinux:2023-minimal\n\
+             COPY agentd /agentd\n\
+             ENV AGENTD_PORT=9000\n",
+        )
+        .expect_err("no CMD means the daemon never starts");
+        assert_eq!(error.kind(), ErrorKind::InvalidArg);
+        let message = error.to_string();
+        assert!(message.contains("no CMD"), "{message}");
+        assert!(message.contains("run-hook timeout"), "{message}");
+        assert!(message.contains("CREATE_FAILED"), "{message}");
+
+        // A non-empty ENTRYPOINT swallows the CMD as its arguments.
+        let error = require_daemon_cmd(
+            "FROM public.ecr.aws/amazonlinux/amazonlinux:2023-minimal\n\
+             COPY agentd /agentd\n\
+             ENTRYPOINT [\"/bin/sh\", \"-c\"]\n\
+             CMD [\"/agentd\"]\n",
+        )
+        .expect_err("a non-empty ENTRYPOINT makes CMD its arguments");
+        assert_eq!(error.kind(), ErrorKind::InvalidArg);
+        let message = error.to_string();
+        assert!(message.contains("ENTRYPOINT"), "{message}");
+        assert!(message.contains("run-hook timeout"), "{message}");
+
+        // An empty CMD is the same absence in different spelling.
+        require_daemon_cmd("FROM x\nCMD []\n").expect_err("CMD [] runs nothing");
+    }
+
+    /// The shapes that must pass: the deployment invariant itself, in exec and spaced
+    /// spellings, and the invariant's `ENTRYPOINT []` with any interior whitespace. The
+    /// derived Dockerfile passes its own guard, which is what keeps the default path
+    /// unaffected.
+    #[test]
+    fn the_deployment_invariant_passes_the_daemon_cmd_guard() {
+        require_daemon_cmd(&default_dockerfile(
+            9000,
+            Some("/work"),
+            &BaseImage::al2023(),
+        ))
+        .expect("the derived Dockerfile is the invariant");
+        require_daemon_cmd("FROM x\nENTRYPOINT []\nCMD [\"/agentd\"]\n").expect("the invariant");
+        require_daemon_cmd("FROM x\nENTRYPOINT [ ]\nCMD [\"/agentd\"]\n")
+            .expect("interior whitespace is still the empty exec form");
+        require_daemon_cmd("FROM x\ncmd [\"/agentd\"]\n").expect("case-insensitive, no ENTRYPOINT");
+        // Last instruction wins, as at build time: a later empty ENTRYPOINT un-swallows.
+        require_daemon_cmd("FROM x\nENTRYPOINT [\"/bin/sh\"]\nENTRYPOINT []\nCMD [\"/agentd\"]\n")
+            .expect("the last ENTRYPOINT is the one the build uses");
+        // And the reverse ordering is refused for the same reason.
+        require_daemon_cmd("FROM x\nENTRYPOINT []\nENTRYPOINT [\"/bin/sh\"]\nCMD [\"/agentd\"]\n")
+            .expect_err("the last ENTRYPOINT is non-empty");
     }
 
     /// Workdir inheritance is refused when neither the base nor the Dockerfile declares

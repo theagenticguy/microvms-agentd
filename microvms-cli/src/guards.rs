@@ -537,6 +537,10 @@ struct ScriptedTransport {
     answers: Mutex<std::collections::HashMap<String, std::collections::VecDeque<(u16, String)>>>,
     /// Fired the first time this operation is seen. The interrupt's trigger.
     trigger: Mutex<Option<(String, tokio::sync::oneshot::Sender<()>)>>,
+    /// The URIs `put_artifact` was asked to fill. On the transport rather than the seam so
+    /// the ordering guard can assert "zero uploads" through the handle it already holds —
+    /// an upload is not a control-plane call, so it must not pollute `calls`.
+    uploads: Mutex<Vec<String>>,
 }
 
 impl ScriptedTransport {
@@ -545,7 +549,12 @@ impl ScriptedTransport {
             calls: Mutex::new(Vec::new()),
             answers: Mutex::new(std::collections::HashMap::new()),
             trigger: Mutex::new(None),
+            uploads: Mutex::new(Vec::new()),
         }
+    }
+
+    fn uploads(&self) -> Vec<String> {
+        self.uploads.lock().expect("not poisoned").clone()
     }
 
     fn answer(&self, operation: &str, status: u16, body: &str) -> &Self {
@@ -717,7 +726,12 @@ impl CoreSeam for ScriptedSeam {
         })
     }
 
-    fn put_artifact(&self, _uri: &str, _bytes: Vec<u8>) -> BoxFuture<'_, Result<(), Error>> {
+    fn put_artifact(&self, uri: &str, _bytes: Vec<u8>) -> BoxFuture<'_, Result<(), Error>> {
+        self.transport
+            .uploads
+            .lock()
+            .expect("not poisoned")
+            .push(uri.to_string());
         Box::pin(async move { Ok(()) })
     }
 }
@@ -1436,6 +1450,88 @@ async fn a_plain_build_never_lists_and_reports_reused_false() {
     );
     assert_eq!(rendered.data["reused"], false);
     assert_eq!(rendered.data["imageName"], "img");
+}
+
+/// **Issue #47: a request core itself refuses costs zero transport calls — including the
+/// S3 upload.** Both uploading paths, `build` and `run`, against a Dockerfile core's own
+/// guards reject (no `CMD`, so the daemon would never start).
+///
+/// The guards always ran; the defect was ordering. `upload_artifact` came before
+/// `build_image`, so a caller iterating on a refused Dockerfile paid one S3 PUT per
+/// attempt for a rejection that was knowable locally. The contract is the one
+/// `create_image`'s docs state: nothing billable before everything checkable is checked.
+///
+/// **Falsification** — run 2026-08-17. Swap `sandbox.preflight(&request)?` back below
+/// `upload_artifact` in either path and that path's `uploads` assertion goes red with the
+/// PUT recorded; the guard still refuses, so only this ordering test catches it.
+#[tokio::test]
+async fn a_locally_refused_dockerfile_costs_no_upload_and_no_call() {
+    let dockerfile_path = std::env::temp_dir().join(format!(
+        "microvm-guard-no-cmd-{}-{:?}.Dockerfile",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    std::fs::write(
+        &dockerfile_path,
+        "FROM public.ecr.aws/amazonlinux/amazonlinux:2023-minimal\nCOPY agentd /agentd\n",
+    )
+    .expect("writes");
+
+    // The build path.
+    let binary = FakeBinary::new("refused-build");
+    let transport = Arc::new(ScriptedTransport::new());
+    let seam = ScriptedSeam {
+        transport: Arc::clone(&transport),
+        clock: Arc::new(YieldingClock::default()),
+    };
+    let command = Command::Build(BuildArgs {
+        binary: binary.0.clone(),
+        base_image_version: None,
+        artifact_uri: None,
+        name: Some("refused".into()),
+        memory: MemoryMib::Mib2048,
+        dockerfile: Some(dockerfile_path.clone()),
+        repair_identity: false,
+        reuse: false,
+        port: None,
+        region: region_flags(),
+        infra: InfraFlags::default(),
+    });
+    let (result, _) = dispatch_with(&seam, &command, full_infra()).await;
+    let error = result.expect_err("core refuses a Dockerfile with no CMD");
+    assert_eq!(error.exit, Exit::InvalidArg, "{}", error.message);
+    assert_eq!(
+        transport.uploads(),
+        Vec::<String>::new(),
+        "build: the refused request must not cost the S3 PUT"
+    );
+    assert_eq!(transport.calls(), Vec::<String>::new(), "build: zero calls");
+
+    // The run path's build arm.
+    let binary = FakeBinary::new("refused-run");
+    // A distinct label from the FakeBinary above: both helpers derive the same
+    // `microvm-guard-<label>-<pid>-<tid>` path, and a shared label is a file/dir collision.
+    let ledgers = TempDir::new("refused-run-ledger");
+    let transport = Arc::new(ScriptedTransport::new());
+    let seam = ScriptedSeam {
+        transport: Arc::clone(&transport),
+        clock: Arc::new(YieldingClock::default()),
+    };
+    let mut args = run_args_for_image("unused", ledgers.0.clone());
+    args.image = None;
+    args.binary = Some(binary.0.clone());
+    args.dockerfile = Some(dockerfile_path.clone());
+    let (result, _) = dispatch_with(&seam, &Command::Run(args), full_infra()).await;
+    let error = result.expect_err("the run path refuses the same Dockerfile");
+    assert_eq!(error.exit, Exit::InvalidArg, "{}", error.message);
+    assert_eq!(
+        transport.uploads(),
+        Vec::<String>::new(),
+        "run: the refused request must not cost the S3 PUT"
+    );
+    assert_eq!(transport.calls(), Vec::<String>::new(), "run: zero calls");
+
+    let _ = std::fs::remove_file(&dockerfile_path);
 }
 
 /// **`build --base-image-version` reaches the `CreateMicrovmImage` body**, and its absence

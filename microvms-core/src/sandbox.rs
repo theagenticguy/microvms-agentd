@@ -569,6 +569,16 @@ impl Sandbox {
         self.control.build_artifact_for(request)
     }
 
+    /// Every local guard [`Self::build_image`] runs, callable **before** the artifact upload.
+    ///
+    /// A delegation to [`ControlPlane::preflight`], on this type so the CLI's build path
+    /// reaches it through the one sandbox it already holds. Local; zero calls. The point is
+    /// ordering: `build_image`'s guards run after the caller's upload, so a request this
+    /// client itself refuses would still cost the S3 PUT unless the caller checks first.
+    pub fn preflight(&self, request: &CreateImageRequest) -> Result<(), Error> {
+        self.control.preflight(request)
+    }
+
     /// The ARN for `identifier`: an ARN passes through with zero calls, a bare name is
     /// resolved through the image listing by exact match.
     ///
