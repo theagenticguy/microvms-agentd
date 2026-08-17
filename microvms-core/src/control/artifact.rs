@@ -266,6 +266,80 @@ pub fn require_workdir(base: &BaseImage, dockerfile: Option<&str>) -> Result<(),
     )))
 }
 
+/// The port in a Dockerfile's last `ENV AGENTD_PORT=`, or `None` when it sets none.
+///
+/// Last rather than first: a later `ENV` of the same name wins at build time, so the last
+/// one is what the daemon reads. Accepts `ENV AGENTD_PORT=9000` and the legacy
+/// `ENV AGENTD_PORT 9000` spelling, since both set the variable and a guard that only
+/// understands one form passes the file it cannot parse.
+///
+/// Hand-rolled for the same reason [`dockerfile_from_ref`] is: the pattern is small and a
+/// regex crate is a dependency this lane cannot add.
+pub fn dockerfile_agentd_port(dockerfile: &str) -> Option<u16> {
+    let mut found = None;
+    for line in dockerfile.lines() {
+        let mut words = line.split_whitespace();
+        let Some(first) = words.next() else { continue };
+        if !first.eq_ignore_ascii_case("ENV") {
+            continue;
+        }
+        let Some(assignment) = words.next() else {
+            continue;
+        };
+        let value = match assignment.split_once('=') {
+            Some(("AGENTD_PORT", value)) => value,
+            Some(_) => continue,
+            // `ENV AGENTD_PORT 9000`: the value is the next word.
+            None if assignment == "AGENTD_PORT" => match words.next() {
+                Some(value) => value,
+                None => continue,
+            },
+            None => continue,
+        };
+        // An unparseable value is not this guard's business: the daemon keeps its default
+        // for one (`agentd/src/config.rs:118`), so there is no disagreement to report.
+        if let Ok(port) = value.parse() {
+            found = Some(port);
+        }
+    }
+    found
+}
+
+/// Rejects a Dockerfile whose `ENV AGENTD_PORT` disagrees with the port the create call
+/// sends as `hooks.port`.
+///
+/// The two are set independently — `hooks.port` comes from `ControlPlane::port`, the
+/// variable from the caller's own Dockerfile — and the platform calls its build-time
+/// `ready`/`validate` hooks on the port in the create call. A guest listening elsewhere
+/// answers nothing, so the build fails.
+///
+/// Rejected rather than warned because the failure points away from its cause: the docker
+/// build succeeds, the log group holds a clean build *and* the daemon's own "agentd
+/// listening" line, and the image still lands in `CREATE_FAILED`. Neither
+/// `GetMicrovmImage` nor the build log names the port — only
+/// `GetMicrovmImageVersion`'s `hooks.port` does, compared by hand against the Dockerfile.
+pub fn require_matching_agentd_port(port: u16, dockerfile: &str) -> Result<(), Error> {
+    let Some(found) = dockerfile_agentd_port(dockerfile) else {
+        // No `ENV AGENTD_PORT` at all is not a disagreement: the daemon's own default is
+        // `DEFAULT_AGENT_PORT`, the same value this client sends unless the caller changed
+        // it. A missing variable with a changed port is caught by the equality below only
+        // when the variable exists, which is the honest limit of a Dockerfile read.
+        return Ok(());
+    };
+    if found == port {
+        return Ok(());
+    }
+    Err(Error::invalid_arg(format!(
+        "the Dockerfile sets ENV AGENTD_PORT={found} but this client sends hooks.port={port}. \
+         These must agree: the platform calls the build-time ready/validate hooks on the port \
+         in the create call, and a daemon listening on {found} answers none of them — the \
+         docker build succeeds, the daemon logs that it is listening, and the image still \
+         fails with CREATE_FAILED naming no port. Set ENV AGENTD_PORT={port} in the \
+         Dockerfile, or build it with default_dockerfile, which derives the value from the \
+         same port."
+    )))
+}
+
 /// Rejects a Dockerfile whose `FROM` is not the selected base image.
 ///
 /// The build runs the Dockerfile *on top of* the base named in `baseImageArn`, so the two
@@ -519,6 +593,65 @@ mod tests {
     fn a_dockerfile_with_no_from_is_left_to_the_build() {
         require_matching_from(&BaseImage::al2023(), "COPY agentd /agentd\n")
             .expect("no FROM is not a disagreement");
+    }
+
+    /// The measured case, reproduced from the Dockerfile that spent it: a hand-written
+    /// guest Dockerfile carrying `ENV AGENTD_PORT=8080` — the plausible port, and the wrong
+    /// one — against a client sending `hooks.port=9000`. The build succeeds, the daemon logs
+    /// `agentd listening`, and the image lands in `CREATE_FAILED` naming no port.
+    #[test]
+    fn a_dockerfile_port_that_disagrees_with_the_hook_port_is_refused() {
+        let error = require_matching_agentd_port(
+            crate::control::DEFAULT_AGENT_PORT,
+            "FROM public.ecr.aws/amazonlinux/amazonlinux:2023-minimal\n\
+             COPY agentd /agentd\n\
+             ENV AGENTD_PORT=8080\n\
+             EXPOSE 8080\n\
+             CMD [\"/agentd\"]\n",
+        )
+        .expect_err("8080 is not the port the create call sends");
+        assert_eq!(error.kind(), ErrorKind::InvalidArg);
+        let message = error.to_string();
+        assert!(message.contains("8080"), "{message}");
+        assert!(message.contains("9000"), "{message}");
+        // The remedy is what a reader acts on, and the diagnostic's value is naming the
+        // symptom that points away from the cause.
+        assert!(message.contains("CREATE_FAILED"), "{message}");
+        assert!(message.contains("ready/validate"), "{message}");
+
+        require_matching_agentd_port(
+            crate::control::DEFAULT_AGENT_PORT,
+            &default_dockerfile(
+                crate::control::DEFAULT_AGENT_PORT,
+                Some("/work"),
+                &BaseImage::al2023(),
+            ),
+        )
+        .expect("the derived Dockerfile agrees with the port it was derived from");
+    }
+
+    /// Both `ENV` spellings set the variable, so a guard reading only `KEY=VALUE` would pass
+    /// the legacy form it could not parse. The last assignment wins, as it does at build
+    /// time.
+    #[test]
+    fn the_port_scan_reads_both_env_spellings_and_takes_the_last() {
+        assert_eq!(dockerfile_agentd_port("ENV AGENTD_PORT=9000\n"), Some(9000));
+        assert_eq!(dockerfile_agentd_port("ENV AGENTD_PORT 8080\n"), Some(8080));
+        assert_eq!(dockerfile_agentd_port("env agentd_port=7000\n"), None);
+        assert_eq!(
+            dockerfile_agentd_port("ENV AGENTD_PORT=8080\nENV AGENTD_PORT=9000\n"),
+            Some(9000),
+        );
+        assert_eq!(dockerfile_agentd_port("ENV AGENTD_LOG=info\n"), None);
+        // Neither a missing variable nor an unparseable one is a disagreement: the daemon
+        // keeps its own default for both (`agentd/src/config.rs:118`).
+        assert_eq!(
+            dockerfile_agentd_port("FROM x\nCOPY agentd /agentd\n"),
+            None
+        );
+        assert_eq!(dockerfile_agentd_port("ENV AGENTD_PORT=nine\n"), None);
+        require_matching_agentd_port(9000, "FROM x\nCOPY agentd /agentd\n")
+            .expect("no variable is not a disagreement");
     }
 
     /// Workdir inheritance is refused when neither the base nor the Dockerfile declares
