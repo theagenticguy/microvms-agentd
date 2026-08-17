@@ -66,7 +66,7 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
@@ -117,7 +117,7 @@ jobs:
     name: semgrep, secret history, licenses, workflow lint
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           # betterleaks scans history, and a shallow clone has none.
           fetch-depth: 0
@@ -186,7 +186,7 @@ jobs:
     name: SBOM and vulnerability scans
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       # syft writes the SBOM, grype audits the SBOM, trivy audits the tree
       # (vulns + IaC misconfig + secrets), osv-scanner audits the lockfiles
       # against OSV directly. Three scanners because their databases disagree
@@ -242,7 +242,7 @@ jobs:
     name: hardcoded constraints match the service model
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: astral-sh/setup-uv@v7
@@ -282,7 +282,7 @@ jobs:
     name: python and node bindings
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: astral-sh/setup-uv@v7
@@ -347,7 +347,7 @@ jobs:
     name: static aarch64 binary
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-unknown-linux-musl
