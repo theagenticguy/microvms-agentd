@@ -4,6 +4,7 @@ version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+publish.workspace = true
 description = "the `microvm` binary: a working sandbox in one command, and nothing microvms-core does not do"
 
 # ── no lib target, deliberately (ARCH-5) ────────────────────────────────────

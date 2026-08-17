@@ -6,7 +6,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Live conformance run driving the **Rust** client stack through the `microvm` CLI.
 
-This is the only live suite, and it now expresses **every named check** — 75 of them, with
+This is the only live suite, and it now expresses **every named check** — 77 of them, with
 none recorded SKIP. `conformance/run.py` was the oracle — 56 checks through the Python
 client — and it went away with that client once both suites ran green against real AWS on
 the same commit (Python 56/56, this one 38/38 with 34 recorded SKIP). Those 34 were the
@@ -36,6 +36,11 @@ The first live round subtracted one. `tree packed in the guest` ran `tar cf` ins
 and was deleted rather than fixed: al2023-minimal ships no `tar` binary, and a step needing
 one tests the base image's tooling rather than this client. The daemon packs and extracts
 through its own `/v1/fs/tar` routes, which is what `cp --tar` drives now.
+
+77 rather than 75: the count had drifted to 76 before anyone updated this line (a measured
+live run reported "76 of 76" against three places claiming 75), and the build log-group
+delete described in `drive_teardown` is the 77th. The summary block at the end derives the
+figure from the checks that ran, so read the number off a run rather than from here.
 
 A hybrid driver, and both lanes are deliberate
 ----------------------------------------------

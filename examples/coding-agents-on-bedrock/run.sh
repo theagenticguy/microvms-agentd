@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
 # Claude Code and Codex CLI, inside a Lambda MicroVM, against Bedrock.
 #
 # What this does, end to end:

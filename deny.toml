@@ -1,0 +1,61 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# cargo-deny: the dependency-license and supply-chain policy for the Rust
+# workspace. `mise run vuln` covers CVEs (grype/trivy/osv-scanner); this gate
+# covers what those cannot: license policy, yanked crates, wildcard version
+# requirements, and untrusted registries. Run: `cargo deny check` (in `mise run
+# security` and CI).
+#
+# The allowlist below is derived from the measured inventory (475 external
+# packages, 2026-08-16): every entry is a license that actually appears in the
+# tree today. A new dependency under a new license fails the gate until the
+# license is read and added here, which is the point.
+
+[graph]
+all-features = true
+
+[licenses]
+# cargo-deny evaluates the full SPDX expression per crate; an OR lets us take
+# either side, so `MIT OR Apache-2.0` passes via either entry.
+allow = [
+  "MIT",
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "Zlib",
+  "0BSD",
+  "MIT-0",
+  "Unlicense",
+  "Unicode-3.0",  # unicode-ident's ICU data tables
+  "CDLA-Permissive-2.0",  # webpki-roots' root store data
+]
+confidence-threshold = 0.93
+
+# The LGPL appearances in the tree (r-efi, linux-raw-sys) are expressions of
+# the form `... OR LGPL-2.1-or-later`: the OR gives us the permissive branch,
+# so no LGPL exception is needed and none is granted.
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+# The seven findings behind this: intra-workspace `{ path = "../protocol" }`
+# dependencies carry no version, which cargo-deny counts as `*`. Nothing here
+# is published to crates.io (the repo is deliberately source-only), so a
+# versionless path dependency is the correct form, and this scopes the
+# exemption to path deps only; a registry wildcard still fails.
+allow-wildcard-paths = true
+
+[advisories]
+# Advisory scanning is grype/trivy/osv-scanner's lane (three databases, every
+# accepted finding recorded with its reason in .trivyignore.yaml or
+# osv-scanner.toml). Running RustSec here too would give findings a fourth
+# place to be silenced; yanked crates are checked because none of the other
+# three scanners sees them.
+version = 2
+yanked = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

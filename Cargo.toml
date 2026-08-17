@@ -23,6 +23,13 @@ resolver = "3"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/theagenticguy/microvms-agentd"
+# The repo is deliberately source-only (README: nothing on crates.io, PyPI, or
+# npm). microvms-py and microvms-js already said `publish = false` out loud;
+# the other five crates never declared it, so `cargo publish` would have
+# accepted them and cargo-deny classified them as public crates, which is what
+# made their versionless path dependencies a wildcard error. One declaration
+# here, inherited by every member.
+publish = false
 
 # Tuned for the shipping artifact: one static binary, small enough to bake into
 # any task base image, with no interpreter or runtime dependency.

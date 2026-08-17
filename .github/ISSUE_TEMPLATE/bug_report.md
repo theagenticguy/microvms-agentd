@@ -1,6 +1,6 @@
 ---
 name: Bug report
-about: The daemon or the Python client does something other than what docs/PROTOCOL.md says
+about: The daemon or a client does something other than what docs/PROTOCOL.md says
 title: ''
 labels: bug
 ---

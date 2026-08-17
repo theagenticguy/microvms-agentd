@@ -138,7 +138,7 @@ waits on a Dockerfile, while a run hook waits on a daemon that is already booted
 daemon that takes more than 60 seconds to answer `/run` fails the launch, and there is
 no way to ask for more time.
 
-A drift checker is being added at `scripts/check-model-drift.py` and wired into
+A drift checker exists at `scripts/check-model-drift.py` and is wired into
 `mise run check`. With it in place, a documented constraint that no longer matches
 the shipped model fails the check mechanically instead of waiting for someone to
 notice the prose.

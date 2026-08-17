@@ -162,7 +162,7 @@ path by which the attacker gains authority (`model/src/lib.rs:27-34`, `model/src
 
 Verification tooling and requirements documents; none is a workspace crate.
 
-- `conformance/run_rs.py` (2294 LOC) — the only live suite, driving the built CLI against real AWS through 75 named checks (`conformance/run_rs.py:8-9`).
+- `conformance/run_rs.py` (2355 LOC) — the only live suite, driving the built CLI against real AWS through 77 named checks (`conformance/run_rs.py:8-9`).
 - `conformance/infra/main.tf` (242 LOC)
 - `spec/core.symspec.json` (1049 LOC) — 51 requirements in the v5 `docVersion: 3` format, checked with a state model the 0.1.0 `symspec` on PATH cannot read (`mise.toml:128-130`).
 - `spec/microvms-core-kickoff.md` (175 LOC)
@@ -170,7 +170,7 @@ Verification tooling and requirements documents; none is a workspace crate.
 - `scripts/check-model-drift.py` (807 LOC) — checks the constraints the client hardcodes against the shipped service model (`mise.toml:185`).
 - `scripts/check-live-rates.py` (624 LOC) — fails if the pinned rate table no longer matches the AWS Pricing API (`mise.toml:275`).
 - `scripts/verify-clean.py` (167 LOC) — queries the account for resources the project left behind, instead of assuming teardown succeeded (`mise.toml:282`).
-- `scripts/check-license-headers.py` (81 LOC) — checks that every tracked `.rs` and `.py` file carries its SPDX line (`lefthook.yml:31`).
+- `scripts/check-license-headers.py` (112 LOC) — checks that every tracked `.rs`, `.py`, `.pyi`, `.mjs`, `.sh`, and `.tf` file carries its SPDX line (`lefthook.yml:31`).
 
 ## See also
 

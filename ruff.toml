@@ -9,7 +9,8 @@
 # The first fix here was `extend-include = ["scripts/*"]`: tell ruff that a file in `scripts/`
 # is Python regardless of its name. It worked, and it was the wrong layer. The same extension
 # blindness then hit a second gate that had nothing to do with ruff —
-# `scripts/check-license-headers.py` enumerates with `git ls-files "*.rs" "*.py"`, so it
+# `scripts/check-license-headers.py` then enumerated with `git ls-files "*.rs" "*.py"` (it
+# covers six extensions now), so it
 # reported "all 100 tracked source files carry the SPDX line" while three of the scripts
 # implementing this repo's gates carried no SPDX line at all (issue #32). Two gates blind for
 # one reason is a naming problem, not a config problem, and `extend-include` only ever taught

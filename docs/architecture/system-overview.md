@@ -52,7 +52,7 @@ and napi-rs rather than through the CLI (`microvms-py/Cargo.toml:22-26`).
 Verification lives in two more places. `model` is a stateright model of the bootstrap and
 exec lifecycle. It has one dependency and no edge to any workspace member, because it
 models the protocol rather than importing it (`model/Cargo.toml:8-9`). `conformance/run_rs.py` drives the built CLI
-against real AWS through 75 named checks (`conformance/run_rs.py:8-10`). Start reading at
+against real AWS through 77 named checks (`conformance/run_rs.py:8-10`). Start reading at
 `agentd/src/lib.rs` for the trust boundary, then `microvms-core/src/lib.rs` for the trap
 ladder.
 
