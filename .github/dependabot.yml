@@ -1,0 +1,24 @@
+# Watches the three ecosystems this repo actually has. Terraform is absent on
+# purpose: conformance/infra is one file with two pinned providers that the
+# live suite exercises directly, and an unattended provider bump there changes
+# what a paid conformance run tests.
+#
+# The npm entry covers microvms-js's single devDependency (@napi-rs/cli);
+# cargo covers Cargo.lock; github-actions covers the version-tagged actions in
+# both workflows, including the checksummed binaries' actions (the checksummed
+# curl installs are refreshed by hand, as their comments state).
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+  - package-ecosystem: npm
+    directory: /microvms-js
+    schedule:
+      interval: weekly

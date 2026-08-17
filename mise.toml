@@ -29,6 +29,8 @@ osv-scanner = "latest"
 terraform = "latest"
 lefthook = "latest"
 node = "22"
+"cargo:cargo-deny" = "latest"
+"aqua:rhysd/actionlint" = "latest"
 
 [env]
 # The shipping target. MicroVMs are ARM64-only, and a static binary is what lets
@@ -91,12 +93,17 @@ run = [
 ]
 
 [tasks.security]
-description = "Semgrep + secret scan + license headers — fast, offline, no writes"
-# Three checks, one exit. Semgrep runs the public rust and secrets rulesets over
+description = "Semgrep + secrets + license headers + dependency licenses + workflow lint"
+# Five checks, one exit. Semgrep runs the public rust and secrets rulesets over
 # shipped source only (test fixtures plant fake tokens on purpose). betterleaks
 # scans the whole git history, not just the tree — a secret that was committed
 # and then deleted is published the moment the repo is. The header check is a
 # closed set over tracked sources, so an unlicensed file cannot land quietly.
+# cargo-deny is the dependency-license policy (deny.toml: measured allowlist,
+# yanked crates, untrusted registries) — `mise run vuln` covers CVEs, this
+# covers what a CVE scanner cannot. actionlint is the only linter that reads
+# the workflows; before it, a workflow mistake was found by the workflow
+# misbehaving.
 run = [
   # --severity WARNING drops the INFO tier: its findings here are std::env::args
   # in a CLI and TempDir in tests — idioms, not defects — and a gate that cries
@@ -104,6 +111,8 @@ run = [
   "semgrep scan --config p/rust --config p/secrets --severity WARNING --severity ERROR --error --quiet --metrics=off protocol/src agentd/src model/src microvms-core/src microvms-cli/src microvms-py/src microvms-js/src",
   "betterleaks git .",
   "./scripts/check-license-headers.py",
+  "cargo deny check",
+  "actionlint",
 ]
 
 [tasks.sbom]

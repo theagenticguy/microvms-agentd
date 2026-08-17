@@ -5,6 +5,18 @@ on:
     branches: [main]
   pull_request:
 
+# Least privilege, stated once: every job here reads the repo and writes
+# nothing. A job that someday needs more (artifact attestation, SARIF upload)
+# raises it per-job rather than widening the default.
+permissions:
+  contents: read
+
+# A push that supersedes a running PR build cancels it; main never cancels, so
+# the history of green on main stays gap-free.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -100,7 +112,7 @@ jobs:
         run: cargo run -p agentd --bin schema -- --check
 
   security:
-    name: semgrep, secret history, license headers
+    name: semgrep, secret history, licenses, workflow lint
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -139,10 +151,9 @@ jobs:
           ./betterleaks git .
       - name: license headers
         run: ./scripts/check-license-headers.py
-      # The LICENSE file itself, and the crate manifests agreeing with it. Not a
-      # dependency-license audit (every dep is permissive today and cargo-deny
-      # would be the tool when that matters); this asserts the repo's own claim
-      # is consistent.
+      # The LICENSE file itself, and the crate manifests agreeing with it. The
+      # dependency-license audit is cargo-deny, two steps down; this asserts the
+      # repo's own claim is consistent.
       - name: license consistency
         shell: bash
         run: |
@@ -151,6 +162,23 @@ jobs:
           for m in $(git ls-files '*/Cargo.toml'); do
             grep -Eq 'license(\.workspace)?[[:space:]]*=' "$m" || { echo "$m declares no license"; exit 1; }
           done
+      # The dependency-license policy (deny.toml): a measured allowlist of the
+      # licenses actually in the tree, copyleft absent by construction, yanked
+      # crates and unknown registries denied. The "every dep is permissive
+      # today" claim the previous comment made is now a gate instead of an
+      # observation. Proven able to fail: removing MIT from the allowlist
+      # rejects 119 crates.
+      - name: cargo-deny (dependency licenses, yanked crates, sources)
+        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          command: check
+          rust-version: stable
+      # The only linter that reads the workflows themselves. Before it, a
+      # workflow mistake was found by the workflow misbehaving.
+      - name: actionlint
+        uses: raven-actions/actionlint@3d39aea434753780c3b3d4a1a31c854b4dbf49d7 # v2.2.0
+        with:
+          fail-on-error: true
 
   sbom:
     name: SBOM and vulnerability scans

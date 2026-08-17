@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # Conformance stack for microvms-agentd.
 #
 # The minimum AWS surface needed to build a MicroVM image and run one:
