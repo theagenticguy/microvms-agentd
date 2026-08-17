@@ -1,5 +1,11 @@
 # microvms-agentd
 
+[![ci](https://github.com/theagenticguy/microvms-agentd/actions/workflows/ci.yml/badge.svg)](https://github.com/theagenticguy/microvms-agentd/actions/workflows/ci.yml)
+[![live conformance](https://github.com/theagenticguy/microvms-agentd/actions/workflows/live-conformance.yml/badge.svg)](https://github.com/theagenticguy/microvms-agentd/actions/workflows/live-conformance.yml)
+[![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
+[![Rust Edition 2024](https://img.shields.io/badge/rust-edition_2024-orange.svg)](Cargo.toml)
+[![Platform: AWS Lambda MicroVMs](https://img.shields.io/badge/platform-AWS_Lambda_MicroVMs-FF9900.svg)](docs/PLATFORM.md)
+
 Run commands and move files in and out of AWS Lambda MicroVMs.
 
 The service gives you an isolated Firecracker VM but no exec API and no
@@ -12,19 +18,15 @@ command inside it, reports the cost, and tears everything down.
 microvm run ./agentd --exec "echo hello from a microvm"
 ```
 
-## What you need
+## Quick start
 
-- An AWS account with Lambda MicroVMs access, in one of the regions that carry
-  the service: `us-east-1`, `us-east-2`, `us-west-2`, `eu-west-1`,
-  `ap-northeast-1`.
-- [mise](https://mise.jdx.dev/), which provides the Rust toolchain, Terraform,
-  and every task below.
-- AWS credentials in your environment (any form the SDK understands).
-
-Everything is source-only; nothing is published to crates.io, PyPI, or npm.
-You build the two binaries yourself, and the build is one task.
-
-## Getting started
+**What you need:** an AWS account with Lambda MicroVMs access in a service
+region (`us-east-1`, `us-east-2`, `us-west-2`, `eu-west-1`, `ap-northeast-1`),
+AWS credentials in your environment, and [mise](https://mise.jdx.dev/), which
+provides the Rust toolchain, Terraform, and every task below. Everything is
+source-only; nothing is published to crates.io, PyPI, or npm (the workspace
+declares `publish = false` so a stray `cargo publish` cannot change that). You
+build the two binaries yourself, and the build is one task.
 
 **1. Clone and build.**
 
@@ -91,7 +93,51 @@ behind. Expect the first run to take a few minutes; most of it is the image
 build, and the image snapshot has a one-week minimum retention, so keep and
 reuse it (`--image`) rather than rebuilding.
 
-## Working with a long-lived VM
+## Why this exists
+
+Lambda MicroVMs launch a Firecracker VM from a container image and give it a
+per-instance HTTPS endpoint, and that is all: no exec API, no file API, no
+way to ask what is running inside. Every team that adopts the platform ends
+up hand-rolling the same in-VM daemon; Harbor and Omnigent each carry one
+baked into their task images (see
+[docs/HARNESS-CAPABILITIES.md](docs/HARNESS-CAPABILITIES.md)).
+
+This repo is that daemon and its client built once, fully, and verified: exec
+that survives auth-token rotation, tar transfer that cannot escape its target
+directory, suspend/resume that preserves running processes, cost reporting
+from pinned rates, and a conformance suite that proves all of it against real
+VMs. The platform also has sharp edges: error responses that point away from
+their causes, a `clientToken` replay that wedges an image in `CREATING` for
+fifteen hours, a memory floor that silently doubles. Each one was measured
+once, recorded in [docs/PLATFORM.md](docs/PLATFORM.md) with its date and
+region, and then closed in the client: illegal states either do not construct
+(regions and sizes are closed enums) or are rejected locally with an error
+that names the finding, before any billable call.
+
+## How it works
+
+```text
+your machine                        AWS
+────────────                        ───
+microvm CLI ──[control plane]──▶ Lambda MicroVMs API
+   │                                 │ build image / run / suspend / terminate
+   │                                 ▼
+   └──[session, HTTPS + proxy auth]▶ per-VM endpoint ──▶ agentd (in the VM)
+                                                          exec · files · health
+```
+
+The **control plane** (`microvms-core`) wraps the service API: image builds
+from a Dockerfile with local pre-flight of the platform's two build traps,
+launch with per-VM secrets through the one-shot `runHookPayload`, suspend and
+resume, teardown that never raises and reports leaked identifiers. The
+**session plane** talks to `agentd` through the VM's authenticated endpoint:
+idempotent detached exec (caller-minted ids, start/poll/ack, output never
+destroyed unread), SSE streaming with byte-cursor resume, streamed file
+transfer, and tar extraction confined with `openat2` so a hostile archive
+cannot write outside its target. The token the endpoint requires rotates
+hourly; detached execs outlive it by design.
+
+### Working with a long-lived VM
 
 Pass `--keep` to leave the VM running. The output includes three values every
 attached command needs: the endpoint, the agent token, and the MicroVM id.
@@ -115,12 +161,10 @@ microvm terminate $ID        # stop paying
 and returns immediately (`--detach`), and reads an existing exec back
 (`--poll <id>`). Suspend and resume preserve memory, the filesystem, and
 running processes, and a suspended VM bills at a small fraction of a running
-one.
+one. If a run is interrupted, `microvm ls` lists what this CLI created and
+could not confirm it deleted, so nothing leaks silently.
 
-If a run is interrupted, `microvm ls` lists what this CLI created and could
-not confirm it deleted, so nothing leaks silently.
-
-## Running coding agents inside a MicroVM
+### Running coding agents inside a MicroVM
 
 [examples/coding-agents-on-bedrock](examples/coding-agents-on-bedrock/) runs
 Claude Code and Codex CLI headless inside a MicroVM, against Bedrock, with no
@@ -140,34 +184,18 @@ explains each decision, including the two platform constraints the Dockerfile
 has to respect.
 
 Two open-source harnesses run coding agents inside Lambda MicroVMs the same
-way: a small daemon baked into the VM image supplies the exec and
-file-transfer API the platform lacks, and a per-VM token arrives through the
-`runHookPayload` hook so the shared image snapshot never contains a usable
-secret.
+way, each carrying its own hand-rolled daemon:
+**Harbor** ([harbor-framework/harbor#2469](https://github.com/harbor-framework/harbor/pull/2469))
+for agent evaluation and **Omnigent**
+([omnigent-ai/omnigent#2217](https://github.com/omnigent-ai/omnigent/pull/2217))
+for server-managed sessions. Both integrations predate this repo's daemon;
+this project is the same architecture built out fully, with the daemon, the
+verified client, and the platform findings shared across any harness instead
+of rediscovered per integration.
+[docs/HARNESS-CAPABILITIES.md](docs/HARNESS-CAPABILITIES.md) maps their
+contracts onto this platform and ranks what is still missing.
 
-- **Harbor** ([harbor-framework/harbor#2469](https://github.com/harbor-framework/harbor/pull/2469))
-  adds Lambda MicroVMs as an agent-evaluation environment: each trial builds
-  the task's Dockerfile into a MicroVM image server-side, launches a VM from
-  the snapshot, and drives the agent through a stdlib-only in-VM daemon with
-  detached start/poll/ack exec, so a command can outrun the 60-minute
-  MicroVM auth-token ceiling. Harbor's Claude Code agent runs against
-  Bedrock (`CLAUDE_CODE_USE_BEDROCK=1`), and its Codex CLI agent takes an
-  `OPENAI_BASE_URL` override, so both run inside the VM with no vendor API
-  key when the execution role carries `bedrock:InvokeModel`.
-- **Omnigent** ([omnigent-ai/omnigent#2217](https://github.com/omnigent-ai/omnigent/pull/2217))
-  adds Lambda MicroVMs as a server-managed sandbox provider: sessions
-  suspend to a snapshot between turns and resume with the running host,
-  its processes, and its live token intact, so an idle session stops
-  billing compute. Its credential guidance is the key pattern: grant the
-  execution role `bedrock:InvokeModel` and point the agent at Bedrock, and
-  no model key ever enters the sandbox.
-
-Both integrations predate this repo's daemon and carry their own; this
-project is the same architecture built out fully, with the daemon, the
-verified client, and the platform findings shared across any harness
-instead of rediscovered per integration.
-
-## Calling it from code
+### Calling it from code
 
 The same lifecycle is available as a library, with the same defaults and the
 same guardrails:
@@ -183,19 +211,12 @@ Both stubs are generated from the Rust source, never hand-written, so the trap
 closures are visible to a type checker and not only at runtime: a dollar amount
 is a `str` a checker refuses to add, `Duration` has no constructor that omits
 provenance, and the two hook timeouts are unrelated classes rather than two
-ints. `microvms-py/examples/typed_usage.py` is the consumer those guarantees are
-checked against.
+ints. Neither stub can go stale unnoticed: `mise run stubs:check` regenerates
+the Python stub and fails on any difference, and Node's `index.d.ts` is
+regenerated before every test run. See
+[docs/reference/public-api.md](docs/reference/public-api.md) for the surface.
 
-Neither stub can go stale unnoticed. `mise run stubs:check` regenerates the
-Python stub and fails on any difference, naming `mise run stubs` as the fix, and
-it runs in `mise run check` and in CI. Node's `index.d.ts` needs no such gate
-because it is not committed at all — it is gitignored and `napi build`
-regenerates it before every test run, local and CI.
-
-See [docs/reference/public-api.md](docs/reference/public-api.md) for the
-surface.
-
-## Using it from scripts and agents
+### Using it from scripts and agents
 
 Every command takes `--json` and then emits exactly one JSON envelope on
 stdout; progress goes to stderr. Success carries `type` and `data`; failure
@@ -205,7 +226,7 @@ exception is `exec --stream`, which emits NDJSON events and the envelope last.
 the CLI's own argument tree, so a tool can discover the surface without
 parsing help text. Details in [docs/reference/cli.md](docs/reference/cli.md).
 
-## What it costs
+### What it costs
 
 Every run reports a cost estimate built from pinned, dated, per-region ARM
 rates; `mise run live:rates` checks the pinned table against the AWS Pricing
@@ -221,40 +242,41 @@ protocol/        daemon↔client wire types; drift is a compile error
 agentd/          the in-VM daemon: exec, file transfer, one-shot bootstrap
 model/           stateright models of the daemon and client lifecycle
 microvms-core/   the client library: control plane, session, cost, sandbox
-microvms-cli/    the microvm binary: 16 commands, JSON envelopes, a manifest
+microvms-cli/    the microvm binary: 17 commands, JSON envelopes, a manifest
 microvms-py/     Python binding (PyO3)
 microvms-js/     Node binding (napi-rs)
 conformance/     the live suite: 77 checks against real AWS, via the CLI
 spec/            51 formal requirements; 3 lifecycle invariants proved in Z3
 ```
 
-The platform has sharp edges: error responses that point away from their
-causes, a `clientToken` replay that wedges an image in `CREATING` for fifteen
-hours, and a memory floor that silently doubles. Each one was measured once,
-recorded in [docs/PLATFORM.md](docs/PLATFORM.md) with its date and region, and
-then closed in the client: illegal states either do not construct (regions and
-sizes are closed enums) or are rejected locally with an error that names the
-finding, before any billable call.
-
 ## Developing
 
 ```bash
 mise run install         # git hooks
 mise run check           # the definition of done: lint, security, all test
-                         # tiers, schema freshness, model drift, cross-compile
+                         # tiers, schema freshness, stub freshness, model
+                         # drift, cross-compile
 ```
 
-The live tier is separate because it creates real MicroVMs and costs money:
+Verification runs at six tiers: Z3 proofs over the spec, stateright models,
+property tests, network-fault simulation (turmoil), a drift gate comparing the
+hardcoded service constraints against the pinned botocore model, and the live
+conformance suite. The live tier is separate because it creates real MicroVMs
+and costs money:
 
 ```bash
 mise run live            # conformance (77 checks) + rates + leak check, ~5 min
 mise run live:destroy    # tear the Terraform stack back down
 ```
 
-Verification runs at six tiers: Z3 proofs over the spec, stateright models,
-property tests, network-fault simulation (turmoil), a drift gate comparing 33
-hardcoded service constraints against the pinned botocore model, and the live
-conformance suite. [CONTRIBUTING.md](CONTRIBUTING.md) has the workflow;
+Supply-chain gates run in `mise run security`, in the git hooks, and in CI:
+semgrep, secret scanning over the full git history, SPDX license headers on
+every tracked source file, `cargo deny` (dependency licenses against a
+measured allowlist, yanked crates, untrusted registries), and actionlint over
+the workflows. CI publishes CycloneDX and SPDX SBOMs per commit, three
+scanners audit them (grype, trivy, osv-scanner), every accepted finding lives
+in an ignore file with its reason, and Dependabot watches cargo, Actions, and
+npm weekly. [CONTRIBUTING.md](CONTRIBUTING.md) has the workflow;
 [docs/README.md](docs/README.md) indexes the rest of the documentation,
 starting with the
 [system overview](docs/architecture/system-overview.md) and the
@@ -262,4 +284,6 @@ starting with the
 
 ## License
 
-Apache-2.0.
+Apache-2.0. Every source file carries an `SPDX-License-Identifier` line, and
+dependency licenses are enforced against the allowlist in
+[deny.toml](deny.toml).
