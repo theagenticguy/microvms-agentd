@@ -40,7 +40,7 @@ jobs:
     environment: live-aws
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@stable
         # rust-toolchain.toml declares the aarch64-musl target, so it installs
