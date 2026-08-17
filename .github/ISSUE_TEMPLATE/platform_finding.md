@@ -30,8 +30,8 @@ we will ask for them before acting.
 
 ## Reproduction
 
-<!-- The AWS CLI calls, boto3 snippet, or conformance/probe_*.py invocation that
-shows it. Something a reader can run to see the same thing. -->
+<!-- The AWS CLI calls, boto3 snippet, or microvm CLI invocation that shows it.
+Something a reader can run to see the same thing. -->
 
 ## Evidence
 

@@ -18,8 +18,9 @@ named explicitly turned out to have unused imports in it.
 The fix is now the file names: the gates are `scripts/*.py`, so ruff finds them the ordinary
 way. `ruff.toml`'s `extend-include = ["scripts/*"]` was the earlier fix and is gone, because
 it taught only ruff — the identical blindness showed up next in
-`scripts/check-license-headers.py`, which enumerates with `git ls-files "*.rs" "*.py"` and had
-therefore never seen these scripts either (issue #32).
+`scripts/check-license-headers.py`, which enumerated with `git ls-files "*.rs" "*.py"` at the
+time (it covers six extensions now) and had therefore never seen these scripts either
+(issue #32).
 
 This is the guard *over* that, and it is separate for a reason: a naming convention nothing
 checks is a convention, and a file that stops matching fails the same silent way the original

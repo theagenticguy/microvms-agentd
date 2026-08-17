@@ -30,7 +30,7 @@ AWS-facing defect this project has hit was invisible until a real run.
 `check` composes the tiers below, and each tier is runnable alone when you
 want a tighter loop.
 
-There are five tiers, and each one catches a defect class the others cannot
+There are six tiers, and each one catches a defect class the others cannot
 see. `cargo test --all` runs all of them; run them individually while
 iterating.
 
@@ -53,6 +53,15 @@ cargo run -p agentd --bin schema -- --check   # regenerate with the same command
 cargo build --release -p agentd --target aarch64-unknown-linux-musl
 ```
 
+`mise run security` is the supply-chain gate, five checks with one exit:
+semgrep over the shipped source, betterleaks over the full git history, the
+SPDX header gate (`scripts/check-license-headers.py`, covering every tracked
+`.rs`, `.py`, `.pyi`, `.mjs`, `.sh`, and `.tf` file), `cargo deny check`
+against the dependency-license policy in `deny.toml`, and actionlint over the
+workflows. The pre-commit hook runs the header gate when a matching file is
+staged, `cargo deny` when a manifest or `deny.toml` changes, and actionlint
+when a workflow changes.
+
 `aarch64-unknown-linux-musl` is the shipping target and CI builds it on every
 push. `.cargo/config.toml` pins `rust-lld`, so `rustup target add
 aarch64-unknown-linux-musl` is the only setup step. You do not need an external
@@ -63,7 +72,8 @@ no Python client any more; `clients/python` is in git history, and the clients
 are the `microvm` CLI and the `microvms-py` / `microvms-js` bindings.
 
 ```bash
-uvx ruff check conformance scripts && uvx ruff format --check conformance scripts
+./scripts/check-lint-coverage.py          # proves ruff sees every Python file
+uvx ruff check . && uvx ruff format --check .
 ./conformance/run_rs.py --self-test       # the live suite's offline half. Free.
 ./scripts/check-live-rates.py --twin-only # the pinned rate tables agree. Offline, free.
 ```
@@ -81,9 +91,13 @@ something was proven wrong. If you add a requirement whose wording shares
 vocabulary with no peer, symspec says so. The usual fix is a glossary link
 committed in the document rather than a looser gate.
 
-CI (`.github/workflows/ci.yml`) runs fmt, clippy, `cargo test --all`, the schema
-staleness check, the aarch64-musl cross-compile, and symspec strict. It does not
-run the Python tests or ruff, so run those yourself before opening a PR.
+CI (`.github/workflows/ci.yml`) runs fmt, clippy, the test tiers on three
+platforms, the schema staleness check, the security job (semgrep, betterleaks
+over history, license headers, cargo-deny, actionlint), the SBOM and
+vulnerability scans, the model-drift gate plus ruff, the binding suites, and
+the aarch64-musl cross-compile. It does not run symspec: the v5 tool that can
+read `spec/core.symspec.json` is not yet published anywhere, so requirements
+verification is `mise run spec` and `mise run spec:core`, run locally.
 
 ## Prove your guard fires
 
@@ -131,7 +145,8 @@ that encodes the artifact as expected behavior.
 `conformance/run_rs.py` tests the real binary against real AWS, which makes it
 the ground truth anchor; the model tier checks a model, not the binary itself.
 It is also the only part of this repo that spends money. `mise run live` runs
-it alongside the rate-drift check and the leak check. To run it by hand:
+it alongside the signer checks (`live:paths`, `live:versions`), the rate-drift
+check, and the leak check. To run it by hand:
 
 ```bash
 terraform -chdir=conformance/infra init
@@ -147,11 +162,11 @@ conformance/run_rs.py \
 suspend/resume probe were here until the Rust port drove this suite green
 against real AWS on the same commit. Both are in git history. The
 suspend/resume assertions they fed still run inside this suite. The 34
-protocol-detail checks that only the Python client could express do not run,
-because the `microvm` CLI has no `cp`, `ack`, `exec --stream`, `stdin`, or
-`health` subcommand. The suite prints each of those as SKIP with the missing
-subcommand named, so a SKIP becomes a PASS the day the CLI grows the
-subcommand.
+protocol-detail checks that only the Python client could express run here
+now: the CLI grew `health`, `ack`, `cp` (with `--tar`), `exec --stream`, and
+`stdin` (see `docs/CLI-COVERAGE-PLAN.md`), and every former SKIP became a
+real check under the name run.py gave it. The suite expresses every named
+check with none skipped.
 
 `--self-test` is the offline half. It drives the envelope-to-exception mapping
 against a stub `microvm` and touches no account, so it is free and belongs in

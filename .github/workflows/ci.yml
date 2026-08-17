@@ -39,11 +39,13 @@ env:
 #   satisfies the actual requirement, which is the Node runtime.
 # * `setup-uv` is on the `v7` **major** tag rather than the newer `v9.0.0`. From
 #   v8 astral stopped publishing major and minor tags on purpose, for supply-chain
-#   reasons — so v9 can only be referenced as an exact version or a git hash. This
-#   repo has no Dependabot, and an exact pin with nothing watching it is a pin that
-#   silently stops receiving patches; a rolling major keeps getting them. v7 is the
-#   last major that offers that and is already on Node 24. When a bot lands here,
-#   pin the hash instead and delete this paragraph.
+#   reasons — so v9 can only be referenced as an exact version or a git hash. When
+#   this paragraph was written the repo had no Dependabot, and an exact pin with
+#   nothing watching it is a pin that silently stops receiving patches; a rolling
+#   major keeps getting them, and v7 is the last major that offers that and is
+#   already on Node 24. `.github/dependabot.yml` now watches github-actions
+#   weekly, so the prerequisite is met: the follow-up is to pin the hash and
+#   delete this paragraph in the change that does it.
 #
 # `dtolnay/rust-toolchain` and `aquasecurity/trivy-action` are composite actions
 # with no Node runtime at all, and `Swatinem/rust-cache@v2` is already Node 24.

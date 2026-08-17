@@ -70,7 +70,8 @@ description = "Format check + clippy + ruff, no writes"
 # Two fixes were tried, and the second is why this comment is shorter than it was. Naming each
 # script here worked for exactly the files someone remembered. `ruff.toml`'s
 # `extend-include = ["scripts/*"]` was structural but taught only ruff — the same blindness
-# then turned up in `check-license-headers.py`, which enumerates `git ls-files "*.rs" "*.py"`
+# then turned up in `check-license-headers.py`, which at the time enumerated only
+# `git ls-files "*.rs" "*.py"` (it covers six extensions now)
 # and so had never seen the scripts either (issue #32). The gates are now named
 # `scripts/*.py`, which every extension-based enumerator in this repo already understands, and
 # `extend-include` is gone. They keep their shebangs and their executable bit, so

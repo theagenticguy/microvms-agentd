@@ -13,7 +13,9 @@ message here: name what was measured, and admit what is unverified. -->
 - [ ] `cargo run -p agentd --bin schema -- --check` (regenerated if the protocol changed)
 - [ ] `cargo build --release -p agentd --target aarch64-unknown-linux-musl`
 - [ ] `symspec check spec/agentd.symspec.json --strict` (if `spec/` changed)
-- [ ] `uvx ruff check conformance scripts && uvx ruff format --check conformance scripts` (if either changed)
+- [ ] `./scripts/check-lint-coverage.py && uvx ruff check . && uvx ruff format --check .` (if any Python changed)
+- [ ] `mise exec -- cargo deny check` (if a `Cargo.toml`, `Cargo.lock`, or `deny.toml` changed)
+- [ ] `mise exec -- actionlint` (if a workflow changed)
 - [ ] `./conformance/run_rs.py --self-test` (if `conformance/` changed — offline and free)
 - [ ] Live conformance run, if this touches the wire protocol or AWS lifecycle.
       Region and pass/fail counts:

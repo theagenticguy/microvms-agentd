@@ -70,6 +70,22 @@ misconfigured setup and reports the counterexample path, so the consequence of
 breaking the invariant is a checked fact rather than a guess. Enforcement
 belongs to whoever builds the image.
 
+## Supply chain
+
+The repo is source-only. Nothing is published to crates.io, PyPI, or npm, and
+`publish = false` in the workspace manifest makes that a machine-enforced fact
+rather than a convention. `mise run security` runs five checks with one exit:
+semgrep over shipped source, betterleaks over the full git history, the SPDX
+header gate over every tracked source file, `cargo deny check` against the
+dependency-license policy in `deny.toml` (measured allowlist, yanked crates
+denied, unknown registries denied), and actionlint over the workflows. CI runs
+the same set, plus SBOM generation and three vulnerability scanners
+(grype, trivy, osv-scanner); every accepted finding is recorded with its
+reason in `.trivyignore.yaml` or `osv-scanner.toml`. The cargo-deny and
+actionlint actions are SHA-pinned, the downloaded scanner binaries are
+version-pinned and checksummed, and `.github/dependabot.yml` watches cargo,
+github-actions, and npm weekly.
+
 ## An open question
 
 The `/run` lifecycle hook is **unauthenticated**. The platform presents no

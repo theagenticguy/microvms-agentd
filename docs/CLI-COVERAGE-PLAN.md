@@ -12,7 +12,8 @@
 > no longer accurate. The numerator is now complete. The denominator settled at
 > **75** rather than 72, because two of the original 38 turned out to be weak
 > readings off the launch envelope and were split into real checks (see
-> `CHANGELOG.md`).
+> `CHANGELOG.md`); it has since grown to **77** as the suite gained checks,
+> which is why the paragraph below says to read the figure off a run.
 >
 > Read this for *why* each surface exists and what the constraints were. For what
 > the suite covers today, run it, or read the summary block at the end of
