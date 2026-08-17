@@ -161,6 +161,10 @@ impl ControlPlane {
         if let Some(dockerfile) = request.dockerfile.as_deref() {
             artifact::require_matching_from(&request.base_image, dockerfile)?;
             artifact::require_matching_agentd_port(self.port, dockerfile)?;
+            artifact::require_keepalive_under_idle_timeout(
+                crate::session::exec::DEFAULT_STREAM_IDLE_TIMEOUT,
+                dockerfile,
+            )?;
         }
 
         // Pinned only when the caller asked for it, and refused locally when they asked for

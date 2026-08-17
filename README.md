@@ -18,6 +18,21 @@ command inside it, reports the cost, and tears everything down.
 microvm run ./agentd --exec "echo hello from a microvm"
 ```
 
+## Contents
+
+- [Quick start](#quick-start) — clone, build, infra, first run
+- [Why this exists](#why-this-exists)
+- [How it works](#how-it-works) — control plane, session plane, and the
+  [long-lived VM](#working-with-a-long-lived-vm),
+  [coding agent](#running-coding-agents-inside-a-microvm),
+  [library](#calling-it-from-code), [scripting](#using-it-from-scripts-and-agents),
+  and [cost](#what-it-costs) paths
+- [Writing your own guest Dockerfile](#writing-your-own-guest-dockerfile) — the
+  traps that cost a build cycle, and how to spend none of them
+- [The workspace](#the-workspace)
+- [Developing](#developing)
+- [License](#license)
+
 ## Quick start
 
 **What you need:** an AWS account with Lambda MicroVMs access in a service
@@ -234,6 +249,56 @@ API. Anything the engine cannot price is reported as unpriced with a reason
 rather than as zero, and a total containing an unpriced line renders as a
 lower bound. Note the image snapshot's one-week minimum retention: deleting an
 image early saves nothing, so reuse is the economical habit.
+
+## Writing your own guest Dockerfile
+
+`--dockerfile` replaces the client's default, so you inherit the daemon lines and
+the platform's constraints along with it. Each item below cost a real build cycle
+to find, and a server-side cycle is roughly three minutes plus a wedged image name
+you cannot reuse (`clientToken` is a permanent idempotency key). Run
+`microvm doctor --binary $AGENTD` before any of this — it names every missing
+prerequisite and prints the command that fills it, which is faster than reading the
+rest of this section.
+
+**Build it locally under arm64 first.** A `dnf` typo or a missing package is free
+to find here and expensive to find server-side:
+
+```bash
+docker buildx build --platform linux/arm64 -t guest-check -f guest.Dockerfile .
+```
+
+With `qemu-aarch64` binfmt registered this builds the real target architecture on
+an x86 host. Two errors in the example Dockerfile were caught this way in seconds.
+
+**`ENV AGENTD_PORT` must be 9000**, the client's `DEFAULT_AGENT_PORT`. The platform
+dials its build-time `ready` and `validate` hooks on the port from the create call,
+so a guest listening elsewhere answers neither, and the build fails with
+`CREATE_FAILED` after a completely clean build log — the daemon's own `agentd
+listening` line appears, with the wrong address, and no error line follows. The
+client refuses that disagreement locally now, including the case where the
+Dockerfile names no port while you have moved the client off the default with
+`--port`: an unset variable leaves the daemon on 9000 rather than on your port.
+
+**Set a `WORKDIR` explicitly.** `al2023-minimal` leaves `WorkingDir` empty, so an
+omitted `--cwd` on every later `exec` resolves against `/`. Check that the user your
+workload runs as can write to the directory you choose; a root-owned `WORKDIR` under
+a non-root workload fails at the first write.
+
+**On `-minimal` bases, spell weak dependencies off as `--setopt=install_weak_deps=0`.**
+The integer is what works; `False` is not accepted.
+
+**Keep `ENTRYPOINT []` and `CMD ["/agentd"]`.** That pair is the trust boundary:
+it is what guarantees no workload runs before the platform's run hook lands and the
+token arrives. An `ENTRYPOINT` that swallows `CMD` produces a VM whose daemon never
+starts, and the symptom is a run-hook timeout that mentions neither.
+
+**Leave `AGENTD_SSE_KEEPALIVE_SECS` alone** unless you also raise the client's
+stream idle timeout. The client treats 60 seconds of silence as a dead connection
+because the daemon's keepalive is 15; a longer interval makes healthy streams look
+dead. This too is refused locally.
+
+[examples/coding-agents-on-bedrock/Dockerfile](examples/coding-agents-on-bedrock/Dockerfile)
+is a working guest Dockerfile that respects all of the above.
 
 ## The workspace
 
