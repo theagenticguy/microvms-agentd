@@ -291,7 +291,7 @@ jobs:
           # pins its own version inline and the venv holds exactly `pytest`, so there
           # is no file a cache key could watch.
           enable-cache: false
-      - uses: actions/setup-node@v5
+      - uses: actions/setup-node@v7
         with:
           node-version: '22'
       # The binding suites are where BIND-2/BIND-5 live: nine planted bypasses
