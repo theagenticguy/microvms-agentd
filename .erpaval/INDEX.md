@@ -14,6 +14,8 @@ lessons before starting work.
 ### architecture-patterns
 - [A byte-offset cursor is what separates a working stream reconnect from a broken one](solutions/architecture-patterns/byte-offset-cursor-is-what-makes-reconnect-work.md) — server-side exec object, framed transport for the terminal event, stdin as a separate request, subscribe-before-replay
 
+- [An absent value is not a neutral one, and the fallback decides](solutions/architecture-patterns/an-absent-value-is-not-a-neutral-one.md) — what a missing value means depends on the consumer's fallback, not on the neighbouring guard; how to find the next agreement pair
+
 ### best-practices
 - [Capture subprocess output through pipes, not temp files, when grandchildren matter](solutions/best-practices/pipes-not-tempfiles-for-subprocess-output.md) — pgid before wait, concurrent drain, no `pre_exec` for demotion
 - [A struct that carries a credential never derives Debug](solutions/best-practices/credential-structs-never-derive-debug.md) — hand-written redaction + per-type guard test; audit the class, not the instance
@@ -25,6 +27,9 @@ lessons before starting work.
 - [Four ways a guard passed against broken code in one session](solutions/test-failures/guards-that-passed-against-broken-code.md) — unpinned compile_fail, expiry-vs-margin fakes, uniform draws, oracle-contradicting assertions, fakes more forgiving than the real parser
 
 ## Recent additions
+
+- 2026-08-17 (session-053b88): the absent-value asymmetry, from closing issue #35
+  and sweeping for the fourth agreement pair.
 
 - 2026-08-08 (session-fa0814): five lessons from the Rust port — the guard-proof
   quadrilogy, aws-config's hidden HTTP client, napi error-code collapse,

@@ -1324,3 +1324,27 @@ And it is **recorded**, which is the point. An unpinned build also reports a
 `baseImageVersion` on its version readback, so the value is not evidence that a pin happened —
 what pinning buys is that two builds weeks apart sit on the same base rather than on whatever
 the default has moved to.
+
+## A guest listening on the wrong port fails the build with a clean build log
+
+Measured 2026-08-16, us-east-1, API version `2025-09-09`, base image `al2023-1` /
+`public.ecr.aws/amazonlinux/amazonlinux:2023-minimal`, baseline memory 8192 MiB.
+
+A guest whose `AGENTD_PORT` disagrees with the create call's `hooks.port` fails
+the build with `CREATE_FAILED`, a fully populated and green build log, and no port
+named anywhere except `GetMicrovmImageVersion`'s `hooks.port`. Every docker layer
+succeeds, the daemon's own `agentd listening` line appears with the wrong `addr`,
+and there is no error line at all — the build-time `ready` and `validate` hooks
+are dialled on the port from the create call, so a daemon listening elsewhere
+answers none of them.
+
+`GetMicrovmImage` reports `state: CREATE_FAILED` and `latestFailedImageVersion`
+with no reason field, so the port is only visible by fetching the image *version*
+and comparing `hooks.port` against the Dockerfile by hand. The existing diagnostic
+sends the reader to the build log group and to build-role log permissions, and
+both are demonstrably fine in this failure, which is what makes it expensive.
+
+The same applies when the Dockerfile names no port at all: an unset `AGENTD_PORT`
+leaves the daemon on its own default of 9000, so a client that moved off 9000
+produces this failure with nothing in the Dockerfile to point at. Both halves are
+now refused before the billable call (`require_matching_agentd_port`).

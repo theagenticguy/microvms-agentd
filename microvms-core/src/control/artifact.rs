@@ -23,6 +23,7 @@
 //! would be a *value* appearing somewhere, not a parameter being declared.
 
 use std::io::Write as _;
+use std::time::Duration;
 
 use crate::error::{Error, ErrorKind};
 
@@ -263,6 +264,178 @@ pub fn require_workdir(base: &BaseImage, dockerfile: Option<&str>) -> Result<(),
          nothing to inherit and every relative path would resolve against `/`. Pass a workdir \
          to default_dockerfile, or set WORKDIR in your own Dockerfile.",
         base.name
+    )))
+}
+
+/// The port in a Dockerfile's last `ENV AGENTD_PORT=`, or `None` when it sets none.
+///
+/// Last rather than first: a later `ENV` of the same name wins at build time, so the last
+/// one is what the daemon reads. Accepts `ENV AGENTD_PORT=9000` and the legacy
+/// `ENV AGENTD_PORT 9000` spelling, since both set the variable and a guard that only
+/// understands one form passes the file it cannot parse.
+///
+/// Hand-rolled for the same reason [`dockerfile_from_ref`] is: the pattern is small and a
+/// regex crate is a dependency this lane cannot add.
+pub fn dockerfile_agentd_port(dockerfile: &str) -> Option<u16> {
+    let mut found = None;
+    for line in dockerfile.lines() {
+        let mut words = line.split_whitespace();
+        let Some(first) = words.next() else { continue };
+        if !first.eq_ignore_ascii_case("ENV") {
+            continue;
+        }
+        let Some(assignment) = words.next() else {
+            continue;
+        };
+        let value = match assignment.split_once('=') {
+            Some(("AGENTD_PORT", value)) => value,
+            Some(_) => continue,
+            // `ENV AGENTD_PORT 9000`: the value is the next word.
+            None if assignment == "AGENTD_PORT" => match words.next() {
+                Some(value) => value,
+                None => continue,
+            },
+            None => continue,
+        };
+        // An unparseable value is not this guard's business: the daemon keeps its default
+        // for one (`agentd/src/config.rs:118`), so there is no disagreement to report.
+        if let Ok(port) = value.parse() {
+            found = Some(port);
+        }
+    }
+    found
+}
+
+/// Rejects a Dockerfile whose `AGENTD_PORT` disagrees with the port the create call sends
+/// as `hooks.port`.
+///
+/// The two are set independently — `hooks.port` comes from `ControlPlane::port`, the
+/// variable from the caller's own Dockerfile — and the platform calls its build-time
+/// `ready`/`validate` hooks on the port in the create call. A guest listening elsewhere
+/// answers nothing, so the build fails.
+///
+/// Rejected rather than warned because the failure points away from its cause: the docker
+/// build succeeds, the log group holds a clean build *and* the daemon's own "agentd
+/// listening" line, and the image still lands in `CREATE_FAILED`. Neither
+/// `GetMicrovmImage` nor the build log names the port — only
+/// `GetMicrovmImageVersion`'s `hooks.port` does, compared by hand against the Dockerfile.
+///
+/// A Dockerfile that sets no `AGENTD_PORT` is checked against
+/// [`DEFAULT_AGENT_PORT`](crate::control::DEFAULT_AGENT_PORT) rather than passed, because
+/// silence is not neutral: `Config::from_env` keeps its own default for an unset variable
+/// (`agentd/src/config.rs:118`, default `agentd/src/config.rs:84`), so the guest listens on
+/// 9000 whether or not the Dockerfile mentions a port. Against a client that changed its
+/// port, the absent variable produces exactly the measured failure — and produces it for a
+/// caller who never typed a port anywhere, which is the harder version to diagnose.
+pub fn require_matching_agentd_port(port: u16, dockerfile: &str) -> Result<(), Error> {
+    // An unparseable value lands here too, and belongs here: the daemon warns and keeps the
+    // same default (`agentd/src/config.rs:174-179`), so both spellings of "the Dockerfile
+    // named no usable port" have the same consequence in the guest.
+    let Some(found) = dockerfile_agentd_port(dockerfile) else {
+        if port == super::DEFAULT_AGENT_PORT {
+            return Ok(());
+        }
+        return Err(Error::invalid_arg(format!(
+            "this client sends hooks.port={port} but the Dockerfile sets no usable \
+             AGENTD_PORT, so the daemon will listen on its own default of {default}. These \
+             must agree: the platform calls the build-time ready/validate hooks on the port \
+             in the create call, and a daemon listening on {default} answers none of them — \
+             the docker build succeeds, the daemon logs that it is listening, and the image \
+             still fails with CREATE_FAILED naming no port. Add ENV AGENTD_PORT={port} to \
+             the Dockerfile, or build it with default_dockerfile, which derives the value \
+             from the same port.",
+            default = super::DEFAULT_AGENT_PORT,
+        )));
+    };
+    if found == port {
+        return Ok(());
+    }
+    Err(Error::invalid_arg(format!(
+        "the Dockerfile sets ENV AGENTD_PORT={found} but this client sends hooks.port={port}. \
+         These must agree: the platform calls the build-time ready/validate hooks on the port \
+         in the create call, and a daemon listening on {found} answers none of them — the \
+         docker build succeeds, the daemon logs that it is listening, and the image still \
+         fails with CREATE_FAILED naming no port. Set ENV AGENTD_PORT={port} in the \
+         Dockerfile, or build it with default_dockerfile, which derives the value from the \
+         same port."
+    )))
+}
+
+/// The seconds in a Dockerfile's last `ENV AGENTD_SSE_KEEPALIVE_SECS=`, or `None` when it
+/// sets none.
+///
+/// Same shape and same reasoning as [`dockerfile_agentd_port`]: last assignment wins, both
+/// `ENV` spellings, and an unparseable value reads as absent because the daemon warns and
+/// keeps its default for one (`agentd/src/config.rs:174-179`).
+pub fn dockerfile_env_u64(dockerfile: &str, key: &str) -> Option<u64> {
+    let mut found = None;
+    for line in dockerfile.lines() {
+        let mut words = line.split_whitespace();
+        let Some(first) = words.next() else { continue };
+        if !first.eq_ignore_ascii_case("ENV") {
+            continue;
+        }
+        let Some(assignment) = words.next() else {
+            continue;
+        };
+        let value = match assignment.split_once('=') {
+            Some((name, value)) if name == key => value,
+            Some(_) => continue,
+            None if assignment == key => match words.next() {
+                Some(value) => value,
+                None => continue,
+            },
+            None => continue,
+        };
+        if let Ok(parsed) = value.parse() {
+            found = Some(parsed);
+        }
+    }
+    found
+}
+
+/// Rejects a Dockerfile whose `AGENTD_SSE_KEEPALIVE_SECS` is not shorter than the client's
+/// stream idle timeout.
+///
+/// The fourth pair of this shape, found by sweeping for the other three. The daemon's SSE
+/// keepalive interval and the client's tolerance for silence are set in different
+/// repositories of truth — the interval in the caller's Dockerfile
+/// (`agentd/src/config.rs:139`, default 15s at `:95`), the tolerance in
+/// [`DEFAULT_STREAM_IDLE_TIMEOUT`](crate::session::exec::DEFAULT_STREAM_IDLE_TIMEOUT),
+/// which is 60s *because* it is four times that 15. Raise the interval past the tolerance
+/// and every attached stream treats a healthy connection as dead, reconnects
+/// `max_reconnects` times, and fails.
+///
+/// The failure names both numbers and misattributes one of them: the client reports that the
+/// stream "went silent for 60s, longer than the keepalive interval"
+/// (`microvms-core/src/session/http.rs:383-387`), where 60 is its own timeout and the
+/// keepalive interval is the number it does not know. So a reader is told the keepalive was
+/// exceeded by a message that prints the wrong value for it, one build cycle after the
+/// Dockerfile that caused it.
+///
+/// Equality is refused, not just excess: an interval exactly equal to the timeout races.
+pub fn require_keepalive_under_idle_timeout(
+    idle_timeout: Duration,
+    dockerfile: &str,
+) -> Result<(), Error> {
+    let Some(secs) = dockerfile_env_u64(dockerfile, "AGENTD_SSE_KEEPALIVE_SECS") else {
+        // Absent is safe here, unlike the port: the daemon's default of 15s is already
+        // under every idle timeout this client will use, and a client that shortens its
+        // timeout below 15s is not something a Dockerfile can be blamed for.
+        return Ok(());
+    };
+    if secs < idle_timeout.as_secs() {
+        return Ok(());
+    }
+    Err(Error::invalid_arg(format!(
+        "the Dockerfile sets ENV AGENTD_SSE_KEEPALIVE_SECS={secs} but this client treats a \
+         stream as dead after {timeout}s of silence. The keepalive must be shorter: the \
+         daemon sends nothing between events except that keepalive, so an interval of \
+         {secs}s makes a healthy stream look dead, and every attach reconnects until it \
+         gives up. The error it raises then reports the client's own {timeout}s as though it \
+         were the keepalive interval, so it names neither the Dockerfile nor {secs}. Leave \
+         the variable unset for the daemon's 15s default, or keep it under {timeout}.",
+        timeout = idle_timeout.as_secs(),
     )))
 }
 
@@ -519,6 +692,144 @@ mod tests {
     fn a_dockerfile_with_no_from_is_left_to_the_build() {
         require_matching_from(&BaseImage::al2023(), "COPY agentd /agentd\n")
             .expect("no FROM is not a disagreement");
+    }
+
+    /// The measured case, reproduced from the Dockerfile that spent it: a hand-written
+    /// guest Dockerfile carrying `ENV AGENTD_PORT=8080` — the plausible port, and the wrong
+    /// one — against a client sending `hooks.port=9000`. The build succeeds, the daemon logs
+    /// `agentd listening`, and the image lands in `CREATE_FAILED` naming no port.
+    #[test]
+    fn a_dockerfile_port_that_disagrees_with_the_hook_port_is_refused() {
+        let error = require_matching_agentd_port(
+            crate::control::DEFAULT_AGENT_PORT,
+            "FROM public.ecr.aws/amazonlinux/amazonlinux:2023-minimal\n\
+             COPY agentd /agentd\n\
+             ENV AGENTD_PORT=8080\n\
+             EXPOSE 8080\n\
+             CMD [\"/agentd\"]\n",
+        )
+        .expect_err("8080 is not the port the create call sends");
+        assert_eq!(error.kind(), ErrorKind::InvalidArg);
+        let message = error.to_string();
+        assert!(message.contains("8080"), "{message}");
+        assert!(message.contains("9000"), "{message}");
+        // The remedy is what a reader acts on, and the diagnostic's value is naming the
+        // symptom that points away from the cause.
+        assert!(message.contains("CREATE_FAILED"), "{message}");
+        assert!(message.contains("ready/validate"), "{message}");
+
+        require_matching_agentd_port(
+            crate::control::DEFAULT_AGENT_PORT,
+            &default_dockerfile(
+                crate::control::DEFAULT_AGENT_PORT,
+                Some("/work"),
+                &BaseImage::al2023(),
+            ),
+        )
+        .expect("the derived Dockerfile agrees with the port it was derived from");
+    }
+
+    /// Both `ENV` spellings set the variable, so a guard reading only `KEY=VALUE` would pass
+    /// the legacy form it could not parse. The last assignment wins, as it does at build
+    /// time.
+    #[test]
+    fn the_port_scan_reads_both_env_spellings_and_takes_the_last() {
+        assert_eq!(dockerfile_agentd_port("ENV AGENTD_PORT=9000\n"), Some(9000));
+        assert_eq!(dockerfile_agentd_port("ENV AGENTD_PORT 8080\n"), Some(8080));
+        assert_eq!(dockerfile_agentd_port("env agentd_port=7000\n"), None);
+        assert_eq!(
+            dockerfile_agentd_port("ENV AGENTD_PORT=8080\nENV AGENTD_PORT=9000\n"),
+            Some(9000),
+        );
+        assert_eq!(dockerfile_agentd_port("ENV AGENTD_LOG=info\n"), None);
+        // Neither a missing variable nor an unparseable one is a disagreement: the daemon
+        // keeps its own default for both (`agentd/src/config.rs:118`).
+        assert_eq!(
+            dockerfile_agentd_port("FROM x\nCOPY agentd /agentd\n"),
+            None
+        );
+        assert_eq!(dockerfile_agentd_port("ENV AGENTD_PORT=nine\n"), None);
+        require_matching_agentd_port(
+            crate::control::DEFAULT_AGENT_PORT,
+            "FROM x\nCOPY agentd /agentd\n",
+        )
+        .expect("no variable agrees with the default, which is what the daemon will use");
+    }
+
+    /// The other half of the pair, and the harder one to diagnose: a Dockerfile that names
+    /// no port at all against a client that moved off the default. Silence is not neutral —
+    /// `Config::from_env` keeps `9000` for an unset variable — so the guest listens on 9000
+    /// while the hooks are dialled on the client's port, which is the measured failure with
+    /// nothing in the Dockerfile to point at.
+    #[test]
+    fn a_dockerfile_naming_no_port_is_refused_when_the_client_moved_off_the_default() {
+        let error = require_matching_agentd_port(
+            8080,
+            "FROM public.ecr.aws/amazonlinux/amazonlinux:2023-minimal\n\
+             COPY agentd /agentd\n\
+             CMD [\"/agentd\"]\n",
+        )
+        .expect_err("a silent Dockerfile leaves the daemon on 9000, not on 8080");
+        assert_eq!(error.kind(), ErrorKind::InvalidArg);
+        let message = error.to_string();
+        assert!(message.contains("8080"), "{message}");
+        assert!(
+            message.contains(&crate::control::DEFAULT_AGENT_PORT.to_string()),
+            "the daemon's default is the value the reader has to learn: {message}"
+        );
+        assert!(message.contains("CREATE_FAILED"), "{message}");
+        assert!(message.contains("ready/validate"), "{message}");
+
+        // An unparseable value has the same consequence in the guest as no value, so it is
+        // refused for the same reason rather than passed as "not this guard's business".
+        require_matching_agentd_port(8080, "FROM x\nENV AGENTD_PORT=nine\n")
+            .expect_err("a value the daemon cannot parse leaves it on its own default");
+
+        // The default-port client is the common case and stays silent: the Dockerfile that
+        // says nothing and the client that changed nothing already agree.
+        require_matching_agentd_port(
+            crate::control::DEFAULT_AGENT_PORT,
+            "FROM x\nCOPY agentd /agentd\n",
+        )
+        .expect("silence agrees with the default");
+    }
+
+    /// The fourth pair of the `FROM`/`WORKDIR`/`AGENTD_PORT` shape, found by sweeping for
+    /// the others: a keepalive interval the client's silence tolerance is shorter than. The
+    /// resulting error prints the client's own timeout as though it were the keepalive, so
+    /// the number a reader would search for never appears.
+    #[test]
+    fn a_keepalive_at_or_over_the_client_idle_timeout_is_refused() {
+        let timeout = crate::session::exec::DEFAULT_STREAM_IDLE_TIMEOUT;
+        assert_eq!(timeout.as_secs(), 60, "the guard's arithmetic assumes this");
+
+        let error =
+            require_keepalive_under_idle_timeout(timeout, "ENV AGENTD_SSE_KEEPALIVE_SECS=90\n")
+                .expect_err("90s of scheduled silence exceeds a 60s tolerance");
+        assert_eq!(error.kind(), ErrorKind::InvalidArg);
+        let message = error.to_string();
+        assert!(message.contains("90"), "{message}");
+        assert!(message.contains("60"), "{message}");
+
+        // Equality races rather than passing: the timeout fires on the same tick the
+        // keepalive is due.
+        require_keepalive_under_idle_timeout(timeout, "ENV AGENTD_SSE_KEEPALIVE_SECS=60\n")
+            .expect_err("an interval equal to the tolerance is a race, not a margin");
+
+        require_keepalive_under_idle_timeout(timeout, "ENV AGENTD_SSE_KEEPALIVE_SECS 30\n")
+            .expect("30s leaves a margin, in the legacy spelling");
+        // The daemon's own default is 15s, so silence is safe for this pair.
+        require_keepalive_under_idle_timeout(timeout, "FROM x\nCOPY agentd /agentd\n")
+            .expect("an unset keepalive leaves the daemon at 15s");
+        require_keepalive_under_idle_timeout(
+            timeout,
+            &default_dockerfile(
+                crate::control::DEFAULT_AGENT_PORT,
+                Some("/work"),
+                &BaseImage::al2023(),
+            ),
+        )
+        .expect("the derived Dockerfile sets no keepalive");
     }
 
     /// Workdir inheritance is refused when neither the base nor the Dockerfile declares
