@@ -22,7 +22,7 @@ axum = "0.8.9"
 # the VM unreachable for good. See the `panic` setting in the workspace release
 # profile — `panic = "abort"` would make this layer unreachable, which is why the
 # profile overrides it back to `unwind`.
-tower-http = { version = "0.6", features = ["limit", "catch-panic"] }
+tower-http = { version = "0.7", features = ["limit", "catch-panic"] }
 tokio = { version = "1.53", features = [
     "rt",
     "macros",
