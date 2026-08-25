@@ -136,12 +136,21 @@ refuses an over-budget payload locally, naming the env's share of it, since
 AWS's own answer arrives after the call and botocore does not check.
 Credential-scale material still belongs on the file path or a role.
 
-**5. Session-lifetime alignment for long execs.** Harbor's daemon exists
-partly because commands must outlive the 60-minute proxy-token ceiling. Our
-detached exec already survives it (state lives in the daemon; the client
-re-minted token reattaches), but nothing documents or tests the
-reattach-after-token-rotation path explicitly. A conformance check plus a
-doc section turns an accident of design into a contract.
+**5. Session-lifetime alignment for long execs. Shipped.** Harbor's daemon
+exists partly because commands must outlive the 60-minute proxy-token ceiling.
+Our detached exec already survived it by design — state lives in the daemon; a
+re-minted token reattaches — and the design is now the tested contract this
+item asked for. The live suite's `reattach after token rotation` section
+(`conformance/run_rs.py`, `drive_token_rotation`) starts a detached exec,
+reattaches from nothing but the three identifiers a harness would have
+persisted — each attach minting a fresh proxy token, which is what a rotation
+*is* — and asserts under the check name `no output produced before the reattach
+was lost` that bytes buffered under one token are read whole under the next.
+What it deliberately does not do is wait the real hour: an expired token being
+refused is the platform's property, not this contract, and the mechanism the
+survival rests on is fully exercised without it. The doc half is
+`docs/EMBEDDING.md`, "The proxy-token reality", which names start, rotate,
+poll, ack as a normal sequence rather than a recovery path.
 
 **6. Idle-signal correctness for outbound-tunnel workloads. Shipped, with
 the naive half ruled out.** The platform measures idleness only by inbound
@@ -165,10 +174,15 @@ what rules out the daemon self-keepaliving: a hung process would otherwise
 bill silently to the 8-hour ceiling. `busy` is "producing", not
 "unfinished" — an exited exec awaiting an ack reads false — and `execs`
 counts every registered entry so a caller can tell a drained VM from one
-holding output nobody read. Not measured: that a poll from outside does in
-fact reset the timer. It is inbound endpoint traffic by construction, so it
-should, but nobody has run a VM to the edge of its idle window while
-polling and watched it survive.
+holding output nobody read. The one thing this section left unmeasured — that
+a poll from outside does in fact reset the timer — has since been measured
+twice over: by hand in `docs/PLATFORM.md` ("An outside poll of `/v1/health`
+does reset the idle timer"), and on every live run by
+`conformance/run_rs.py`'s `drive_idle_keepalive`, which runs a VM to the edge
+of a 60-second idle window while polling and watches it survive under the
+check name `a VM polled from outside outlives its idle window` — then stops
+polling and watches the same VM suspend, which is the control that proves the
+survival was the polling.
 
 **7. An eve backend adapter (separate package, later).** Ten session
 methods over the Node binding makes this platform a pinnable eve backend:
@@ -209,8 +223,13 @@ the existing per-request contract unchanged for anyone who sends no launch
 env. Busy semantics: producing rather than unfinished, reported to an
 orchestrator *outside* the VM, because the guest-side keepalive this
 document floated cannot work against a proxy that terminates outside the
-guest. Item 5 is still open: the reattach-after-token-rotation path works by
-design and nothing tests or documents it explicitly.
+guest. Item 5 has shipped too, and it cost no code: the
+reattach-after-token-rotation path always worked by design, and what this
+document asked for — a conformance check plus a doc section — is exactly what
+landed. `drive_token_rotation` and `drive_idle_keepalive` in
+`conformance/run_rs.py` are the checks; `docs/EMBEDDING.md` carries the
+operator-facing halves of both, the rotate-mid-run sequence and the
+outside-poll keepalive ownership.
 
 Reading `readTextFile` from the AI SDK sandbox contract while item 4 was
 being built turned up one gap this document had missed. That method takes

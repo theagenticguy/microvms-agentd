@@ -35,6 +35,7 @@ mod exit;
 // here and the process-level ones are in `tests/`. `cfg(test)` only.
 #[cfg(test)]
 mod guards;
+mod history;
 mod ledger;
 mod manifest;
 mod render;
@@ -371,9 +372,9 @@ fn infra_for(command: &Command) -> Infra {
 ///
 /// The interrupt is a parameter rather than built in the `run` arm, so the behavioral guard
 /// dispatches through this exact function with [`commands::lifecycle::never`] instead of
-/// maintaining a seventeen-arm copy that only differs there. `main` passes
+/// maintaining an eighteen-arm copy that only differs there. `main` passes
 /// [`commands::lifecycle::on_ctrl_c`]; nothing is installed until the future is polled, so the
-/// sixteen commands that never poll it pay nothing.
+/// seventeen commands that never poll it pay nothing.
 async fn handle<O: std::io::Write, E: std::io::Write>(
     ctx: &mut Ctx<'_, O, E>,
     command: &Command,
@@ -394,6 +395,7 @@ async fn handle<O: std::io::Write, E: std::io::Write>(
         Command::Resume(args) => commands::lifecycle::resume(ctx, args).await,
         Command::Terminate(args) => commands::lifecycle::terminate(ctx, args).await,
         Command::Ls(args) => commands::local::ls(ctx, args),
+        Command::History(args) => commands::local::history(ctx, args),
         Command::Logs(args) => commands::local::logs(ctx, args),
         Command::Cost(args) => commands::cost::cost(ctx, args),
         Command::Doctor(args) => commands::doctor::doctor(ctx, args).await,

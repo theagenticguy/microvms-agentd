@@ -106,14 +106,24 @@ microvm exec "mkdir -p /workspace/.codex" "${ATTACH[@]}" --json >/dev/null
 microvm cp "$CODEXCFG" vm:/workspace/.codex/config.toml --mode 0600 "${ATTACH[@]}" --json >/dev/null
 rm -f "$CODEXCFG"
 
+# The daemon runs as root, so everything cp wrote is root-owned 0600 — which
+# the demoted agent cannot read. Hand the workspace to uid 1000 (the user the
+# Dockerfile created) in one root exec before any agent runs.
+microvm exec "chown -R 1000:1000 /workspace" "${ATTACH[@]}" --json >/dev/null
+
 # ── 4. run both agents, headless, inside the VM ─────────────────────────────
+# --user 1000 on every agent exec, and it is not hardening theater: Claude
+# Code's --dangerously-skip-permissions refuses to run as root, and the
+# refusal is nearly silent — as uid 0 the agent denies its own tool calls and
+# reports anyway. Measured: uid 0 made zero Bash calls on this task shape;
+# uid 1000 made 147.
 echo "--- claude code ---"
 microvm exec ". /workspace/.agent-env && claude -p 'Write a one-line bash command that counts files in /usr/bin, then run it with your Bash tool and report the number.' --allowedTools Bash" \
-  "${ATTACH[@]}" --timeout 240
+  --user 1000 --group 1000 "${ATTACH[@]}" --timeout 240
 
 echo "--- codex ---"
 microvm exec ". /workspace/.agent-env && codex exec --skip-git-repo-check -s workspace-write 'Create hello.py that prints hello from a microvm, run it, and show the output.'" \
-  "${ATTACH[@]}" --timeout 240
+  --user 1000 --group 1000 "${ATTACH[@]}" --timeout 240
 
 echo "--- proof of work ---"
 microvm exec "cat /workspace/hello.py 2>/dev/null; ls -la /workspace" "${ATTACH[@]}" --timeout 60

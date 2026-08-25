@@ -75,6 +75,7 @@ use serde_json::{Map, json};
 use crate::cli::{BuildArgs, ResumeArgs, RunArgs, SuspendArgs, TerminateArgs};
 use crate::commands::{Ctx, Rendered, response_type};
 use crate::exit::Exit;
+use crate::history::{Event, History};
 use crate::ledger::Ledger;
 use crate::render::RunOutcome;
 use crate::seam::state_dir;
@@ -167,11 +168,15 @@ pub async fn run<O: std::io::Write, E: std::io::Write>(
 
     let ledger_root = state_dir(args.state_dir.clone(), ctx.env);
     let mut ledger = Ledger::new(region.as_str(), &ledger_root);
+    // Kept as a string before the sandbox takes the `Region`: the history event below wants
+    // the name, and the type is not `Copy`.
+    let region_name = region.as_str().to_string();
     let mut sandbox = ctx.seam.open_sandbox(region, args.port).await?;
     let mut outcome = RunOutcome {
         image_name: Some(name.clone()),
         ..RunOutcome::default()
     };
+    let mut exec_report: Option<ExecReport> = None;
 
     // The launch, raced against the interrupt. `Box::pin` so the two arms are the same shape
     // and the select does not need the body to be a named future.
@@ -184,6 +189,7 @@ pub async fn run<O: std::io::Write, E: std::io::Write>(
             &name,
             size,
             &mut outcome,
+            &mut exec_report,
         ));
         tokio::select! {
             result = body => result,
@@ -226,6 +232,41 @@ pub async fn run<O: std::io::Write, E: std::io::Write>(
     outcome.kept = args.keep;
     outcome.leaked = ledger.record.leaked.clone();
 
+    // The VM's history, keyed by the id the service answered — which is why it is written
+    // here rather than as each step happened: `imageBuilt` predates the launch, and until
+    // `RunMicrovm` is accepted there is no id to file it under. A launch that never got an
+    // id writes nothing, because a history nobody can look up is not a record. Every value
+    // below is the platform's (the sandbox's own `Microvm` and the `TeardownReport`), and
+    // every append swallows its failures — this is the teardown path.
+    if let Some(vm) = sandbox.microvm() {
+        let history = History::for_vm(&ledger_root, &vm.id);
+        if building && let Some(image) = sandbox.image() {
+            history.append(Event::ImageBuilt {
+                image_identifier: image.identifier.clone(),
+                image_name: image.name.clone(),
+            });
+        }
+        history.append(Event::Launched {
+            image_identifier: vm.image_arn.clone(),
+            endpoint: vm.endpoint.clone(),
+            region: region_name.clone(),
+        });
+        if let Some(exec) = &exec_report {
+            history.append(Event::Exec {
+                exec_id: exec.exec_id.clone(),
+                exit_code: exec.exit_code,
+                truncated: exec.truncated,
+                writers_may_be_alive: exec.writers_may_be_alive,
+            });
+        }
+        if !args.keep {
+            history.append(Event::Terminated {
+                terminate_accepted: teardown.terminate_accepted,
+                undeleted: teardown.undeleted.clone(),
+            });
+        }
+    }
+
     // Cost is attributed whichever way the run ended: a launch that was interrupted still
     // billed for the seconds it ran, and a report only on the happy path is a report that
     // hides the expensive failures.
@@ -263,11 +304,29 @@ pub async fn run<O: std::io::Write, E: std::io::Write>(
     Ok(rendered)
 }
 
+/// What `run --exec`'s one exec reported, for the history record.
+///
+/// A separate struct from [`RunOutcome`] because the two answer different callers: the
+/// outcome renders the envelope and flattens the daemon's report into it, and history needs
+/// the report's own fields — `writers_may_be_alive` in particular, which the envelope never
+/// carried and which must stay an `Option` so its absence is an absence.
+struct ExecReport {
+    exec_id: String,
+    exit_code: Option<i32>,
+    truncated: bool,
+    writers_may_be_alive: Option<bool>,
+}
+
 /// The build/launch/exec body `run` races against the interrupt.
 ///
 /// Separated so the `select!` arm is one expression, and because every `?` in here has to be
 /// cancellable — which it is, since the only state that must survive a cancellation lives in
 /// `sandbox` and `ledger`, both borrowed rather than owned.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the borrows are the design: everything that must survive a cancelled launch \
+              lives with the caller, and a bundling struct would hide which ones do"
+)]
 async fn launch_and_exec<O: std::io::Write, E: std::io::Write>(
     ctx: &mut Ctx<'_, O, E>,
     args: &RunArgs,
@@ -276,6 +335,7 @@ async fn launch_and_exec<O: std::io::Write, E: std::io::Write>(
     name: &str,
     size: microvms_core::SizeClass,
     outcome: &mut RunOutcome,
+    exec_report: &mut Option<ExecReport>,
 ) -> Result<(), Error> {
     let started = std::time::Instant::now();
 
@@ -353,7 +413,16 @@ async fn launch_and_exec<O: std::io::Write, E: std::io::Write>(
     let timeout = Duration::from_secs_f64(args.timeout.max(0.0));
     if let Some(command) = exec {
         ctx.out.progress(&format!("exec: {command}"));
-        let request = start_request(StartSpec::command(&command));
+        // Widened at the call site rather than through a second constructor — the comment on
+        // `start_request` names a second constructor as where a field silently acquires a
+        // different answer. Demotion is the difference between a working agent and one that
+        // refuses its own tools as root, so `run --exec` carries the same `--user`/`--group`
+        // that `exec` does, through the same spec.
+        let request = start_request(StartSpec {
+            user: args.user,
+            group: args.group,
+            ..StartSpec::command(&command)
+        });
         let result = sandbox
             .session()
             .expect("run() built one")
@@ -366,6 +435,17 @@ async fn launch_and_exec<O: std::io::Write, E: std::io::Write>(
             .outcome
             .as_ref()
             .is_some_and(|outcome| outcome.truncated);
+        // For the history record, off the daemon's own report — the id it confirmed and the
+        // outcome fields it carried, never anything the child printed.
+        *exec_report = Some(ExecReport {
+            exec_id: result.exec_id.clone(),
+            exit_code: result.exit_code(),
+            truncated: outcome.truncated,
+            writers_may_be_alive: result
+                .outcome
+                .as_ref()
+                .map(|outcome| outcome.writers_may_be_alive),
+        });
     }
     outcome.running_seconds = run_started.elapsed().as_secs_f64();
     outcome.endpoint = Some(endpoint.clone());
@@ -946,6 +1026,17 @@ pub async fn suspend<O: std::io::Write, E: std::io::Write>(
         )
         .await?;
 
+    // Recorded only when the service really answered SUSPENDED: history carries what the
+    // platform reported, and a freeze that settled TERMINATED is not a suspension however
+    // the command exits.
+    if settled.state == "SUSPENDED" {
+        History::for_vm(
+            &state_dir(args.state_dir.clone(), ctx.env),
+            &args.microvm_id,
+        )
+        .append(Event::Suspended);
+    }
+
     let mut data = Map::new();
     data.insert("microvmId".into(), json!(args.microvm_id));
     data.insert("state".into(), json!(settled.state));
@@ -989,6 +1080,13 @@ pub async fn resume<O: std::io::Write, E: std::io::Write>(
             wait_opts(args.timeout),
         )
         .await?;
+
+    // The wait returned, so the service reported RUNNING — which is what `resumed` means.
+    History::for_vm(
+        &state_dir(args.state_dir.clone(), ctx.env),
+        &args.microvm_id,
+    )
+    .append(Event::Resumed);
 
     let mut data = Map::new();
     data.insert("microvmId".into(), json!(args.microvm_id));
@@ -1102,6 +1200,20 @@ pub async fn terminate<O: std::io::Write, E: std::io::Write>(
             );
         }
     }
+
+    // The teardown verdict, in the TeardownReport's own terms: whether the terminate call
+    // was accepted, and what a delete was asked for and did not remove. Appended however
+    // the calls above went — a terminate that failed is exactly the run a caller will want
+    // the record of — and the append swallows its own failures, because this is the
+    // teardown path and a history error must not displace the real outcome.
+    History::for_vm(
+        &state_dir(args.state_dir.clone(), ctx.env),
+        &args.microvm_id,
+    )
+    .append(Event::Terminated {
+        terminate_accepted: !leaked.contains(&args.microvm_id),
+        undeleted: leaked.clone(),
+    });
 
     let mut data = Map::new();
     data.insert("microvmId".into(), json!(args.microvm_id));
@@ -1288,6 +1400,50 @@ mod tests {
         assert!(bare.env.is_empty());
         assert_eq!(bare.user, None);
         assert_eq!(bare.group, None);
+    }
+
+    /// `run --exec` and `exec` produce the same `StartRequest` for the same inputs.
+    ///
+    /// The two paths *agreeing* is the property, not either one in isolation: both build
+    /// their spec and hand it to the one `start_request`, and this test is what makes a
+    /// second constructor — "where it silently acquires a different answer" — fail loudly
+    /// instead. The specs below are built exactly the way each command builds its own:
+    /// `run` widens the one-shot constructor with the demotion pair, `exec` writes every
+    /// field. `exec_id` is compared by shape rather than value, because freshness per
+    /// invocation is that field's own tested property.
+    #[test]
+    fn run_exec_and_exec_agree_on_the_start_request_they_send() {
+        let command = "id -u";
+        let (user, group) = (Some(1000), Some(2000));
+
+        // `run --exec 'id -u' --user 1000 --group 2000`, as lifecycle.rs builds it.
+        let from_run = start_request(StartSpec {
+            user,
+            group,
+            ..StartSpec::command(command)
+        });
+        // `microvm exec 'id -u' --user 1000 --group 2000`, as attached.rs builds it —
+        // every field written, the flag-less ones at their parsed defaults.
+        let from_exec = start_request(StartSpec {
+            command,
+            cwd: None,
+            exec_id: None,
+            stdin: false,
+            env: std::collections::HashMap::new(),
+            user,
+            group,
+        });
+
+        assert_eq!(from_run.command, from_exec.command);
+        assert_eq!(from_run.shell, from_exec.shell);
+        assert_eq!(from_run.cwd, from_exec.cwd);
+        assert_eq!(from_run.env, from_exec.env);
+        assert_eq!(from_run.user, from_exec.user);
+        assert_eq!(from_run.group, from_exec.group);
+        assert_eq!(from_run.stdin, from_exec.stdin);
+        assert_eq!(from_run.timeout_sec, from_exec.timeout_sec);
+        assert!(from_run.exec_id.starts_with("x-"), "{}", from_run.exec_id);
+        assert!(from_exec.exec_id.starts_with("x-"), "{}", from_exec.exec_id);
     }
 
     /// The wait carries the caller's deadline and never a negative one.

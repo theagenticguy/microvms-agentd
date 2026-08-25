@@ -1,6 +1,6 @@
 # microvms-agentd · CLI
 
-The `microvm` binary has seventeen subcommands, declared as one `clap` `Subcommand` enum in `microvms-cli/src/cli.rs:90-227` and built from `microvms-cli/Cargo.toml:20-22`.
+The `microvm` binary has eighteen subcommands, declared as one `clap` `Subcommand` enum in `microvms-cli/src/cli.rs` and built from `microvms-cli/Cargo.toml:20-22`.
 
 ## Global flags
 
@@ -256,6 +256,25 @@ Flags:
 
 - `--state-dir <STATE_DIR>` — where the ledgers live; defaults to `$MICROVM_STATE_DIR` or `~/.microvm/runs`. `microvms-cli/src/cli.rs:733-734`.
 
+## history
+
+```
+microvm history [OPTIONS] <VM_ID>
+```
+
+Prints what was asked of one MicroVM and what the platform reported back: `imageBuilt` (when `run`'s own invocation built the image — a standalone `build` has no VM id and writes no history), `launched`, `exec` per exec, `suspended`, `resumed`, and `terminated` with the teardown's own verdict. The record is an append-only JSONL file at `<state-dir>/history/<vm-id>.jsonl`, one camelCase object per line with a per-VM `seq` counter and an epoch-seconds `at`, appended by `run`, `exec`, `suspend`, `resume`, and `terminate` with the same swallowed-failure discipline as the ledger — an unwritable state directory never fails a teardown.
+
+Unlike the ledger `ls` reads, nothing ever deletes a history file: the record survives terminate on purpose, because a caller attesting over a run needs it precisely after the VM is gone. A VM with no history file is a clean empty result rather than an error — asking about a VM this state dir never saw is a question, not a mistake. A truncated last line (a process killed mid-append) is reported as an unreadable record rather than skipped.
+
+What the record does not prove: it shows what was asked of the VM and what the daemon and the control plane reported back — identifiers, endpoints, exit codes, teardown verdicts — not what a process inside the guest did between execs. Every value is the platform's; nothing the guest printed ever reaches a history line, because a record built from guest output would be a record the workload can forge.
+
+`microvms-cli/src/commands/local.rs`, storage in `microvms-cli/src/history.rs`.
+
+Flags:
+
+- `<VM_ID>` — the MicroVM whose history to print. Required.
+- `--state-dir <STATE_DIR>` — where the histories live; defaults to `$MICROVM_STATE_DIR` or `~/.microvm/runs`.
+
 ## logs
 
 ```
@@ -420,6 +439,7 @@ Each command declares its `type` discriminant and the `data` keys its success en
 | `resume` | `microvm.state` |
 | `terminate` | `microvm.teardown` |
 | `ls` | `microvm.runs` |
+| `history` | `microvm.history` |
 | `logs` | `microvm.logs` |
 | `cost` | `microvm.cost` |
 | `doctor` | `microvm.doctor` |

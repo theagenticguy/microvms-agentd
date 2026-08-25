@@ -138,7 +138,40 @@ Token rotation costs nothing on the daemon side. All exec state — the records,
 the buffered output, the stream cursors — lives in the daemon, keyed by
 `exec_id`, so a detached exec started under one proxy token is polled and acked
 under the next one. Start, rotate, poll, ack is a normal sequence, not a
-recovery path.
+recovery path. This is a tested contract, not an inference: the live suite's
+`reattach after token rotation` section starts a detached exec, drops every
+piece of client state except the endpoint, the agent token, and the MicroVM id,
+reattaches under freshly minted proxy tokens, and asserts that the output
+produced *before* the reattach comes back whole — nothing buffered under one
+token is lost to the next (`conformance/run_rs.py`, `drive_token_rotation`).
+
+## The idle keepalive is yours, and it must run outside the VM
+
+The platform measures idleness by inbound traffic through the endpoint proxy
+and suspends a VM whose window elapses without any. Your harness — the
+orchestrator outside the VM — owns the keepalive: poll `GET /v1/health` on an
+interval well under the launch's `maxIdleDurationSeconds`, and each poll is the
+inbound traffic that resets the timer. Measured, both halves: a polled VM
+outlives its idle window and the same VM suspends once the polling stops
+(`docs/PLATFORM.md`, "An outside poll of `/v1/health` does reset the idle
+timer"; asserted every live run by `conformance/run_rs.py`,
+`drive_idle_keepalive`).
+
+An in-guest keepalive **cannot** work, and it is worth knowing why before
+someone builds one: the endpoint proxy terminates *outside* the VM and forwards
+over loopback, so a request a guest process sends to the daemon's own port is
+generated on the far side of the meter and never crosses it. A guest-side
+keepalive route would answer 200 and change nothing, and the failure would
+surface as a suspend during exactly the long run it was added to protect
+(`docs/HARNESS-CAPABILITIES.md`, gap 6). Neither does in-guest *work*: a VM
+running a multi-hour exec with no outside traffic is suspended mid-work at the
+idle window. The process survives — suspend is a freeze, not a kill — but
+nothing external can reach it until someone resumes it.
+
+`/v1/health` is the right route for the poll: unauthenticated, one small
+request, and it carries `busy` and `execs` so the poll is informed rather than
+unconditional — an orchestrator can stop keeping a drained VM alive instead of
+billing it to the duration ceiling.
 
 ## What the hand-rolled daemons needed, and where agentd covers it
 
