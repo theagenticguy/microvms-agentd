@@ -261,6 +261,7 @@ fn aws_commands(binary: &std::path::Path) -> Vec<(&'static str, Command, Door)> 
                 stream: false,
                 from_offset: None,
                 stdin: false,
+                state_dir: Some(std::env::temp_dir().join("microvm-guard-history")),
                 attach: attach_flags(),
                 region: region_flags(),
             }),
@@ -318,6 +319,7 @@ fn aws_commands(binary: &std::path::Path) -> Vec<(&'static str, Command, Door)> 
             Command::Suspend(SuspendArgs {
                 microvm_id: "mvm-1".into(),
                 timeout: 30.0,
+                state_dir: Some(std::env::temp_dir().join("microvm-guard-history")),
                 region: region_flags(),
             }),
             Door::ControlPlane,
@@ -327,6 +329,7 @@ fn aws_commands(binary: &std::path::Path) -> Vec<(&'static str, Command, Door)> 
             Command::Resume(ResumeArgs {
                 microvm_id: "mvm-1".into(),
                 timeout: 30.0,
+                state_dir: Some(std::env::temp_dir().join("microvm-guard-history")),
                 region: region_flags(),
             }),
             Door::ControlPlane,
@@ -339,6 +342,7 @@ fn aws_commands(binary: &std::path::Path) -> Vec<(&'static str, Command, Door)> 
                 image_name: None,
                 delete_image: false,
                 wait: false,
+                state_dir: Some(std::env::temp_dir().join("microvm-guard-history")),
                 region: region_flags(),
             }),
             Door::ControlPlane,
@@ -360,10 +364,15 @@ fn aws_commands(binary: &std::path::Path) -> Vec<(&'static str, Command, Door)> 
 ///
 /// Listed with a reason rather than skipped by a naming rule, so a *new* AWS-touching command is
 /// covered by the guard by default and can only leave the net by someone writing its name here.
-const LOCAL_ONLY: [(&str, &str); 6] = [
+const LOCAL_ONLY: [(&str, &str); 7] = [
     (
         "ls",
         "reads the local ledger; the whole point is that AWS cannot attribute a dead run",
+    ),
+    (
+        "history",
+        "reads the local per-VM history; the record's value is that it survives the VM, and \
+         no GetMicrovm can answer about an id the platform has already forgotten",
     ),
     (
         "logs",
@@ -489,6 +498,10 @@ fn the_behavioral_guard_covers_every_registered_command() {
 async fn no_local_command_touches_a_seam_door() {
     let commands = [
         Command::Ls(LsArgs {
+            state_dir: Some(std::path::PathBuf::from("/nonexistent-guard-ledgers")),
+        }),
+        Command::History(crate::cli::HistoryArgs {
+            microvm_id: "mvm-1".into(),
             state_dir: Some(std::path::PathBuf::from("/nonexistent-guard-ledgers")),
         }),
         Command::Logs(LogsArgs {
@@ -962,6 +975,20 @@ async fn an_interrupt_whose_teardown_succeeds_reports_no_leak_and_still_exits_in
         crate::ledger::read_all(&dir.0).is_empty(),
         "a clean teardown leaves no ledger"
     );
+    // The history is the opposite property, asserted side by side on purpose: the ledger is
+    // gone because nothing leaked, and the record of what happened survives anyway — with
+    // the values the platform reported (`RunMicrovm`'s own id and endpoint, the teardown's
+    // acceptance), which is what `microvm history` exists to answer after the VM is gone.
+    let events = crate::history::read_events(&dir.0, "mvm-abc123");
+    assert_eq!(events.len(), 2, "launched, then terminated: {events:?}");
+    assert_eq!(events[0]["event"], "launched");
+    assert_eq!(
+        events[0]["endpoint"],
+        "https://mvm-abc123.microvm.us-east-1.amazonaws.com"
+    );
+    assert_eq!(events[0]["region"], "us-east-1");
+    assert_eq!(events[1]["event"], "terminated");
+    assert_eq!(events[1]["terminateAccepted"], true);
 }
 
 // ── image name resolution and `build --reuse`, against the scripted transport ─
@@ -1933,6 +1960,11 @@ fn exec_command(shape: impl FnOnce(&mut ExecArgs)) -> Command {
         stream: false,
         from_offset: None,
         stdin: false,
+        state_dir: Some(std::env::temp_dir().join(format!(
+            "microvm-guard-exec-history-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ))),
         attach: attach_flags(),
         region: region_flags(),
     };
@@ -2933,6 +2965,141 @@ impl Drop for TempFile {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.0);
     }
+}
+
+// ── the per-VM history, through the shipped handlers ─────────────────────────
+//
+// `src/history.rs`'s own tests prove the module; these prove the *wiring* — that the handlers
+// really append, with the platform's values, and that the record survives the command that
+// wrote it. A history module that worked perfectly and was never called would pass every unit
+// test and record nothing.
+
+/// **`terminate` appends a `terminated` event carrying the teardown's own verdict.**
+///
+/// The values are the platform's: `terminateAccepted` reflects whether the call was accepted,
+/// and the file survives the terminate — which is the whole reason history is not the ledger.
+///
+/// **Guard proof.** Delete the `History::for_vm(..).append(Event::Terminated {..})` block from
+/// `lifecycle::terminate` and the read below is empty; the command's envelope and exit are
+/// unchanged, which is why only this test catches it. Broken exactly so on 2026-08-25
+/// (block commented out, test red on `read.len()`), then restored.
+#[tokio::test]
+async fn a_terminate_appends_a_terminated_event_that_survives_the_command() {
+    let dir = TempDir::new("history-terminate");
+    let transport = Arc::new(ScriptedTransport::new());
+    transport.answer("TerminateMicrovm", 200, "{}");
+
+    let seam = ScriptedSeam {
+        transport: Arc::clone(&transport),
+        clock: Arc::new(YieldingClock::default()),
+    };
+    let command = Command::Terminate(TerminateArgs {
+        microvm_id: "mvm-1".into(),
+        image_identifier: None,
+        image_name: None,
+        delete_image: false,
+        wait: false,
+        state_dir: Some(dir.0.clone()),
+        region: region_flags(),
+    });
+    let (result, _) = dispatch_with(&seam, &command, full_infra()).await;
+    result.expect("the terminate succeeds");
+
+    let read = crate::history::read_events(&dir.0, "mvm-1");
+    assert_eq!(read.len(), 1, "the handler must append: {read:?}");
+    assert_eq!(read[0]["event"], "terminated");
+    assert_eq!(read[0]["terminateAccepted"], true);
+    assert_eq!(read[0]["undeleted"], serde_json::json!([]));
+    assert_eq!(read[0]["seq"], 0);
+
+    // And a terminate whose call is refused records that verdict rather than a clean one:
+    // the failed teardown is exactly the run a caller wants the record of.
+    let transport = Arc::new(ScriptedTransport::new());
+    transport.answer(
+        "TerminateMicrovm",
+        409,
+        r#"{"message": "ConflictException"}"#,
+    );
+    let seam = ScriptedSeam {
+        transport: Arc::clone(&transport),
+        clock: Arc::new(YieldingClock::default()),
+    };
+    let command = Command::Terminate(TerminateArgs {
+        microvm_id: "mvm-1".into(),
+        image_identifier: None,
+        image_name: None,
+        delete_image: false,
+        wait: false,
+        state_dir: Some(dir.0.clone()),
+        region: region_flags(),
+    });
+    let (result, _) = dispatch_with(&seam, &command, full_infra()).await;
+    result.expect("a failed teardown still reports rather than raising");
+
+    let read = crate::history::read_events(&dir.0, "mvm-1");
+    assert_eq!(read.len(), 2, "the second append continues the sequence");
+    assert_eq!(
+        read[1]["seq"], 1,
+        "counting the file is what makes two processes one sequence"
+    );
+    assert_eq!(read[1]["terminateAccepted"], false);
+    assert_eq!(read[1]["undeleted"], serde_json::json!(["mvm-1"]));
+}
+
+/// **`exec` appends an `exec` event with the daemon's own report, and `--detach` appends one
+/// with a null exit code.**
+///
+/// The null is the honest half: a detached start does not know the outcome, and a record
+/// claiming one would be a record this process never observed. The waited exec's fields are
+/// read off the daemon's poll body, never off anything the child printed.
+///
+/// **Guard proof.** Delete the `history.append(Event::Exec {..})` after `wait_and_ack` in
+/// `attached::exec` and the first read below is empty while the envelope is byte-identical.
+#[tokio::test]
+async fn an_exec_appends_the_daemons_report_and_a_detached_one_appends_a_null_code() {
+    let dir = TempDir::new("history-exec");
+    let script = DaemonScript::new();
+    script
+        .reply(200, STARTED_BODY)
+        .reply(200, &poll_body("exited", "4", "out", true))
+        .reply(200, &poll_body("acked", "4", "out", true));
+    let command = exec_command(|args| {
+        args.exec_id = Some("x-1".into());
+        args.state_dir = Some(dir.0.clone());
+    });
+    let (result, _, _) = against_daemon(&script, &command).await;
+    result.expect("the exec completes");
+
+    let read = crate::history::read_events(&dir.0, "mvm-1");
+    assert_eq!(read.len(), 1, "{read:?}");
+    assert_eq!(read[0]["event"], "exec");
+    assert_eq!(read[0]["execId"], "x-1");
+    assert_eq!(
+        read[0]["exitCode"], 4,
+        "the daemon's code, not a success default"
+    );
+    assert_eq!(read[0]["truncated"], true);
+    assert_eq!(read[0]["writersMayBeAlive"], false);
+
+    // The detached shape: started, not waited, so the outcome is honestly unknown.
+    let script = DaemonScript::new();
+    script.reply(200, STARTED_BODY);
+    let command = exec_command(|args| {
+        args.detach = true;
+        args.exec_id = Some("x-1".into());
+        args.state_dir = Some(dir.0.clone());
+    });
+    let (result, _, _) = against_daemon(&script, &command).await;
+    result.expect("a detached start succeeds");
+
+    let read = crate::history::read_events(&dir.0, "mvm-1");
+    assert_eq!(read.len(), 2);
+    assert_eq!(read[1]["event"], "exec");
+    assert_eq!(
+        read[1]["exitCode"],
+        serde_json::Value::Null,
+        "a detached start has no outcome to record: {read:?}"
+    );
 }
 
 // ── CLI-3's classification half ──────────────────────────────────────────────

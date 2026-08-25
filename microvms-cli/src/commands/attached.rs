@@ -43,7 +43,8 @@ use serde_json::{Map, Value, json};
 use crate::cli::{AckArgs, AttachFlags, CpArgs, ExecArgs, HealthArgs, RegionFlags, StdinArgs};
 use crate::commands::{Ctx, Rendered, STREAM_RESPONSE, response_type};
 use crate::exit::{CliError, Exit};
-use crate::seam::Attach;
+use crate::history::{Event, History};
+use crate::seam::{Attach, state_dir};
 
 /// The prefix that means "this side of the copy is in the VM".
 ///
@@ -155,13 +156,28 @@ pub async fn exec<O: std::io::Write, E: std::io::Write>(
     // publishes the same string.
     let exec_id = handle.exec_id().to_string();
 
+    // The VM's history, keyed by the id the caller attached with. Every append below carries
+    // the daemon's own report — the confirmed exec id and the outcome fields — and swallows
+    // its failures, so an unwritable state dir costs the record and never the exec.
+    let history = History::for_vm(
+        &state_dir(args.state_dir.clone(), ctx.env),
+        &args.attach.microvm_id,
+    );
+
     if let Some(bytes) = feed {
         write_and_close(ctx, &handle, &bytes).await?;
     }
 
     let timeout = Duration::from_secs_f64(args.timeout.max(0.0));
     if args.stream {
-        return stream_exec(ctx, &handle, &exec_id, args.from_offset.unwrap_or(0)).await;
+        return stream_exec(
+            ctx,
+            &handle,
+            &exec_id,
+            args.from_offset.unwrap_or(0),
+            &history,
+        )
+        .await;
     }
     if args.detach {
         // Started and nothing else: no wait, and above all no ack. The ack is the irreversible
@@ -178,9 +194,29 @@ pub async fn exec<O: std::io::Write, E: std::io::Write>(
             phase: microvms_core::protocol::exec::Phase::Running,
             outcome: None,
         };
+        // A null exit code, honestly: the outcome is not known yet, and a record claiming
+        // one would be a record this process never observed.
+        history.append(Event::Exec {
+            exec_id: exec_id.clone(),
+            exit_code: None,
+            truncated: false,
+            writers_may_be_alive: None,
+        });
         return Ok(render_exec(&exec_id, &started));
     }
     let result = handle.wait_and_ack(timeout).await?;
+    history.append(Event::Exec {
+        exec_id: exec_id.clone(),
+        exit_code: result.exit_code(),
+        truncated: result
+            .outcome
+            .as_ref()
+            .is_some_and(|outcome| outcome.truncated),
+        writers_may_be_alive: result
+            .outcome
+            .as_ref()
+            .map(|outcome| outcome.writers_may_be_alive),
+    });
     Ok(render_exec(&exec_id, &result))
 }
 
@@ -242,6 +278,7 @@ async fn stream_exec<O: std::io::Write, E: std::io::Write>(
     handle: &microvms_core::session::ExecHandle,
     exec_id: &str,
     offset: u64,
+    history: &History,
 ) -> Result<Rendered, CliError> {
     let options = StreamOptions {
         offset,
@@ -283,6 +320,16 @@ async fn stream_exec<O: std::io::Write, E: std::io::Write>(
         end.reason != EndReason::Stopped,
         "this callback never breaks, so a Stopped ending would mean core reported one that did"
     );
+
+    // The terminal event's own fields, or nulls for a cut stream — a record claiming exit 0
+    // for a stream that ended without its exit event would be the same lie the envelope
+    // refuses below.
+    history.append(Event::Exec {
+        exec_id: exec_id.to_string(),
+        exit_code: exit.as_ref().and_then(|event| event.exit_code),
+        truncated: exit.as_ref().is_some_and(|event| event.truncated),
+        writers_may_be_alive: exit.as_ref().map(|event| event.writers_may_be_alive),
+    });
 
     let mut data = Map::new();
     data.insert("execId".into(), json!(exec_id));

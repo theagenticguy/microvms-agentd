@@ -80,7 +80,7 @@ pub struct Cli {
     pub quiet: bool,
 }
 
-/// The seventeen commands.
+/// The eighteen commands.
 ///
 /// Variant order is the order `microvm --help` and the manifest list them in, which is
 /// lifecycle order rather than alphabetical: a reader meeting this surface for the first time
@@ -88,7 +88,8 @@ pub struct Cli {
 /// `stdin`, `cp` — sit together after `build` because they share the same three identifiers and
 /// the same door ([`crate::seam::CoreSeam::attach_session`]), which is the distinction that
 /// matters when reading the list: everything above them creates or destroys, and everything in
-/// that block addresses a VM that already exists.
+/// that block addresses a VM that already exists. `history` sits beside `ls` because they are
+/// the same kind of thing: a local read of what this machine's own state directory recorded.
 #[derive(Debug, Subcommand)]
 pub enum Command {
     /// Build an image, launch a VM, run a command, report the cost, tear it down.
@@ -175,6 +176,15 @@ pub enum Command {
     /// killed process never got to report — which no ListMicrovms call can attribute back to
     /// a command that died.
     Ls(LsArgs),
+
+    /// Print what was asked of one MicroVM and what the platform reported back.
+    ///
+    /// Reads the local per-VM history — appended by `run`, `exec`, `suspend`, `resume`, and
+    /// `terminate` — rather than asking AWS, and the record survives terminate on purpose: a
+    /// caller attesting over a run needs it precisely after the VM is gone. It shows what the
+    /// daemon and the control plane reported, never what a process inside the guest did
+    /// between execs.
+    History(HistoryArgs),
 
     /// Name an image's build log group, which is where a failed build's only evidence lives.
     ///
@@ -725,6 +735,10 @@ pub struct ExecArgs {
     #[arg(long)]
     pub stdin: bool,
 
+    /// Where the VM's history is appended. Defaults to $MICROVM_STATE_DIR or ~/.microvm/runs.
+    #[arg(long)]
+    pub state_dir: Option<PathBuf>,
+
     #[command(flatten)]
     pub attach: AttachFlags,
 
@@ -841,6 +855,10 @@ pub struct SuspendArgs {
     #[arg(long, default_value_t = 300.0)]
     pub timeout: f64,
 
+    /// Where the VM's history is appended. Defaults to $MICROVM_STATE_DIR or ~/.microvm/runs.
+    #[arg(long)]
+    pub state_dir: Option<PathBuf>,
+
     #[command(flatten)]
     pub region: RegionFlags,
 }
@@ -854,6 +872,10 @@ pub struct ResumeArgs {
     /// How long to wait for RUNNING, in seconds.
     #[arg(long, default_value_t = 300.0)]
     pub timeout: f64,
+
+    /// Where the VM's history is appended. Defaults to $MICROVM_STATE_DIR or ~/.microvm/runs.
+    #[arg(long)]
+    pub state_dir: Option<PathBuf>,
 
     #[command(flatten)]
     pub region: RegionFlags,
@@ -883,6 +905,10 @@ pub struct TerminateArgs {
     #[arg(long)]
     pub wait: bool,
 
+    /// Where the VM's history is appended. Defaults to $MICROVM_STATE_DIR or ~/.microvm/runs.
+    #[arg(long)]
+    pub state_dir: Option<PathBuf>,
+
     #[command(flatten)]
     pub region: RegionFlags,
 }
@@ -890,6 +916,17 @@ pub struct TerminateArgs {
 #[derive(Args, Debug)]
 pub struct LsArgs {
     /// Where the ledgers live. Defaults to $MICROVM_STATE_DIR or ~/.microvm/runs.
+    #[arg(long)]
+    pub state_dir: Option<PathBuf>,
+}
+
+#[derive(Args, Debug)]
+pub struct HistoryArgs {
+    /// The MicroVM whose history to print.
+    #[arg(value_name = "VM_ID")]
+    pub microvm_id: String,
+
+    /// Where the histories live. Defaults to $MICROVM_STATE_DIR or ~/.microvm/runs.
     #[arg(long)]
     pub state_dir: Option<PathBuf>,
 }
@@ -1162,11 +1199,12 @@ mod tests {
         Cli::command().debug_assert();
     }
 
-    /// Seventeen subcommands, named as the manifest and the response table name them.
+    /// Eighteen subcommands, named as the manifest and the response table name them.
     ///
     /// The five after `exec` are the attached block — `health`, `ack`, `stdin`, `cp` beside it —
     /// and their position is asserted rather than incidental, because `--help`'s reading order is
-    /// the only documentation of which commands need the identifier triple.
+    /// the only documentation of which commands need the identifier triple. `history` sits
+    /// beside `ls` because both are local reads of this machine's own state directory.
     #[test]
     fn the_tree_registers_the_lifecycle_commands_the_attached_block_and_the_local_ones() {
         let registered: Vec<String> = Cli::command()
@@ -1187,6 +1225,7 @@ mod tests {
                 "resume",
                 "terminate",
                 "ls",
+                "history",
                 "logs",
                 "cost",
                 "doctor",
@@ -1194,6 +1233,32 @@ mod tests {
                 "constants",
                 "dockerfile",
             ]
+        );
+    }
+
+    /// `history` takes a VM id and a state dir, and nothing that reaches AWS.
+    ///
+    /// The absence half is the point: a `--region` on `history` would imply a remote read,
+    /// and the command's whole claim is that it reads what this machine's state directory
+    /// recorded. Same shape as `ls`, which the region-domain test above already relies on.
+    #[test]
+    fn history_parses_a_vm_id_and_a_state_dir_and_carries_no_region() {
+        let parsed =
+            Cli::try_parse_from(["microvm", "history", "mvm-1", "--state-dir", "/tmp/state"])
+                .expect("a vm id and a state dir parse");
+        let Command::History(args) = parsed.command else {
+            panic!("a history parses as a history");
+        };
+        assert_eq!(args.microvm_id, "mvm-1");
+        assert_eq!(args.state_dir, Some(PathBuf::from("/tmp/state")));
+
+        assert!(
+            Cli::try_parse_from(["microvm", "history"]).is_err(),
+            "a history with no VM id has nothing to read"
+        );
+        assert!(
+            Cli::try_parse_from(["microvm", "history", "mvm-1", "--region", "us-east-1"]).is_err(),
+            "a local read takes no region"
         );
     }
 

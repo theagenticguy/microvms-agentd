@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
-//! `ls`, `logs`, `manifest`, `constants`, `dockerfile` — the commands that touch no account.
+//! `ls`, `history`, `logs`, `manifest`, `constants`, `dockerfile` — the commands that touch no
+//! account.
 //!
 //! Grouped by that property rather than by shape, because it is the property the behavioral
 //! thinness guard cares about: `tests/thinness.rs` asserts that every command *not* in this
@@ -13,11 +14,11 @@
 
 use serde_json::{Map, Value, json};
 
-use crate::cli::{DockerfileArgs, LogsArgs, LsArgs};
+use crate::cli::{DockerfileArgs, HistoryArgs, LogsArgs, LsArgs};
 use crate::commands::{Ctx, Rendered, response_type};
 use crate::exit::{CliError, Exit};
-use crate::ledger;
 use crate::seam::state_dir;
+use crate::{history, ledger};
 
 /// Lists what this CLI created and could not confirm it deleted.
 pub fn ls<O: std::io::Write, E: std::io::Write>(
@@ -60,6 +61,77 @@ pub fn ls<O: std::io::Write, E: std::io::Write>(
                     },
                 )
             })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    Ok(Rendered::ok(kind, data, text, dense))
+}
+
+/// Prints what was asked of one MicroVM and what the platform reported back.
+///
+/// Reads the local per-VM history rather than asking AWS, for `ls`'s reason turned around:
+/// the record's value is that it survives the VM, and no `GetMicrovm` can answer about an id
+/// the platform has already forgotten. A VM with no history file is a clean empty result,
+/// not an error — asking about a VM this state dir never saw is a question, not a mistake,
+/// since the id may be real and the record may live in another machine's state directory.
+pub fn history<O: std::io::Write, E: std::io::Write>(
+    ctx: &mut Ctx<'_, O, E>,
+    args: &HistoryArgs,
+) -> Result<Rendered, CliError> {
+    let root = state_dir(args.state_dir.clone(), ctx.env);
+    let events = history::read_events(&root, &args.microvm_id);
+
+    let mut data = Map::new();
+    data.insert("microvmId".into(), json!(args.microvm_id));
+    data.insert("events".into(), json!(events));
+    let (kind, _) = response_type("history");
+
+    let describe = |event: &Value| -> String {
+        // The event-specific fields, in one terse tail. Unknown keys render too, so a
+        // record written by a newer build still reads rather than printing blank.
+        let mut fields: Vec<String> = event
+            .as_object()
+            .map(|object| {
+                object
+                    .iter()
+                    .filter(|(key, _)| !matches!(key.as_str(), "seq" | "at" | "event"))
+                    .map(|(key, value)| match value {
+                        Value::String(text) => format!("{key}={text}"),
+                        other => format!("{key}={other}"),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        fields.sort();
+        fields.join(" ")
+    };
+    let line_of = |event: &Value, separator: &str| -> String {
+        format!(
+            "{}{separator}{}{separator}{}{separator}{}",
+            event["seq"]
+                .as_u64()
+                .map(|seq| seq.to_string())
+                .unwrap_or_else(|| "-".to_string()),
+            event["at"]
+                .as_u64()
+                .map(|at| at.to_string())
+                .unwrap_or_else(|| "-".to_string()),
+            event["event"].as_str().unwrap_or("unreadable"),
+            describe(event),
+        )
+    };
+
+    let dense = events
+        .iter()
+        .map(|event| line_of(event, "\t"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let text = if events.is_empty() {
+        format!("no history for {} in this state dir", args.microvm_id)
+    } else {
+        events
+            .iter()
+            .map(|event| line_of(event, "  "))
             .collect::<Vec<_>>()
             .join("\n")
     };
@@ -335,6 +407,92 @@ mod tests {
         .expect("ls never fails");
         assert_eq!(rendered.text, "nothing outstanding");
         assert_eq!(rendered.data["runs"], json!([]));
+    }
+
+    /// `history` for a VM this state dir never saw is a clean empty success.
+    ///
+    /// Not an error: the id may be real and the record may live in another machine's state
+    /// directory, so asking is a question rather than a mistake. A command that failed here
+    /// would make "did anything happen to this VM" unanswerable for the empty case, which is
+    /// half the question's value.
+    #[test]
+    fn history_for_an_unseen_vm_is_a_clean_empty_result() {
+        let mut out = Output::new(Format::Plain, false, Vec::new(), Vec::new());
+        let env = |_: &str| None;
+        let seam = crate::seam::PanickingSeam;
+        let mut context = ctx(&mut out, &seam, &env);
+        let rendered = history(
+            &mut context,
+            &HistoryArgs {
+                microvm_id: "mvm-never-seen".to_string(),
+                state_dir: Some(std::path::PathBuf::from("/nonexistent-microvm-state")),
+            },
+        )
+        .expect("an unseen VM is a question, not a mistake");
+        assert_eq!(rendered.kind, "microvm.history");
+        assert_eq!(rendered.data["microvmId"], "mvm-never-seen");
+        assert_eq!(rendered.data["events"], json!([]));
+        assert!(rendered.text.contains("no history"), "{}", rendered.text);
+    }
+
+    /// `history` renders one terse line per event, and the envelope carries them verbatim.
+    ///
+    /// The events in `data` are exactly what `history::read_events` produced — a rendering
+    /// that reshaped them would be a second wire format for one file.
+    #[test]
+    fn history_renders_one_line_per_event_and_the_envelope_carries_them_verbatim() {
+        let dir = std::env::temp_dir().join(format!(
+            "microvm-cli-local-history-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("a temp dir");
+
+        let file = crate::history::History::for_vm(&dir, "mvm-1");
+        file.append(crate::history::Event::Launched {
+            image_identifier: "arn:image".to_string(),
+            endpoint: "https://mvm-1.example".to_string(),
+            region: "us-east-1".to_string(),
+        });
+        file.append(crate::history::Event::Terminated {
+            terminate_accepted: true,
+            undeleted: Vec::new(),
+        });
+
+        let mut out = Output::new(Format::Plain, false, Vec::new(), Vec::new());
+        let env = |_: &str| None;
+        let seam = crate::seam::PanickingSeam;
+        let mut context = ctx(&mut out, &seam, &env);
+        let rendered = history(
+            &mut context,
+            &HistoryArgs {
+                microvm_id: "mvm-1".to_string(),
+                state_dir: Some(dir.clone()),
+            },
+        )
+        .expect("history never fails");
+
+        assert_eq!(
+            rendered.data["events"],
+            json!(crate::history::read_events(&dir, "mvm-1")),
+            "the envelope is the file's own shape"
+        );
+        let lines: Vec<&str> = rendered.text.lines().collect();
+        assert_eq!(lines.len(), 2, "one line per event: {}", rendered.text);
+        assert!(lines[0].contains("launched"), "{}", lines[0]);
+        assert!(
+            lines[0].contains("endpoint=https://mvm-1.example"),
+            "{}",
+            lines[0]
+        );
+        assert!(lines[1].contains("terminated"), "{}", lines[1]);
+        // Dense is the same rows, tab-separated, with seq in field one.
+        let dense: Vec<&str> = rendered.dense_text.lines().collect();
+        assert!(dense[0].starts_with("0\t"), "{}", rendered.dense_text);
+        assert!(dense[1].starts_with("1\t"), "{}", rendered.dense_text);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// **`logs` fails rather than reporting an empty list, and names the group.**

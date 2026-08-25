@@ -307,7 +307,7 @@ protocol/        daemon↔client wire types; drift is a compile error
 agentd/          the in-VM daemon: exec, file transfer, one-shot bootstrap
 model/           stateright models of the daemon and client lifecycle
 microvms-core/   the client library: control plane, session, cost, sandbox
-microvms-cli/    the microvm binary: 17 commands, JSON envelopes, a manifest
+microvms-cli/    the microvm binary: 18 commands, JSON envelopes, a manifest
 microvms-py/     Python binding (PyO3)
 microvms-js/     Node binding (napi-rs)
 conformance/     the live suite: 77 checks against real AWS, via the CLI
