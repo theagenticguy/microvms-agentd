@@ -353,7 +353,16 @@ async fn launch_and_exec<O: std::io::Write, E: std::io::Write>(
     let timeout = Duration::from_secs_f64(args.timeout.max(0.0));
     if let Some(command) = exec {
         ctx.out.progress(&format!("exec: {command}"));
-        let request = start_request(StartSpec::command(&command));
+        // Widened at the call site rather than through a second constructor — the comment on
+        // `start_request` names a second constructor as where a field silently acquires a
+        // different answer. Demotion is the difference between a working agent and one that
+        // refuses its own tools as root, so `run --exec` carries the same `--user`/`--group`
+        // that `exec` does, through the same spec.
+        let request = start_request(StartSpec {
+            user: args.user,
+            group: args.group,
+            ..StartSpec::command(&command)
+        });
         let result = sandbox
             .session()
             .expect("run() built one")
@@ -1288,6 +1297,50 @@ mod tests {
         assert!(bare.env.is_empty());
         assert_eq!(bare.user, None);
         assert_eq!(bare.group, None);
+    }
+
+    /// `run --exec` and `exec` produce the same `StartRequest` for the same inputs.
+    ///
+    /// The two paths *agreeing* is the property, not either one in isolation: both build
+    /// their spec and hand it to the one `start_request`, and this test is what makes a
+    /// second constructor — "where it silently acquires a different answer" — fail loudly
+    /// instead. The specs below are built exactly the way each command builds its own:
+    /// `run` widens the one-shot constructor with the demotion pair, `exec` writes every
+    /// field. `exec_id` is compared by shape rather than value, because freshness per
+    /// invocation is that field's own tested property.
+    #[test]
+    fn run_exec_and_exec_agree_on_the_start_request_they_send() {
+        let command = "id -u";
+        let (user, group) = (Some(1000), Some(2000));
+
+        // `run --exec 'id -u' --user 1000 --group 2000`, as lifecycle.rs builds it.
+        let from_run = start_request(StartSpec {
+            user,
+            group,
+            ..StartSpec::command(command)
+        });
+        // `microvm exec 'id -u' --user 1000 --group 2000`, as attached.rs builds it —
+        // every field written, the flag-less ones at their parsed defaults.
+        let from_exec = start_request(StartSpec {
+            command,
+            cwd: None,
+            exec_id: None,
+            stdin: false,
+            env: std::collections::HashMap::new(),
+            user,
+            group,
+        });
+
+        assert_eq!(from_run.command, from_exec.command);
+        assert_eq!(from_run.shell, from_exec.shell);
+        assert_eq!(from_run.cwd, from_exec.cwd);
+        assert_eq!(from_run.env, from_exec.env);
+        assert_eq!(from_run.user, from_exec.user);
+        assert_eq!(from_run.group, from_exec.group);
+        assert_eq!(from_run.stdin, from_exec.stdin);
+        assert_eq!(from_run.timeout_sec, from_exec.timeout_sec);
+        assert!(from_run.exec_id.starts_with("x-"), "{}", from_run.exec_id);
+        assert!(from_exec.exec_id.starts_with("x-"), "{}", from_exec.exec_id);
     }
 
     /// The wait carries the caller's deadline and never a negative one.

@@ -477,6 +477,25 @@ pub struct RunArgs {
     #[arg(long, value_name = "KEY=VALUE", value_parser = parse_env_pair)]
     pub launch_env: Vec<(String, String)>,
 
+    /// Numeric uid to run --exec's command as. Omitted runs as the daemon's own user.
+    ///
+    /// Numeric because that is the protocol's type (`StartRequest.user: Option<u32>`) and the
+    /// daemon's mechanism (`Command::uid`, between fork and exec) — a *name* would need an
+    /// `/etc/passwd` lookup inside a guest whose base image may not have one. The number is
+    /// not validated here: the guest's uid space is the daemon's to know, and the spawn
+    /// failure it answers for a uid it cannot assume is the real check.
+    ///
+    /// Meaningless without --exec — there is no command to demote — so that combination is
+    /// refused locally before any billable call.
+    #[arg(long, value_name = "UID", requires = "exec")]
+    pub user: Option<u32>,
+
+    /// Numeric gid to run --exec's command as. Omitted keeps the daemon's own group.
+    ///
+    /// Refused without --exec, for the same reason as --user.
+    #[arg(long, value_name = "GID", requires = "exec")]
+    pub group: Option<u32>,
+
     /// Leave the VM and image running. You are then paying for them.
     #[arg(long)]
     pub keep: bool,
@@ -1296,6 +1315,38 @@ mod tests {
         ];
         alone.extend(attach);
         Cli::try_parse_from(&alone).expect("--detach pairs with --exec-id and tolerates --timeout");
+    }
+
+    /// `run --user`/`--group` require `--exec`: without a command there is nothing to demote.
+    ///
+    /// Refused by the parser rather than the handler, so the mistake costs zero billable
+    /// calls — a `run` that launched a VM and *then* noticed the meaningless flag would have
+    /// spent real money answering a usage error.
+    ///
+    /// **Guard proof.** Drop `requires = "exec"` from `RunArgs::user` and the first half of
+    /// this test goes red (done 2026-08-25, failed as stated, restored).
+    #[test]
+    fn run_demotion_flags_require_an_exec_and_are_refused_before_any_call() {
+        for flag in [vec!["--user", "1000"], vec!["--group", "1000"]] {
+            let mut argv = vec!["microvm", "run", "--image", "img"];
+            argv.extend(flag.iter().copied());
+            assert!(
+                Cli::try_parse_from(&argv).is_err(),
+                "{flag:?} without --exec has nothing to demote and must not parse"
+            );
+        }
+
+        // With --exec, both parse and carry the numbers.
+        let parsed = Cli::try_parse_from([
+            "microvm", "run", "--image", "img", "--exec", "id -u", "--user", "1000", "--group",
+            "2000",
+        ])
+        .expect("demotion beside a command parses");
+        let Command::Run(args) = parsed.command else {
+            panic!("parsed a run");
+        };
+        assert_eq!(args.user, Some(1000));
+        assert_eq!(args.group, Some(2000));
     }
 
     /// `--env` splits at the first `=`, keeps an empty VALUE, and refuses the two misreads.
