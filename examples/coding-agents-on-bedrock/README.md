@@ -76,13 +76,29 @@ subshells find no `ls`, `wc`, or `python3` (every command exits 127) even
 though the daemon's own execs resolve them fine. Codex probes absolute paths
 when lookup fails, so it limps through; Claude Code does not.
 
+## The user, and why root silently breaks the agent
+
+The Dockerfile creates uid/gid 1000 (by appending to `/etc/passwd` directly —
+`useradd` is not in the minimal base), `chown`s `/workspace` to it, and every
+agent exec passes `--user 1000 --group 1000`. Omit that and the failure is
+worse than an error: Claude Code's `--dangerously-skip-permissions` refuses
+to run as root, and under `acceptEdits` the agent then denies its own Bash,
+Grep, and WebFetch calls and returns a confident report built on zero tool
+calls. Measured on this task shape: as uid 0 the agent made no shell calls
+at all; as uid 1000 it made 147.
+
+The daemon itself stays root; demotion is per-command, which is why the
+script can still run `chown -R 1000:1000 /workspace` as root after the
+credential copies (the daemon writes `cp` files as root-owned `0600`, which
+a demoted agent cannot read).
+
 ## The runs
 
-Each agent gets one non-interactive task through `microvm exec`:
+Each agent gets one non-interactive task through `microvm exec`, demoted:
 
 ```bash
-microvm exec ". /workspace/.agent-env && claude -p '<task>' --allowedTools Bash" ...
-microvm exec ". /workspace/.agent-env && codex exec --skip-git-repo-check -s workspace-write '<task>'" ...
+microvm exec ". /workspace/.agent-env && claude -p '<task>' --allowedTools Bash" --user 1000 --group 1000 ...
+microvm exec ". /workspace/.agent-env && codex exec --skip-git-repo-check -s workspace-write '<task>'" --user 1000 --group 1000 ...
 ```
 
 Claude Code is asked to write and run a shell one-liner; Codex is asked to
