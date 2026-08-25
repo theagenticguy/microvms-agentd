@@ -305,16 +305,24 @@ mod tests {
     ///
     /// The teardown path calls this, and a history write that raised would replace the
     /// caller's real failure with a filesystem one.
+    ///
+    /// The unwritable root is a regular *file*, not `/proc/...`: a path component that is a
+    /// file cannot become a directory on any platform, whereas `/proc/definitely-not-writable`
+    /// resolves to a perfectly creatable `<drive>:\proc\...` on Windows — measured as exactly
+    /// this test writing there and failing on the windows-latest CI tier.
     #[test]
     fn an_unwritable_state_directory_is_survivable() {
-        let root = Path::new("/proc/definitely-not-writable");
+        let dir = TempDir::new("unwritable");
+        let root = dir.0.join("a-file-not-a-directory");
+        std::fs::write(&root, "occupied").expect("writes");
         // The append really is attempted against the unwritable root — rather than a
         // history that quietly writes nowhere and would pass for the wrong reason.
-        History::for_vm(root, "mvm-1").append(launched());
+        History::for_vm(&root, "mvm-1").append(launched());
         assert!(
-            read_events(root, "mvm-1").is_empty(),
+            read_events(&root, "mvm-1").is_empty(),
             "nothing was written, and nothing raised"
         );
+        assert!(root.is_file(), "the root is still the file it was");
     }
 
     /// A truncated last line is reported as unreadable rather than skipped.
