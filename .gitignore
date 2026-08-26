@@ -28,6 +28,11 @@ microvms-js/*.node
 microvms-js/index.js
 microvms-js/index.d.ts
 microvms-js/node_modules/
+# One package directory per entry in `package.json`'s `napi.targets`, written by
+# `napi create-npm-dirs` and filled by `napi artifacts`. Derived in full — name, `os`,
+# `cpu`, `libc`, and the inherited license and repository all come from the root
+# manifest — so the target list is the source and these are its output.
+microvms-js/npm/
 sbom/
 docs/.repomix/
 docs/.packets/
