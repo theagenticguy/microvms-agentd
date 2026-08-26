@@ -40,12 +40,11 @@ confidence-threshold = 0.93
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"
-# The seven findings behind this: intra-workspace `{ path = "../protocol" }`
-# dependencies carry no version, which cargo-deny counts as `*`. Nothing here
-# is published to crates.io (the repo is deliberately source-only), so a
-# versionless path dependency is the correct form, and this scopes the
-# exemption to path deps only; a registry wildcard still fails.
-allow-wildcard-paths = true
+# No `allow-wildcard-paths`, and its absence is the gate. Every intra-workspace
+# `{ path = ... }` dependency also carries a `version`, which is what `cargo publish`
+# requires of a crate bound for the registry — a versionless path dep counts as `*`
+# here, so dropping the exemption means one setting enforces what three published
+# manifests need.
 
 [advisories]
 # Advisory scanning is grype/trivy/osv-scanner's lane (three databases, every

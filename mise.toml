@@ -273,6 +273,38 @@ description = "Release build of the `microvm` CLI, for the host"
 # an artifact only the live tier consumes.
 run = "cargo build --release -p microvms-cli"
 
+[tasks."publish:check"]
+description = "The publish set is the intended one and every manifest can upload. Offline"
+# In `check` because it costs a `cargo metadata` and catches the class of defect that is
+# otherwise found by a release tag: `cargo publish` requires `description`, `license`, a
+# `readme` file that exists, keywords within crates.io's limits, and a `version` on every
+# path dependency, and nothing in `build`, `test`, or `lint` reads any of that. A tag is the
+# worst place to learn it, because crates.io versions are immutable — there is no second
+# `0.1.0`.
+#
+# It also asserts the publish set by equality, so a crate that quietly becomes publishable
+# fails here. `agentd` and `agentd-model` are `publish = false` on purpose and a diff that
+# flips either one has to say so.
+run = "./scripts/check-publishable.py"
+
+[tasks."publish:dry-run"]
+description = "Package and verify every publishable crate as if the others were released"
+# NOT in `check`, and not for the usual reason. This is the strongest gate in the repo for
+# release readiness and it needs the network: `cargo publish --workspace --dry-run` resolves
+# against the registry, so `--offline` fails outright with "attempting to make an HTTP
+# request". `check` is offline and free, which is what makes it runnable on a plane and
+# therefore runnable at all — so this runs in `ci.yml`, beside the other network tiers.
+#
+# `--workspace` publishes in dependency order (Cargo 1.90+) and verifies the whole set as
+# one build, which is the only way the `microvms-core -> microvms-protocol` edge gets checked
+# the way a consumer will resolve it rather than through the path dependency.
+#
+# Needs a COMMITTED tree. `cargo publish` refuses while any tracked file differs from HEAD —
+# staged is still dirty — because packaging uncommitted work verifies something that is not in
+# the repository. That is invisible in CI, where the checkout is clean by construction, and it
+# is the first thing this hits when run from a working branch.
+run = "./scripts/check-publishable.py --dry-run"
+
 [tasks."live:check"]
 description = "Fail if the live tier's own wiring is wrong. Offline and free"
 # In `check` rather than `live` for the reason `model:check` gives: no network, no
@@ -297,6 +329,7 @@ depends = [
   "schema:check",
   "stubs:check",
   "model:check",
+  "publish:check",
   "live:check",
   "build",
 ]

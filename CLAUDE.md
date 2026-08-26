@@ -1,9 +1,10 @@
 # CLAUDE.md
 
-Verified client stack + in-VM daemon for AWS Lambda MicroVMs, in Rust. Source-only:
-nothing publishes to crates.io/PyPI/npm. Read `docs/PLATFORM.md` (measured platform
-findings), `docs/PROTOCOL.md` (wire contract — never change silently), `docs/TRUST.md`
-(threat model), `docs/STRATEGY.md` (scope; orchestrators and fork-snapshots are declined).
+Verified client stack + in-VM daemon for AWS Lambda MicroVMs, in Rust. Nothing is on a
+registry yet; see **Publishing** below for which crates are configured to go and which are
+`publish = false` on purpose. Read `docs/PLATFORM.md` (measured platform findings),
+`docs/PROTOCOL.md` (wire contract — never change silently), `docs/TRUST.md` (threat model),
+`docs/STRATEGY.md` (scope; orchestrators and fork-snapshots are declined).
 
 ## Commands
 
@@ -94,7 +95,11 @@ requirements sharing vocabulary with no peer need a glossary link, not a looser 
 
 ## Layout
 
-- `protocol/` — daemon<->client wire types; drift is a compile error
+- `protocol/` — daemon<->client wire types; drift is a compile error. The *package* is
+  `microvms-protocol`, because `protocol` is taken on crates.io, and every dependent renames
+  it back with `package = "microvms-protocol"`. So `use protocol::` is correct in source and
+  wrong in a manifest, and `cargo test -p protocol` fails with "package not found" —
+  the selector is `-p microvms-protocol`.
 - `agentd/` — the in-VM daemon (exec, file transfer, one-shot bootstrap)
 - `model/` — stateright models of daemon and client lifecycle
 - `microvms-core/` — the client library; the type system carries every trap closure
@@ -124,6 +129,48 @@ requirements sharing vocabulary with no peer need a glossary link, not a looser 
 
 Dependency direction: cli -> core -> protocol; bindings -> core; agentd -> protocol.
 `site/` depends on `docs/` and on git, and never writes to either.
+
+## Publishing
+
+Nothing is on a registry yet. Three crates are configured to go, and the set is asserted by
+equality in `scripts/check-publishable.py` — a fourth crate that quietly becomes publishable
+fails `mise run check`.
+
+| Artifact | Registry | Name |
+|---|---|---|
+| `protocol/` | crates.io | `microvms-protocol` |
+| `microvms-core/` | crates.io | `microvms-core` |
+| `microvms-cli/` | crates.io | `microvms-cli` (the binary stays `microvm`) |
+| `microvms-py/` | PyPI | `microvms` |
+| `microvms-js/` | npm | `microvms` + one package per platform triple |
+
+`agentd` and `agentd-model` are `publish = false` on purpose, each with the reason in its own
+manifest: the daemon reaches a consumer as a static aarch64 binary baked into a task image,
+and the model is a proof harness. The workspace default is `publish = false`, so a new member
+is unpublishable until someone opts it in.
+
+Two gates, split by whether they need the network:
+
+```bash
+mise run publish:check    # in `check`. Offline: the publish set, and metadata cargo requires
+mise run publish:dry-run  # NOT in `check`. Needs the registry; runs in ci.yml
+```
+
+`cargo publish --workspace --dry-run` cannot run offline — it exits 101 with "attempting to
+make an HTTP request" — which is why the dry run is out of a gate documented as offline. What
+`check` covers is the manifest half: a missing `readme` file, a sixth keyword, a path
+dependency with no `version`.
+
+Three things about the registry surface that a manifest does not make obvious:
+
+- Every version is immutable on all three registries. There is no second `0.1.0`, so a
+  first release is worth tagging `0.1.0-rc.1` and yanking rather than burning the number.
+- npm requires the package to exist before a trusted publisher can be configured, and there
+  is no org- or scope-level configuration — the root package and every platform package each
+  need their own. crates.io has the same first-publish requirement. PyPI does not: a pending
+  publisher creates the project on first use, so the Python side never needs a token.
+- `npm publish --dry-run` is **not** safe here. napi's `prepublishOnly` runs `napi
+  prepublish`, which really publishes the platform packages. Use `--ignore-scripts`.
 
 ## Rules
 

@@ -19,10 +19,10 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "microvms-protocol",
  "nix 0.31.3",
  "pin-project-lite",
  "proptest",
- "protocol",
  "schemars",
  "serde",
  "serde_json",
@@ -2204,8 +2204,8 @@ dependencies = [
  "http 1.5.0",
  "hyper",
  "hyper-util",
+ "microvms-protocol",
  "proptest",
- "protocol",
  "reqwest",
  "rust_decimal",
  "rust_decimal_macros",
@@ -2223,11 +2223,20 @@ name = "microvms-js"
 version = "0.1.0"
 dependencies = [
  "microvms-core",
+ "microvms-protocol",
  "napi",
  "napi-build",
  "napi-derive",
- "protocol",
  "tokio",
+]
+
+[[package]]
+name = "microvms-protocol"
+version = "0.1.0"
+dependencies = [
+ "schemars",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -2235,7 +2244,7 @@ name = "microvms-py"
 version = "0.1.0"
 dependencies = [
  "microvms-core",
- "protocol",
+ "microvms-protocol",
  "pyo3",
  "tokio",
 ]
@@ -2702,15 +2711,6 @@ dependencies = [
  "rusty-fork",
  "tempfile",
  "unarray",
-]
-
-[[package]]
-name = "protocol"
-version = "0.1.0"
-dependencies = [
- "schemars",
- "serde",
- "serde_json",
 ]
 
 [[package]]

@@ -23,12 +23,16 @@ resolver = "3"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/theagenticguy/microvms-agentd"
-# The repo is deliberately source-only (README: nothing on crates.io, PyPI, or
-# npm). microvms-py and microvms-js already said `publish = false` out loud;
-# the other five crates never declared it, so `cargo publish` would have
-# accepted them and cargo-deny classified them as public crates, which is what
-# made their versionless path dependencies a wildcard error. One declaration
-# here, inherited by every member.
+# Default-deny, and an allowlist rather than a denylist for the same reason
+# `microvms-cli/tests/thinness.rs` gives: a denylist is defeated by the crate
+# nobody thought to write down. A member added later is unpublishable until
+# someone says otherwise in its own manifest, next to the reason.
+#
+# The three that opt in with `publish = true` are `microvms-protocol`,
+# `microvms-core`, and `microvms-cli`. The four that stay here are each a
+# deliberate absence: `agentd` and `agentd-model` because the daemon ships as a
+# binary baked into an image and the model is a proof harness, `microvms-py` and
+# `microvms-js` because their registry is PyPI and npm.
 publish = false
 
 # Tuned for the shipping artifact: one static binary, small enough to bake into

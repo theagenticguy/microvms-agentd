@@ -13,10 +13,36 @@ name = "microvms"
 version = "0.1.0"
 description = "Python bindings over microvms-core: the MicroVMs client with every trap closure"
 requires-python = ">=3.9"
-# No `authors`, no `license`, no `readme`, no `classifiers`, no `urls`. This is a
-# locally-built wheel for `maturin develop`, not a package anyone publishes, and
-# the metadata a publish needs is metadata a reader could mistake for intent to
-# publish.
+readme = "README.md"
+# PEP 639: an SPDX expression, which is why there is no
+# `License :: OSI Approved :: ...` entry in `classifiers` below. The two forms are
+# mutually exclusive — a wheel carrying both is rejected at build time.
+license = "Apache-2.0"
+keywords = ["microvms", "lambda", "aws", "sandbox", "microvm"]
+# `abi3-py39` in Cargo.toml is what makes one wheel load on every version listed
+# here, so this list is a claim about the interpreters the extension supports
+# rather than a matrix the build has to enumerate.
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Topic :: System :: Distributed Computing",
+    "Topic :: System :: Emulators",
+    "Typing :: Typed",
+]
+
+[project.urls]
+Homepage = "https://theagenticguy.github.io/microvms-agentd/"
+Documentation = "https://theagenticguy.github.io/microvms-agentd/"
+Repository = "https://github.com/theagenticguy/microvms-agentd"
+Issues = "https://github.com/theagenticguy/microvms-agentd/issues"
 
 [tool.maturin]
 # Defaults to the Cargo.toml next to this file; stated because `maturin build -m`
