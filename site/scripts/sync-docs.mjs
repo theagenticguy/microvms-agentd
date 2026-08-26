@@ -42,7 +42,7 @@ import {
   rmSync,
   writeFileSync
 } from "node:fs"
-import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path"
+import { basename, dirname, isAbsolute, join, posix, relative, resolve, sep } from "node:path"
 
 const SOURCE = "../docs"
 const TARGET = "src/content/docs"
@@ -339,27 +339,57 @@ const normalizeSlashes = (path) => {
 }
 
 /**
- * Rewrites a relative link that leaves the published corpus into a commit-pinned repository permalink.
+ * Where a tree page is written, which is also its route.
  *
- * A relative `.md` link between two published pages is left exactly as written, and that is the whole
- * reason this function is small. Astro resolves such a link against the entry's own path, so it is
- * correct on the rendered page; and it is correct on the raw Markdown twin too, because a relative
- * target resolves against the twin's own directory, which already carries the base segment. Relative is
- * the one link form that needs no rewriting on either surface.
+ * Lowercased, so the content directory mirrors the routes EXACTLY. Astro's glob loader slugs a filename
+ * by lowercasing it, so `PLATFORM.md` is served at `/platform/` with its twin at `/platform.md` — and a
+ * relative link authored as `../EMBEDDING.md` then resolves on the rendered page, where Astro maps it
+ * through the slug, and 404s on the twin, where nothing rewrites it and the file on disk is
+ * `embedding.md`. Measured: main's `reference/cli.md` carries exactly that link, the HTML was correct,
+ * the link validator reported every internal link valid, and the twin pointed at nothing.
  *
- * Everything else is a 404 waiting to happen: a link to a repository file the site does not serve, or to
- * a page it does not publish. Those become permalinks, pinned to a SHA for the same reason the citations
- * are — a blob link against a moving branch rots the day the file moves.
+ * A relative link is base-agnostic. It is NOT case-agnostic. Making the filename the slug is what closes
+ * that, because then there is no second spelling for anything to disagree about.
  */
-const rewriteEscapingLinks = (body, treePath, { published, commit, tracked, treePrefix, report }) => {
+const contentPathOf = (treePath) => treePath.toLowerCase()
+
+/**
+ * Rewrites a relative link so it resolves on BOTH surfaces, or into a commit-pinned repository permalink
+ * when it leaves the published corpus.
+ *
+ * Two cases and no third:
+ *
+ * - **A link to a published page** is re-pointed at that page's content path, which is its route. Where
+ *   the filename was already lowercase this is a no-op, which is most links in this tree.
+ * - **Anything else** is a 404 waiting to happen — a link to a repository file the site does not serve,
+ *   or to a page it does not publish — and becomes a permalink, pinned to a SHA for the same reason the
+ *   citations are: a blob link against a moving branch rots the day the file moves.
+ */
+const rewriteLinks = (
+  body,
+  treePath,
+  { contentPaths, commit, tracked, treePrefix, report, renamed }
+) => {
   const dir = dirname(treePath) === "." ? "" : dirname(treePath)
+  const from = dirname(contentPathOf(treePath))
   return body.replace(/\]\(([^)\s]+)\)/g, (match, target) => {
     if (/^[a-z][a-z0-9+.-]*:/i.test(target) || target.startsWith("/") || target.startsWith("#")) {
       return match
     }
     const [path, fragment] = target.split("#", 2)
+    const anchor = fragment === undefined ? "" : `#${fragment}`
     const treeTarget = normalizeSlashes(dir === "" ? path : `${dir}/${path}`)
-    if (published.has(treeTarget)) return match
+
+    const contentTarget = contentPaths.get(treeTarget)
+    if (contentTarget !== undefined) {
+      const relative = posix.relative(from, contentTarget)
+      // `posix.relative` drops the leading `./` a Markdown sibling link wants.
+      const rewritten = relative.startsWith(".") ? relative : `./${relative}`
+      if (rewritten === `./${path}` || rewritten === path) return match
+      renamed(`${treePath}: ${target} -> ${rewritten}`)
+      return `](${rewritten}${anchor})`
+    }
+
     const repoTarget = normalizeSlashes(`${treePrefix}/${dir === "" ? path : `${dir}/${path}`}`)
     if (!tracked.has(repoTarget)) {
       throw new Error(
@@ -368,7 +398,6 @@ const rewriteEscapingLinks = (body, treePath, { published, commit, tracked, tree
       )
     }
     report(`${treePath} -> ${repoTarget}`)
-    const anchor = fragment === undefined ? "" : `#${fragment}`
     return `](${REPO_URL}/blob/${commit}/${repoTarget}${anchor})`
   })
 }
@@ -442,7 +471,28 @@ const main = () => {
 
   const treePages = markdownUnder(source)
   if (treePages.length === 0) fail(`no .md files under ${source}`)
-  const published = new Set(treePages.filter((treePath) => !UNPUBLISHED.has(treePath)))
+  const published = treePages.filter((treePath) => !UNPUBLISHED.has(treePath))
+
+  /*
+   * Tree path -> where the page is written, which is also its route. Built before the loop because a
+   * link is rewritten against the whole map rather than against one page: a link in the first file may
+   * point at the last.
+   *
+   * Two tree paths differing only in case would collide into one content path and one would silently
+   * overwrite the other, so that is a hard failure rather than a last-writer-wins.
+   */
+  const contentPaths = new Map()
+  for (const treePath of published) {
+    const contentPath = contentPathOf(treePath)
+    const clash = [...contentPaths].find(([, existing]) => existing === contentPath)
+    if (clash !== undefined) {
+      fail(
+        `${treePath} and ${clash[0]} both publish as ${contentPath}. A route has one spelling, so ` +
+          "one page would overwrite the other. Rename one in the tree."
+      )
+    }
+    contentPaths.set(treePath, contentPath)
+  }
 
   const owned = new Set(readManifest(target))
   const generated = new Set()
@@ -451,6 +501,7 @@ const main = () => {
   const fallbacks = []
   const unnamed = []
   const rewrittenLinks = []
+  const renamedLinks = []
   const pages = []
 
   const emit = (contentPath, content) => {
@@ -486,22 +537,24 @@ const main = () => {
     const placement = placementOf(treePath)
     if (!treePath.includes("/") && !AUTHORITATIVE.has(treePath)) unnamed.push(treePath)
 
-    const linked = rewriteEscapingLinks(body, treePath, {
-      published,
+    const linked = rewriteLinks(body, treePath, {
+      contentPaths,
       commit,
       tracked,
       treePrefix,
-      report: (entry) => rewrittenLinks.push(entry)
+      report: (entry) => rewrittenLinks.push(entry),
+      renamed: (entry) => renamedLinks.push(entry)
     })
 
+    const contentPath = contentPathOf(treePath)
     pages.push({
       treePath,
-      id: treePath.slice(0, -".md".length).toLowerCase(),
+      id: contentPath.slice(0, -".md".length),
       title,
       order: placement.order
     })
     emit(
-      treePath,
+      contentPath,
       `${frontmatter({
         ...placement,
         title,
@@ -542,17 +595,20 @@ const main = () => {
    * hand is how a published page becomes an orphan nothing links to.
    */
   const sidebar = [...AUTHORITATIVE]
-    .filter(([treePath]) => published.has(treePath))
+    .filter(([treePath]) => contentPaths.has(treePath))
     .sort(([, a], [, b]) => a.order - b.order)
     .map(([treePath, named]) => ({
       label: named.label,
-      link: `/${treePath.slice(0, -".md".length).toLowerCase()}/`
+      link: `/${contentPathOf(treePath).slice(0, -".md".length)}/`
     }))
     .concat(
-      unnamed.slice().sort().map((treePath) => {
-        const id = treePath.slice(0, -".md".length).toLowerCase()
-        return { label: pages.find((page) => page.id === id)?.title ?? id, link: `/${id}/` }
-      })
+      unnamed
+        .slice()
+        .sort()
+        .map((treePath) => {
+          const id = contentPathOf(treePath).slice(0, -".md".length)
+          return { label: pages.find((page) => page.id === id)?.title ?? id, link: `/${id}/` }
+        })
     )
 
   // Only a path this tool wrote on a previous run is a prune candidate, so a hand-authored page sharing
@@ -569,7 +625,7 @@ const main = () => {
           source: relative(process.cwd(), source),
           commit,
           owned: [...generated].sort(),
-          publishedTreePaths: [...published].sort(),
+          publishedTreePaths: published.slice().sort(),
           sidebar
         },
         undefined,
@@ -585,6 +641,7 @@ const main = () => {
     out.write(`${dryRun ? "would remove" : "removed"}  ${join(target, path)}\n`)
   }
   for (const entry of rewrittenLinks) out.write(`  link -> permalink  ${entry}\n`)
+  for (const entry of renamedLinks) out.write(`  link -> route      ${entry}\n`)
   for (const { treePath, title, fallback } of fallbacks) {
     out.write(`  fallback title  ${treePath} -> ${JSON.stringify(title)}  (${fallback})\n`)
   }
@@ -595,6 +652,7 @@ const main = () => {
     `${dryRun ? "dry run: " : ""}${generated.size} pages at ${commit.slice(0, 12)}, ` +
       `${written.length} ${verb}, ${unchanged.length} unchanged, ${stale.length} stale, ` +
       `${UNPUBLISHED.size} unpublished, ${rewrittenLinks.length} links pinned, ` +
+      `${renamedLinks.length} links re-pointed at a route, ` +
       `${fallbacks.length} fallback titles\n`
   )
   if (fallbacks.length > 0) {

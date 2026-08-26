@@ -457,6 +457,49 @@ describe("the raw-Markdown route", () => {
 })
 
 /* =================================================================================================
+ * The content directory mirrors the routes.
+ * ================================================================================================= */
+
+describe("every generated content path is its own route", () => {
+  /**
+   * Astro's glob loader slugs a filename by lowercasing it, so `PLATFORM.md` is served at `/platform/`
+   * with its twin at `/platform.md`. Any filename that is not already slug-cased therefore has TWO
+   * spellings — the one on disk and the one in the route — and a relative link authored against the
+   * first resolves on the rendered page, where Astro maps it through the slug, and 404s on the twin,
+   * where nothing rewrites it.
+   *
+   * That shipped: `reference/cli.md` linked `../EMBEDDING.md`, the HTML was correct, the link validator
+   * reported every internal link valid, and the twin pointed at nothing. `sync-docs.mjs` now writes
+   * every page at its slug, which removes the second spelling rather than rewriting links to work
+   * around it — and this is the assertion that keeps it removed.
+   */
+  const contentFiles = (): ReadonlyArray<string> => {
+    const walk = (directory: string, prefix: string): ReadonlyArray<string> =>
+      readdirSync(directory, { withFileTypes: true }).flatMap((entry) => {
+        if (entry.isDirectory()) return walk(join(directory, entry.name), `${prefix}${entry.name}/`)
+        return /\.mdx?$/.test(entry.name) ? [`${prefix}${entry.name}`] : []
+      })
+    return walk(content, "")
+  }
+
+  it("writes no path that differs from its own slug", () => {
+    const files = contentFiles()
+    expect(files.length).toBeGreaterThan(0)
+    expect(files.filter((path) => path !== path.toLowerCase())).toEqual([])
+  })
+
+  it("names a page for every twin the build emitted, in the same case", () => {
+    /*
+     * The same invariant read off `dist/` rather than off the inputs, which is where a route mapping
+     * that disagrees with the filename would actually show up.
+     */
+    const twins = builtTwins().filter((twin) => !CONFIG.twinsWithoutPages.includes(twin as never))
+    expect(twins.length).toBeGreaterThan(0)
+    expect(twins.filter((twin) => twin !== twin.toLowerCase())).toEqual([])
+  })
+})
+
+/* =================================================================================================
  * Silent render failures.
  * ================================================================================================= */
 
