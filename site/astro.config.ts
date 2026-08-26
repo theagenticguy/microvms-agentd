@@ -16,6 +16,7 @@ import { baseRawLinks } from "./src/lib/base-raw-links.js"
 import { citationLinks } from "./src/lib/citation-links.js"
 import mermaid from "./src/lib/mermaid.js"
 import { robotsPolicyFile } from "./src/lib/robots.js"
+import { rootTwin } from "./src/lib/root-twin.js"
 
 /**
  * Where this site is published.
@@ -160,6 +161,14 @@ export default defineConfig({
   },
 
   integrations: [
+    /*
+     * FIRST, so every later pass sees one root twin at its final path rather than two spellings of it.
+     * `starlight-md-txt` emits the landing page's twin as the dotfile `.md`, which GitHub Pages refuses
+     * to serve — a 404 no gate over `dist/` can see, because the file is there and the host is the one
+     * declining. This renames it to `index.md`.
+     */
+    rootTwin(),
+
     /*
      * Registered ahead of Starlight, and it closes a defect that is invisible from every angle a build
      * reports on: the raw `.md` twins are built from each page's Markdown SOURCE while the rendered tree

@@ -410,14 +410,39 @@ describe("the head discovery block", () => {
  * ================================================================================================= */
 
 describe("the raw-Markdown route", () => {
-  it("maps the site root to the route the raw-twin plugin actually injects", () => {
-    // The root entry's id is the empty string or `index`, and both map to `<base>/.md` — a dotfile,
-    // which is why a census built on a shell glob under-reports by exactly the landing page.
-    expect(rawMarkdownUrl("", CONTEXT).pathname).toBe(`${CONFIG.probeBase}/.md`)
-    expect(rawMarkdownUrl("index", CONTEXT).pathname).toBe(`${CONFIG.probeBase}/.md`)
+  it("maps the site root to a twin path a host will serve, not to a dotfile", () => {
+    /*
+     * `starlight-md-txt` maps the root entry — id `""` or `index` — to an undefined slug, so the twin it
+     * EMITS is the dotfile `<base>/.md`. GitHub Pages answers 404 for that path while serving every other
+     * twin, measured against the deployed site, so `rootTwin()` renames the file and this maps to the
+     * renamed path. The two must agree or the landing page's `rel="alternate"` points at nothing.
+     */
+    expect(rawMarkdownUrl("", CONTEXT).pathname).toBe(`${CONFIG.probeBase}/index.md`)
+    expect(rawMarkdownUrl("index", CONTEXT).pathname).toBe(`${CONFIG.probeBase}/index.md`)
     expect(rawMarkdownUrl("reference/cli", CONTEXT).pathname).toBe(
       `${CONFIG.probeBase}/reference/cli.md`
     )
+  })
+
+  it("emits every twin at a path a static host will serve", () => {
+    /*
+     * The limit of "assert over the built output", made into an assertion.
+     *
+     * A file can be present in `dist/`, present in the uploaded artifact, and still unreachable: GitHub
+     * Pages serves no path whose segment begins with `.` or `_`. That is how the landing page's twin
+     * shipped as a 404 with every local probe green — the build was right and the host declined.
+     *
+     * Checking the shape of the path is what a build can do about a host's rule. `_astro/` is excluded
+     * because it is Astro's own asset directory, which Pages does serve.
+     */
+    const twins = builtTwins()
+    expect(twins.length).toBeGreaterThan(0)
+    const unreachable = twins.filter((twin) =>
+      twin
+        .split("/")
+        .some((segment) => segment.startsWith(".") || (segment.startsWith("_") && segment !== "_astro"))
+    )
+    expect(unreachable).toEqual([])
   })
 
   it("keeps the base segment out of the origin, however the base is written", () => {
@@ -624,9 +649,13 @@ describe("the agent note survives into every surface", () => {
 
   it("passes verbatim into the page's `.md` twin, directive and label both", () => {
     for (const page of carriers()) {
-      const twin = readDist(`${page === "index" ? "" : page}.md`)
-      expect(twin, `${page}.md lost the directive`).toContain(":::agent")
-      expect(twin, `${page}.md lost the label`).toContain(`**${AGENT_NOTE_LABEL}.**`)
+      // The twin's path comes from the module that builds it, not from a mapping restated here: when
+      // the root entry's twin moved off its dotfile path, a restated mapping would have kept reading a
+      // file the build no longer emits and passed on whatever it found.
+      const path = served(rawMarkdownUrl(page, BUILT_CONTEXT).pathname)
+      const twin = readDist(path)
+      expect(twin, `${path} lost the directive`).toContain(":::agent")
+      expect(twin, `${path} lost the label`).toContain(`**${AGENT_NOTE_LABEL}.**`)
       expect(twin).not.toContain(":::agent\\[")
     }
   })
