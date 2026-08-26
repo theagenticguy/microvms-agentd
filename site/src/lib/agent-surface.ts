@@ -111,12 +111,17 @@ export const siteUrl = (relative: string, context: SiteContext): URL =>
 /**
  * The raw-Markdown route for a docs entry.
  *
- * `starlight-md-txt` injects `/[...slug].md` and maps the root entry — whose id is the empty string
- * or `index` — to an undefined slug, so the site root's raw route is `<base>/.md`. Reproducing that
- * mapping here rather than guessing is what keeps this control off a 404.
+ * `starlight-md-txt` injects `/[...slug].md` and maps the root entry — whose id is the empty string or
+ * `index` — to an undefined slug, so the twin it emits for the landing page is `<base>/.md`. A dotfile,
+ * and GitHub Pages will not serve one: measured against the deployed site, every other twin answered 200
+ * with `text/markdown` and `/.md` answered 404 while the file was 4,613 bytes in the artifact.
+ *
+ * So the root entry maps to `index.md` here, and `rootTwin()` renames the emitted file to match. The two
+ * have to move together — a mismatch points the landing page's own `rel="alternate"` at a 404, which is
+ * worse than omitting it, because an agent follows the link and attributes the failure to this site.
  */
 export const rawMarkdownUrl = (entryId: string, context: SiteContext): URL =>
-  siteUrl(`${entryId === "index" ? "" : entryId}.md`, context)
+  siteUrl(`${entryId === "" || entryId === "index" ? "index" : entryId}.md`, context)
 
 /** One page, as a machine reader is told about it. */
 export interface PageReference {
