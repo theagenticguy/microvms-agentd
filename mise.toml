@@ -124,6 +124,7 @@ description = "CycloneDX + SPDX SBOMs into sbom/ (gitignored; CI publishes them 
 run = """
 mkdir -p sbom
 syft . --exclude './conformance/infra/.terraform/**' --exclude './target/**' --exclude './microvms-js/node_modules/**' \
+  --exclude './site/node_modules/**' --exclude './site/dist/**' \
   -o cyclonedx-json=sbom/microvms-agentd.cdx.json \
   -o spdx-json=sbom/microvms-agentd.spdx.json -q
 """
@@ -549,3 +550,74 @@ description = "Install the `microvm` binary into ~/.cargo/bin, so it runs bare"
 # resolution every gate tested; a floating install could resolve newer
 # dependency versions than anything in CI ever compiled.
 run = "cargo install --path microvms-cli --locked"
+
+# ── the documentation site ──────────────────────────────────────────────────
+#
+# `site/` publishes `docs/` to GitHub Pages, and the reason it is a build rather than a
+# `docs/` directory someone browses on github.com is the machine surface: a raw `.md`
+# twin per page, the three `llms.txt` bundles, per-page discovery links, and diagrams
+# rendered to SVG at build time. An agent that scrapes rendered HTML pays for navigation
+# chrome, a search widget, and a theme toggle to read three paragraphs.
+#
+# NOT in `check`'s dependency list, for the reason `spec` and `spec:core` are out: it
+# needs a `pnpm install` on a fresh clone, and a gate that fails on a fresh clone is a
+# gate people learn to skip. `docs:check` depends on the install so it works from cold;
+# `.github/workflows/docs.yml` runs the same tiers on every push and pull request. Treat
+# a green `mise run check` as saying nothing about the site.
+#
+# `site/src/content/docs/` is GENERATED in full and gitignored. Edit `docs/` for the
+# published pages, or `site/authored/` for the landing page and the agent page; a change
+# made in the content directory is discarded by the next sync with no diff to show for it.
+
+[tasks."docs:install"]
+description = "Install the docs site's dependencies (pnpm, into site/node_modules)"
+dir = "site"
+run = "pnpm install --frozen-lockfile"
+
+[tasks."docs:sync"]
+description = "Copy docs/ into the site's generated content directory and stamp frontmatter"
+dir = "site"
+# Reads `docs/` and never writes to it. Starlight requires a `title` in frontmatter and
+# offers no H1 fallback, while ccu forbids frontmatter on its outputs and strips it — so
+# the title is derived here and the tree stays read-only.
+run = "node scripts/sync-docs.mjs"
+
+[tasks."docs:braces"]
+description = "Fail on a bare `{` outside a fence, which breaks the raw Markdown routes"
+dir = "site"
+depends = ["docs:sync"]
+# The raw-twin builder parses every page through remark-mdx, where a brace opens a JSX
+# expression, and the resulting build failure names neither the page nor the field. This
+# names the file, line, and column in milliseconds. `## GET /v1/exec/{id}` is the shape
+# it catches; backticks around the path are the only legal repair.
+run = "node scripts/brace-gate.mjs src/content/docs"
+
+[tasks."docs:build"]
+description = "Build the site into site/dist (offline, free)"
+dir = "site"
+depends = ["docs:braces"]
+# The build is itself three gates: starlight-links-validator fails it on a broken
+# internal link, the citation rewriter fails it on a `path:line` that does not resolve at
+# the pinned commit, and the mermaid plugin fails it on a diagram it cannot render rather
+# than shipping the fence as a code block on a page that looks plausible.
+run = "pnpm exec astro build"
+
+[tasks."docs:test"]
+description = "The dist/ probes: twins, discovery links, deep-link budget, cloaking, diagrams"
+dir = "site"
+# Reads the built output rather than the inputs, because the inputs are what you already
+# believe: three of the four machine surfaces fail silently, and a check against a
+# component's props passes while the emitted href is wrong.
+run = "pnpm exec vitest run"
+
+[tasks."docs:check"]
+description = "The docs site's definition of done: install, gates, typecheck, build, probes"
+depends = ["docs:install", "docs:build"]
+dir = "site"
+run = ["pnpm exec astro check", "pnpm exec vitest run"]
+
+[tasks."docs:dev"]
+description = "Serve the site locally with hot reload"
+dir = "site"
+depends = ["docs:braces"]
+run = "pnpm exec astro dev"

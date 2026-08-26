@@ -834,7 +834,7 @@ no signal that it belongs to the finished-exec half. Mitigation: `agentd/tests/s
 already asserts `definition_collisions == []`; extend it to assert the expected `$defs` key
 set so a flatten added or removed shows up as a named failure.
 
-## The /v1/exec/{id}/stream SSE contract — three payloads and three event names
+## The `/v1/exec/{id}/stream` SSE contract — three payloads and three event names
 
 **Producer:** `protocol/src/exec.rs:180-206` (`OutputEvent`, `GapEvent`, `ExitEvent`), `:256-258` (`EVENT_*`), `:171-178` (`StreamQuery`)
 

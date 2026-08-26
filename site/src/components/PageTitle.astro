@@ -1,0 +1,19 @@
+---
+// SPDX-License-Identifier: Apache-2.0
+/**
+ * Starlight's page title, with the page-action controls beneath it.
+ *
+ * `PageTitle` is the override point because it is the first thing inside the content column on every
+ * page the default template renders, so no route ships without the controls. This site declares no
+ * splash template; a splash route renders no `PageTitle`, and would need the controls mounted again.
+ *
+ * The default component is delegated to rather than reimplemented, so the heading keeps the id that
+ * the skip link and the table of contents both target.
+ */
+import Default from "@astrojs/starlight/components/PageTitle.astro"
+
+import PageActions from "./PageActions.astro"
+---
+
+<Default {...Astro.props}><slot /></Default>
+<PageActions />

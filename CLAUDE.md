@@ -15,6 +15,8 @@ mise run check       # THE definition of done: lint, security, test, schema:chec
                      #   stubs:check, model:check, live:check, build. Offline, free.
 mise run live        # real-AWS conformance + rates + leak check. BILLABLE (~15 min).
                      #   Never run casually; never wire to a hook.
+mise run docs:check  # the docs site: install, brace gate, build, typecheck, dist probes.
+                     #   Offline, free, ~20s. NOT inside `check`.
 mise tasks           # everything else
 ```
 
@@ -31,6 +33,12 @@ Two names in that list mean less than they look like:
   which is how a transitive RUSTSEC hit surfaces. Fix those with `cargo update -p <crate>`
   and read the resulting `Cargo.lock` diff before committing — a targeted bump in this
   workspace also re-resolves neighbouring edges.
+- `check` also says nothing about the docs site. `docs:check` is out of its `depends` for
+  the reason `spec` is out: it needs a `pnpm install`, and a gate that fails on a fresh
+  clone is a gate people learn to skip. `.github/workflows/docs.yml` runs the same tiers on
+  every push and pull request, with no path filter — a change under `agentd/src/` can break
+  that build, because the site resolves every `path:line` citation against git at a pinned
+  commit and fails when a cited path is gone.
 
 Individual tiers:
 
@@ -106,8 +114,16 @@ requirements sharing vocabulary with no peer need a glossary link, not a looser 
   Those citations anchor to line numbers, so a refactor silently aims them at the wrong
   code while they still read as authoritative — regenerate the affected files instead of
   editing a stale one, and let the hand-written document win any disagreement.
+- `site/` — the Astro + Starlight build that publishes `docs/` to GitHub Pages, and with it
+  the machine surface: a raw `.md` twin per page, the three `llms.txt` bundles, per-page
+  `rel="alternate"` and JSON-LD, commit-pinned citation permalinks, and Mermaid rendered to
+  SVG at build time. `site/src/content/docs/` is GENERATED in full and gitignored — edit
+  `docs/` for a published page or `site/authored/` for the landing and agent pages; an edit
+  in the content directory is discarded by the next sync with no diff to show for it.
+  `docs/README.md` is deliberately unpublished, because the sidebar is that file generated.
 
 Dependency direction: cli -> core -> protocol; bindings -> core; agentd -> protocol.
+`site/` depends on `docs/` and on git, and never writes to either.
 
 ## Rules
 

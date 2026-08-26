@@ -418,31 +418,31 @@ Starts a command under a caller-minted `exec_id`, idempotent on that id, so a re
 
 `agentd/src/routes.rs:463-474`
 
-### GET /v1/exec/{id}
+### GET `/v1/exec/{id}`
 
 Polls status and output, read-only, so polling never mutates the entry and output survives until an explicit ack.
 
 `agentd/src/routes.rs:475-485`
 
-### POST /v1/exec/{id}/ack
+### POST `/v1/exec/{id}/ack`
 
 Releases output and enters TTL collection; only acked entries are ever collected, so output nobody read is never destroyed.
 
 `agentd/src/routes.rs:519-529`
 
-### POST /v1/exec/{id}/kill
+### POST `/v1/exec/{id}/kill`
 
 Sends SIGTERM then SIGKILL to the whole process group rather than the direct child alone, because a shell that backgrounded a server leaves the interesting process outside the child pid.
 
 `agentd/src/routes.rs:530-541`
 
-### POST /v1/exec/{id}/stdin
+### POST `/v1/exec/{id}/stdin`
 
 Writes to a child's stdin or signals EOF, a separate request from the output stream so a dropped attach does not cost the ability to feed the process.
 
 `agentd/src/routes.rs:504-518`
 
-### GET /v1/exec/{id}/stream
+### GET `/v1/exec/{id}/stream`
 
 Follows output as Server-Sent Events from a byte offset, resumable with `?offset=N`; a body that ends without an `exit` event means the connection failed, not the command.
 

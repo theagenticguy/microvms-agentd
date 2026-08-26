@@ -1,0 +1,98 @@
+---
+// SPDX-License-Identifier: Apache-2.0
+/**
+ * Starlight's `<head>`, extended with the two things it does not emit: the block that points a machine
+ * reader at this page's raw Markdown route and at the site's machine surfaces, and the JSON-LD graph
+ * that states the same relationship in a vocabulary a different consumer reads.
+ *
+ * One component owns every machine hint on the page, which is what stops the canonical URL and the
+ * JSON-LD `url` from disagreeing with nothing to catch it.
+ *
+ * Deliberately absent: `rel="describedby"`, which is the wrong relationship and has no adopters — not
+ * even llmstxt.org itself; and any visually-hidden agent-directed block, which is content served to
+ * machines and hidden from every human. That is cloaking wearing an accessibility class name.
+ *
+ * Also absent: raster icons and social-card metas. This site ships neither a `.ico` nor a card
+ * generator, and a `<link>` or an `og:image` naming a file the build does not emit is worse than the
+ * absent tag — a crawler follows it and attributes the 404 here.
+ *
+ * Every URL is built with `new URL()`, never by concatenating strings. `Astro.site` EXCLUDES the base —
+ * for this site it is `https://theagenticguy.github.io` — so resolving a path against it directly drops
+ * the `/microvms-agentd` segment and yields a 404 that only appears in production.
+ * `import.meta.env.BASE_URL` is the accessor that includes it.
+ */
+import Default from "@astrojs/starlight/components/Head.astro"
+
+import { discoveryLinks } from "../lib/agent-surface.js"
+import { jsonLdGraph, jsonLdText, type SiteDescription } from "../lib/jsonld.js"
+
+/**
+ * The site node, stated once.
+ *
+ * No `searchEndpoint`: Starlight's search is Pagefind, which runs entirely in the browser, so no GET
+ * returns results and a `SearchAction` here would be a machine-readable claim that 404s on the first
+ * consumer that follows it.
+ */
+const SITE: SiteDescription = {
+  name: "microvms-agentd",
+  description:
+    "A verified client stack and in-VM daemon for AWS Lambda MicroVMs, in Rust: the wire protocol, " +
+    "the trust boundary, and measured platform behavior.",
+  inLanguage: "en",
+  publisher: { name: "theagenticguy", url: "https://github.com/theagenticguy/microvms-agentd" }
+}
+
+const { site } = Astro
+if (site === undefined) {
+  throw new Error(
+    "`site` is unset in astro.config.ts, so no absolute machine-surface URL can be built"
+  )
+}
+
+const base = import.meta.env.BASE_URL
+const context = { site, base }
+
+const route = Astro.locals.starlightRoute
+const { entry } = route
+
+const links = discoveryLinks(entry.id, context)
+
+const graph = jsonLdGraph(
+  {
+    entryId: entry.id,
+    title: entry.data.title,
+    description: entry.data.description ?? SITE.description,
+    /*
+     * `lastUpdated` is Starlight's git-derived timestamp, present because `lastUpdated: true` is set in
+     * the config. Omitted rather than defaulted when git has nothing to say — a synced page carries
+     * `editUrl: false` and no history of its own, and an invented date is a fact the graph asserts.
+     */
+    ...(route.lastUpdated === undefined
+      ? {}
+      : { dateModified: route.lastUpdated.toISOString() })
+  },
+  SITE,
+  context
+)
+---
+
+{/* The default is delegated to, never replaced: replacing it drops the canonical link and the sitemap
+    reference, and both are silent losses. */}
+<Default {...Astro.props}><slot /></Default>
+
+{
+  links.map((link) => (
+    <link rel={link.rel} type={link.type} href={link.href} title={link.title} />
+  ))
+}
+
+{/*
+  `set:html` and never `{...}` interpolation, which would HTML-escape the JSON into `&quot;` entities
+  that no `application/ld+json` parser accepts.
+
+  `is:inline` is stated rather than inferred. Astro already treats a `<script>` carrying an attribute as
+  inline, and says so as a hint on every `astro check` run; this is not JavaScript, so bundling it would
+  be wrong as well as impossible. Declaring the intent silences a hint that would otherwise appear on
+  every green run, and a warning that appears on every green run is a warning nobody reads.
+*/}
+<script is:inline type="application/ld+json" set:html={jsonLdText(graph)} />

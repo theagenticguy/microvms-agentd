@@ -1,0 +1,10 @@
+# esbuild's install script fetches the platform binary that vite and vitest link against; without it
+# the first build fails on a missing native module rather than on anything in this repository.
+allowBuilds:
+  esbuild: true
+# Both are newer than pnpm's default cooldown window. Pinned exactly in package.json and excluded here,
+# because under `minimumReleaseAge` a pin whose only satisfying version is inside the window has no
+# installable candidate and the install fails outright rather than resolving to something older.
+minimumReleaseAgeExclude:
+  - '@astrojs/starlight@0.41.9'
+  - astro@7.2.7

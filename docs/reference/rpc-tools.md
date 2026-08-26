@@ -15,7 +15,7 @@ Two places where `docs/PROTOCOL.md`, the hand-written contract, disagrees with t
 - Its route table lists 17 rows and omits `GET /v1/schema` (`docs/PROTOCOL.md:13-31`). That endpoint is served and is row 18 of the generated schema (`agentd/src/routes.rs:137`).
 - It describes `POST HOOKS/resume` as signalling in-memory state loss (`docs/PROTOCOL.md:19`). The source records the opposite as a dated measurement and records that the state-loss claim was inferred rather than measured (`agentd/src/routes.rs:261-275`). This file follows the measurement.
 
-## GET /v1/exec/{id}
+## GET `/v1/exec/{id}`
 
 ```rs
 pub async fn poll(State(state): State<AppState>, Path(id): Path<String>) -> Response {
@@ -35,7 +35,7 @@ Strictly read-only — nothing in the handler may write to the registry or an en
 
 `agentd/src/exec.rs:407`
 
-## GET /v1/exec/{id}/stream
+## GET `/v1/exec/{id}/stream`
 
 ```rs
 pub async fn stream(
@@ -283,7 +283,7 @@ Starts a command under a caller-minted `exec_id`, idempotently on that id (`agen
 
 `agentd/src/exec.rs:331`
 
-## POST /v1/exec/{id}/ack
+## POST `/v1/exec/{id}/ack`
 
 ```rs
 pub async fn ack(State(state): State<AppState>, Path(id): Path<String>) -> Response {
@@ -303,7 +303,7 @@ This is the only way output leaves the daemon's custody, and only acked entries 
 
 `agentd/src/exec.rs:831`
 
-## POST /v1/exec/{id}/kill
+## POST `/v1/exec/{id}/kill`
 
 ```rs
 pub async fn kill(State(state): State<AppState>, Path(id): Path<String>) -> Response {
@@ -323,7 +323,7 @@ The signal goes to the process group and not just the direct child, because a sh
 
 `agentd/src/exec.rs:905`
 
-## POST /v1/exec/{id}/stdin
+## POST `/v1/exec/{id}/stdin`
 
 ```rs
 pub async fn write_stdin(
