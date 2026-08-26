@@ -31,3 +31,8 @@ microvms-js/node_modules/
 sbom/
 docs/.repomix/
 docs/.packets/
+# The CodeGraph index: a derived SQLite database of this tree's symbols and edges,
+# plus the running daemon's socket and pid. It is rebuilt from source by `codegraph
+# index`, so committing it would commit one machine's 18 MB binary artifact — and a
+# live unix socket and pid file, which are meaningless in any other checkout.
+.codegraph/
