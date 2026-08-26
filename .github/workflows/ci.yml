@@ -89,7 +89,7 @@ jobs:
             # Not the binding crates: pyo3 wants a Python to link against on
             # Windows and napi wants its build tooling; both get their real
             # coverage in the `bindings` job, under the toolchains that ship them.
-            cargo clippy -p protocol -p microvms-core -p microvms-cli -p agentd-model --all-targets -- -D warnings
+            cargo clippy -p microvms-protocol -p microvms-core -p microvms-cli -p agentd-model --all-targets -- -D warnings
           fi
       # Linux: one command covers all six tiers — the daemon's unit tests, the
       # stateright model over every reachable state, the proptest tar-confinement
@@ -105,7 +105,7 @@ jobs:
           if [ "${{ matrix.os }}" = "ubuntu-latest" ]; then
             cargo test --all
           else
-            cargo test -p protocol -p microvms-core -p microvms-cli -p agentd-model
+            cargo test -p microvms-protocol -p microvms-core -p microvms-cli -p agentd-model
           fi
       # Belt to the test suite's braces, and not redundant: this runs the real
       # generator against the real path and fails with the regenerate command in

@@ -161,6 +161,13 @@ make an HTTP request" — which is why the dry run is out of a gate documented a
 `check` covers is the manifest half: a missing `readme` file, a sixth keyword, a path
 dependency with no `version`.
 
+`publish:check` also reads every `-p <crate>` in `ci.yml`, `docs.yml`, and `mise.toml` and
+fails on one that names no package. A rename is the only thing that breaks those, and the
+failure is uneven: ubuntu's tiers use `--all` and stay green while the macOS and Windows tiers,
+which name crates explicitly, are the only ones that go red. Markdown is deliberately out of
+scope — the counterexample four paragraphs up is a `-p protocol` this gate would otherwise
+flag.
+
 Three things about the registry surface that a manifest does not make obvious:
 
 - Every version is immutable on all three registries. There is no second `0.1.0`, so a

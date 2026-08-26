@@ -35,8 +35,10 @@ green forever the moment someone set `publish = false` at the root.
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 import sys
+from pathlib import Path
 
 #: The crates that go to crates.io, and nothing else.
 #:
@@ -60,6 +62,28 @@ REQUIRED = ("description", "license", "repository", "readme")
 MAX_KEYWORDS = 5
 MAX_KEYWORD_LEN = 20
 MAX_CATEGORIES = 5
+
+#: Files whose `-p <crate>` selectors must name a crate that exists.
+#:
+#: Executable surfaces only. A workflow or a task that selects a missing package fails with
+#: `package ID specification ... did not match any packages` and takes the build with it. A
+#: markdown file showing the same string is prose, and `CLAUDE.md` deliberately quotes
+#: `cargo test -p protocol` as the example of what *does not* work — so scanning docs here
+#: would fail the gate on its own documentation.
+SELECTOR_FILES = (
+    ".github/workflows/ci.yml",
+    ".github/workflows/docs.yml",
+    "mise.toml",
+)
+
+#: `-p foo` and `--package foo`, the two spellings cargo accepts.
+#:
+#: Only applied to a line that invokes `cargo`, because `-p` is not cargo's alone: `mkdir -p
+#: sbom` appears in both files above and matches this pattern exactly. That scoping is also
+#: this check's limit — a `cargo` invocation whose selector sits on a shell continuation line
+#: is not seen. Every one in this repo is on a single line, and a missed selector fails the
+#: build the old way rather than passing something wrong.
+SELECTOR = re.compile(r"(?:-p|--package)[ =]+([A-Za-z0-9_-]+)")
 
 
 def metadata() -> dict:
@@ -90,9 +114,41 @@ def publishable(package: dict) -> bool:
     return package["publish"] != []
 
 
+def stale_selectors(names: set[str]) -> list[str]:
+    """Every `-p <crate>` in a workflow or task that names a package cargo cannot find.
+
+    A package rename is the only thing that breaks these, which is why the check lives beside
+    the publish set rather than in a gate of its own: a crate whose registry name differs from
+    its directory name is exactly the situation that produces one. `protocol` became
+    `microvms-protocol` because the bare name is taken on crates.io, and the two selectors in
+    `ci.yml` that still said `-p protocol` failed only on macOS and Windows — the platforms
+    whose tiers name crates explicitly, where ubuntu's `--all` passed and reported green.
+    """
+    failures: list[str] = []
+    for relative in SELECTOR_FILES:
+        path = Path(relative)
+        if not path.exists():
+            failures.append(f"{relative} is in SELECTOR_FILES and does not exist")
+            continue
+        for number, line in enumerate(path.read_text().splitlines(), start=1):
+            # Comments describe intent and may name a crate that is gone on purpose.
+            if line.lstrip().startswith("#") or "cargo" not in line:
+                continue
+            for selected in SELECTOR.findall(line):
+                if selected not in names:
+                    failures.append(
+                        f"{relative}:{number} selects `-p {selected}`, which is not a package "
+                        f"in this workspace. cargo fails with `package ID specification "
+                        f"'{selected}' did not match any packages`."
+                    )
+    return failures
+
+
 def main() -> int:
     packages = metadata()["packages"]
     failures: list[str] = []
+
+    failures.extend(stale_selectors({p["name"] for p in packages}))
 
     actual = {p["name"] for p in packages if publishable(p)}
     if actual != PUBLISHED:
