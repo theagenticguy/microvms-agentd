@@ -23,13 +23,13 @@ crate-type = ["cdylib", "rlib"]
 # (BIND-1): a binding that depended on the CLI would be a binding whose surface
 # is whatever the CLI happened to expose, and the CLI is a consumer of this same
 # core rather than a layer above it.
-microvms-core = { version = "0.1.0", path = "../microvms-core" }
+microvms-core = { version = "0.1.0-rc.1", path = "../microvms-core" }
 # The wire types the session surface already answers with (`Health`, `Phase`,
 # `Outcome`, `ExitEvent`). Not a new dependency in substance: `microvms-core`'s
 # public signatures return these, so a binding that mapped them without naming
 # the crate would have to re-declare their fields — which is exactly the drift
 # `protocol` was extracted to make impossible (ARCH-2).
-protocol = { package = "microvms-protocol", version = "0.1.0", path = "../protocol" }
+protocol = { package = "microvms-protocol", version = "0.1.0-rc.1", path = "../protocol" }
 # No `extension-module` feature. It is deprecated, and enabling it disables
 # libpython linking for *every* target in the workspace, which breaks
 # `cargo test` and `cargo build -p microvms-py` with undefined `_PyExc_*`
