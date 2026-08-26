@@ -20,7 +20,23 @@ RUN dnf install -y nodejs22 npm python3 git tar gzip which findutils procps-ng \
 RUN npm install -g @anthropic-ai/claude-code @openai/codex \
     && npm cache clean --force
 
-RUN mkdir -p /workspace
+# A non-root user for the agents to run as. Appended to /etc/passwd and
+# /etc/group directly because `useradd` is not in the minimal base and pulling
+# shadow-utils in for one line is a bigger image for no more correctness.
+#
+# The uid is not decoration. Claude Code's --dangerously-skip-permissions
+# refuses to run as root, and the refusal is nearly silent: the agent then
+# denies its own Bash/Grep/WebFetch calls and returns a confident report over
+# zero tool calls. Measured: the same task as uid 0 made no shell calls at
+# all; as uid 1000 it made 147. run.sh passes `--user 1000` per exec — the
+# daemon itself stays root, demotion is per-command.
+RUN echo "agent:x:1000:1000::/workspace:/bin/bash" >> /etc/passwd \
+    && echo "agent:x:1000:" >> /etc/group
+
+# Owned by the agent uid, because WORKDIR here is where every exec lands and
+# a root-owned one fails a demoted workload at its first write (the trap
+# docs/EMBEDDING.md warns about).
+RUN mkdir -p /workspace && chown 1000:1000 /workspace
 WORKDIR /workspace
 
 ENV AGENTD_PORT=9000

@@ -1,8 +1,10 @@
 name: live conformance
 
 # Manual only, and deliberately so. This workflow launches real MicroVMs in a
-# real account: it costs money, it takes about fifteen minutes, and it needs
-# credentials that can create IAM roles. None of that belongs on a push trigger.
+# real account: it costs money, it takes about twenty minutes (the suite's own
+# docstring breaks that down — the idle-keepalive section deliberately waits out
+# a 60-second idle window twice), and it needs credentials that can create IAM
+# roles. None of that belongs on a push trigger.
 #
 # The `environment:` below is the actual gate. Configure it in repository settings
 # with a required reviewer, and no fork, no bot, and no compromised token can

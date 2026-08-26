@@ -6,7 +6,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Live conformance run driving the **Rust** client stack through the `microvm` CLI.
 
-This is the only live suite, and it now expresses **every named check** — 77 of them, with
+This is the only live suite, and it now expresses **every named check** — 85 of them, with
 none recorded SKIP. `conformance/run.py` was the oracle — 56 checks through the Python
 client — and it went away with that client once both suites ran green against real AWS on
 the same commit (Python 56/56, this one 38/38 with 34 recorded SKIP). Those 34 were the
@@ -41,6 +41,16 @@ through its own `/v1/fs/tar` routes, which is what `cp --tar` drives now.
 live run reported "76 of 76" against three places claiming 75), and the build log-group
 delete described in `drive_teardown` is the 77th. The summary block at the end derives the
 figure from the checks that ran, so read the number off a run rather than from here.
+
+85 rather than 77, and the eight are the two long-run contracts
+`docs/HARNESS-CAPABILITIES.md` said worked by design with nothing testing them. Gap 5 —
+detached exec outliving the 60-minute proxy-token ceiling — is `drive_token_rotation`,
+four checks against the suite's own VM. Gap 6's unmeasured tail — "a poll from outside
+should reset the idle timer" — is `drive_idle_keepalive`, four checks (three
+measurements plus its own teardown, counted for the same reason the log-group delete
+is) against a second VM launched with the model's minimum idle window and deliberately
+run to the edge of it, twice. That section is the slow one and its own output says how
+long it takes.
 
 A hybrid driver, and both lanes are deliberate
 ----------------------------------------------
@@ -94,8 +104,10 @@ that actually runs in production went untested.
 Money
 -----
 
-This run creates real MicroVMs and is billable, ~15 min. It belongs to `mise run live`
-and is never hooked. `--self-test` is the offline half: it drives the
+This run creates real MicroVMs and is billable, ~20 min — ~15 for the main flow plus
+about five for `drive_idle_keepalive`, which launches a second VM (from the image already
+built, so no second build) and deliberately waits out a 60-second idle window twice. It
+belongs to `mise run live` and is never hooked. `--self-test` is the offline half: it drives the
 envelope-to-exception mapping and the NDJSON stream reader against a stub `microvm`
 script and touches no account.
 
@@ -1547,6 +1559,212 @@ def drive_suspend_resume(cli: Cli, launched: Envelope, results: Results) -> None
         )
 
 
+def drive_token_rotation(cli: Cli, launched: Envelope, results: Results) -> None:
+    """Reattach after a token rotation: gap 5 of `docs/HARNESS-CAPABILITIES.md`. Four checks.
+
+    The contract under test is the one Harbor's hand-rolled daemon existed for: a detached
+    exec must outlive the 60-minute proxy-token ceiling, because all exec state lives in the
+    daemon keyed by `exec_id` and a re-minted token reattaches to it. Waiting a real hour to
+    watch a token expire would cost more than every other section combined and would test
+    AWS's clock, not this contract — so what is exercised is the *mechanism* the survival
+    rests on: a fresh attach mints a fresh proxy token (`CoreSeam::attach_session` builds a
+    new `PlaneMinter` per invocation, so every `microvm` process here is a new token), and
+    the reattach carries **no client state at all** beyond the three identifiers a harness
+    would have persisted. If the daemon's ack-before-TTL property held only for the process
+    that started the exec, this is the section that would say so.
+
+    The rotation is real, not simulated: each `Cli.call` is a separate process, so the
+    start, the polls, and the ack below run under *different* proxy tokens by construction.
+    What a 60-minute wait would add is only the proof that an **expired** token is refused,
+    which is the platform's property (`microvms-core/src/session/proxy.rs:63`), not the
+    daemon's or this client's.
+
+    The output produced *before* the reattach is the assertion that matters: bytes buffered
+    under token A must be readable under token B, or a harness that rotates mid-run loses
+    everything its workload said before minute sixty.
+    """
+    print("\n-- reattach after token rotation (gap 5) --")
+    attach = attach_args(cli, launched)
+
+    # Two echoes bracketing a sleep, detached: the first lands under the starting token,
+    # the second lands while the polls below are already running under later ones. The
+    # sleep is long enough that the start's own process has exited — and its token with
+    # it, as far as any shared state goes — before the exec finishes.
+    started = cli.call(
+        "exec",
+        "echo before-rotation; sleep 8; echo after-rotation",
+        "--exec-id",
+        "rot1",
+        "--detach",
+        *attach,
+    )
+    results.eq(
+        "a detached exec accepted before the rotation",
+        started.data.get("phase"),
+        "running",
+    )
+
+    # The reattach: a new process, a new `attach_session`, a new proxy token, and nothing
+    # carried over but the three identifiers. Polled to completion the same way the
+    # identity section polls, because polling is the read a reattaching harness performs.
+    final = None
+    for _ in range(20):
+        final = cli.call("exec", "--poll", "rot1", *attach)
+        if final.data.get("phase") != "running":
+            break
+        time.sleep(1)
+    assert final is not None
+    rotated_stdout = final.data.get("stdout") or ""
+    results.check(
+        "a reattach from only the three identifiers reads the exec",
+        final.data.get("phase") == "exited" and final.data.get("exitCode") == 0,
+        f"phase={final.data.get('phase')!r} exitCode={final.data.get('exitCode')!r}",
+    )
+    # The load-bearing one. `before-rotation` was written under the starting token and
+    # nothing acked it, so it must still be in the buffer the rotated attach reads. An
+    # empty or truncated-at-the-front stdout here is output lost across a rotation, which
+    # is exactly what the ack-before-TTL design exists to prevent.
+    results.check(
+        "no output produced before the reattach was lost",
+        "before-rotation" in rotated_stdout and "after-rotation" in rotated_stdout,
+        repr(rotated_stdout[:80]),
+    )
+    # And the exec is still one exec: the ack that releases it goes through yet another
+    # fresh token, and it works exactly once — proving the rotated attaches were views
+    # onto the daemon's one record rather than anything token-scoped.
+    results.ok(
+        "the rotated session acks the exec it did not start",
+        lambda: cli.call("ack", "rot1", *attach),
+    )
+
+
+def drive_idle_keepalive(
+    cli: Cli, launched: Envelope, aws: Any, results: Results
+) -> None:
+    """External polling resets the idle timer: gap 6's unmeasured tail. Four checks —
+    three measurements plus this section's own teardown, which is a recorded row for the
+    same reason `drive_teardown`'s log-group delete is: a cleanup that quietly failed
+    would leave a billing VM behind a green run.
+
+    `docs/PLATFORM.md` measured this once by hand ("An outside poll of `/v1/health` does
+    reset the idle timer") with a polled VM and an unpolled control; this is that
+    measurement as a named check, so it cannot silently stop being true. Both halves run
+    against **one** VM, sequentially — survive-while-polled first, suspend-once-unpolled
+    second — because the second half doubles as this section's own control: a platform that
+    stopped suspending idle VMs at all would pass the first half vacuously, and the second
+    is what would catch it.
+
+    Its own VM rather than the suite's, launched from the image the suite already built
+    (`run --image`, so no second 15-minute build): the suite's VM carries `--max-idle-sec
+    600` because every other section needs it to stay up, and running *it* to the edge of a
+    10-minute window would cost more wall time than this whole file. 60 is the model's
+    minimum (`IdlePolicy.maxIdleDurationSeconds` declares `min: 60`).
+
+    This is the slow section and says so: about four minutes of deliberate waiting — ~90s
+    polled, then up to ~150s waiting for the unpolled suspend — plus one VM launch. The
+    teardown is in this function's own `finally`, not the caller's, because the caller's
+    `finally` only knows the suite's VM; a section that launches must be the section that
+    terminates, however it exits.
+    """
+    print("\n-- idle-timer reset via external polling (gap 6) --")
+    idle_window = 60  # the model's minimum, and the whole reason this is affordable
+    print(
+        f"  slow check: ~4 minutes of deliberate waiting against a {idle_window}s idle window"
+    )
+    second = cli.call(
+        "run",
+        "--image",
+        str(launched.data["imageIdentifier"]),
+        "--name",
+        f"microvm-cli-conformance-idle-{secrets.token_hex(4)}",
+        "--memory",
+        str(BASELINE_MEMORY_MIB),
+        "--keep",
+        "--region",
+        cli.region,
+        "--max-idle-sec",
+        str(idle_window),
+        "--suspended-sec",
+        "600",
+        "--max-duration-sec",
+        "1800",
+        timeout=15 * 60,
+    )
+    microvm_id = str(second.data["microvmId"])
+    attach = attach_args(cli, second)
+    # The control plane's own state read, because "still RUNNING" is the platform's claim
+    # to make: a health answer alone could not distinguish a live VM from one the poll
+    # itself just auto-resumed.
+    plane = aws.client(SERVICE)
+
+    try:
+        # Half one: no exec traffic for 1.5x the idle window, while `microvm health` polls
+        # from outside every 15 seconds — well under the window, with three missed polls of
+        # margin. Each poll is one small inbound request through the endpoint proxy, which
+        # is the thing the platform meters.
+        deadline = time.monotonic() + idle_window * 1.5
+        polls = 0
+        while time.monotonic() < deadline:
+            cli.call("health", *attach)
+            polls += 1
+            time.sleep(15)
+        state = plane.get_microvm(microvmIdentifier=microvm_id)["state"]
+        results.check(
+            "a VM polled from outside outlives its idle window",
+            state == "RUNNING",
+            f"{state} after {int(idle_window * 1.5)}s against a {idle_window}s window, "
+            f"{polls} health polls",
+        )
+        # And the poll was informed, not blind: `busy` reads false on a VM running nothing,
+        # which is the field an orchestrator branches on before deciding to keep paying.
+        quiet = cli.call("health", *attach)
+        results.eq(
+            "an idle VM reports itself not busy to its keepalive",
+            quiet.data.get("busy"),
+            False,
+        )
+
+        # Half two, the control: stop polling and let the window elapse. This is the half
+        # that proves the first was the polling — a VM that also survived *this* would mean
+        # the platform had stopped metering and the check above passed against nothing.
+        # Sampled through the control plane only, because a health poll here would reset
+        # the very timer being watched.
+        print(f"  polling stopped; waiting for the {idle_window}s window to elapse")
+        suspended_state = None
+        wait_deadline = time.monotonic() + idle_window * 2.5
+        while time.monotonic() < wait_deadline:
+            time.sleep(20)
+            suspended_state = plane.get_microvm(microvmIdentifier=microvm_id)["state"]
+            if suspended_state != "RUNNING":
+                break
+        results.check(
+            "the same VM suspends once the polling stops",
+            suspended_state in {"SUSPENDING", "SUSPENDED"},
+            f"{suspended_state} after the window elapsed unpolled",
+        )
+    finally:
+        # This section's own VM, this section's own teardown. Terminate works from RUNNING,
+        # SUSPENDING, and SUSPENDED alike, so however the checks above ended the VM goes.
+        # No `--delete-image`: the image is the suite's and the caller's teardown owns it.
+        # `data.leaked` is read rather than only "no exception", because `terminate` reports
+        # a failed delete as a named leak on a success envelope — that is its contract, and
+        # a check that only caught the raise would call a leaked VM torn down.
+        try:
+            torn = cli.call(
+                "terminate", microvm_id, "--wait", "--region", cli.region, timeout=300.0
+            )
+        except Exception as exc:  # noqa: BLE001 - a teardown failure is a finding
+            results.check(
+                "the idle-check VM was terminated", False, f"{microvm_id}: {exc!r}"
+            )
+        else:
+            results.check(
+                "the idle-check VM was terminated",
+                not torn.data.get("leaked"),
+                f"{microvm_id} leaked={torn.data.get('leaked')!r}",
+            )
+
+
 def drive_teardown(
     cli: Cli, launched: Envelope, results: Results, logs: Any = None
 ) -> None:
@@ -2269,6 +2487,10 @@ def main() -> int:
             drive_exec(cli, launched, results)
             drive_health(cli, launched, results)
             drive_exec_identity(cli, launched, results)
+            # After the identity section because it leans on the same detach/poll/ack
+            # surface that section just proved, so a rotation failure here points at the
+            # rotation rather than at a broken poll.
+            drive_token_rotation(cli, launched, results)
             drive_streaming(cli, launched, results)
             drive_stdin(cli, launched, results)
             drive_file_transfer(cli, launched, results, Path(tmp))
@@ -2277,9 +2499,16 @@ def main() -> int:
             # ran before it is evidence the survival claim is about a daemon that was
             # already doing real work — and anything after it would be confounded by it.
             drive_output_cap(cli, launched, results)
-            # Suspend/resume last, because it is the only section that changes the VM's
-            # state for forty seconds and every section above wants a running one.
+            # Suspend/resume last among the shared-VM sections, because it is the only one
+            # that changes the VM's state for forty seconds and every section above wants a
+            # running one.
             drive_suspend_resume(cli, launched, results)
+            # The idle-keepalive section runs on its own VM (launched from the image this
+            # suite already built, so no second build) and is the slowest section here —
+            # its own output says how long. Last, so its four minutes of deliberate
+            # waiting delay nothing, and so a failure in any cheaper section is reported
+            # before this one spends its time.
+            drive_idle_keepalive(cli, launched, aws, results)
 
             print("\n== daemon logs ==")
             lines = read_daemon_logs(
