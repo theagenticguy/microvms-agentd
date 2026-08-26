@@ -31,3 +31,21 @@ microvms-js/node_modules/
 sbom/
 docs/.repomix/
 docs/.packets/
+# The CodeGraph index: a derived SQLite database of this tree's symbols and edges,
+# plus the running daemon's socket and pid. It is rebuilt from source by `codegraph
+# index`, so committing it would commit one machine's 18 MB binary artifact — and a
+# live unix socket and pid file, which are meaningless in any other checkout.
+.codegraph/
+# The documentation site's install and build output. `site/src/content/docs/` is the one
+# that matters: it is GENERATED in full by `site/scripts/sync-docs.mjs` from `docs/` plus
+# `site/authored/`, so committing it would put a second copy of every claim in the repo and
+# make a reviewer decide whether a diff in it is the point of a change or the residue of
+# one. It is also the copy an editor would reach for first, and the next build discards
+# that edit with no diff to show for it.
+site/node_modules/
+site/dist/
+site/.astro/
+site/src/content/docs/
+# The wire schema, copied out of docs/ so the site can serve it at a stable URL. The
+# committed original is docs/schema.json, which a gate byte-compares against the daemon.
+site/public/schema.json

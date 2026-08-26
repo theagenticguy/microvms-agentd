@@ -1,82 +1,267 @@
 # microvms-agentd · Risk hotspots
 
-Risk here combines four signals, because this repo has no conventional static analyser whose findings are severity-labeled per file. The score is `2 × live_round_bugs + 0.25 × distinct_trap_markers + 1 × rising_churn + 1 × live_coverage_gap`. A **live-round bug** is a defect found only by spending real money against real AWS. Five commits carry them, and each one marks a place where a fake diverged from the platform. A **trap marker** is a `TRAP-N` reference in the source, counted once per distinct trap ID per file; each is a guard holding a documented platform behavior in place, so a regression there reappears live rather than in CI. **Rising churn** is a commit count above median + 1σ. A **live-coverage gap** means the file's behavior is not reachable by the one live suite, `conformance/run_rs.py`. The two severity tiers map cleanly onto the packet's original schema: a live-round bug is `error`-class evidence, a trap marker is a `warn`-class standing hazard.
+Risk here is composed from two measured signals, because the one the default recipe reaches
+for is empty. Both gate-level static-analysis passes return zero findings on every file:
+`cargo clippy --all-targets --message-format=json` emits 0 diagnostics at `warning` or
+`error` level, and the semgrep pass the gate runs over all seven crates
+(`mise.toml:112`) reports 0 results. So severity is measured instead as **test-tier reach**,
+using CodeGraph's covering-test relation over the 4,430-node index. A symbol counts once, and
+only if it carries at least one inbound `calls`/`references`/`instantiates` dependent and
+sits outside any `#[cfg(test)]` region. **`error`** means no test file reaches it and its
+containing file holds zero in-file `#[test]` functions — no test tier in this repository
+reaches that symbol through a source-level edge. **`warn`** means no test file reaches it but
+the file does carry an in-file `#[cfg(test)]` module, so a same-file unit test may while no
+cross-file tier does. Trend is cross-sectional over the 30-day window: 78 live source files
+were touched across 114 commits, per-file commit counts have median 4.0 and population σ
+2.7928, so `↑ rising` is 7 or more commits (19 files), `→ flat` is 2 to 6 (58 files), and
+`↓ falling` is 1 (1 file). The score is `2 × error + 0.5 × warn + 1 × (trend is rising)`,
+ties broken by commit count descending. Totals across the 75 scored files: 278 error-class
+and 654 warn-class findings.
 
-This analysis has three limitations. First, the repo is five days old, with 31 commits between 2026-08-05 and 2026-08-09, so the 30-day window covers the entire history and there is no trend to decay. Every surviving file has at least one commit in the window, which makes `↓ falling` unreachable and leaves only `↑ rising` and `→ flat` in the Trend column. Second, trap-marker counts were initially taken as raw mention counts, which ranked `microvms-core/src/control/mod.rs` above `microvms-core/src/session/mod.rs`. That ranking was misleading because that file is the trap catalog; its 10 markers sit in a module doc-comment as a table of contents, not as 10 resident hazards. To correct this, the weight was cut to 0.25 and counting switched to distinct trap IDs. Third, every file in this repo has the same top owner, `bgagent`, so the ownership column separates nothing. The column is retained because the minority shares mark which files the four publication-hardening commits touched.
+Four limitations bound every number below. First, the repository's whole history — 114
+commits, 2026-08-05 to 2026-08-17 — fits inside the 30-day window, so there is no earlier
+baseline and the trend arrow compares a file against its peers, never against its own past.
+Second, the covering-test relation counts test *files*, and Rust's dominant unit-test idiom
+here is an in-file `#[cfg(test)] mod tests`; 770 such tests exist across
+`microvms-core` (436), `microvms-cli` (172), `agentd` (130), `protocol` (17) and `model` (15),
+and none of them can satisfy a cross-file rule. A `warn` count is therefore a statement about
+tier reach, not about absence of testing — `microvms-core/src/sandbox.rs` returns an empty
+`codegraph affected -d 1` result while holding 27 unit tests of its own. Third, and most
+consequential for reading the table: **no source-level edge can cross the PyO3 or napi-rs FFI
+boundary**, so the 159 pytest functions in `microvms-py/tests/` and the 168 `test(` calls in
+`microvms-js/__test__/` cannot register as covering tests for the Rust code they exercise, and
+CodeGraph does not classify a `.mjs` file as a test at all. Every `error` count in a bindings
+file measures Rust-tier reach only; the residual risk is narrower than "untested" and is
+named per file in the drill-down. The index also resolves references by name, so a
+declaration whose name is short or collides with a widely used external type absorbs mentions
+that are not references to it. `Duration` (`microvms-js/src/cost.rs:60`) is the clearest
+instance: it is the only node of that name in the index, so every `Duration` in the workspace
+resolves onto it, and it is credited with coverage from
+`microvms-core/tests/turmoil_client.rs`, a file containing zero references to `microvms-js`.
+`live` (`microvms-js/src/session.rs:274`) and `data` (`microvms-py/src/exec.rs:236`) are
+likewise sole holders of their names. So per-symbol dependent counts below are what the index
+records rather than verified call sites, and the direction of the bias on `error` counts is
+toward understating them. Fourth, ownership carries no bus-factor information: one
+human authors 87 of 114 commits under two identities and a `bgagent` bot the other 27, every
+file has one or two distinct authors, and a `bgagent` top-owner share marks a file that
+arrived inside a large squashed commit rather than one with a second maintainer. Two files
+are excluded from scoring because they are test code that lives under `src/`:
+`microvms-cli/src/guards.rs` (`#![cfg(test)]` at `microvms-cli/src/guards.rs:20`, declared at
+`microvms-cli/src/main.rs:36-37`) and `microvms-core/src/control/fake.rs` (declared at
+`microvms-core/src/control/mod.rs:928-929`). That exclusion matters: `guards.rs` is the
+joint-highest-churn source file in the repository at 13 commits, so a churn-only ranking puts
+a file that never ships in a binary at the top.
 
 | File | Trend | Open findings | Top owner | Citation |
 | --- | --- | --- | --- | --- |
-| The in-VM session transport | ↑ rising | 2 error, 2 warn | bgagent 80% | `microvms-core/src/session/mod.rs` (996 LOC) |
-| Launch, the launch wait, and the proxy token | → flat | 1 error, 7 warn | bgagent 100% | `microvms-core/src/control/microvm.rs` (1235 LOC) |
-| The SSE frame parser | ↑ rising | 1 error, 0 warn | bgagent 100% | `microvms-core/src/session/sse.rs` (695 LOC) |
-| The control-plane client and trap catalog | → flat | 0 error, 10 warn | bgagent 100% | `microvms-core/src/control/mod.rs` (714 LOC) |
-| Cost and pricing arithmetic | ↑ rising | 1 error, 1 warn | bgagent 83% | `microvms-core/src/cost.rs` (4125 LOC) |
-| The wire request and response types | → flat | 0 error, 10 warn | bgagent 100% | `microvms-core/src/control/ops.rs` (701 LOC) |
-| The CLI lifecycle commands | ↑ rising | 1 error, 2 warn | bgagent 60% | `microvms-cli/src/commands/lifecycle.rs` (1090 LOC) |
-| Guest identity repair | → flat | 1 error, 0 warn | bgagent 100% | `agentd/src/identity.rs` (737 LOC) |
-| Envelope and human rendering | ↑ rising | 1 error, 0 warn | bgagent 80% | `microvms-cli/src/render.rs` (899 LOC) |
-| Image create, build wait, and capabilities | → flat | 1 error, 3 warn | bgagent 67% | `microvms-core/src/control/image.rs` (1026 LOC) |
-| The fake control plane every offline tier trusts | → flat | 0 error, 4 warn | bgagent 100% | `microvms-core/src/control/fake.rs` (443 LOC) |
-| The Python binding's cost surface | ↑ rising | 0 error, 1 warn | bgagent 75% | `microvms-py/src/cost.rs` (1152 LOC) |
-| The HTTP transport seam | → flat | 1 error, 0 warn | bgagent 100% | `microvms-core/src/session/http.rs` (531 LOC) |
-| The Node binding's cost surface | → flat | 0 error, 1 warn | bgagent 67% | `microvms-js/src/cost.rs` (1061 LOC) |
+| `microvms-py/src/cost.rs` | ↑ rising | 0 warn, 66 error | Laith Al-Saadoon 57% | `microvms-py/src/cost.rs` (1,123 LOC) |
+| `microvms-js/src/cost.rs` | → flat | 0 warn, 65 error | Laith Al-Saadoon 60% | `microvms-js/src/cost.rs` (1,038 LOC) |
+| `microvms-js/src/session.rs` | → flat | 0 warn, 25 error | Laith Al-Saadoon 60% | `microvms-js/src/session.rs` (609 LOC) |
+| `microvms-core/src/cost.rs` | ↑ rising | 93 warn, 0 error | bgagent 71% | `microvms-core/src/cost.rs` (4,127 LOC) |
+| `microvms-py/src/exec.rs` | ↑ rising | 0 warn, 22 error | Laith Al-Saadoon 71% | `microvms-py/src/exec.rs` (631 LOC) |
+| `microvms-js/src/exec.rs` | → flat | 0 warn, 19 error | Laith Al-Saadoon 60% | `microvms-js/src/exec.rs` (456 LOC) |
+| `microvms-js/src/sandbox.rs` | → flat | 0 warn, 16 error | Laith Al-Saadoon 60% | `microvms-js/src/sandbox.rs` (623 LOC) |
+| `microvms-js/src/process.rs` | ↓ falling | 0 warn, 12 error | Laith Al-Saadoon 100% | `microvms-js/src/process.rs` (541 LOC) |
+| `microvms-py/src/session.rs` | → flat | 0 warn, 11 error | Laith Al-Saadoon 67% | `microvms-py/src/session.rs` (605 LOC) |
+| `microvms-core/src/sandbox.rs` | ↑ rising | 40 warn, 0 error | Laith Al-Saadoon 73% | `microvms-core/src/sandbox.rs` (2,371 LOC) |
+| `agentd/src/fs.rs` | ↑ rising | 38 warn, 0 error | bgagent 57% | `agentd/src/fs.rs` (2,628 LOC) |
+| `microvms-py/src/sandbox.rs` | → flat | 0 warn, 10 error | Laith Al-Saadoon 67% | `microvms-py/src/sandbox.rs` (780 LOC) |
+
+The shape of that list is the finding. Nine of the twelve rows are binding files, and the
+reason is structural rather than per-file: all 18 files under `microvms-py/src/` and
+`microvms-js/src/` — 3,856 and 3,773 LOC respectively — contain zero `#[cfg(test)]` modules
+and zero `#[test]` functions, while the other five crates hold 770 between them — an average
+of 19 per file in `microvms-core`, 11 in `microvms-cli`, 10 in `agentd`. The three
+non-binding rows (`microvms-core/src/cost.rs`, `microvms-core/src/sandbox.rs`,
+`agentd/src/fs.rs`) are the opposite case: heavily unit-tested files whose churn is rising
+and whose public surface no cross-file tier reaches.
 
 ## Per-file drill-down
 
-### microvms-core/src/session/mod.rs
+### 1. `microvms-py/src/cost.rs`
 
-**What's there.** The in-VM client: a `Transport` holding an HTTP backend, the agent token, and the optional proxy auth, plus the `Session` and `SessionBuilder` that sit on top of it (`microvms-core/src/session/mod.rs:62-71`). It is the single funnel every request to a running MicroVM passes through, which is why the proxy-token mint sits inside it rather than beside it (`microvms-core/src/session/mod.rs:88-90`).
+**What's there.** The PyO3 mirror of the cost engine, whose stated job is wrapping the core
+types "without loosening any of them (BIND-5)" by making the unsafe spellings absent rather
+than rejected — no `__float__`, `__int__`, `__index__`, `__add__` or any numeric dunder on
+`EstimatedUsd`, no `#[pyo3(transparent)]`, and no defaulting `Duration` constructor
+(`microvms-py/src/cost.rs:2-24`). Concretely it is 111 symbols of `#[pyclass(frozen,
+from_py_object)]` wrappers: `PyDuration` (`microvms-py/src/cost.rs:89`), `PySizeClass`
+(`microvms-py/src/cost.rs:488`), `PyRateTable` (`microvms-py/src/cost.rs:576`), `PyLineItem`
+(`microvms-py/src/cost.rs:313`) and `PyCostReport` (`microvms-py/src/cost.rs:696`).
 
-**Recent activity.** 5 commits, above the rising threshold of 4 (median 2, σ 1.70). Two of those five are live-round fixes, which is the highest concentration in the repo.
+**Recent activity.** 7 commits in the 30-day window, `↑ rising` — at the rising threshold of
+7 and joint-highest among all binding files.
 
-**Owners.** bgagent 80% (4 of 5), Laith Al-Saadoon 20%.
+**Owners.** Laith Al-Saadoon 57% (4 of 7 commits); `bgagent` 43% (3 of 7). Two identities,
+one of them a bot, so no second human reviewer is implied.
 
-**Findings.** 2 error-class, 2 warn-class. The first error is the header-injection bug from `522bcd2`: `Transport::request` replaced the header vector with the auth headers instead of prepending, stripping the content-type the exec path set, so the daemon answered 400 "body is not a valid start request" while all 310 tests stayed green, because the fakes parse bodies without reading content-type. The fix and its reasoning are inline at `microvms-core/src/session/mod.rs:106-113`, and the guard is `a_callers_content_type_survives_the_auth_header_injection` at `microvms-core/src/session/mod.rs:699-711` with its break-proof recipe written into the doc comment at `microvms-core/src/session/mod.rs:696-697`. The second error is the null `agentToken` from `1a567e4`: core minted the token inside `Sandbox::run` and nothing exposed it, so conformance authenticated as the literal string `'None'` and three checks failed in one shape. `Session::agent_token()` now hands the bearer back (`microvms-core/src/session/mod.rs:199-201`) with the reasoning at `microvms-core/src/session/mod.rs:717`, and `Debug` still redacts (`microvms-core/src/session/mod.rs:983`). The two warn-class traps are TRAP-7 and TRAP-9, both proxy-token properties (`microvms-core/src/session/mod.rs:5-6`). There is no live-coverage gap, because `drive_exec` and `drive_lifecycle` both drive this path (`conformance/run_rs.py:839`, `conformance/run_rs.py:938`).
+**Findings.** 66 error, 0 warn. All 66 of the file's 66 symbols that carry inbound dependents
+are error-class, the highest count in the repository, and `codegraph affected
+microvms-py/src/cost.rs -d 1 --json` returns an empty `affectedTests` array against 2
+dependents traversed in total. The most-depended-on uncovered symbols are `PySizeClass` (10
+dependents, `microvms-py/src/cost.rs:488`), the `seconds` getter (6 dependents,
+`microvms-py/src/cost.rs:126`), `PyDuration` (5, `microvms-py/src/cost.rs:89`) and
+`PyRateTable` (5, `microvms-py/src/cost.rs:576`). The mitigation is real and it is dynamic:
+`microvms-py/tests/test_cost.py` holds 39 pytest functions over 753 lines, and the generated
+stubs are gated by `stubs:check` (`mise.toml:179-195`, listed in `check` at `mise.toml:297`).
+What no tier covers is a Rust-level refactor of the absences the module docs enumerate — a
+`__float__` accidentally reintroduced on `EstimatedUsd` is caught only if a Python test
+happens to assert its absence, after a full native rebuild.
 
-### microvms-core/src/control/microvm.rs
+### 2. `microvms-js/src/cost.rs`
 
-**What's there.** Launch, the launch wait, the four lifecycle calls, and the proxy token, with TRAP-5 and TRAP-8 closed at the type level (`microvms-core/src/control/microvm.rs:1-2`). `RunHookPayload` cannot hold an over-ceiling value, so the 4096-byte check happens where the payload is constructed rather than where the request is sent, closing every path into `RunMicrovm` with one guard (`microvms-core/src/control/microvm.rs:5-8`).
+**What's there.** The napi-rs mirror of the same engine, where the entire BIND-5 requirement
+reduces to one decision: every type is a `#[napi]` **class** and never `#[napi(object)]`,
+because an object converts by structure and `{ amount: 1.5 }` would satisfy an `EstimatedUsd`
+parameter (`microvms-js/src/cost.rs:2-12`). `valueOf`, `toJSON`, `Symbol.toPrimitive` and any
+`add` method are absent by design, so `Number(usd)` is `NaN` and the figure leaves only
+through `.amount` as a string (`microvms-js/src/cost.rs:16-25`).
 
-**Recent activity.** 3 commits, flat. One is a live-round fix (`2cc840b`, +85/-2).
+**Recent activity.** 5 commits, `→ flat`. It ranks second on score with no rising bonus,
+entirely on finding count.
 
-**Owners.** bgagent 100% (3 of 3).
+**Owners.** Laith Al-Saadoon 60% (3 of 5); `bgagent` 40% (2 of 5).
 
-**Findings.** 1 error-class, 7 warn-class, which is the highest distinct-trap count of any file. The error is credential leakage. Both `RunHookPayload`'s `Debug` (`microvms-core/src/control/microvm.rs:78`) and `ProxyToken`'s (`microvms-core/src/control/microvm.rs:222`) were derived and printed live secrets, while three sibling types already guarded the same invariant by hand. Each now redacts, and the guard was verified by restoring the derive and confirming the test fails. Among the warns, TRAP-5 shows the service's own documentation reproducing the bug. The model's doc string for `runHookPayload` reads "Maximum: 16,384 bytes" while its shape `RunMicrovmRequestRunHookPayloadString` declares `max: 4096`, so a reader who checks the docs rather than the shape uses a limit 4x too large (`microvms-core/src/control/microvm.rs:10-17`, corroborated at `docs/PLATFORM.md:56-76`). The live-coverage gap covers the payload ceiling and the terminal-state fast-fail. 25 inline tests cover them, but no live check pushes a 4097-byte payload or kills a VM before `RUNNING`, since both would cost a launch to observe.
+**Findings.** 65 error, 0 warn, out of 66 symbols with inbound dependents — and the 66th is a
+measurement artifact, not a covered symbol. The one symbol credited with coverage is
+`Duration` (`microvms-js/src/cost.rs:60`), attributed to
+`microvms-core/tests/turmoil_client.rs`, which contains zero references to `microvms-js` in
+either spelling. `Duration` is the only node of that name in the entire index, so every
+`Duration` mention in the workspace — including every `std::time::Duration` — resolves onto
+this one napi class. The real figure for this file is 66 of 66. Highest-dependent uncovered
+symbols are `SizeClass` (27 dependents, `microvms-js/src/cost.rs:422`), `Amount` (5,
+`microvms-js/src/cost.rs:187`), the `CostReport::wrap` constructor (4,
+`microvms-js/src/cost.rs:619`), `Total` (3, `microvms-js/src/cost.rs:383`) and `all` (3,
+`microvms-js/src/cost.rs:450`).
+`microvms-js/__test__/cost.mjs` exercises this surface with 42 `test(` calls over 733 lines,
+but CodeGraph does not classify `.mjs` as a test file, so those never appear in `affected`
+output for any path. This crate's `index.d.ts` is gitignored (`.gitignore:29`) and no drift
+gate for it appears anywhere in `mise.toml`, unlike its Python twin whose stubs are checked
+at `mise.toml:179-195` — the one asymmetry on this list that is a gap in the gate rather than
+a limit of the measurement.
 
-### microvms-core/src/session/sse.rs
+### 3. `microvms-js/src/session.rs`
 
-**What's there.** Incremental Server-Sent Events parsing and the typed events the daemon emits, hand-rolled rather than taken from a crate because "an eventsource crate would bring a reconnect policy keyed on `Last-Event-ID`, which is the wrong cursor: it resumes at an event, and this protocol resumes at a byte" (`microvms-core/src/session/sse.rs:17-21`). Bytes buffer until a blank line proves a frame complete, so a `data:` line split across two reads is not lost (`microvms-core/src/session/sse.rs:4-9`).
+**What's there.** The control API of one running MicroVM on the Node side, where the binding
+inherits its exclusion guarantees from the core: `Sandbox` owns its `Session` by value, hands
+out only `Option<&Session>`, `Session` is not `Clone`, and no accessor exposes the agent
+token, so a second independent session against the same VM cannot be constructed
+(`microvms-js/src/session.rs:4-12`). The mutex is tokio's rather than `std`'s because every
+method is `async` and holds the guard across an `await`, reproducing the `&mut self` exclusion
+that `suspend`/`resume`/`terminate` require (`microvms-js/src/session.rs:14-18`).
 
-**Recent activity.** 4 commits, at the rising threshold. `2cc840b` rewrote it (+266/-21), the largest single-file change in that commit after `cost.rs`.
+**Recent activity.** 5 commits, `→ flat`.
 
-**Owners.** bgagent 100% (4 of 4).
+**Owners.** Laith Al-Saadoon 60% (3 of 5); `bgagent` 40% (2 of 5).
 
-**Findings.** 1 error-class, 0 warn-class. The error is a denial-of-service case the offline tiers could not see. The parser rescanned its whole buffer from byte zero on every chunk with no ceiling, so 6.5 MB of unterminated stream cost 31 seconds of CPU inside the async task. The fix has two parts. A resuming cursor backs up `MAX_TERMINATOR_LEN - 1` so a terminator that straddles two reads is still found (`microvms-core/src/session/sse.rs:34`). A 4 MiB pending ceiling errors as `Protocol`, which is fatal to the stream loop rather than a reconnect into the same wedge (`microvms-core/src/session/sse.rs:68`, `microvms-core/src/session/sse.rs:115-125`). The constant's doc comment explains the threat model. The peer is a proxy, and a proxy answering a stream request with an HTML error page produces exactly that shape, with no frame boundary ever coming (`microvms-core/src/session/sse.rs:39-46`). The regression test names the measured shape — 800 unterminated 8 KiB reads (`microvms-core/src/session/sse.rs:514`). The live-coverage gap is the hostile-input path. `drive_streaming` exercises well-formed streaming (`conformance/run_rs.py:1282`), but no live check feeds the parser a non-SSE body, so the ceiling is proven only by the 13 inline tests.
+**Findings.** 25 error, 0 warn, from 27 symbols with inbound dependents out of 33 total. The
+two the index ranks highest by dependent count are the lock-acquiring internals rather than
+the public methods — `Live::session` at 18 (`microvms-js/src/session.rs:244`) and the `live()`
+guard-taker at 17 (`microvms-js/src/session.rs:274`) — though both names are short enough that
+those counts are inflated by the name-resolution caveat above; `into_request` (3,
+`microvms-js/src/session.rs:142`), `in_sandbox` (3, `microvms-js/src/session.rs:264`) and
+`port` (3, `microvms-js/src/session.rs:306`) follow. Those two functions are where the
+"held for exactly one method call and no more" invariant in the doc comment at
+`microvms-js/src/session.rs:272-273` actually lives, and a lock-scope regression in them is
+the class of defect a dynamic suite detects only as a hang. `codegraph affected
+microvms-js/src/session.rs -d 1` does return two tests —
+`agentd/tests/turmoil_transport.rs` and `microvms-core/tests/turmoil_client.rs` — reached
+through the core types this file wraps, not through the binding surface itself.
 
-### microvms-core/src/control/mod.rs
+### 4. `microvms-core/src/cost.rs`
 
-**What's there.** The control-plane client — SigV4-signed rest-json — and the repo's trap catalog, enumerating TRAP-1, 2, 3, 4, 5, 8, and 11 against the specific method or type that closes each, with an S1/S2 strength label per entry (`microvms-core/src/control/mod.rs:15-29`). `ControlPlane::new` resolves credentials and either yields a usable client or says why not; there is no builder and no partially constructed state (`microvms-core/src/control/mod.rs:7-11`).
+**What's there.** The cost engine proper, and the largest file in the workspace at 4,127
+lines: rate data carried as types rather than prose because MicroVMs publishes no standalone
+pricing page, with two invariants enforced by shape instead of at runtime — "seconds are
+measured, dollars are estimated" via a `DurationP` enum whose every variant names its
+provenance (COST-1), and "unknown is not zero" via `Amount::Unpriced` as a distinct variant
+that forces a match arm (COST-3), promoting to `Total::AtLeast` so a floor cannot be read
+without its reasons (COST-4) (`microvms-core/src/cost.rs:2-27`). Central types are
+`RateTable` with its `region`/`source_url`/`retrieved` provenance fields
+(`microvms-core/src/cost.rs:849`), `CalendarDate` (`microvms-core/src/cost.rs:209`),
+`LineItem` (`microvms-core/src/cost.rs:1440`), `CostReport`
+(`microvms-core/src/cost.rs:1478`) and `RunUsage` (`microvms-core/src/cost.rs:1730`).
 
-**Recent activity.** 2 commits, flat. No live-round fix touched it.
+**Recent activity.** 7 commits, `↑ rising`.
 
-**Owners.** bgagent 100% (2 of 2).
+**Owners.** `bgagent` 71% (5 of 7); Laith Al-Saadoon 29% (2 of 7). The only top-5 file whose
+top owner is the bot, which means most of its 4,127 lines landed inside large squashed
+commits.
 
-**Findings.** 0 error-class, 10 warn-class. This ties for the highest distinct-trap count, and it is the count that forced the scoring-weight correction. These 10 are references rather than resident hazards. The file's main risk is that it holds the written rationale for why the other guards exist. Two entries carry most of that weight. TRAP-11 is closed by leaving a method unimplemented: `CreateMicrovmShellAuthToken` is in the service model and deliberately not implemented, so the test for it counts the calls a full lifecycle made rather than asserting a refusal (`microvms-core/src/control/mod.rs:26-37`). The file also explains why every downstream guard is necessary rather than redundant. botocore's `VALIDATED_METADATA_ATTRS` is `{required, min, document, union}`, so `max`, `pattern`, and `enum` violations go to the wire; the assumption that the SDK validates the model was never true (`microvms-core/src/control/mod.rs:39-44`). The live-coverage gap is the whole class of traps closed by absence. A trap closed by a method not existing cannot be probed live at all, so the 11 inline tests and the `spec:core` requirement tier are the only oracle.
+**Findings.** 93 warn, 0 error — the largest warn count in the repository, and every one of
+them is a tier-reach statement rather than an absence of tests: the file carries 65 in-file
+`#[test]` functions, so no symbol qualifies for the error class. Highest-dependent uncovered
+symbols are `RateTable` (15 dependents, `microvms-core/src/cost.rs:849`), `CalendarDate`
+(14, `microvms-core/src/cost.rs:209`), `LineItem` (13, `microvms-core/src/cost.rs:1440`),
+`today_utc` (12, `microvms-core/src/cost.rs:251`), `CostReport` (11,
+`microvms-core/src/cost.rs:1478`) and `RunUsage` (11, `microvms-core/src/cost.rs:1730`).
+`codegraph affected microvms-core/src/cost.rs -d 1` reaches 8 test files, the broadest of any
+file on this list. Two specifics deserve attention: `today_utc`
+(`microvms-core/src/cost.rs:251`) reads the wall clock and floors on integer division, so it
+is the file's one ambient-time dependency and cannot be exercised deterministically by a
+`turmoil` tier that controls virtual time only; and `RateTable::retrieved`
+(`microvms-core/src/cost.rs:849`) makes rate freshness a data property, which the separate
+`scripts/check-live-rates.py --twin-only` cross-check exists to verify (`mise.toml:412-414`)
+rather than any Rust test tier.
 
-### microvms-core/src/cost.rs
+### 5. `microvms-py/src/exec.rs`
 
-**What's there.** What a run cost and what a plan will cost, with every figure labeled by provenance. Two rules hold throughout. Seconds are measured and dollars are estimated, so there is no type for an actual dollar amount, only `EstimatedUsd` (`microvms-core/src/cost.rs:15-21`). An unknown cost is not represented as zero; `Amount::Unpriced` carries a reason as a distinct variant a consumer must handle (`microvms-core/src/cost.rs:23-28`).
+**What's there.** One exec plus the SSE stream exposed as a Python iterator, which the module
+docs single out as the only shape on the surface that needed real work: `ExecStream::new`
+spawns a driver onto the shared runtime with an owned `ExecHandle` and a bounded `mpsc`
+sender, and `__next__` blocks on `recv` (`microvms-py/src/exec.rs:4-15`). The channel bound
+is deliberately 1, because the daemon's SSE body is the backpressure signal and an unbounded
+channel would buffer a fast producer's whole output inside the binding — the failure the
+core's byte-offset cursor exists to make unnecessary (`microvms-py/src/exec.rs:11-15`);
+dropping the iterator drops the receiver, the next `send` fails, and the drive ends on
+`ControlFlow::Break` (`microvms-py/src/exec.rs:18-20`).
 
-**Recent activity.** 6 commits, the highest churn of any source file in the repo and well above the rising threshold. `2cc840b` changed it +266/-27.
+**Recent activity.** 7 commits, `↑ rising` — tied with `microvms-py/src/cost.rs` for the
+hottest binding file.
 
-**Owners.** bgagent 83% (5 of 6), Laith Al-Saadoon 17%.
+**Owners.** Laith Al-Saadoon 71% (5 of 7); `bgagent` 29% (2 of 7).
 
-**Findings.** 1 error-class, 1 warn-class, plus the repo's worst live-coverage gap. The error is the oracle-parity divergence from `2cc840b`. It survived because a wrong guard test required the extra row: the guard asserted the divergence rather than catching it. As a result, lower-bound totals named reasons instead of phases, `--estimate` mislabeled its report, and dense output carried a total row the Python oracle never emitted. The coverage gap has three parts. First, 65 inline tests cover the arithmetic but no live check exercises a bill. The only live-adjacent gate is `scripts/check-live-rates.py`, which validates the rates against the Pricing API but not the computation over them (`mise.toml:256-275`). Second, the same arithmetic is triplicated into `microvms-py/src/cost.rs` (1152 LOC) and `microvms-js/src/cost.rs` (1061 LOC). Both report zero tests under `cargo test --workspace` because their guards only run under maturin and napi (`.github/workflows/ci.yml`, `bindings` job). `conformance/run_rs.py` drives the CLI, so nothing exercises either binding against real AWS. Third, one rate in the table is derived rather than read. `RateTable::storage_gb_month` is the API's per-GB-hour figure times `HOURS_PER_MONTH`, and the earlier hand-copied value was 1.37% low (`microvms-core/src/cost.rs:58-60`, `docs/PLATFORM.md:259-264`). The warn-class trap is TRAP-13, the five-row sizing table that must be read as data rather than computed as four times the baseline. Planting the peak in place of the baseline produces an error exactly 4x in magnitude (`microvms-core/src/sizing.rs:13`, `microvms-core/src/sizing.rs:290`).
+**Findings.** 22 error, 0 warn, covering all 22 of the file's symbols that have inbound
+dependents (58 symbols total, so most of the surface has no recorded dependent at all).
+`codegraph affected microvms-py/src/exec.rs -d 1 --json` returns an empty `affectedTests`
+array. Ranked by dependents: `PyExecResult` (5, `microvms-py/src/exec.rs:64`), a `wrap`
+constructor (5, `microvms-py/src/exec.rs:78`), the `seconds` getter (3,
+`microvms-py/src/exec.rs:629`), `PyStdinAck` (2, `microvms-py/src/exec.rs:173`), `data` (2,
+`microvms-py/src/exec.rs:236`) and `PyExecHandle` (2, `microvms-py/src/exec.rs:485`). The
+drop-and-break lifecycle described at `microvms-py/src/exec.rs:18-20` is the specific
+untested-at-Rust-tier surface worth attention, because a leaked driver task shows up as a
+hang or a stray thread rather than a failing assertion.
+`microvms-py/tests/test_exec.py` covers the behaviour dynamically with 29 pytest functions
+over 655 lines. `PyExecResult` keeping `exit_code` and `signal` as `Option<i32>` rather than
+sentinel integers (`microvms-py/src/exec.rs:64-68`) is the kind of distinction that a
+Python-only test can assert but no Rust tier here defends.
+
+## Reproduction
+
+Every number above traces to one of these, run from the repository root at commit
+`5e6f752a4c2a75f88522a38ce40d0a444f23ebc4`:
+
+- Trend and ownership — `git log --since=30.days.ago --name-only --pretty=format:'---%H|%an|%ae'`,
+  keeping `.rs`/`.py` paths outside `tests/`, `conformance/`, `scripts/`, `examples/`,
+  `benches/` that still exist on disk (78 files; 15 touched paths have since been deleted,
+  including the retired `clients/python/` package).
+- Static-analysis baseline — `cargo clippy --all-targets --message-format=json` (0
+  diagnostics) and the semgrep invocation at `mise.toml:112` (0 results).
+- Covering-test relation — reverse traversal of `calls`/`references`/`instantiates` edges in
+  `.codegraph/codegraph.db` at depth 1. The rule was validated against 126 markers harvested
+  from 33 `codegraph explore` calls: depth 1 agrees on 124 of 126, and the 2 disagreements are
+  test-glob edge cases (`microvms-js/__test__/*.mjs` is not treated as a test;
+  `microvms-py/examples/typed_usage.py` is). Aligning on those reproduces the tool at 126/126.
+- In-file unit-test census — count of `#[test]` and `tokio::test` attributes per
+  `*/src/**/*.rs`.
+- Per-file coverage cross-check — `codegraph affected <path> -d 1 --json`. Depth matters: at
+  the default `-d 5` every path returns the same saturated 19-file test set, so the default
+  invocation is not a discriminator.
 
 ## See also
 
-- [microvms-agentd · System overview](../architecture/system-overview.md)
-- [microvms-agentd · Contract map](../insights/contract-map.md)
-- [microvms-agentd · Business logic](../insights/business-logic.md)
-- [microvms-agentd · Impact analysis](../insights/impact-analysis.md)
-- [microvms-agentd · Debugging guide](../insights/debugging-guide.md)
+- [business logic](../insights/business-logic.md) — 6 shared source citations
+- [impact analysis](../insights/impact-analysis.md) — 6 shared source citations
+- [contract map](../insights/contract-map.md) — 5 shared source citations
+- [public api](../reference/public-api.md) — 5 shared source citations
+- [dead code](dead-code.md) — 4 shared source citations

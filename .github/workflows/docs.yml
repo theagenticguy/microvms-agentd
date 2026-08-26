@@ -1,0 +1,201 @@
+name: docs
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  # A manual dispatch so the site can be republished without a commit — the pages
+  # carry commit-pinned citation permalinks, and a rebuild is how a stale pin moves.
+  workflow_dispatch:
+
+# Least privilege, stated once: the build reads the repo and writes nothing. The
+# deploy job raises it to what Pages needs and no further.
+permissions:
+  contents: read
+
+# A push that supersedes a running PR build cancels it; main never cancels, so the
+# history of green on main stays gap-free — and a cancelled main run would leave a
+# Pages deployment half-created.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+# No path filter, deliberately. The site is not built only from `site/` and `docs/`:
+# every generated page carries `path:line` citations that the build resolves against
+# git at a pinned commit, and it FAILS when a cited path no longer exists. So a change
+# to `agentd/src/` can break this build, which is the point — a citation that silently
+# stops resolving is a docs site lying with a link. A path filter would also make this
+# a required check that skips, which blocks a PR rather than passing it.
+#
+# Action versions follow `ci.yml`'s recorded rule: every `uses:` here resolves to a
+# Node 24 action, because the runner forces Node 20 actions onto 24 anyway and prints
+# a warning per step. `checkout@v5` and `setup-node@v5` match that file's choices for
+# the reasons it records; the three Pages actions are on their current majors, which
+# are the first ones on Node 24 (`upload-pages-artifact` is composite and has no
+# runtime of its own).
+
+jobs:
+  build:
+    name: build and gate the docs site
+    runs-on: ubuntu-latest
+    steps:
+      # The WHOLE history. Two things read it and both degrade silently on a shallow
+      # clone: `sync-docs.mjs` stamps each page's `lastUpdated` from the source file's
+      # last commit, and a shallow clone gives every file the same date — a claim that
+      # every page changed together. And the citation rewriter resolves every cited
+      # path with `git ls-tree` at the pinned commit, which is not reachable at depth 1.
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      # The version comes from `site/package.json`'s `packageManager` field, which is where pnpm
+      # itself reads it, so the runner and a developer's shell cannot disagree about which pnpm
+      # built the lockfile. `package_json_file` is required because the input defaults to a
+      # `package.json` at the repository root, and this project's lives one directory down — with
+      # the default the action finds no file, reads no version, and fails with `No pnpm version is
+      # specified` before anything else in this job runs.
+      - uses: pnpm/action-setup@v6
+        with:
+          package_json_file: site/package.json
+
+      # `cache: pnpm` needs pnpm already on PATH to resolve the store directory, which is why this
+      # step follows the one above rather than leading.
+      - uses: actions/setup-node@v5
+        with:
+          # The HIGHEST floor in play, not Astro's. `astro@7` declares node >=22.12.0 and it is
+          # tempting to pin that; pnpm 11.21 declares >=22.13 and fails this job outright with
+          # `This version of pnpm requires at least Node.js v22.13` the moment `cache: pnpm` asks it
+          # for the store path. `site/package.json`'s `engines.node` carries the same floor, and
+          # `tests/toolchain.test.ts` asserts this pin satisfies it — two places that must agree,
+          # with something checking that they do.
+          node-version: '22.13'
+          cache: pnpm
+          cache-dependency-path: site/pnpm-lock.yaml
+
+      # `--frozen-lockfile` so a lockfile that disagrees with `package.json` fails here
+      # rather than resolving to something nobody reviewed.
+      - name: install
+        working-directory: site
+        run: pnpm install --frozen-lockfile
+
+      # Where the site will actually be served, derived rather than hardcoded, so a fork
+      # builds URLs for its own origin instead of this one. The rule is GitHub's own: a
+      # repository named `<owner>.github.io` is served at the origin root and everything
+      # else under a path segment named for the repository. The base decides every URL the
+      # machine surfaces emit AND whether a robots.txt can exist at all — RFC 9309 §2.3
+      # puts it at the origin root, so a path-prefixed site cannot own one.
+      #
+      # `vars.DOCS_SITE` / `vars.DOCS_BASE` override both, which is the whole change needed
+      # to move this site to a custom domain.
+      #
+      # Read from `github.repository`, which is `owner/repo` on every event, rather than from
+      # `github.event.repository.name`, which is a field of the event PAYLOAD and so depends
+      # on which trigger fired. A missing value there would not fail: it would expand to the
+      # empty string and derive the base `//`, a URL naming a host.
+      - name: resolve the published origin and base
+        id: target
+        env:
+          SLUG: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          owner=${SLUG%%/*}
+          repo=${SLUG#*/}
+          test -n "$owner" && test -n "$repo" && test "$owner/$repo" = "$SLUG"
+          owner_lc=$(printf '%s' "$owner" | tr '[:upper:]' '[:lower:]')
+          if [ "$(printf '%s' "$repo" | tr '[:upper:]' '[:lower:]')" = "${owner_lc}.github.io" ]
+          then base="/"
+          else base="/${repo}/"
+          fi
+          printf 'origin=https://%s.github.io\n' "$owner_lc" >> "$GITHUB_OUTPUT"
+          printf 'base=%s\n' "$base" >> "$GITHUB_OUTPUT"
+
+      # `github.sha` on a pull_request event is a synthetic merge commit that exists on no
+      # branch, so a permalink to it 404s once the check is garbage-collected. The head SHA
+      # is the commit under review and is reachable from this checkout.
+      - name: resolve the commit every permalink pins to
+        id: commit
+        env:
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PUSH_SHA: ${{ github.sha }}
+        run: printf 'sha=%s\n' "${HEAD_SHA:-$PUSH_SHA}" >> "$GITHUB_OUTPUT"
+
+      # Runs before the build, on purpose. One bare `{` outside a fence reaches the
+      # raw-twin builder's MDX parser as a JSX expression and fails the whole route with a
+      # message naming neither the page nor the field. This names the file, line and column
+      # in milliseconds. `pnpm run sync` is its prerequisite: the corpus it scans is the
+      # generated content directory, which is what the twin builder will parse.
+      - name: sync the docs tree, then the brace gate
+        working-directory: site
+        env:
+          DOCS_COMMIT: ${{ steps.commit.outputs.sha }}
+        run: |
+          pnpm run sync
+          pnpm run braces
+
+      - name: typecheck
+        working-directory: site
+        env:
+          DOCS_SITE: ${{ vars.DOCS_SITE || steps.target.outputs.origin }}
+          DOCS_BASE: ${{ vars.DOCS_BASE || steps.target.outputs.base }}
+        run: pnpm run check
+
+      # The build is itself a gate: `starlight-links-validator` fails it on a broken
+      # internal link, the citation rewriter fails it on a `path:line` that does not resolve
+      # at the pinned commit, and the mermaid plugin fails it on a diagram it cannot render
+      # rather than passing the fence through as a code block.
+      - name: build
+        working-directory: site
+        env:
+          DOCS_SITE: ${{ vars.DOCS_SITE || steps.target.outputs.origin }}
+          DOCS_BASE: ${{ vars.DOCS_BASE || steps.target.outputs.base }}
+          DOCS_COMMIT: ${{ steps.commit.outputs.sha }}
+        run: pnpm exec astro build
+
+      # Three of the four machine surfaces fail SILENTLY — a twin that 404s, a discovery
+      # link pointing at a file the build never emitted, a deep link dropped by HPACK. The
+      # suite reads `dist/`, so it must run after the build and it must run with the same
+      # base the build used.
+      # Both variables, not just the base: the suite resolves every expected URL from the same pair the
+      # build used, so a build for one origin cannot be checked against another and pass.
+      - name: gate the built surface
+        working-directory: site
+        env:
+          DOCS_SITE: ${{ vars.DOCS_SITE || steps.target.outputs.origin }}
+          DOCS_BASE: ${{ vars.DOCS_BASE || steps.target.outputs.base }}
+        run: pnpm exec vitest run
+
+      - name: upload the Pages artifact
+        uses: actions/upload-pages-artifact@v5
+        with:
+          path: site/dist
+
+  deploy:
+    name: deploy to GitHub Pages
+    # Only from main, and never from a pull request: a fork PR's token cannot write Pages,
+    # and a deploy from an unreviewed branch would publish it at the production URL.
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    needs: build
+    runs-on: ubuntu-latest
+    # Raised here and nowhere else. `id-token: write` is what `deploy-pages` exchanges for
+    # its short-lived deployment credential, so no long-lived secret exists to leak.
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    # Pages allows one deployment at a time and an interrupted one leaves the site in a
+    # half-published state, so this group never cancels — separate from the workflow-wide
+    # group above, which does cancel superseded PR builds.
+    concurrency:
+      group: github-pages-deploy
+      cancel-in-progress: false
+    steps:
+      # `enablement: true` turns Pages on with `build_type: workflow` through the API when
+      # it is off, so the first run of this workflow configures the repository instead of
+      # failing on a setting a human has to find. It is a no-op once set.
+      - uses: actions/configure-pages@v6
+        with:
+          enablement: true
+      - id: deployment
+        uses: actions/deploy-pages@v5

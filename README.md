@@ -347,6 +347,16 @@ starting with the
 [system overview](docs/architecture/system-overview.md) and the
 [debugging guide](docs/insights/debugging-guide.md).
 
+The same documentation is published at
+**<https://theagenticguy.github.io/microvms-agentd/>**, built from `docs/` by `site/` and deployed
+by `.github/workflows/docs.yml`. It is not a nicer rendering of the same files so much as a second
+surface: every page is also served as raw Markdown at its own path with `.md` appended, the whole
+corpus comes as `llms.txt`, `llms-full.txt` and `llms-small.txt`, every `path:line` citation is a
+commit-pinned link into this repository, and the Mermaid diagrams are rendered to SVG at build time
+so they are present in a fetch that runs no JavaScript.
+[For agents](https://theagenticguy.github.io/microvms-agentd/agents/) is the page that names which
+surface answers which question. `mise run docs:check` builds and gates it locally.
+
 ## License
 
 Apache-2.0. Every source file carries an `SPDX-License-Identifier` line, and

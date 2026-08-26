@@ -1,0 +1,125 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+/*
+ * Styles for the page-action controls, the agent note, and the build-time diagrams.
+ *
+ * The class prefix must match `PageActions.astro` and `agent-note.ts` — three files agree on the
+ * string `docs-`, and the inline script in `PageActions.astro` cannot read frontmatter, so renaming
+ * the prefix means renaming it in all three.
+ *
+ * Only the rules that carry a constraint are here. Every value below exists because dropping it
+ * breaks something specific.
+ */
+
+/* The control group sits under the page title, inline, wrapping on a narrow viewport. */
+.docs-page-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  align-items: center;
+  margin-block-start: 0.75rem;
+}
+
+/*
+ * `min-height` is the load-bearing declaration, not decoration. SC 2.5.8 Target Size (Minimum) wants
+ * a 24x24 CSS-pixel target, and an inline anchor in a flex row collapses to its line box — which is
+ * under 20px at a typical docs font size. Block padding on an inline box does not grow the box, so
+ * the height is stated rather than padded into existence.
+ */
+.docs-page-action {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  min-height: 24px;
+  padding-inline: 0.5rem;
+  padding-block: 0.15rem;
+  border: 1px solid var(--sl-color-gray-5);
+  border-radius: 0.25rem;
+  font-size: var(--sl-text-xs);
+  line-height: 1.2;
+  text-decoration: none;
+  background: none;
+  cursor: pointer;
+  color: var(--sl-color-gray-2);
+}
+
+.docs-page-action:hover,
+.docs-page-action:focus-visible {
+  border-color: currentColor;
+  color: var(--sl-color-white);
+}
+
+/*
+ * The copy button reports its own outcome in its label, because `navigator.clipboard` needs a secure
+ * context and fails silently on plain HTTP. These two rules are what make that outcome perceivable
+ * for a reader who cannot perceive a colour change.
+ */
+.docs-page-action[data-docs-state="copied"] {
+  border-style: double;
+  border-width: 3px;
+}
+
+.docs-page-action[data-docs-state="failed"] {
+  border-style: dashed;
+}
+
+/*
+ * Without `vector-effect` a 1.25 stroke scaled down to a 16px box renders under one device pixel and
+ * fades out entirely on a standard-density display.
+ */
+.docs-icon {
+  inline-size: 1em;
+  block-size: 1em;
+  stroke-width: 1.5;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  vector-effect: non-scaling-stroke;
+  flex: none;
+}
+
+/*
+ * The note addressed to a machine reader.
+ *
+ * Distinguished by a border rather than by a background colour, per SC 1.4.1 Use of Colour: colour
+ * alone is not an information channel. The `div` is deliberate — several identically named
+ * complementary landmarks is an axe `landmark-unique` violation, which is what an `aside` here
+ * produces on every page carrying more than one note.
+ *
+ * It is visible to everyone. A visually-hidden block addressed to an agent is content served to
+ * machines and hidden from every human, which is cloaking wearing an accessibility class name.
+ */
+.docs-agent-note {
+  border: 3px double var(--sl-color-gray-4);
+  padding: 0.75rem 1rem;
+  margin-block: 1.25rem;
+}
+
+.docs-agent-note > :first-child {
+  margin-block-start: 0;
+}
+
+.docs-agent-note > :last-child {
+  margin-block-end: 0;
+}
+
+/*
+ * A build-time diagram.
+ *
+ * The SVG carries an intrinsic width in px from the renderer's own layout pass, so `max-inline-size`
+ * plus `height: auto` is what keeps a wide sequence diagram inside the content column instead of
+ * widening the page and introducing a horizontal scroll on the document.
+ *
+ * `overflow-x: auto` gives the diagram its own scroll container when the viewport is narrower than the
+ * diagram is legible. That container is reachable by keyboard because `mermaid.ts` writes
+ * `tabindex="0"` onto the figure it emits: a scrollable region with no focusable descendant cannot be
+ * scrolled without a pointer (SC 2.1.1). The attribute is written at mdast rather than applied by a
+ * hast visitor, because a late hast pass that replaces the subtree would discard it.
+ */
+.docs-mermaid {
+  margin-block: 1.5rem;
+  overflow-x: auto;
+}
+
+.docs-mermaid svg {
+  max-inline-size: 100%;
+  block-size: auto;
+}

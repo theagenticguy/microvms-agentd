@@ -1,0 +1,138 @@
+---
+// SPDX-License-Identifier: Apache-2.0
+/**
+ * The page-action control group: copy this page's Markdown, open its raw route, or open it prefilled
+ * in an external assistant.
+ *
+ * The `docs-` prefix appears in three places that must agree — the markup below, the `dataset` keys in
+ * the inline script, and `styles/docs.css`.
+ *
+ * This is a local component rather than a plugin. `starlight-page-context-action` is the better of the
+ * two candidates and is still declined: its MDX cleaner is regex-based, and it emits its own
+ * `<path>.md` and `llms.txt` routes, which collide with the two dependencies that already own those
+ * routes. A dependency that must be half-disabled to avoid two collisions costs more than the twenty
+ * lines it saves.
+ *
+ * The icons are inline SVG rather than an icon package. A dependency for three 16px glyphs is a
+ * supply-chain edge and an install step for markup that fits in this file, and `currentColor` plus
+ * `vector-effect` are the only two properties that matter for them.
+ *
+ * Every href is computed in `src/lib/agent-surface.ts`, which is where the format table and the
+ * character budget are asserted.
+ */
+import { deepLinks, rawMarkdownUrl } from "../lib/agent-surface.js"
+
+const route = Astro.locals.starlightRoute
+const { site } = Astro
+
+/*
+ * A missing `site` is a build error rather than a fallback. Without it the canonical URL, the sitemap
+ * and every href below are wrong in the same way, and a machine hint that resolves to nothing is worse
+ * than an absent one.
+ */
+if (site === undefined) {
+  throw new Error("`site` is unset in astro.config.ts, so no absolute page URL can be built")
+}
+
+const context = { site, base: import.meta.env.BASE_URL }
+const markdownUrl = rawMarkdownUrl(route.entry.id, context)
+// `Astro.url.pathname` already carries the base segment, so this resolves against the bare origin.
+const pageUrl = new URL(Astro.url.pathname, site)
+const title = route.entry.data.title
+
+const links = deepLinks(
+  { title, pageUrl: pageUrl.href, markdownUrl: markdownUrl.href },
+  route.entry.body ?? ""
+)
+---
+
+<div class="docs-page-actions not-content">
+  {/*
+    A real button, so it is reachable by keyboard and announced as an action. It carries the raw
+    route on a data attribute and fetches it on click: the raw route is the one producer of this
+    page's Markdown, so what a human copies and what an agent reads cannot diverge.
+  */}
+  <button
+    type="button"
+    class="docs-page-action"
+    data-docs-copy={markdownUrl.pathname}
+    data-docs-idle="Copy as Markdown"
+    data-docs-done="Copied"
+    data-docs-failed="Copy failed: open the raw Markdown instead"
+  >
+    <svg class="docs-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" aria-hidden="true">
+      <rect x="9" y="9" width="12" height="12" rx="2" />
+      <path d="M15 5H5a2 2 0 0 0-2 2v10" />
+    </svg>
+    <span data-docs-copy-label>Copy as Markdown</span>
+  </button>
+
+  <a class="docs-page-action" href={markdownUrl.pathname}>
+    <svg class="docs-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" aria-hidden="true">
+      <rect x="2" y="6" width="20" height="12" rx="2" />
+      <path d="M6 15V9l3 3 3-3v6M17 9v6M14.5 12.5 17 15l2.5-2.5" />
+    </svg>
+    <span>View as Markdown</span>
+  </a>
+
+  {
+    links.map((link) => (
+      <a
+        class="docs-page-action"
+        href={link.href}
+        target="_blank"
+        rel="noopener noreferrer"
+        data-docs-target={link.target.id}
+        data-docs-carries-content={String(link.carriesContent)}
+      >
+        <svg
+          class="docs-icon"
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          aria-hidden="true"
+        >
+          <path d="M14 4h6v6M20 4 11 13" />
+          <path d="M18 14v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h5" />
+        </svg>
+        <span>{link.target.label}</span>
+      </a>
+    ))
+  }
+</div>
+
+{/*
+  `navigator.clipboard` needs a secure context, and a docs page opened over plain HTTP or from the
+  filesystem has none. The failure is therefore reported in the control's own label rather than
+  swallowed: a button that appears to work and does nothing is the defect this handles.
+*/}
+<script>
+  document.querySelectorAll<HTMLButtonElement>("[data-docs-copy]").forEach((button) => {
+    const label = button.querySelector("[data-docs-copy-label]")
+    const source = button.dataset.docsCopy
+    if (label === null || source === undefined) return
+
+    const say = (text: string, failed: boolean) => {
+      label.textContent = text
+      button.dataset.docsState = failed ? "failed" : "copied"
+      window.setTimeout(() => {
+        label.textContent = button.dataset.docsIdle ?? "Copy as Markdown"
+        delete button.dataset.docsState
+      }, 4000)
+    }
+
+    button.addEventListener("click", async () => {
+      try {
+        if (!window.isSecureContext || navigator.clipboard === undefined) {
+          throw new Error("the clipboard needs a secure context")
+        }
+        const response = await fetch(source)
+        if (!response.ok) throw new Error(`the raw route answered ${response.status}`)
+        await navigator.clipboard.writeText(await response.text())
+        say(button.dataset.docsDone ?? "Copied", false)
+      } catch {
+        say(button.dataset.docsFailed ?? "Copy failed", true)
+      }
+    })
+  })
+</script>

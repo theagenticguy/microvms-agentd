@@ -1,0 +1,38 @@
+{
+  "name": "microvms-agentd-docs",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "The documentation site for microvms-agentd, built so an agent can read it without rendering it.",
+  "packageManager": "pnpm@11.21.0",
+  "engines": {
+    "node": ">=22.13"
+  },
+  "scripts": {
+    "sync": "node scripts/sync-docs.mjs",
+    "braces": "node scripts/brace-gate.mjs src/content/docs",
+    "prebuild": "pnpm run sync && pnpm run braces",
+    "build": "astro build",
+    "predev": "pnpm run sync && pnpm run braces",
+    "dev": "astro dev",
+    "preview": "astro preview",
+    "check": "astro check",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@astrojs/markdown-satteri": "0.3.8",
+    "@astrojs/starlight": "0.41.9",
+    "astro": "7.2.7",
+    "beautiful-mermaid": "1.1.3",
+    "satteri": "0.10.5",
+    "starlight-base-path": "0.2.1",
+    "starlight-links-validator": "0.25.3",
+    "starlight-llms-txt": "0.11.0",
+    "starlight-md-txt": "0.1.0"
+  },
+  "devDependencies": {
+    "@astrojs/check": "0.9.10",
+    "typescript": "5.9.3",
+    "vitest": "4.1.11"
+  }
+}

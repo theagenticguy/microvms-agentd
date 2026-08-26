@@ -16,7 +16,11 @@ The set is every extension in COMMENT, not just `.rs` and `.py`. The original
 gate covered those two and nothing else, which left the eight `.mjs` Node test
 files, the example's `.sh`, and the conformance `.tf` permanently unlicensed —
 the same extension blindness issue #32 was about, one layer up: a closed set is
-only closed over what it enumerates.
+only closed over what it enumerates. `.ts`, `.astro` and `.css` are in it for the
+same reason, and each one taught the inserter something a leader alone cannot
+express: an Astro component's `---` fence must stay the first line, and `//` in
+CSS is not a comment but an invalid declaration a parser recovers from by eating
+the rule that follows it.
 """
 
 from __future__ import annotations
@@ -38,9 +42,19 @@ COMMENT = {
     ".py": "#",
     ".pyi": "#",
     ".mjs": "//",
+    ".ts": "//",
+    ".astro": "//",
+    ".css": "/*",
     ".sh": "#",
     ".tf": "#",
 }
+
+#: Extension -> comment closer, for the syntaxes a leader alone cannot express.
+#: CSS is the one that matters: `//` is not a comment there at all but an invalid
+#: declaration, and a parser recovers from it by skipping to the next semicolon —
+#: which silently eats the declaration that follows. A leader-only map would emit
+#: a header that removes a rule.
+CLOSER = {".css": " */"}
 
 
 def tracked_sources() -> list[Path]:
@@ -61,7 +75,7 @@ def has_spdx(path: Path) -> bool:
 
 
 def insertion_point(lines: list[str], path: Path) -> int:
-    """After a shebang and any PEP 723 block, before everything else."""
+    """After a shebang, a PEP 723 block, or an Astro frontmatter fence."""
     at = 0
     if lines and lines[0].startswith("#!"):
         at = 1
@@ -73,6 +87,11 @@ def insertion_point(lines: list[str], path: Path) -> int:
         while at < len(lines) and lines[at] != "# ///":
             at += 1
         at += 1  # past the closing marker
+    # An `.astro` component's `---` fence must be the first line in the file, so
+    # the header goes inside it — where the language is JavaScript and `//` holds.
+    # Inserting above the fence turns the component's script into page content.
+    if path.suffix == ".astro" and lines and lines[0].strip() == "---":
+        at = 1
     return at
 
 
@@ -80,7 +99,7 @@ def fix(path: Path) -> None:
     text = path.read_text(encoding="utf-8")
     lines = text.splitlines()
     at = insertion_point(lines, path)
-    lines.insert(at, f"{COMMENT[path.suffix]} {SPDX}")
+    lines.insert(at, f"{COMMENT[path.suffix]} {SPDX}{CLOSER.get(path.suffix, '')}")
     # An empty file has no trailing newline to preserve; copying that absence
     # onto the line just inserted writes an unterminated last line (measured as
     # ruff W292 when this same gate was ported to another repo).
