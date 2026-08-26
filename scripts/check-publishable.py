@@ -144,11 +144,66 @@ def stale_selectors(names: set[str]) -> list[str]:
     return failures
 
 
+def tag_version_skew(tag: str, packages: list[dict]) -> list[str]:
+    """Every manifest whose version disagrees with the release tag.
+
+    The version a consumer receives is the one in the manifest, not the one in the tag, and
+    they live in three unrelated files: the Cargo manifests, `microvms-py/pyproject.toml`, and
+    `microvms-js/package.json`. A release that bumps two of the three publishes the wrong
+    version to the third registry under a tag that claims otherwise, and every registry version
+    is immutable — so the wrong number cannot be withdrawn, only superseded.
+
+    Only the published crates are compared. `agentd` and `agentd-model` never reach a consumer,
+    so their versions are free to diverge and a gate that forced them to match would be
+    asserting tidiness rather than a contract.
+    """
+    expected = tag.removeprefix("v")
+    failures: list[str] = []
+
+    for package in sorted(packages, key=lambda p: p["name"]):
+        if package["name"] in PUBLISHED and package["version"] != expected:
+            failures.append(
+                f"{package['name']} is version {package['version']} and the tag says "
+                f"{expected} ({package['manifest_path']})"
+            )
+
+    for relative, found in (
+        ("microvms-py/pyproject.toml", _toml_version("microvms-py/pyproject.toml")),
+        ("microvms-js/package.json", _json_version("microvms-js/package.json")),
+    ):
+        if found != expected:
+            failures.append(
+                f"{relative} is version {found} and the tag says {expected}"
+            )
+
+    return failures
+
+
+def _toml_version(relative: str) -> str | None:
+    """`[project] version` without a TOML parser, because 3.11 is the floor and tomllib is 3.11+.
+
+    Read with a regex rather than `tomllib` so this script keeps an empty dependency set: a
+    release gate that needs a package installed is a gate that can fail for a reason unrelated
+    to the release.
+    """
+    text = Path(relative).read_text()
+    match = re.search(r'(?m)^version\s*=\s*"([^"]+)"', text)
+    return match.group(1) if match else None
+
+
+def _json_version(relative: str) -> str | None:
+    return json.loads(Path(relative).read_text()).get("version")
+
+
 def main() -> int:
     packages = metadata()["packages"]
     failures: list[str] = []
 
     failures.extend(stale_selectors({p["name"] for p in packages}))
+
+    tag = next((a.split("=", 1)[1] for a in sys.argv if a.startswith("--tag=")), None)
+    if tag:
+        failures.extend(tag_version_skew(tag, packages))
 
     actual = {p["name"] for p in packages if publishable(p)}
     if actual != PUBLISHED:
@@ -224,6 +279,8 @@ def main() -> int:
         f"publishable: {len(PUBLISHED)} crates, metadata complete "
         f"({', '.join(sorted(PUBLISHED))})"
     )
+    if tag:
+        print(f"publishable: every published manifest agrees with tag {tag}")
 
     if "--dry-run" in sys.argv:
         print("publishable: cargo publish --workspace --dry-run (needs the network)")

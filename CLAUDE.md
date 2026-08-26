@@ -168,6 +168,17 @@ which name crates explicitly, are the only ones that go red. Markdown is deliber
 scope — the counterexample four paragraphs up is a `-p protocol` this gate would otherwise
 flag.
 
+A release is one tag. `.github/workflows/release.yml` fires on `v*` and publishes all three
+registries plus the daemon binary, holding no secrets: every credential is minted from the
+OIDC token GitHub issues to that run. Bumping a version means bumping it in three unrelated
+files — the Cargo manifests, `microvms-py/pyproject.toml`, `microvms-js/package.json` — and
+`./scripts/check-publishable.py --tag=vX.Y.Z` is what refuses a tag that disagrees with any of
+them.
+
+Renaming `release.yml` invalidates **eleven** trusted-publisher configurations at once (three
+crates, one PyPI project, the npm root and four platform packages), and npm does not validate
+its configuration on save — the error appears only at publish time.
+
 Three things about the registry surface that a manifest does not make obvious:
 
 - Every version is immutable on all three registries. There is no second `0.1.0`, so a
