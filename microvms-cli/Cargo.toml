@@ -4,8 +4,11 @@ version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-publish.workspace = true
+publish = true
 description = "the `microvm` binary: a working sandbox in one command, and nothing microvms-core does not do"
+readme = "README.md"
+keywords = ["microvms", "lambda", "aws", "sandbox", "cli"]
+categories = ["command-line-utilities", "virtualization"]
 
 # ── no lib target, deliberately (ARCH-5) ────────────────────────────────────
 #
@@ -44,7 +47,7 @@ path = "src/main.rs"
 [dependencies]
 # The whole product surface. Every AWS call, every trap closure, the cost engine,
 # and the error taxonomy the exit table is a rendering of.
-microvms-core = { path = "../microvms-core" }
+microvms-core = { version = "0.1.0", path = "../microvms-core" }
 # No direct `protocol` edge: the wire types are named through
 # `microvms_core::protocol::` (core's re-export), so this crate has exactly one
 # door to everything below it. The direct edge existed while core lacked the

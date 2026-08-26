@@ -1,11 +1,19 @@
 [package]
-name = "protocol"
+# `protocol` is taken on crates.io (an unrelated crate, at 3.x), so the package
+# carries the prefix and every dependent renames it back with
+# `package = "microvms-protocol"`. That keeps `use protocol::` compiling in all 17
+# source files that name it: the rename is a manifest concern and does not reach
+# the code.
+name = "microvms-protocol"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-publish.workspace = true
+publish = true
 description = "Wire types shared by the microvms-agentd daemon and its clients"
+readme = "README.md"
+keywords = ["microvms", "lambda", "aws", "protocol", "serde"]
+categories = ["encoding", "virtualization"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }

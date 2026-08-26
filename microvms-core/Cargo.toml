@@ -4,8 +4,11 @@ version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-publish.workspace = true
+publish = true
 description = "The MicroVMs control-plane and in-VM client: every trap closure, the cost engine, the sizing model"
+readme = "README.md"
+keywords = ["microvms", "lambda", "aws", "sandbox", "microvm"]
+categories = ["api-bindings", "virtualization"]
 
 # The complete dependency set, written once.
 #
@@ -26,7 +29,7 @@ description = "The MicroVMs control-plane and in-VM client: every trap closure, 
 # alternative is a client that redefines `Phase`, `Outcome`, and the SSE event
 # payloads locally, which is precisely the drift the protocol crate was extracted to
 # make impossible. A field renamed in `protocol/` must break this crate's build.
-protocol = { path = "../protocol" }
+protocol = { package = "microvms-protocol", version = "0.1.0", path = "../protocol" }
 # The error taxonomy's Display impls. 2.x rather than 1.x: `#[error]` on an enum
 # with `#[from]` is the same surface, and the 2.0 line is what receives fixes.
 thiserror = "2.0.19"

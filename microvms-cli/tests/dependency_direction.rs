@@ -200,8 +200,11 @@ fn the_workspace_members_are_the_crates_the_architecture_names() {
             "microvms-cli",
             "microvms-core",
             "microvms-js",
+            // `protocol/`'s *package* is `microvms-protocol` — the bare name is taken on
+            // crates.io. Dependents rename it back to `protocol`, so this is the one place in
+            // the workspace where the registry name is visible.
+            "microvms-protocol",
             "microvms-py",
-            "protocol",
         ],
         "a workspace member appeared or vanished. The dependency-direction assertions above are \
          equalities over the four crates ARCH-3/4/5 name, so a new member that depended on the \

@@ -71,6 +71,13 @@ jobs:
         with:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
+      # For the PEP 723 publish gate at the end of this job, and only on the platform
+      # that runs it. See the `security` job for why no cache: there is no lockfile in
+      # this repo for a cache key to watch, and this script's dependency set is empty.
+      - uses: astral-sh/setup-uv@v7
+        if: matrix.os == 'ubuntu-latest'
+        with:
+          enable-cache: false
       - run: cargo fmt --all -- --check
         if: matrix.os == 'ubuntu-latest'
       - name: clippy (client crates everywhere, everything on linux)
@@ -82,7 +89,7 @@ jobs:
             # Not the binding crates: pyo3 wants a Python to link against on
             # Windows and napi wants its build tooling; both get their real
             # coverage in the `bindings` job, under the toolchains that ship them.
-            cargo clippy -p protocol -p microvms-core -p microvms-cli -p agentd-model --all-targets -- -D warnings
+            cargo clippy -p microvms-protocol -p microvms-core -p microvms-cli -p agentd-model --all-targets -- -D warnings
           fi
       # Linux: one command covers all six tiers — the daemon's unit tests, the
       # stateright model over every reachable state, the proptest tar-confinement
@@ -98,7 +105,7 @@ jobs:
           if [ "${{ matrix.os }}" = "ubuntu-latest" ]; then
             cargo test --all
           else
-            cargo test -p protocol -p microvms-core -p microvms-cli -p agentd-model
+            cargo test -p microvms-protocol -p microvms-core -p microvms-cli -p agentd-model
           fi
       # Belt to the test suite's braces, and not redundant: this runs the real
       # generator against the real path and fails with the regenerate command in
@@ -112,6 +119,20 @@ jobs:
       - name: schema artifact is not stale
         if: matrix.os == 'ubuntu-latest'
         run: cargo run -p agentd --bin schema -- --check
+
+      # The one release gate that cannot run in `mise run check`: `cargo publish
+      # --workspace --dry-run` resolves against crates.io, so `--offline` fails with
+      # "attempting to make an HTTP request" and `check` is offline by contract. Here
+      # instead, where the network already is.
+      #
+      # It packages and verifies `microvms-protocol`, `microvms-core`, and `microvms-cli`
+      # as if each were already released, which is the only place the
+      # `core -> protocol` edge is resolved the way a consumer will resolve it rather
+      # than through the path dependency that shadows it in every other build. The
+      # offline half of the same script runs in `check` and asserts the publish set.
+      - name: every publishable crate can actually publish
+        if: matrix.os == 'ubuntu-latest'
+        run: ./scripts/check-publishable.py --dry-run
 
   security:
     name: semgrep, secret history, licenses, workflow lint

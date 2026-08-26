@@ -38,10 +38,11 @@ microvm run ./agentd --exec "echo hello from a microvm"
 **What you need:** an AWS account with Lambda MicroVMs access in a service
 region (`us-east-1`, `us-east-2`, `us-west-2`, `eu-west-1`, `ap-northeast-1`),
 AWS credentials in your environment, and [mise](https://mise.jdx.dev/), which
-provides the Rust toolchain, Terraform, and every task below. Everything is
-source-only; nothing is published to crates.io, PyPI, or npm (the workspace
-declares `publish = false` so a stray `cargo publish` cannot change that). You
-build the two binaries yourself, and the build is one task.
+provides the Rust toolchain, Terraform, and every task below. Nothing is on
+crates.io, PyPI, or npm yet, so you build the two binaries yourself and the build
+is one task. `microvms-protocol`, `microvms-core`, and `microvms-cli` are the
+crates configured to publish when a release is tagged; `agentd` is not one of
+them, because the daemon reaches a consumer as a binary baked into a task image.
 
 **1. Clone and build.**
 
