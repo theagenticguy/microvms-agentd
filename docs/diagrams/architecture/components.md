@@ -4,14 +4,17 @@
 classDiagram
     direction LR
 
-    namespace microvms-core {
-        class ControlPlane {
-            +create_image(request)
-            +run_microvm(request)
-            +suspend(id)
-            +resume(id)
-            +terminate(id)
+    namespace microvms-cli {
+        class CoreSeam {
+            <<trait>>
+            +control_plane(region)
+            +open_sandbox(region, port)
+            +attach_session(region, ..)
+            +put_artifact(uri, bytes)
         }
+    }
+
+    namespace microvms-core {
         class Sandbox {
             +build_image(request)
             +run(request)
@@ -19,12 +22,19 @@ classDiagram
             +resume()
             +terminate(opts)
         }
+        class ControlPlane {
+            +create_image(request)
+            +run_microvm(request)
+            +wait_for_running(id, opts)
+            +terminate(id)
+            +mint_auth_token(id)
+        }
         class Session {
             +health()
             +wait_until_ready(timeout)
-            +run(StartRequest)
+            +run(req)
             +run_sync(req, timeout)
-            +upload_file(path, bytes)
+            +upload_tar(remote, archive)
         }
         class ExecHandle {
             +poll()
@@ -33,137 +43,73 @@ classDiagram
             +write_stdin(data, eof)
             +ack()
         }
-        class CostReport {
-            +total()
-            +items()
-            +by_phase(phase)
-            +is_complete()
-            +render()
-        }
-        class RateTable {
-            +region()
-            +vcpu_second()
-            +gb_second()
-            +is_stale(today)
-        }
-        class Region {
-            +as_str()
-            +unlisted(name)
-            +is_supported()
-            +from_str(s)
-        }
-        class SizeClass {
-            +from_baseline_mib(mib)
-            +baseline_mib()
-            +peak_vcpu()
-            +baseline_gb()
-        }
-    }
-
-    namespace protocol {
-        class StartRequest {
-            +exec_id
-            +command
-            +shell
-            +timeout_sec
-            +stdin
-        }
-        class PollResponse {
-            +exec_id
-            +phase
-            +result
-        }
-        class Health {
-            +version
-            +bootstrapped
-            +disk
-            +identity_degraded
-        }
     }
 
     namespace agentd {
         class Routes {
             +app(state)
+            +handler_for(endpoint)
             +surface_docs()
-            +VERSION
+            +run_hook(state, body)
+            +health(state)
         }
         class AppState {
-            +bootstrap(presented)
+            +bootstrap(presented, env)
             +token_matches(presented)
             +with_execs(f)
             +disk_guard()
             +identity_report()
         }
-    }
-
-    namespace model {
-        class Agentd {
-            +new(cfg)
-            +init_states()
-            +actions(state, out)
-            +next_state(last, action)
-            +properties()
-        }
-        class ClientLifecycle {
-            +new(cfg)
-            +init_states()
-            +actions(state, out)
-            +next_state(last, action)
-            +properties()
+        class Confined {
+            +open(root)
+            +create_dir(parts)
+            +create_file(parts)
+            +create_symlink(parts, target)
+            +set_mode(parts, mode)
         }
     }
 
-    namespace microvms-cli {
-        class CoreSeam {
-            <<trait>>
-            +control_plane(region)
-            +open_sandbox(region, port)
-            +attach_session(...)
-            +put_artifact(uri, bytes)
-        }
-    }
-
-    namespace microvms-js {
-        class NodeSandbox["Sandbox"] {
-            <<napi>>
-            +create(region)
-            +run(options)
-            +suspend()
-            +resume()
-            +terminate(options)
-        }
-    }
-
-    namespace microvms-py {
-        class PySandbox["Sandbox"] {
-            <<pyclass>>
-            +run(...)
-            +suspend()
-            +resume()
-            +terminate(...)
-            +session()
-        }
-    }
-
-    Sandbox --> ControlPlane : invokes
-    Sandbox --> Session : owns
-    ControlPlane --> Region : holds
-    Session --> ExecHandle : creates
-    Session --> StartRequest : sends
-    Session --> Health : reads
-    ExecHandle --> PollResponse : decodes
-    CostReport --> RateTable : cites
-    CostReport --> SizeClass : prices
-    RateTable --> Region : scopes
-    Routes --> AppState : carries
-    Routes --> StartRequest : accepts
-    Routes --> PollResponse : returns
-    Routes --> Health : serves
     CoreSeam --> ControlPlane : builds
     CoreSeam --> Sandbox : opens
     CoreSeam --> Session : attaches
-    NodeSandbox --> Sandbox : wraps
-    PySandbox --> Sandbox : wraps
-    Agentd ..> Routes : mirrors
-    ClientLifecycle ..> Sandbox : mirrors
+    Sandbox --> ControlPlane : invokes
+    Sandbox --> Session : owns
+    Session --> ExecHandle : creates
+    Session ..> Routes : requests
+    ExecHandle ..> Routes : streams
+    Routes --> AppState : carries
+    Routes --> Confined : dispatches
 ```
+
+## Legend
+
+| Node or edge | Citations |
+| --- | --- |
+| `CoreSeam` | trait `microvms-cli/src/seam.rs:136`; methods `microvms-cli/src/seam.rs:138`, `:141`, `:148`, `:172`; `AwsSeam` impl `:179`, `:183`, `:201`, `:225` |
+| `Sandbox` | struct `microvms-core/src/sandbox.rs:422`; methods `:551`, `:648`, `:755`, `:837`, `:935` |
+| `ControlPlane` | struct `microvms-core/src/control/mod.rs:160`; methods `microvms-core/src/control/image.rs:157`, `microvms-core/src/control/microvm.rs:356`, `:435`, `:563`, `:581` |
+| `Session` | struct `microvms-core/src/session/mod.rs:184`; methods `:329`, `:342`, `:380`, `:408`, `:444` |
+| `ExecHandle` | struct `microvms-core/src/session/exec.rs:213`; methods `:228`, `:248`, `:285`, `:624`, `:654` |
+| `Routes` | module of free functions, not a type: `agentd/src/routes.rs:36`, `:110`, `:371`, `:178`, `:314` |
+| `AppState` | struct `agentd/src/state.rs:110`; methods `:202`, `:245`, `:257`, `:176`, `:183` |
+| `Confined` | struct `agentd/src/fs.rs:297`; methods `:350`, `:416`, `:428`, `:448`, `:535` |
+| `CoreSeam --> ControlPlane` | `microvms-cli/src/seam.rs:138`, impl `:179` |
+| `CoreSeam --> Sandbox` | `microvms-cli/src/seam.rs:141`, impl `:183` |
+| `CoreSeam --> Session` | `microvms-cli/src/seam.rs:148`, impl `:201` |
+| `Sandbox --> ControlPlane` | `microvms-core/src/sandbox.rs:65-67`, `:553`, `:696`, `:773`, `:859`, `:951` |
+| `Sandbox --> Session` | `microvms-core/src/sandbox.rs:70`, `:535`, `:648` |
+| `Session --> ExecHandle` | `microvms-core/src/session/mod.rs:380`, `:403` |
+| `Session ..> Routes` | `microvms-core/src/session/mod.rs:331`, `:382`; `microvms-core/src/session/files.rs:45`, `:52` |
+| `ExecHandle ..> Routes` | `microvms-core/src/session/exec.rs:233`, `:592`, `:659` |
+| `Routes --> AppState` | `agentd/src/routes.rs:36` |
+| `Routes --> Confined` | `agentd/src/routes.rs:132-135`, `agentd/src/fs.rs:1433`, `:1480`, `:631` |
+| `..>` dashed | the HTTP wire, not a crate dependency: the shared contract is the `protocol` crate, re-exported at `microvms-core/src/lib.rs:77` and `agentd/src/routes.rs:18-20`, and the permitted directions are asserted by `microvms-cli/tests/dependency_direction.rs` |
+| `+` prefix | the class-diagram marker for a listed member, not a Rust visibility claim: `Confined` and its methods are crate-private (`agentd/src/fs.rs:297`, `:350`), as are `routes::run_hook` and `routes::health` (`agentd/src/routes.rs:178`, `:314`) |
+
+## See also
+
+- [impact analysis](../../insights/impact-analysis.md) — 10 shared source citations
+- [processes](../../behavior/processes.md) — 9 shared source citations
+- [business logic](../../insights/business-logic.md) — 9 shared source citations
+- [sequences](../behavioral/sequences.md) — 8 shared source citations
+- [data flow](../../architecture/data-flow.md) — 7 shared source citations

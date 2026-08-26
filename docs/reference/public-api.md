@@ -1,10 +1,24 @@
 # microvms-agentd · Public API
 
-The public surface is four crates. `microvms-core` is the client library. It contains the control plane, the in-VM session, the cost engine, and the trap closures in one crate (`microvms-core/src/lib.rs:2`). `protocol` expresses the wire contract as types, and both the daemon and every Rust client share it (`protocol/src/lib.rs:2`). `microvms-py` and `microvms-js` are thin bindings that add no validation of their own.
+Four crates carry a public surface. `microvms-core` is the client library: the control plane, the in-VM daemon client, the cost engine, and every trap closure in one crate (`microvms-core/src/lib.rs:2-3`), exposing nine public modules and re-exporting `protocol` so consumers name wire types through core rather than depending on `protocol` directly (`microvms-core/src/lib.rs:65-82`). `protocol` states the wire contract as types, shared by the daemon and every client. `microvms-py` and `microvms-js` are thin bindings that hold no validation of their own — every refusal a caller sees is raised by the core, with the core's message naming the `docs/PLATFORM.md` finding behind it (`microvms-py/src/lib.rs:12-18`).
 
-`microvms-cli` is not part of the public API. It declares exactly one `[[bin]]` and no `src/lib.rs`, so it exports nothing (`microvms-cli/Cargo.toml:11`). Its command surface is documented in `reference/cli.md`.
+`microvms-cli` is not part of this surface. It declares exactly one `[[bin]]` and no `src/lib.rs`, so it exports nothing a binding could depend on, and `tests/dependency_direction.rs` fails if a lib target ever appears (`microvms-cli/Cargo.toml:10-20`). Its commands are documented in `reference/cli.md`.
+
+Thirty symbols are listed, ranked by inbound reference count within each surface. Seven public names fall below the cut and are not documented here: `CreateImageRequest` (`microvms-core/src/control/mod.rs:275`), `RunMicrovmRequest` (`microvms-core/src/control/mod.rs:389`), `run_report` (`microvms-core/src/cost.rs:1778`), `estimate_run` (`microvms-core/src/cost.rs:1900`), `RunRequest` (`microvms-core/src/sandbox.rs:146`), `Lifecycle` (`microvms-core/src/sandbox.rs:97`), and `TeardownReport` (`microvms-core/src/sandbox.rs:335`).
 
 ## microvms-core
+
+### Error
+
+```rs
+#[derive(Debug, thiserror::Error)]
+#[error("{message}")]
+pub struct Error {
+```
+
+A failure classified once at the point it is raised, deliberately a struct with a private body rather than an enum, because an enum over every raise site would make each new failure a breaking change for a binding that matched exhaustively.
+
+`microvms-core/src/error.rs:41-43`
 
 ### Region
 
@@ -13,9 +27,20 @@ The public surface is four crates. `microvms-core` is the client library. It con
 pub enum Region {
 ```
 
-`Region` names an AWS region. The enum is closed over the five regions that run MicroVMs, plus a named escape hatch. Because the set is closed, a typo'd region is a compile error rather than an `AccessDeniedException` with a null message.
+An AWS region, closed over the five that run MicroVMs plus a named escape hatch, so a typo'd region is a compile error rather than an `AccessDeniedException` carrying a null message.
 
 `microvms-core/src/region.rs:44-45`
+
+### ErrorKind
+
+```rs
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum ErrorKind {
+```
+
+The coarse failure classes, one per non-zero row of the CLI's exit table, with the integer exit code left to the CLI because a library owning process exit codes would be a library with an opinion about being a process.
+
+`microvms-core/src/error.rs:126-127`
 
 ### SizeClass
 
@@ -30,23 +55,39 @@ pub enum SizeClass {
 }
 ```
 
-`SizeClass` is one of the five documented size classes. The enum is closed, so an off-table `minimumMemoryInMiB` figure cannot be represented.
+The five documented size classes, named for the baseline a caller writes into `minimumMemoryInMiB` and deliberately not for the peak, since naming both would suggest the two are picked independently.
 
 `microvms-core/src/sizing.rs:112-119`
 
-### Error
+### Session
 
 ```rs
-#[derive(Debug, thiserror::Error)]
-#[error("{message}")]
-pub struct Error {
+pub struct Session {
 ```
 
-`Error` is the one error type every fallible call in the crate returns. It carries a coarse `ErrorKind`, an optional wire classification, and a message. When a call fails a local guard, the message names the `docs/PLATFORM.md` finding behind that guard.
+The control API of one running MicroVM.
 
-`microvms-core/src/error.rs:41-43`
+`microvms-core/src/session/mod.rs:184`
 
-`ErrorKind` is the coarse classification that `Error::kind` returns. It has thirteen failure classes, one per non-zero row of the CLI's exit table. The mapping to an integer exit code is left to the CLI (`microvms-core/src/error.rs:127`).
+### ControlPlane
+
+```rs
+pub struct ControlPlane {
+```
+
+The control-plane client, holding its transport and clock behind `Arc` so a caller keeping one across tasks does not need a second credential chain.
+
+`microvms-core/src/control/mod.rs:160`
+
+### Sandbox
+
+```rs
+pub struct Sandbox {
+```
+
+One MicroVM's whole life: the state machine, the suspended window, and explicit teardown.
+
+`microvms-core/src/sandbox.rs:422`
 
 ### WireKind
 
@@ -55,7 +96,7 @@ pub struct Error {
 pub enum WireKind {
 ```
 
-`WireKind` lists the daemon-side failure classes a client branches on. Several of them collapse onto one `ErrorKind` at the exit code rather than at the raise site.
+The daemon-side failure classes the conformance suite asserts on, several of which collapse onto one `ErrorKind` at the exit code rather than at the raise site.
 
 `microvms-core/src/error.rs:218-219`
 
@@ -66,9 +107,19 @@ pub enum WireKind {
 pub struct RunHookTimeout(u32);
 ```
 
-`RunHookTimeout` is a timeout for the `run`, `resume`, `suspend`, or `terminate` hook. It accepts 1..=60 seconds and provides no conversion from `BuildHookTimeout`.
+A timeout for the `run`, `resume`, `suspend`, or `terminate` hook, accepting 1..=60 seconds and offering no conversion from `BuildHookTimeout`.
 
 `microvms-core/src/hooks.rs:47-48`
+
+### Transport
+
+```rs
+pub struct Transport {
+```
+
+A backend, the agent token, and the proxy auth every request needs, kept separate from `Session` because `ExecHandle` needs it and holding a whole session would make the two mutually recursive.
+
+`microvms-core/src/session/mod.rs:63`
 
 ### BuildHookTimeout
 
@@ -77,56 +128,20 @@ pub struct RunHookTimeout(u32);
 pub struct BuildHookTimeout(u32);
 ```
 
-`BuildHookTimeout` is a timeout for the `ready` or `validate` image-build hook, and it accepts 1..=3600 seconds. It is a separate type so a build-sized value cannot reach a field that caps at 60.
+A timeout for the `ready` or `validate` image-build hook, accepting 1..=3600 seconds, and a distinct type so a build-sized value cannot reach a field that caps at 60.
 
 `microvms-core/src/hooks.rs:53-54`
 
-## microvms-core::control
-
-### ControlPlane
+### EstimatedUsd
 
 ```rs
-pub struct ControlPlane {
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct EstimatedUsd(Decimal);
 ```
 
-`ControlPlane` is the control-plane client. It holds its transport and clock behind `Arc`, so a caller sharing it across tasks does not need a second credential chain.
+Dollars derived from published rates and not the bill, with no `From<EstimatedUsd> for f64`, no `Into`, no `Deref`, and no `as_f64`, so laundering an estimate into a float does not compile.
 
-`microvms-core/src/control/mod.rs:132`
-
-### CreateImageRequest
-
-```rs
-#[derive(Clone, Debug)]
-pub struct CreateImageRequest {
-```
-
-`CreateImageRequest` holds everything `CreateMicrovmImage` needs. The type closes the known traps; for example, it has no `client_token` field at all.
-
-`microvms-core/src/control/mod.rs:225-226`
-
-Also re-exported from `control::` and not given their own entry: `Image`, a built image plus the log group the service created alongside it (`microvms-core/src/control/image.rs:58-59`); `RunMicrovmRequest` (`microvms-core/src/control/mod.rs:320`); `Microvm`, `ProxyToken`, `RunHookPayload`, `BaseImage`, `WaitOpts`, `ConnectorIntent`, and `build_artifact` (`microvms-core/src/control/mod.rs:58-61`).
-
-## microvms-core::session
-
-### Session
-
-```rs
-pub struct Session {
-```
-
-`Session` is the control API of one running MicroVM.
-
-`microvms-core/src/session/mod.rs:183`
-
-### Session::run
-
-```rs
-    pub async fn run(&self, req: protocol::exec::StartRequest) -> Result<ExecHandle, Error> {
-```
-
-`Session::run` starts a command and returns its handle without waiting. It uses the request's `exec_id` as the idempotency key.
-
-`microvms-core/src/session/mod.rs:333`
+`microvms-core/src/cost.rs:548-549`
 
 ### ExecHandle
 
@@ -134,9 +149,31 @@ pub struct Session {
 pub struct ExecHandle {
 ```
 
-`ExecHandle` addresses one exec by its caller-minted id. Because the id comes from the caller, a handle survives a process restart. Rebuild it with the same id and every method still addresses the same server-side exec.
+One exec addressed by its caller-minted id, which is also the idempotency key, so rebuilding a handle with the same id after a process restart still addresses the same server-side exec.
 
-`microvms-core/src/session/exec.rs:189`
+`microvms-core/src/session/exec.rs:213`
+
+### RateTable
+
+```rs
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RateTable {
+```
+
+The five us-east-1 rates, held privately so that pricing compute from the ARM rate is a property of the type rather than of a code path a caller can bypass.
+
+`microvms-core/src/cost.rs:848-849`
+
+### CostReport
+
+```rs
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CostReport {
+```
+
+Per-phase cost attribution for one sandbox, measured or projected, holding the rate table it was computed against so it stays reproducible after `pinned_rates` is updated.
+
+`microvms-core/src/cost.rs:1477-1478`
 
 ### ExecResult
 
@@ -150,156 +187,45 @@ pub struct ExecResult {
 }
 ```
 
-`ExecResult` holds an exec's phase and, once the child has exited, its outcome. It is a thin wrapper over the daemon's `PollResponse` rather than a re-modelling of it.
+An exec's phase and, once it has one, its outcome — a thin wrapper over the daemon's `PollResponse` rather than a re-modelling of it, so the two cannot disagree.
 
 `microvms-core/src/session/exec.rs:66-72`
 
-## microvms-core::sandbox
-
-### Sandbox
-
-```rs
-pub struct Sandbox {
-```
-
-`Sandbox` manages one MicroVM's whole life. It holds the state machine, the suspended window, and explicit teardown.
-
-`microvms-core/src/sandbox.rs:353`
-
-### Sandbox::build_image
-
-```rs
-    pub async fn build_image(&mut self, request: CreateImageRequest) -> Result<&Image, Error> {
-```
-
-`build_image` builds an image and waits for it to become usable. It runs every local guard before the call, because the create happens after the caller's artifact upload.
-
-`microvms-core/src/sandbox.rs:482`
-
-### Sandbox::run
-
-```rs
-    pub async fn run(&mut self, request: RunRequest) -> Result<&mut Session, Error> {
-```
-
-`Sandbox::run` launches a MicroVM, waits for RUNNING, and hands back its session. If the sandbox has already bootstrapped, the call fails locally, without making any control-plane calls.
-
-`microvms-core/src/sandbox.rs:521`
-
-### Sandbox::terminate
-
-```rs
-    pub async fn terminate(&mut self, opts: TeardownOpts) -> TeardownReport {
-```
-
-`terminate` tears down best-effort. It always returns a report rather than an error, and the report lists what leaked.
-
-`microvms-core/src/sandbox.rs:801`
-
-### Lifecycle
-
-```rs
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Lifecycle {
-```
-
-`Lifecycle` models the sandbox's `vm_state` as six states and no others, so variant strings like `"RUNNING "` and `"Running"` cannot both exist.
-
-`microvms-core/src/sandbox.rs:96-97`
-
-### RunRequest
-
-```rs
-#[derive(Clone, Debug)]
-pub struct RunRequest {
-```
-
-`RunRequest` holds everything a launch needs. Its defaults are the values the Python client measured, and it has an optional `agent_token` field for a caller that mints its own token.
-
-`launch_env` is a `HashMap<String, String>` delivered in the same `runHookPayload` as the token, and the daemon applies it as the base environment of every exec in that VM, under each request's own `env`. Empty by default, and an empty map produces byte-for-byte the payload this client always sent, so a caller who never touches the field cannot be affected by it existing. Build it one pair at a time with `with_launch_env(key, value)`. It shares the token's 4096-byte payload budget, and `RunHookPayload::for_launch` refuses an over-ceiling payload before any control-plane call, naming the byte count and how much of it the env accounted for.
-
-`microvms-core/src/sandbox.rs:145-146`
-
-### TeardownReport
-
-```rs
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct TeardownReport {
-```
-
-`TeardownReport` records what teardown deleted and what leaked. It is returned rather than raised because teardown runs where a `finally` would.
-
-`microvms-core/src/sandbox.rs:289-290`
-
-`TeardownOpts` selects which resources beyond the VM `terminate` should delete and whether to wait for TERMINATED (`microvms-core/src/sandbox.rs:228`).
-
-## microvms-core::cost
-
-### RateTable
+### Image
 
 ```rs
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct RateTable {
+pub struct Image {
 ```
 
-`RateTable` holds us-east-1 rates, pinned to the date and source they were read from. Its five rate fields are private, which forces compute to be priced from the ARM figure.
+A built image, and the log group the service created alongside it.
 
-`microvms-core/src/cost.rs:846-847`
-
-### CostReport
-
-```rs
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct CostReport {
-```
-
-`CostReport` gives per-phase cost attribution for one sandbox, either measured or projected. It holds the rate table it was computed against, so it stays reproducible after `pinned_rates` is updated.
-
-`microvms-core/src/cost.rs:1475-1476`
-
-### run_report
-
-```rs
-pub fn run_report(
-    size: SizeClass,
-    usage: &RunUsage,
-    rates: &RateTable,
-    today: CalendarDate,
-    label: impl Into<String>,
-) -> Result<CostReport, Error> {
-```
-
-`run_report` computes per-phase cost attribution for one sandbox's lifecycle. It takes `today` as a parameter rather than reading a clock, so a report is a pure function of its inputs.
-
-`microvms-core/src/cost.rs:1776-1782`
-
-### estimate_run
-
-```rs
-pub fn estimate_run(
-    size: SizeClass,
-    plan: &PlanUsage,
-    rates: &RateTable,
-    today: CalendarDate,
-    label: impl Into<String>,
-) -> Result<CostReport, Error> {
-```
-
-`estimate_run` computes what a plan will cost before anything is spent. It marks every duration `Provenance::Projected`, so the report cannot be mistaken for a measured one.
-
-`microvms-core/src/cost.rs:1898-1904`
+`microvms-core/src/control/image.rs:58-59`
 
 ## protocol
 
-### PROTOCOL_VERSION
+### protocol::exec::Phase
 
 ```rs
-pub const PROTOCOL_VERSION: &str = "1";
+#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Phase {
 ```
 
-`PROTOCOL_VERSION` is the protocol version. It tracks the `/v1/` path namespace rather than the crate version, so a daemon patch does not look like an incompatible upgrade.
+An exec's phase on the wire, with schemars reading the same `#[serde(...)]` attributes serde does so the published schema describes what the daemon actually emits.
 
-`protocol/src/lib.rs:58`
+`protocol/src/exec.rs:22-24`
+
+### protocol::health::Health
+
+```rs
+#[derive(Debug, Deserialize, JsonSchema, Serialize)]
+pub struct Health {
+```
+
+The `GET /v1/health` response: daemon version, bootstrap state, disk pressure, whether startup identity repair degraded, and the exec-activity pair `busy` / `execs`.
+
+`protocol/src/health.rs:10-11`
 
 ### protocol::exec::StartRequest
 
@@ -308,9 +234,20 @@ pub const PROTOCOL_VERSION: &str = "1";
 pub struct StartRequest {
 ```
 
-`StartRequest` is the `POST /v1/exec/start` body. Its `command` field is either an argv array or, with `shell: true`, a single script string.
+The `POST /v1/exec/start` body, whose `command` field is either an argv array or, with `shell: true`, a single script string.
 
-`protocol/src/exec.rs:64-65`
+`protocol/src/exec.rs:103-104`
+
+### protocol::exec::Outcome
+
+```rs
+#[derive(Clone, Debug, Default, Deserialize, JsonSchema, Serialize)]
+pub struct Outcome {
+```
+
+Captured output and exit status of a finished exec.
+
+`protocol/src/exec.rs:57-58`
 
 ### protocol::exec::PollResponse
 
@@ -325,84 +262,25 @@ pub struct PollResponse {
 }
 ```
 
-`PollResponse` is the `GET /v1/exec/{id}` body. It flattens the outcome into the response and omits it entirely while the exec is still running.
+The `GET /v1/exec/{id}` body, which flattens the outcome into the response and omits it entirely while the exec is still running.
 
-`protocol/src/exec.rs:190-197`
+`protocol/src/exec.rs:229-236`
 
-### protocol::health::Health
+## microvms-py
 
-```rs
-#[derive(Debug, Deserialize, JsonSchema, Serialize)]
-pub struct Health {
-```
+The Python module is declared rather than assembled: a `#[pymodule] mod microvms` lists its members in `#[pymodule_export]` use statements, 26 classes and 7 functions, so the macro can see the whole membership and `maturin generate-stubs` emits the real surface instead of a `__getattr__` escape hatch (`microvms-py/src/lib.rs:110-129`). The exception hierarchy stays imperative in `#[pymodule_init]`, because `create_exception!` builds its types at runtime and leaves no introspection record for `#[pymodule_export]` to carry (`microvms-py/src/lib.rs:103-137`). Every method is sync, blocking on one shared multi-thread tokio runtime with `py.detach` first (`microvms-py/src/lib.rs:42-46`). The generated stub and its PEP 561 marker are committed as `microvms-py/microvms.pyi` and `microvms-py/py.typed`, and `mise run stubs:check` fails when the committed stub no longer matches the pyo3 surface (`mise.toml:179-181`).
 
-`Health` is the `GET /v1/health` response. It reports the daemon version, bootstrap state, disk pressure, whether startup identity repair degraded, and the exec-activity pair `busy` / `execs`.
-
-`busy` and `execs` exist for an orchestrator *outside* the VM: the platform measures idleness by inbound traffic through the endpoint proxy, which terminates outside the guest, so a request from inside the guest cannot reset the idle timer and the orchestrator's own poll is the only traffic that counts. `busy` is true only while some exec is actually running, so an exited-but-unacked exec reads false; `execs` counts every registered entry in any phase. Both are `#[serde(default)]`, unlike every other field, because a client routinely talks to a daemon baked into an older image and a required field would make a health call fail outright against one.
-
-`protocol/src/health.rs:10-11`
-
-### protocol::hook::RunHookEnvelope
+### microvms-py Region
 
 ```rs
-#[derive(Debug, Deserialize, JsonSchema, Serialize)]
-pub struct RunHookEnvelope {
-    #[serde(rename = "runHookPayload")]
-    pub run_hook_payload: Option<String>,
-}
+#[pyclass(frozen, from_py_object, name = "Region", module = "microvms")]
+#[derive(Clone)]
+pub struct PyRegion {
 ```
 
-`RunHookEnvelope` is the envelope the platform posts to the run hook. Its single field is a string, so the caller's own JSON sits one `serde_json` parse deeper than the request body.
+An AWS region, closed over the five that run MicroVMs plus a named escape hatch, exported to Python as `Region`.
 
-`protocol/src/hook.rs:24-28`
-
-### protocol::hook::RunHook
-
-```rs
-#[derive(Debug, Default, Deserialize, JsonSchema, Serialize)]
-pub struct RunHook {
-    pub agent_token: String,
-    #[serde(default)]
-    pub env: HashMap<String, String>,
-}
-```
-
-`RunHook` is the caller's own payload, one parse inside `RunHookEnvelope`. `env` is optional and becomes the base environment of every later exec, under each request's own `env`.
-
-Read it with `RunHook::parse`, not with `serde_json::from_str`. The function walks the payload by hand so that every refusal is one of `RunHookError`'s named variants, and the reason is the trust contract rather than tidiness: serde's own messages quote the value they rejected, and the value here is the agent token. Each variant names a key or a shape and never a value. `parse` also ignores unknown keys, because a 400 at this hook makes the platform terminate the VM before forwarding any traffic — a newer client's unrecognised field must not be a dead launch.
-
-`protocol/src/hook.rs`
-
-### protocol::fs::FileReadQuery
-
-```rs
-#[derive(Debug, Default, Deserialize, JsonSchema, Serialize)]
-pub struct FileReadQuery {
-    pub path: String,
-    #[serde(default)]
-    pub start_line: Option<u64>,
-    #[serde(default)]
-    pub end_line: Option<u64>,
-}
-```
-
-`FileReadQuery` is `GET /v1/fs/file`'s query: `FsQuery`'s `path` plus an optional line range. A separate type from `FsQuery` because a line range means nothing on the write or tar routes and a shared type would publish it on all four; `mode` is absent here for the same reason pointing the other way.
-
-Both bounds are 1-based and inclusive, matching the AI SDK harness's `readTextFile`. An `end_line` past the last line reads through EOF without an error rather than answering 416. `start_line=0` and `end_line < start_line` are 400.
-
-`protocol/src/fs.rs`
-
-Also public and not given their own entry: `VERSION_HEADER`, the `microvms-agentd-version` response header on every response including errors (`protocol/src/lib.rs:66`); `protocol::exec::StreamKind`, `OutputEvent`, `GapEvent`, `ExitEvent`, `StdinRequest`, `StdinResponse`, `KillResponse`, `ErrorBody`, and the ten `ERROR_*` slugs a client branches on (`protocol/src/exec.rs:227-247`); and `protocol::hook::RunHookError`, the typed refusal `RunHook::parse` answers with.
-
-## Bindings
-
-Both bindings are typed, and neither type surface is written by hand.
-
-`microvms-py` ships `microvms/__init__.pyi` and a PEP 561 `py.typed` marker inside the wheel, so a checker reads the stub rather than inferring `Any`. The stub is generated by `./scripts/generate-py-stubs.py` in three stages: `maturin generate-stubs` reads pyo3's `experimental-inspect` introspection data out of the compiled cdylib (which is what carries the Rust doc comments into the stub), the trailing `def __getattr__(name: str) -> Incomplete` escape hatch maturin appends is dropped so an unknown name is an error rather than an `Any`, and the 14 `create_exception!` types are appended by importing the built module — `create_exception!` emits no introspection record, so that hierarchy cannot come from maturin. The committed copy lives at `microvms-py/microvms.pyi`, and `mise run stubs:check` fails when it no longer matches the crate.
-
-What that buys a caller is the trap closures at edit time rather than at run time. `EstimatedUsd.amount` is typed `str` and the class declares no `__float__`, `__int__`, `__index__`, or `__add__`, so laundering a dollar amount into arithmetic is a type error. `Duration` declares no `__new__`, so a span cannot be built without naming its provenance. `RunHookTimeout` and `BuildHookTimeout` are unrelated classes, so the 60x transposition is refused before pyo3's argument conversion runs. `MicrovmError` declares `code`, `kind`, `wire_kind`, and `retryable`, which is what lets a caller branch on an error without parsing its message. `microvms-py/examples/typed_usage.py` exercises each of these, and `microvms-py/tests/test_stubs.py` asserts the stub against the imported module by parsing it with `ast` rather than by re-running the generator.
-
-`microvms-js` gets `index.d.ts` from `napi build`, which napi-rs generates from the same Rust doc comments. It is deliberately **not** committed: `.gitignore` excludes it alongside the compiled `.node` addon and the generated `index.js` loader, because all three are one platform's build output. It therefore needs no drift gate — every consumer of it, local or CI, has just regenerated it. The one thing no gate covers is that nothing in this repo type-checks against it: the Node suite is six `.mjs` files and there is no `tsconfig.json`, so `index.d.ts` is a surface shipped for downstream TypeScript consumers rather than one this repo's own tests exercise.
+`microvms-py/src/region.rs:30-32`
 
 ### microvms-py Sandbox
 
@@ -411,138 +289,205 @@ What that buys a caller is the trap closures at edit time rather than at run tim
 pub struct PySandbox {
 ```
 
-`PySandbox` is the Python-facing sandbox. It exposes `build_image`, `run`, `suspend`, `resume`, and `terminate` as sync methods over one shared tokio runtime. Every state guard stays in the core crate.
+One MicroVM's whole life, with `build_image`, `run`, `suspend`, `resume`, and `terminate` as the five transitions and every state guard left in the core.
 
 `microvms-py/src/sandbox.rs:266-267`
 
-### microvms-js Sandbox
+### microvms-py Session
 
-```ts
-export declare class Sandbox {
+```rs
+#[pyclass(frozen, name = "Session", module = "microvms")]
+pub struct PySession {
 ```
 
-`Sandbox` is the Node-facing sandbox. It is built through the static async factory `create(region: Region): Promise<Sandbox>`, because credential resolution cannot happen in a napi constructor. The factory takes a `Region` instance rather than a string.
+One running MicroVM's control API, with the proxy auth handled for you.
 
-`microvms-js/index.d.ts:366`
+`microvms-py/src/session.rs:182-183`
+
+### microvms-py EstimatedUsd
+
+```rs
+#[pyclass(
+    frozen,
+    skip_from_py_object,
+    name = "EstimatedUsd",
+    module = "microvms"
+)]
+#[derive(Clone, Copy)]
+pub struct PyEstimatedUsd {
+```
+
+A dollar figure with no `__float__`, `__int__`, `__index__`, or `__add__`, whose `amount` answers a string, so `float(usd)` raises `TypeError` — the Python equivalent of the core's missing impl.
+
+`microvms-py/src/cost.rs:169-176`
+
+## microvms-js
+
+The Node surface has no barrel: every `#[napi]` item in the crate is exported, and `index.d.ts` plus the `index.js` loader and the compiled `.node` addon are generated by `napi build` and excluded from the repository as one platform's build output (`.gitignore:27-29`). Two shapes appear side by side and mean different things: `#[napi]` on a struct is a JS class with methods, while `#[napi(object)]` is a copied plain object with no methods, which is how the same wire results that pyo3 renders as frozen classes arrive in Node (`microvms-js/src/exec.rs:65-66`, `microvms-js/src/session.rs:48-49`). Construction diverges from Python for a reason that is structural rather than stylistic: `PySandbox` has a `#[new]` constructor that blocks on the shared runtime (`microvms-py/src/sandbox.rs:310-316`), and a `#[napi(constructor)]` cannot be async, so the Node class is built through a static factory instead (`microvms-js/src/sandbox.rs:354-358`).
+
+### microvms-js Region
+
+```rs
+#[napi]
+#[derive(Clone)]
+pub struct Region {
+```
+
+An AWS region, closed over the five that run MicroVMs plus a named escape hatch, taken as an instance rather than a string everywhere on this surface.
+
+`microvms-js/src/region.rs:33-35`
+
+### microvms-js Session
+
+```rs
+#[napi]
+pub struct Session {
+```
+
+One running MicroVM's control API, with the proxy auth handled for you.
+
+`microvms-js/src/session.rs:227-228`
+
+### microvms-js Sandbox
+
+```rs
+#[napi]
+pub struct Sandbox {
+```
+
+One MicroVM's whole life, with `buildImage`, `run`, `suspend`, `resume`, and `terminate` as the five transitions and every state guard left in the core.
+
+`microvms-js/src/sandbox.rs:345-346`
+
+### microvms-js ExecProcess
+
+```rs
+#[napi]
+pub struct ExecProcess {
+```
+
+A long-running exec in the AI SDK's `SandboxProcess` shape, built by `Session.spawn` and never by a constructor, and the one entry on this surface with no peer in `microvms-py`.
+
+`microvms-js/src/process.rs:192-193`
 
 ## HTTP
 
-The daemon serves 18 routes, assembled by walking one list (`agentd/src/routes.rs:332`) that both the router and `GET /v1/schema` read. A route cannot be served unless it appears in that list, and a listed route with no handler panics at startup (`agentd/src/routes.rs:31-35`).
+The daemon serves 18 routes. All of them come from one list, `surface_docs`, which `app` walks to build the router and `GET /v1/schema` walks to publish the document (`agentd/src/routes.rs:371-626`). A route cannot be served unless it appears in that list, and a listed route with no handler panics at startup rather than serving an undocumented surface (`agentd/src/routes.rs:110-140`). Each row also declares its auth, which is what splits the router in two: `Auth::Bearer` rows go behind the token guard, `Auth::Open` and `Auth::PlatformHook` rows do not (`agentd/src/routes.rs:51-59`).
 
-The six lifecycle hooks live under `HOOK_PREFIX` = `/aws/lambda-microvms/runtime/v1` (`protocol/src/hook.rs:13`). They are unauthenticated because the platform has no token to present, and a consumer must never call them. Every `/v1/` route except `health` and `schema` requires the bearer agent token.
+The six lifecycle hooks sit under a prefix fixed by the service, `/aws/lambda-microvms/runtime/v1` (`protocol/src/hook.rs:15`). They are unauthenticated because the platform has no token to present, and a consumer must never call them.
 
 ### POST /aws/lambda-microvms/runtime/v1/ready
 
-This is the image-build readiness probe. It answers 200 even before bootstrap, because the question it answers is whether the daemon started.
+The image-build readiness probe, answering 200 even before bootstrap, because the question it answers is whether the daemon started.
 
-`agentd/src/routes.rs:113`
+`agentd/src/routes.rs:401-408`
 
 ### POST /aws/lambda-microvms/runtime/v1/resume
 
-The daemon acknowledges this hook. The token, filesystem, exec records, and backgrounded processes survive a suspend/resume cycle. The guest's view of time jumps, however, so any held timeout or lease expires at once.
+Acknowledged; the token, filesystem, exec records, and even backgrounded processes survive a suspend/resume cycle, but the guest's view of time jumps, so any timeout or lease held by a running command expires at once.
 
-`agentd/src/routes.rs:117`
+`agentd/src/routes.rs:446-455`
 
 ### POST /aws/lambda-microvms/runtime/v1/run
 
-This hook is the one-shot token bootstrap. The `agent_token` sits inside `runHookPayload`, one JSON parse deeper than the request body.
+The one-shot token bootstrap and the optional launch environment beside it, both one JSON parse deeper than the request body inside `runHookPayload`, sharing the platform's 4096-byte payload budget.
 
-`agentd/src/routes.rs:115`
+`agentd/src/routes.rs:416-438`
 
 ### POST /aws/lambda-microvms/runtime/v1/suspend
 
-The daemon acknowledges and logs this hook.
+Acknowledged and logged.
 
-`agentd/src/routes.rs:116`
+`agentd/src/routes.rs:439-445`
 
 ### POST /aws/lambda-microvms/runtime/v1/terminate
 
-The daemon acknowledges this hook and begins graceful shutdown, draining in-flight requests.
+Acknowledged; begins graceful shutdown with in-flight requests draining.
 
-`agentd/src/routes.rs:118`
+`agentd/src/routes.rs:456-462`
 
 ### POST /aws/lambda-microvms/runtime/v1/validate
 
-This is the image-build validation probe. It behaves like `ready` and for the same reason.
+The image-build validation probe, on the same reasoning as `ready`.
 
-`agentd/src/routes.rs:114`
+`agentd/src/routes.rs:409-415`
 
 ### POST /v1/exec/start
 
-Starts a command under a caller-minted `exec_id`. The route is idempotent on that id, so a retry returns success without spawning a second child.
+Starts a command under a caller-minted `exec_id`, idempotent on that id, so a retry returns success without spawning a second child.
 
-`agentd/src/routes.rs:119`
+`agentd/src/routes.rs:463-474`
 
 ### GET /v1/exec/{id}
 
-Polls status and output. The route is read-only, so polling never mutates the entry, and output survives until an explicit ack.
+Polls status and output, read-only, so polling never mutates the entry and output survives until an explicit ack.
 
-`agentd/src/routes.rs:120`
+`agentd/src/routes.rs:475-485`
 
 ### POST /v1/exec/{id}/ack
 
-Releases output and moves the entry into TTL collection. Only acked entries are ever collected, so unread output is never destroyed.
+Releases output and enters TTL collection; only acked entries are ever collected, so output nobody read is never destroyed.
 
-`agentd/src/routes.rs:127`
+`agentd/src/routes.rs:519-529`
 
 ### POST /v1/exec/{id}/kill
 
-Sends SIGTERM then SIGKILL to the whole process group rather than just the direct child.
+Sends SIGTERM then SIGKILL to the whole process group rather than the direct child alone, because a shell that backgrounded a server leaves the interesting process outside the child pid.
 
-`agentd/src/routes.rs:128`
+`agentd/src/routes.rs:530-541`
 
 ### POST /v1/exec/{id}/stdin
 
-Writes to a child's stdin or signals EOF. It is a separate request from the output stream, so a dropped attach does not cost the ability to feed the process.
+Writes to a child's stdin or signals EOF, a separate request from the output stream so a dropped attach does not cost the ability to feed the process.
 
-`agentd/src/routes.rs:126`
+`agentd/src/routes.rs:504-518`
 
 ### GET /v1/exec/{id}/stream
 
-Follows output as Server-Sent Events from a byte offset. The stream emits `output`, `gap`, and a terminal `exit` event. Because a finished command always ends with `exit`, a body that closes without one means the connection failed.
+Follows output as Server-Sent Events from a byte offset, resumable with `?offset=N`; a body that ends without an `exit` event means the connection failed, not the command.
 
-`agentd/src/routes.rs:125`
+`agentd/src/routes.rs:486-503`
 
 ### GET /v1/fs/file
 
-Reads one file, streamed as `application/octet-stream`.
+Reads one file, or a 1-based inclusive line range of it, always streamed — an `end_line` past the last line reads through EOF without error, and omitting both bounds returns the whole file byte-identically.
 
-`agentd/src/routes.rs:132`
+`agentd/src/routes.rs:542-557`
 
 ### PUT /v1/fs/file
 
-Writes one file. The path is not confined to a root, because the same token already authorizes exec.
+Writes one file, deliberately not confined to a root, because the same token authorizes exec and a root prefix would add no security while breaking harnesses that write to home directories and `/etc`.
 
-`agentd/src/routes.rs:133`
+`agentd/src/routes.rs:558-570`
 
 ### GET /v1/fs/tar
 
-Downloads a tree as uncompressed tar, packing symlinks as symlinks.
+Downloads a tree as tar, packing symlinks as symlinks, which is the producing half of what extraction accepts.
 
-`agentd/src/routes.rs:134`
+`agentd/src/routes.rs:571-582`
 
 ### PUT /v1/fs/tar
 
-Uploads and extracts a tar under `?path=`. This is the one confined write path, because member paths come from the archive rather than the caller. The confinement mirrors the CPython tarfile `data` filter.
+Uploads and extracts a tar under `?path=`, the one confined write path because member paths come from the archive rather than the caller, mirroring the CPython tarfile `data` filter.
 
-`agentd/src/routes.rs:135`
+`agentd/src/routes.rs:583-598`
 
 ### GET /v1/health
 
-Reports liveness, the daemon version, and whether bootstrap has completed. The route is unauthenticated.
+Reports liveness, daemon version, bootstrap completion, and whether any exec is still running; `busy` exists so an orchestrator outside the VM can hold it alive, since the platform measures idleness by inbound traffic through a proxy that terminates outside the guest.
 
-`agentd/src/routes.rs:136`
+`agentd/src/routes.rs:599-614`
 
 ### GET /v1/schema
 
-Returns every route, shape, status code, and operative limit as one document. The route is unauthenticated, so a protocol-version mismatch stays diagnosable.
+Returns this document: every route, shape, status code, and operative limit.
 
-`agentd/src/routes.rs:137`
+`agentd/src/routes.rs:615-624`
 
 ## See also
 
-- [microvms-agentd · Impact analysis](../insights/impact-analysis.md)
-- [microvms-agentd · Business logic](../insights/business-logic.md)
-- [microvms-agentd · Contract map](../insights/contract-map.md)
-- [microvms-agentd · System overview](../architecture/system-overview.md)
-- [microvms-agentd · Debugging guide](../insights/debugging-guide.md)
+- [contract map](../insights/contract-map.md) — 22 shared source citations
+- [impact analysis](../insights/impact-analysis.md) — 21 shared source citations
+- [business logic](../insights/business-logic.md) — 13 shared source citations
+- [system overview](../architecture/system-overview.md) — 8 shared source citations
+- [debugging guide](../insights/debugging-guide.md) — 8 shared source citations
