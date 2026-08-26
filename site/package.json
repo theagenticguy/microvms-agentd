@@ -4,6 +4,7 @@
   "private": true,
   "type": "module",
   "description": "The documentation site for microvms-agentd, built so an agent can read it without rendering it.",
+  "packageManager": "pnpm@11.21.0",
   "engines": {
     "node": ">=22.12.0"
   },

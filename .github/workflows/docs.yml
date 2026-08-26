@@ -48,8 +48,18 @@ jobs:
         with:
           fetch-depth: 0
 
+      # The version comes from `site/package.json`'s `packageManager` field, which is where pnpm
+      # itself reads it, so the runner and a developer's shell cannot disagree about which pnpm
+      # built the lockfile. `package_json_file` is required because the input defaults to a
+      # `package.json` at the repository root, and this project's lives one directory down — with
+      # the default the action finds no file, reads no version, and fails with `No pnpm version is
+      # specified` before anything else in this job runs.
       - uses: pnpm/action-setup@v6
+        with:
+          package_json_file: site/package.json
 
+      # `cache: pnpm` needs pnpm already on PATH to resolve the store directory, which is why this
+      # step follows the one above rather than leading.
       - uses: actions/setup-node@v5
         with:
           # The floor `astro@7` declares. Named rather than inherited so a runner image
