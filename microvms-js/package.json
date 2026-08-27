@@ -1,5 +1,5 @@
 {
-  "name": "microvms",
+  "name": "@theagenticguy/microvms",
   "version": "0.1.0",
   "description": "Node bindings over microvms-core: the MicroVMs client with every trap closure",
   "license": "Apache-2.0",

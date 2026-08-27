@@ -142,7 +142,7 @@ fails `mise run check`.
 | `microvms-core/` | crates.io | `microvms-core` |
 | `microvms-cli/` | crates.io | `microvms-cli` (the binary stays `microvm`) |
 | `microvms-py/` | PyPI | `microvms` |
-| `microvms-js/` | npm | `microvms` + one package per platform triple |
+| `microvms-js/` | npm | `@theagenticguy/microvms` + one package per platform triple |
 
 `agentd` and `agentd-model` are `publish = false` on purpose, each with the reason in its own
 manifest: the daemon reaches a consumer as a static aarch64 binary baked into a task image,
@@ -185,8 +185,17 @@ Three things about the registry surface that a manifest does not make obvious:
   first release is worth tagging `0.1.0-rc.1` and yanking rather than burning the number.
 - npm requires the package to exist before a trusted publisher can be configured, and there
   is no org- or scope-level configuration — the root package and every platform package each
-  need their own. crates.io has the same first-publish requirement. PyPI does not: a pending
-  publisher creates the project on first use, so the Python side never needs a token.
+  need their own. crates.io has the same first-publish requirement, plus a **verified email
+  address on the account**, which no dry run surfaces because `--dry-run` never reaches the
+  upload endpoint. PyPI needs neither: a pending publisher creates the project on first use,
+  so the Python side never needs a token.
+- The npm package is scoped **because a granular token can only be restricted to packages
+  that already exist, or to a scope.** The five packages a bootstrap has to create do not
+  exist yet, so an unscoped name would require an all-packages token — write access to the 19
+  unrelated packages this account already owns. `@theagenticguy` was an empty scope, so a
+  token restricted to it reaches exactly the new packages and nothing else. That reasoning
+  applies again every time a platform triple is added, because a new platform package is
+  another package OIDC cannot create.
 - `npm publish --dry-run` is **not** safe here. napi's `prepublishOnly` runs `napi
   prepublish`, which really publishes the platform packages. Use `--ignore-scripts`.
 
