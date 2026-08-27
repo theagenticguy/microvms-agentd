@@ -287,6 +287,19 @@ description = "The publish set is the intended one and every manifest can upload
 # flips either one has to say so.
 run = "./scripts/check-publishable.py"
 
+[tasks."release:tag"]
+description = "Create and push a release tag, refusing a reused or stale one. THE way to release"
+# `git tag` is not idempotent and its failure is not fatal to a shell sequence: a leftover local
+# `v0.1.0` from three weeks earlier made `git tag -a v0.1.0` fail while the following
+# `git push origin v0.1.0` succeeded, pushing the OLD tag at a commit predating the crate rename
+# and the release workflow. No CI check separates that from a real release — an ancestry test
+# passes an old commit on main, and the tag-versus-manifest check passes it too, because every
+# version here read `0.1.0` for weeks.
+#
+# So the control is here, before the tag exists: no reuse local or remote, a clean tree, HEAD at
+# main's tip, and `publish:check` against the tag.
+run = "./scripts/release-tag.sh"
+
 [tasks."npm:check"]
 description = "The npm package's loader and glibc floor. Needs a built addon"
 # Out of `check`, because both gates read build artifacts rather than sources: `index.js` and

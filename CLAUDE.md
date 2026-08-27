@@ -168,12 +168,20 @@ which name crates explicitly, are the only ones that go red. Markdown is deliber
 scope — the counterexample four paragraphs up is a `-p protocol` this gate would otherwise
 flag.
 
-A release is one tag. `.github/workflows/release.yml` fires on `v*` and publishes all three
-registries plus the daemon binary, holding no secrets: every credential is minted from the
-OIDC token GitHub issues to that run. Bumping a version means bumping it in three unrelated
-files — the Cargo manifests, `microvms-py/pyproject.toml`, `microvms-js/package.json` — and
+A release is one tag, and `mise run release:tag vX.Y.Z` is how to create it — never `git tag`
+followed by `git push`. `git tag` refuses to overwrite and that refusal does not stop a
+following push, so a tag name left over from an earlier attempt gets pushed still pointing at
+its old commit. Nothing downstream catches it: an ancestry check passes an old commit on main,
+and the tag-versus-manifest check passes it too, because every version here read `0.1.0` for
+weeks.
+
+`.github/workflows/release.yml` fires on `v*` and publishes all three registries plus the daemon
+binary, holding no secrets: every credential is minted from the OIDC token GitHub issues to that
+run. Bumping a version means bumping it in three unrelated files — the Cargo manifests,
+`microvms-py/pyproject.toml`, `microvms-js/package.json` — and
 `./scripts/check-publishable.py --tag=vX.Y.Z` is what refuses a tag that disagrees with any of
-them.
+them. A version bump also changes `microvms-py/microvms.pyi`, because the stub declares
+`__version__` from `microvms_core::VERSION`, so `mise run stubs` belongs in the same commit.
 
 Renaming `release.yml` invalidates **eleven** trusted-publisher configurations at once (three
 crates, one PyPI project, the npm root and four platform packages), and npm does not validate
