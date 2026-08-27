@@ -17,7 +17,7 @@ description = "Exec and file-transfer daemon for AWS Lambda MicroVMs"
 # know lives there, so a field renamed on one side fails to compile on the other —
 # which is earlier and cheaper than the schema artifact catching it in CI, and far
 # earlier than a consumer catching it at runtime.
-protocol = { package = "microvms-protocol", version = "0.1.0", path = "../protocol" }
+protocol = { package = "microvms-protocol", version = "0.1.1", path = "../protocol" }
 axum = "0.8.9"
 # tower-http 0.7 is a breaking line; axum 0.8.9 pins ^0.6.8 internally, so we
 # stay on 0.6 to keep one version of the middleware types in the tree.

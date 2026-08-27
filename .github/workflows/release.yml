@@ -91,7 +91,15 @@ jobs:
 
   crates-io:
     name: publish to crates.io
-    needs: guard
+    # Waits for EVERY artifact to build, not just the guard, and that ordering is what v0.1.0
+    # was missing. With `needs: guard` alone this job published three immutable crates while the
+    # aarch64 wheel and addon were still failing, so PyPI and npm skipped and 0.1.0 became a
+    # version that exists on one registry of three and can never exist on the other two.
+    #
+    # Nothing here makes a release atomic — crates.io, PyPI and npm are three separate
+    # irreversible acts. What this does is move every *buildable* failure ahead of the first
+    # one, so a broken artifact costs a re-tag rather than a burnt version number.
+    needs: [guard, wheels, sdist, addons]
     runs-on: ubuntu-latest
     environment: release
     permissions:
@@ -128,25 +136,53 @@ jobs:
     needs: guard
     strategy:
       fail-fast: false
+      # `zig` is set only on the aarch64 linux leg, and it is what makes that wheel exist at
+      # all. `manylinux: auto` for aarch64 selects a manylinux2014 cross container whose GCC is
+      # glibc-2.17 era, and `aws-lc-sys` does not compile with it — no `stdatomic.h`, no
+      # `AT_HWCAP2`, `-march=armv8.4-a+sha3` unknown. That is what failed the v0.1.0 release.
+      #
+      # `maturin --zig` compiles through zig instead and produces a wheel tagged
+      # `manylinux_2_17_aarch64`, whose extension module was verified to reference nothing above
+      # GLIBC_2.17 — the tag checked against the shipped `.so`'s symbols rather than trusted,
+      # because an overstated manylinux tag is an install that succeeds and an import that
+      # fails.
+      #
+      # `container: off` runs maturin on the runner rather than in that container, which is the
+      # arrangement the verification used: maturin finds zig on PATH.
       matrix:
         include:
-          - { runner: ubuntu-latest, target: x86_64, manylinux: auto }
-          - { runner: ubuntu-latest, target: aarch64, manylinux: auto }
-          - { runner: macos-latest, target: aarch64 }
+          - { runner: ubuntu-latest, target: x86_64, manylinux: auto, container: '', zig: '' }
+          - { runner: ubuntu-latest, target: aarch64, manylinux: '2_17', container: 'off', zig: '--zig' }
+          - { runner: macos-latest, target: aarch64, manylinux: '', container: '', zig: '' }
           # Cross-compiled from the arm64 macOS runner rather than built natively: Rust
           # demoted `x86_64-apple-darwin` to Tier 2 in 1.90 and GitHub is discontinuing free
           # macOS x86_64 runners for public repositories.
-          - { runner: macos-latest, target: x86_64 }
-          - { runner: windows-latest, target: x64 }
+          - { runner: macos-latest, target: x86_64, manylinux: '', container: '', zig: '' }
+          - { runner: windows-latest, target: x64, manylinux: '', container: '', zig: '' }
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        if: matrix.zig != ''
+        with:
+          targets: aarch64-unknown-linux-gnu
+      # The same pinned tarball the addons job uses, for the same reason: one zig acquisition
+      # mechanism, and the one the verification ran against.
+      - name: install zig (pinned, checksummed)
+        if: matrix.zig != ''
+        run: |
+          set -euo pipefail
+          curl -sSfL -o zig.tar.xz https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz
+          echo "70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00  zig.tar.xz" | sha256sum -c -
+          tar -xJf zig.tar.xz
+          echo "$PWD/zig-x86_64-linux-0.16.0" >> "$GITHUB_PATH"
       - uses: PyO3/maturin-action@v1.51.0
         with:
           command: build
-          args: --release -m microvms-py/Cargo.toml --out dist
+          args: --release -m microvms-py/Cargo.toml --out dist ${{ matrix.zig }}
           target: ${{ matrix.target }}
           manylinux: ${{ matrix.manylinux }}
+          container: ${{ matrix.container }}
           sccache: 'true'
       - uses: actions/upload-artifact@v7
         with:
@@ -183,11 +219,20 @@ jobs:
     permissions:
       id-token: write # exchanged for a short-lived PyPI token, and signs the attestations
     steps:
+      - uses: actions/checkout@v7
       - uses: actions/download-artifact@v7
         with:
           pattern: dist-*
           merge-multiple: true
           path: dist
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: false
+      # Every wheel against its own manylinux tag, before anything immutable is uploaded. pip
+      # selects by that tag and trusts it, so an overstated one installs and then fails to
+      # import — and the aarch64 wheel is built through zig precisely to keep that claim true.
+      - name: every wheel honours its manylinux tag
+        run: ./scripts/check-addon-glibc.py dist
       # No `password:` and no `user:`. The action performs the OIDC exchange itself, and it
       # generates and uploads PEP 740 attestations by default — so provenance needs no
       # configuration here, only the permission above.
@@ -217,8 +262,8 @@ jobs:
       # and that floor is invisible to any test running on the image that produced it.
       matrix:
         include:
-          - { runner: ubuntu-latest, target: x86_64-unknown-linux-gnu, cross: '--use-napi-cross' }
-          - { runner: ubuntu-latest, target: aarch64-unknown-linux-gnu, cross: '--use-napi-cross' }
+          - { runner: ubuntu-latest, target: x86_64-unknown-linux-gnu, cross: '--cross-compile' }
+          - { runner: ubuntu-latest, target: aarch64-unknown-linux-gnu, cross: '--cross-compile' }
           - { runner: macos-latest, target: aarch64-apple-darwin, cross: '' }
           - { runner: windows-latest, target: x86_64-pc-windows-msvc, cross: '' }
     runs-on: ${{ matrix.runner }}
@@ -231,6 +276,16 @@ jobs:
       - uses: actions/setup-node@v7
         with:
           node-version: '24'
+      # zig backs `--cross-compile`; napi installs `cargo-zigbuild` but not zig. Pinned and
+      # checksummed, as `addons.yml` records at length.
+      - name: install zig (pinned, checksummed)
+        if: matrix.cross != ''
+        run: |
+          set -euo pipefail
+          curl -sSfL -o zig.tar.xz https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz
+          echo "70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00  zig.tar.xz" | sha256sum -c -
+          tar -xJf zig.tar.xz
+          echo "$PWD/zig-x86_64-linux-0.16.0" >> "$GITHUB_PATH"
       - name: napi build
         working-directory: microvms-js
         run: >
