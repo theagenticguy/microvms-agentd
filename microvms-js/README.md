@@ -1,9 +1,9 @@
-# microvms
+# @theagenticguy/microvms
 
 Node bindings over `microvms-core`, the client library for AWS Lambda MicroVMs.
 
 ```bash
-npm install microvms
+npm install @theagenticguy/microvms
 ```
 
 A prebuilt native addon per platform, selected through `optionalDependencies`. No compiler

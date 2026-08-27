@@ -76,6 +76,25 @@ SELECTOR_FILES = (
     "mise.toml",
 )
 
+#: Workflows whose addon build matrix must cover exactly `napi.targets`.
+#:
+#: `microvms-js/package.json` is the source of truth, because that list decides which npm
+#: packages exist and which entries `napi pre-publish` writes into the root package's
+#: `optionalDependencies`. A triple in a workflow and not in the manifest builds an artifact no
+#: package wants; a triple in the manifest and not in a workflow ships a root package naming a
+#: platform nothing built, and a consumer on it gets an unresolvable install.
+ADDON_WORKFLOWS = (
+    ".github/workflows/addons.yml",
+    ".github/workflows/release.yml",
+)
+
+#: A Rust triple in a `target:` key, told apart from maturin's by shape.
+#:
+#: `release.yml` also carries a wheel matrix whose `target:` values are maturin's own names —
+#: `x86_64`, `aarch64`, `x64` — and those are not Rust triples and must not be compared against
+#: `napi.targets`. Two or more hyphens is what separates them.
+WORKFLOW_TARGET = re.compile(r"target:\s*([A-Za-z0-9_.-]+)")
+
 #: `-p foo` and `--package foo`, the two spellings cargo accepts.
 #:
 #: Only applied to a line that invokes `cargo`, because `-p` is not cargo's alone: `mkdir -p
@@ -144,6 +163,47 @@ def stale_selectors(names: set[str]) -> list[str]:
     return failures
 
 
+def addon_target_drift() -> list[str]:
+    """Every workflow whose addon matrix disagrees with `napi.targets`.
+
+    The npm side of a release is five packages, and four of them are named after a platform
+    triple. Nothing in a build reconciles the workflow matrix with the manifest, so the two
+    drift silently and the symptom arrives at a consumer rather than at CI: a root package
+    listing `@theagenticguy/microvms-darwin-arm64` at an exact version that was never
+    published resolves to nothing, and `npm install` fails on that platform alone.
+    """
+    manifest = json.loads(Path("microvms-js/package.json").read_text())
+    declared = set(manifest.get("napi", {}).get("targets") or [])
+    failures: list[str] = []
+
+    if not declared:
+        return ["microvms-js/package.json declares no `napi.targets`"]
+
+    for relative in ADDON_WORKFLOWS:
+        path = Path(relative)
+        if not path.exists():
+            failures.append(f"{relative} is in ADDON_WORKFLOWS and does not exist")
+            continue
+        found = {
+            value
+            for line in path.read_text().splitlines()
+            if not line.lstrip().startswith("#")
+            for value in WORKFLOW_TARGET.findall(line)
+            if value.count("-") >= 2
+        }
+        for triple in sorted(found - declared):
+            failures.append(
+                f"{relative} builds {triple}, which is not in `napi.targets`. That artifact "
+                f"belongs to no npm package."
+            )
+        for triple in sorted(declared - found):
+            failures.append(
+                f"{relative} does not build {triple}, which `napi.targets` declares. The root "
+                f"package would name a platform package that was never published."
+            )
+    return failures
+
+
 def tag_version_skew(tag: str, packages: list[dict]) -> list[str]:
     """Every manifest whose version disagrees with the release tag.
 
@@ -200,6 +260,7 @@ def main() -> int:
     failures: list[str] = []
 
     failures.extend(stale_selectors({p["name"] for p in packages}))
+    failures.extend(addon_target_drift())
 
     tag = next((a.split("=", 1)[1] for a in sys.argv if a.startswith("--tag=")), None)
     if tag:
