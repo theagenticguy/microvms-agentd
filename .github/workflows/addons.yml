@@ -35,20 +35,24 @@ jobs:
       # `scripts/check-publishable.py` asserts the two agree, for this file and `release.yml`
       # together. The runner choice stays here: which machine builds a triple is CI's
       # business, not the package's.
-      # `cross` is `--use-napi-cross` for the glibc targets and empty elsewhere, and it is the
-      # difference between a portable addon and one that only runs on this month's runner
-      # image. A native build links against the host's glibc: `ubuntu-latest` is Ubuntu 24.04
-      # (glibc 2.39), and the resulting addon fails to load on RHEL 9, Amazon Linux 2023,
-      # Debian 12 and Ubuntu 22.04 — measured, see `scripts/check-addon-glibc.py`.
-      # `--use-napi-cross` downloads `@napi-rs/cross-toolchain` (glibc 2.17) and the same build
-      # comes out needing no more than GLIBC_2.16.
+      # `cross` is `--cross-compile` for the glibc targets and empty elsewhere, and it decides
+      # whether the addon runs anywhere but this month's runner image. A native build links
+      # against the host's glibc: `ubuntu-latest` is Ubuntu 24.04, so the addon requires
+      # GLIBC_2.39 and fails to load on every current distribution below that. Measured, see
+      # `scripts/check-addon-glibc.py`.
       #
-      # Both linux targets therefore build on the x64 runner: that toolchain cross-compiles to
-      # arm64, so a native arm64 runner would only reintroduce the host's glibc.
+      # `--cross-compile` routes through `cargo-zigbuild`, which yields GLIBC_2.30 on both linux
+      # targets. `--use-napi-cross` would give a lower floor still — 2.16 — and cannot be used:
+      # its toolchain is glibc-2.17-era GCC and `aws-lc-sys` does not compile for aarch64 with
+      # it (no `stdatomic.h`, no `AT_HWCAP2`, `-march=armv8.4-a+sha3` unknown). That is what
+      # broke the v0.1.0 release, after the x64 leg passed and hid it.
+      #
+      # Both linux targets build on the x64 runner: zig cross-compiles to arm64, so a native
+      # arm64 runner would only reintroduce its own glibc.
       matrix:
         include:
-          - { runner: ubuntu-latest, target: x86_64-unknown-linux-gnu, cross: '--use-napi-cross' }
-          - { runner: ubuntu-latest, target: aarch64-unknown-linux-gnu, cross: '--use-napi-cross' }
+          - { runner: ubuntu-latest, target: x86_64-unknown-linux-gnu, cross: '--cross-compile' }
+          - { runner: ubuntu-latest, target: aarch64-unknown-linux-gnu, cross: '--cross-compile' }
           - { runner: macos-latest, target: aarch64-apple-darwin, cross: '' }
           - { runner: windows-latest, target: x86_64-pc-windows-msvc, cross: '' }
     runs-on: ${{ matrix.runner }}
@@ -61,6 +65,28 @@ jobs:
       - uses: actions/setup-node@v7
         with:
           node-version: '24'
+
+      # zig is the compiler and linker behind `--cross-compile`, and napi auto-installs
+      # `cargo-zigbuild` but not zig itself. Pinned and checksummed rather than fetched from a
+      # third-party action, matching how `ci.yml` obtains syft, grype, betterleaks and
+      # osv-scanner: refreshing this means updating both the version and the hash from
+      # https://ziglang.org/download/index.json.
+      #
+      # `cargo-zigbuild` also accepts a pip-installed `ziglang` module, which is NOT used here
+      # because the verification behind this change ran against a real zig binary. Shipping the
+      # arrangement that was measured beats shipping the one that should also work.
+      - name: install zig (pinned, checksummed)
+        if: matrix.cross != ''
+        run: |
+          set -euo pipefail
+          curl -sSfL -o zig.tar.xz https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz
+          echo "70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00  zig.tar.xz" | sha256sum -c -
+          tar -xJf zig.tar.xz
+          echo "$PWD/zig-x86_64-linux-0.16.0" >> "$GITHUB_PATH"
+      - name: zig is on PATH
+        if: matrix.cross != ''
+        run: zig version
+
       # `--release` matters: a debug addon is around 250 MB against a few tens of megabytes
       # stripped, and npm would carry that forever at an immutable version.
       - name: napi build
