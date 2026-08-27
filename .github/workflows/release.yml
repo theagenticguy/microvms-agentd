@@ -1,10 +1,9 @@
 name: release
 
-# Tag-triggered, and the tag is the only input. Every registry config below pins trust to
-# THIS filename, so renaming this file silently invalidates eleven trusted-publisher
-# configurations — three crates on crates.io, one project on PyPI, and the npm root plus
-# four platform packages. npm does not validate its configuration when you save it; the
-# error appears only at publish time.
+# Tag-triggered, and the tag is the only input. Every registry config pins trust to THIS
+# filename, so renaming this file silently invalidates five trusted-publisher configurations:
+# three crates on crates.io, one project on PyPI, one package on npm. npm does not validate
+# its configuration when you save it, so the error appears only at publish time.
 on:
   push:
     tags: ['v*']
@@ -169,9 +168,18 @@ jobs:
 
   # ── npm ─────────────────────────────────────────────────────────────────
   #
-  # Four native builds, one per platform, because the addon is a compiled artifact and npm
-  # selects it through `optionalDependencies`. Every runner is native — including
-  # `ubuntu-24.04-arm` for aarch64 Linux — so nothing here cross-compiles a C toolchain.
+  # Four builds, ONE package. The addon is a compiled artifact per platform, and the usual
+  # napi layout publishes a package per platform plus a root that selects between them through
+  # `optionalDependencies`. This ships all four binaries in the single package instead, which
+  # the generated loader already supports because it tries a local
+  # `./<binaryName>.<suffix>.node` before any per-platform package.
+  #
+  # The trade is measured: 12.2 MB packed and 25.9 MB unpacked against roughly 3 MB for the
+  # matching-platform-only layout. What it buys is one trusted-publisher configuration instead
+  # of five, and — the reason it is worth it — no bootstrap problem when a platform is added.
+  # npm cannot create a package over OIDC, so under the split layout every new triple needs a
+  # fresh non-OIDC publish with a credential to match. Under one package a new triple is a
+  # matrix entry.
   addons:
     name: build the node addon (${{ matrix.target }})
     needs: guard
@@ -270,59 +278,42 @@ jobs:
           '
           npx --yes semver@7 -r ">=11.5.1" "$(npm --version)" > /dev/null \
             || { echo "npm $(npm --version) predates trusted publishing (needs >= 11.5.1)"; exit 1; }
+      # Every platform's addon lands beside the loader in ONE package, so they download
+      # straight into the package directory rather than into a staging area. `napi
+      # create-npm-dirs`, `napi artifacts` and `napi pre-publish` are all absent: those exist
+      # to build and publish a package per platform, which this no longer does.
+      #
+      # The generated loader already prefers a local file — `require('./microvms.<triple>.node')`
+      # is tried before `require('<package>-<suffix>')` — so one package carrying all four
+      # binaries works with the loader unchanged and no `optionalDependencies` at all.
       - uses: actions/download-artifact@v7
         with:
           pattern: addon-*
           merge-multiple: true
-          path: microvms-js/artifacts
-      # The loader and types, which the root package cannot be published without.
+          path: microvms-js
+      # The loader and types, which the package cannot be published without: both are
+      # gitignored and this job never runs `napi build`.
       - uses: actions/download-artifact@v7
         with:
           name: binding-js
           path: microvms-js
-      # `napi artifacts` IS the completeness gate, and no separate check is wired after it.
-      # napi's release documentation asks for one, on the grounds that the CLI warns and
-      # continues when an expected target binary is missing — that is not true of the version
-      # pinned here. Probed 2026-08-26 with `@napi-rs/cli` 3.8, staging one of four binaries:
-      # `Internal Error: Missing artifacts for configured targets: aarch64-unknown-linux-gnu
-      # (microvms.linux-arm64-gnu.node), ...` and a non-zero exit.
-      #
-      # Two layers above it close the same hole from the other side: `needs: addons` skips
-      # this whole job if any matrix leg failed, and `if-no-files-found: error` fails a leg
-      # that built nothing. A fourth check here would report coverage these three already
-      # provide.
-      - name: assemble the per-platform packages
+      # The loader is generated against whatever `name` was in `package.json` at build time and
+      # nothing reconciles the two, so a rename ships a package whose `require` fails on every
+      # platform while `npm install` succeeds. Measured on
+      # `@theagenticguy/microvms@0.1.0-rc.1`, which shipped a loader from before the package
+      # was scoped. This also asserts every configured triple has its binary present, which is
+      # what `napi artifacts` used to fail on.
+      - name: the loader resolves every configured platform
+        run: ./scripts/check-npm-loader.py --all-platforms
+      - name: the addons stay within the glibc ceiling
+        run: ./scripts/check-addon-glibc.py microvms-js
+      # One publish. OIDC mints the credential and npm generates the provenance attestation
+      # automatically, because this is a public package from a public repository — the
+      # `--provenance` flag is not needed, and `publishConfig` deliberately does not set it,
+      # since that would break a publish from anywhere without an OIDC identity.
+      - name: publish
         working-directory: microvms-js
-        run: |
-          set -euo pipefail
-          npx -y -p @napi-rs/cli@3 napi create-npm-dirs
-          npx -y -p @napi-rs/cli@3 napi artifacts --output-dir artifacts --npm-dir npm
-      # The one thing `napi artifacts` does NOT check: whether the root package's loader can
-      # find the platform packages it is about to be published beside. It is generated against
-      # whatever `name` was in `package.json` at build time and nothing reconciles the two, so
-      # a rename ships a root whose `require` fails on every platform while `npm install`
-      # succeeds. Measured on `@theagenticguy/microvms@0.1.0-rc.1`, which shipped a loader from
-      # before the package was scoped.
-      - name: the loader resolves the packages it ships beside
-        run: ./scripts/check-npm-loader.py
-      # Re-asserted over the assembled packages, not only per build leg. What ships is whatever
-      # landed in `npm/<target>/`, and an artifact can be replaced between the build and here.
-      - name: the assembled addons stay within the glibc ceiling
-        run: ./scripts/check-addon-glibc.py microvms-js/npm
-      # `napi pre-publish` publishes the four platform packages; `npm publish` publishes the
-      # root. Both go over OIDC, and npm generates the provenance attestation automatically
-      # because this is a public package from a public repository — the `--provenance` flag
-      # is not needed and `publishConfig` deliberately does not set it, since that would
-      # break a publish from anywhere without an OIDC identity.
-      #
-      # `--no-gh-release`: the `github-release` job below owns the release and its assets, and
-      # two creators of one release race each other.
-      - name: publish the platform packages, then the root
-        working-directory: microvms-js
-        run: |
-          set -euo pipefail
-          npx -y -p @napi-rs/cli@3 napi pre-publish -t npm --no-gh-release --npm-dir npm
-          npm publish --access public
+        run: npm publish --access public
 
   # ── the daemon, and the attestation crates.io cannot give ────────────────
   #
