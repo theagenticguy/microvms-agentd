@@ -47,7 +47,34 @@ jobs:
     name: the tag and the manifests agree
     runs-on: ubuntu-latest
     steps:
+      # Whole history, because the ancestry check below needs it and a shallow clone has none.
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      # Catches a tag created on a branch that was never merged, which is what tagging from a
+      # working branch produces.
+      #
+      # It does NOT catch a stale tag reused from an earlier attempt, and that limit is measured
+      # rather than assumed: a leftover local `v0.1.0` from 2026-08-06 pointed at a commit
+      # older than the crate rename and the publish flags, and that commit is a perfectly good
+      # ancestor of main — this check passes it. The manifest comparison below cannot separate
+      # them either, because every version in this repository read `0.1.0` for weeks, so a
+      # stale tag agrees with the manifests it predates.
+      #
+      # `mise run release:tag` is the control for that case, because the mistake happens at
+      # tag time, not at run time.
+      - name: the tagged commit is on main
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          git fetch --no-tags --quiet origin main
+          if ! git merge-base --is-ancestor HEAD FETCH_HEAD; then
+            echo "::error::$TAG points at $(git rev-parse --short HEAD), which is not on main."
+            echo "Tagging from a working branch produces this; tag a commit that is on main."
+            exit 1
+          fi
+          echo "$TAG -> $(git rev-parse --short HEAD), on main"
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: astral-sh/setup-uv@v7
