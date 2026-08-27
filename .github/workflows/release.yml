@@ -91,7 +91,15 @@ jobs:
 
   crates-io:
     name: publish to crates.io
-    needs: guard
+    # Waits for EVERY artifact to build, not just the guard, and that ordering is what v0.1.0
+    # was missing. With `needs: guard` alone this job published three immutable crates while the
+    # aarch64 wheel and addon were still failing, so PyPI and npm skipped and 0.1.0 became a
+    # version that exists on one registry of three and can never exist on the other two.
+    #
+    # Nothing here makes a release atomic — crates.io, PyPI and npm are three separate
+    # irreversible acts. What this does is move every *buildable* failure ahead of the first
+    # one, so a broken artifact costs a re-tag rather than a burnt version number.
+    needs: [guard, wheels, sdist, addons]
     runs-on: ubuntu-latest
     environment: release
     permissions:
