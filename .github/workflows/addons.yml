@@ -35,12 +35,22 @@ jobs:
       # `scripts/check-publishable.py` asserts the two agree, for this file and `release.yml`
       # together. The runner choice stays here: which machine builds a triple is CI's
       # business, not the package's.
+      # `cross` is `--use-napi-cross` for the glibc targets and empty elsewhere, and it is the
+      # difference between a portable addon and one that only runs on this month's runner
+      # image. A native build links against the host's glibc: `ubuntu-latest` is Ubuntu 24.04
+      # (glibc 2.39), and the resulting addon fails to load on RHEL 9, Amazon Linux 2023,
+      # Debian 12 and Ubuntu 22.04 — measured, see `scripts/check-addon-glibc.py`.
+      # `--use-napi-cross` downloads `@napi-rs/cross-toolchain` (glibc 2.17) and the same build
+      # comes out needing no more than GLIBC_2.16.
+      #
+      # Both linux targets therefore build on the x64 runner: that toolchain cross-compiles to
+      # arm64, so a native arm64 runner would only reintroduce the host's glibc.
       matrix:
         include:
-          - { runner: ubuntu-latest, target: x86_64-unknown-linux-gnu }
-          - { runner: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu }
-          - { runner: macos-latest, target: aarch64-apple-darwin }
-          - { runner: windows-latest, target: x86_64-pc-windows-msvc }
+          - { runner: ubuntu-latest, target: x86_64-unknown-linux-gnu, cross: '--use-napi-cross' }
+          - { runner: ubuntu-latest, target: aarch64-unknown-linux-gnu, cross: '--use-napi-cross' }
+          - { runner: macos-latest, target: aarch64-apple-darwin, cross: '' }
+          - { runner: windows-latest, target: x86_64-pc-windows-msvc, cross: '' }
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v7
@@ -58,9 +68,38 @@ jobs:
         run: >
           npx -y -p @napi-rs/cli@3 napi build
           --manifest-path ../Cargo.toml --package microvms-js
-          --platform --release --target ${{ matrix.target }} --output-dir .
+          --platform --release --target ${{ matrix.target }} ${{ matrix.cross }} --output-dir .
+
+      # Only the glibc legs have a floor to assert, which is exactly `cross != ''`.
+      - uses: astral-sh/setup-uv@v7
+        if: matrix.cross != ''
+        with:
+          enable-cache: false
+      - name: the addon does not demand a newer glibc than its oldest supported host
+        if: matrix.cross != ''
+        run: ./scripts/check-addon-glibc.py microvms-js
       - uses: actions/upload-artifact@v7
         with:
           name: addon-${{ matrix.target }}
           path: microvms-js/*.node
+          if-no-files-found: error
+
+      # The generated loader and type declarations, from ONE leg. Both are
+      # platform-independent — the loader enumerates every configured target and picks at
+      # runtime — and both are gitignored, so a job that publishes without building has no
+      # other way to obtain them, and `package.json` names `index.js` in `files` and points
+      # `main` at it. Uploading from all four legs would mean four artifacts of identical
+      # content with no designated source.
+      #
+      # The loader is also generated against whatever `name` was in `package.json` at build
+      # time, which is why it has to come from a build of THIS commit rather than a developer's
+      # working copy. `scripts/check-npm-loader.py` asserts the two agree.
+      - name: upload the generated loader and types
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        uses: actions/upload-artifact@v7
+        with:
+          name: binding-js
+          path: |
+            microvms-js/index.js
+            microvms-js/index.d.ts
           if-no-files-found: error

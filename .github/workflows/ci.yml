@@ -363,6 +363,13 @@ jobs:
         run: |
           npx -y -p @napi-rs/cli@3 napi build --manifest-path Cargo.toml --package microvms-js --platform --output-dir . --cwd microvms-js
           node --test "microvms-js/__test__/*.mjs"
+      # The generated loader against the package name it will be published under. This is the
+      # only job that builds the addon, so it is the only place the real `index.js` exists on a
+      # pull request — and a loader generated for a stale package name passes every test above,
+      # because the tests load the local `.node` file directly and never exercise the
+      # optional-dependency fallback a consumer depends on.
+      - name: the npm loader resolves its platform packages
+        run: ./scripts/check-npm-loader.py
 
   build:
     name: static aarch64 binary

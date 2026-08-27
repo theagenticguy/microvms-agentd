@@ -177,12 +177,15 @@ jobs:
     needs: guard
     strategy:
       fail-fast: false
+      # See `addons.yml` for why `cross` exists and why both glibc targets build on the x64
+      # runner. A native build inherits the runner image's glibc as a floor on every consumer,
+      # and that floor is invisible to any test running on the image that produced it.
       matrix:
         include:
-          - { runner: ubuntu-latest, target: x86_64-unknown-linux-gnu }
-          - { runner: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu }
-          - { runner: macos-latest, target: aarch64-apple-darwin }
-          - { runner: windows-latest, target: x86_64-pc-windows-msvc }
+          - { runner: ubuntu-latest, target: x86_64-unknown-linux-gnu, cross: '--use-napi-cross' }
+          - { runner: ubuntu-latest, target: aarch64-unknown-linux-gnu, cross: '--use-napi-cross' }
+          - { runner: macos-latest, target: aarch64-apple-darwin, cross: '' }
+          - { runner: windows-latest, target: x86_64-pc-windows-msvc, cross: '' }
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v7
@@ -198,11 +201,31 @@ jobs:
         run: >
           npx -y -p @napi-rs/cli@3 napi build
           --manifest-path ../Cargo.toml --package microvms-js
-          --platform --release --target ${{ matrix.target }} --output-dir .
+          --platform --release --target ${{ matrix.target }} ${{ matrix.cross }} --output-dir .
+      - uses: astral-sh/setup-uv@v7
+        if: matrix.cross != ''
+        with:
+          enable-cache: false
+      - name: the addon does not demand a newer glibc than its oldest supported host
+        if: matrix.cross != ''
+        run: ./scripts/check-addon-glibc.py microvms-js
       - uses: actions/upload-artifact@v7
         with:
           name: addon-${{ matrix.target }}
           path: microvms-js/*.node
+          if-no-files-found: error
+
+      # See `addons.yml` for why this comes from one leg. Without it the root package ships
+      # with no loader at all: `index.js` is gitignored, the publish job below never runs
+      # `napi build`, and `files` names a file that would not exist.
+      - name: upload the generated loader and types
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        uses: actions/upload-artifact@v7
+        with:
+          name: binding-js
+          path: |
+            microvms-js/index.js
+            microvms-js/index.d.ts
           if-no-files-found: error
 
   npm:
@@ -215,6 +238,11 @@ jobs:
       id-token: write # the npm CLI exchanges this for a short-lived publish token
     steps:
       - uses: actions/checkout@v7
+      # For the PEP 723 loader gate below. No cache: see `ci.yml`'s `security` job — there is
+      # no lockfile here to key one on, and that script's dependency set is empty.
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: false
       # Node 24, for npm 11.x. Trusted publishing requires npm >= 11.5.1 and Node >=
       # 22.14.0, and every Node 22 release ships npm 10.9 — so pinning the version this
       # package's `engines.node` floor allows would authenticate with a CLI that has no OIDC
@@ -247,6 +275,11 @@ jobs:
           pattern: addon-*
           merge-multiple: true
           path: microvms-js/artifacts
+      # The loader and types, which the root package cannot be published without.
+      - uses: actions/download-artifact@v7
+        with:
+          name: binding-js
+          path: microvms-js
       # `napi artifacts` IS the completeness gate, and no separate check is wired after it.
       # napi's release documentation asks for one, on the grounds that the CLI warns and
       # continues when an expected target binary is missing — that is not true of the version
@@ -264,6 +297,18 @@ jobs:
           set -euo pipefail
           npx -y -p @napi-rs/cli@3 napi create-npm-dirs
           npx -y -p @napi-rs/cli@3 napi artifacts --output-dir artifacts --npm-dir npm
+      # The one thing `napi artifacts` does NOT check: whether the root package's loader can
+      # find the platform packages it is about to be published beside. It is generated against
+      # whatever `name` was in `package.json` at build time and nothing reconciles the two, so
+      # a rename ships a root whose `require` fails on every platform while `npm install`
+      # succeeds. Measured on `@theagenticguy/microvms@0.1.0-rc.1`, which shipped a loader from
+      # before the package was scoped.
+      - name: the loader resolves the packages it ships beside
+        run: ./scripts/check-npm-loader.py
+      # Re-asserted over the assembled packages, not only per build leg. What ships is whatever
+      # landed in `npm/<target>/`, and an artifact can be replaced between the build and here.
+      - name: the assembled addons stay within the glibc ceiling
+        run: ./scripts/check-addon-glibc.py microvms-js/npm
       # `napi pre-publish` publishes the four platform packages; `npm publish` publishes the
       # root. Both go over OIDC, and npm generates the provenance attestation automatically
       # because this is a public package from a public repository — the `--provenance` flag
