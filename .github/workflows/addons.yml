@@ -1,0 +1,66 @@
+name: addons
+
+# Manual only, and it publishes nothing. This builds the Node addon for every configured
+# platform and uploads each one as an artifact, so a machine that cannot cross-compile to
+# macOS or Windows can still obtain all of them.
+#
+# That separation is what removes a credential from the npm bootstrap. npm requires a package
+# to exist before a trusted publisher can be configured for it, and there is no scope-level
+# configuration — so the root package and all four platform packages must be created once by
+# something that is not OIDC. Publishing from CI would mean an npm token in this repository's
+# secrets; publishing from a maintainer's terminal needs the binaries, which is what this
+# produces. Build here, publish there, and no long-lived credential exists in either place.
+#
+# Useful beyond the bootstrap: adding a platform triple creates another package OIDC cannot
+# create, so the same dance recurs, and a developer who wants a cross-platform addon without
+# cutting a release can run this too.
+on:
+  workflow_dispatch:
+
+# Reads the repository and writes nothing. There is deliberately no `id-token` and no
+# `contents: write` here — a build job that cannot publish is a build job whose compromise
+# publishes nothing.
+permissions:
+  contents: read
+
+jobs:
+  addons:
+    name: build the node addon (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      # The triples must match `microvms-js/package.json`'s `napi.targets`, which is the
+      # source of truth for what packages exist on npm — a triple here that is missing there
+      # builds an artifact no package wants, and the reverse ships a root package whose
+      # `optionalDependencies` names a platform nothing built.
+      # `scripts/check-publishable.py` asserts the two agree, for this file and `release.yml`
+      # together. The runner choice stays here: which machine builds a triple is CI's
+      # business, not the package's.
+      matrix:
+        include:
+          - { runner: ubuntu-latest, target: x86_64-unknown-linux-gnu }
+          - { runner: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu }
+          - { runner: macos-latest, target: aarch64-apple-darwin }
+          - { runner: windows-latest, target: x86_64-pc-windows-msvc }
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+      # `--release` matters: a debug addon is around 250 MB against a few tens of megabytes
+      # stripped, and npm would carry that forever at an immutable version.
+      - name: napi build
+        working-directory: microvms-js
+        run: >
+          npx -y -p @napi-rs/cli@3 napi build
+          --manifest-path ../Cargo.toml --package microvms-js
+          --platform --release --target ${{ matrix.target }} --output-dir .
+      - uses: actions/upload-artifact@v7
+        with:
+          name: addon-${{ matrix.target }}
+          path: microvms-js/*.node
+          if-no-files-found: error
