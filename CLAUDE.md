@@ -142,7 +142,7 @@ fails `mise run check`.
 | `microvms-core/` | crates.io | `microvms-core` |
 | `microvms-cli/` | crates.io | `microvms-cli` (the binary stays `microvm`) |
 | `microvms-py/` | PyPI | `microvms` |
-| `microvms-js/` | npm | `@theagenticguy/microvms` + one package per platform triple |
+| `microvms-js/` | npm | `@theagenticguy/microvms` — one package, all four addons inside |
 
 `agentd` and `agentd-model` are `publish = false` on purpose, each with the reason in its own
 manifest: the daemon reaches a consumer as a static aarch64 binary baked into a task image,
@@ -184,11 +184,20 @@ Three things about the registry surface that a manifest does not make obvious:
 - Every version is immutable on all three registries. There is no second `0.1.0`, so a
   first release is worth tagging `0.1.0-rc.1` and yanking rather than burning the number.
 - npm requires the package to exist before a trusted publisher can be configured, and there
-  is no org- or scope-level configuration — the root package and every platform package each
-  need their own. crates.io has the same first-publish requirement, plus a **verified email
-  address on the account**, which no dry run surfaces because `--dry-run` never reaches the
+  is no org- or scope-level configuration. **That is why the addon ships as one package rather
+  than the usual napi layout of one per platform:** OIDC cannot create a package, so a
+  per-platform layout needs a fresh non-OIDC publish, with a credential to match, every time a
+  triple is added. One package makes a new triple a matrix entry. The generated loader already
+  prefers a local `./<binaryName>.<suffix>.node` over any per-platform package, so this needs
+  no loader change — it costs 12.2 MB packed against roughly 3 MB.
+- crates.io has the same first-publish requirement, plus a **verified email address on the
+  account**, which no dry run surfaces because `cargo publish --dry-run` never reaches the
   upload endpoint. PyPI needs neither: a pending publisher creates the project on first use,
   so the Python side never needs a token.
+- `npm trust github <package> --workflow release.yml --environment release --allow-publish` is
+  the CLI equivalent of the website's trusted-publisher form, and needs **npm 12**. It refuses
+  a bypass-2FA granular token on purpose, so it runs against an `npm login` session with an
+  interactive challenge.
 - The npm package is scoped **because a granular token can only be restricted to packages
   that already exist, or to a scope.** The five packages a bootstrap has to create do not
   exist yet, so an unscoped name would require an all-packages token — write access to the 19

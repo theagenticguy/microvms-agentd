@@ -4,28 +4,29 @@
 # dependencies = []
 # ///
 # SPDX-License-Identifier: Apache-2.0
-"""Assert the generated npm loader can find the platform packages it will be published beside.
+"""Assert the npm package ships a loader that can find the addons inside it.
 
-`napi build` generates `microvms-js/index.js` and `index.d.ts`, both gitignored, and the
+`napi build` generates `microvms-js/index.js` and `index.d.ts`. Both are gitignored, and the
 loader inside `index.js` is written against the package name that was in `package.json` at
-generation time. Nothing regenerates it when that name changes and nothing compares the two, so
-the root package can ship a loader that resolves a set of package names nobody publishes.
+generation time. Nothing regenerates it when that name changes and nothing compares the two.
 
-Measured, not hypothetical. `@theagenticguy/microvms@0.1.0-rc.1` shipped with a loader
-generated while the package was still the unscoped `microvms`: it called
-`require('microvms-linux-x64-gnu')` and `require('microvms-wasm32-wasi')`, so a consumer with
-`@theagenticguy/microvms-linux-x64-gnu` correctly installed got `Error: Cannot find native
-binding`. `npm install` succeeded, npm selected the right platform package, and `require`
-failed — the failure is entirely inside the root tarball.
+Two failures, both measured on `@theagenticguy/microvms@0.1.0-rc.1` rather than imagined:
 
-The absence case is worse and was latent in the release workflow. Its npm job checks out the
-repo and downloads `.node` artifacts, never running `napi build`; with `index.js` gitignored,
-`files` would name a file that does not exist and the root package would ship with `main`
-pointing at nothing.
+The loader can name a package that does not exist. That release shipped a loader generated while
+the package was still the unscoped `microvms`, so it called `require('microvms-linux-x64-gnu')`.
+`npm install` succeeded, npm resolved the right binding, and `require` failed with `Cannot find
+native binding` — the defect sits entirely inside the tarball.
 
-Both cases are the same assertion: for every triple in `napi.targets`, the loader must name
-`<package-name>-<suffix>`. That ties the loader to the manifest rather than to whenever someone
-last built.
+The loader can be absent altogether. The release workflow checks out the repo and downloads
+`.node` artifacts without ever running `napi build`; with `index.js` gitignored, `files` named a
+file that did not exist and `main` pointed at nothing.
+
+Every platform's addon now ships in this one package, and the generated loader tries
+`require('./<binaryName>.<suffix>.node')` BEFORE any per-platform package — which is what makes
+one package viable and also what makes a missing binary fatal, since there is no longer anything
+to fall back to. `--all-platforms` adds that check, and belongs wherever the full set has been
+assembled. Without it only the loader itself is checked, which is what a job that built one
+target can honestly assert.
 """
 
 from __future__ import annotations
@@ -38,7 +39,7 @@ PACKAGE_JSON = Path("microvms-js/package.json")
 LOADER = Path("microvms-js/index.js")
 TYPES = Path("microvms-js/index.d.ts")
 
-#: Rust triple -> the package-name suffix and `.node` infix napi derives from it.
+#: Rust triple -> the suffix napi derives from it, for both the package name and the `.node` file.
 #:
 #: napi's own mapping, restated because the CLI exposes it only by doing the work. A triple this
 #: does not know fails loudly rather than being skipped, since a skipped target is exactly the
@@ -56,9 +57,11 @@ SUFFIX = {
 
 
 def main() -> int:
+    all_platforms = "--all-platforms" in sys.argv
     manifest = json.loads(PACKAGE_JSON.read_text())
     name = manifest["name"]
-    targets = manifest.get("napi", {}).get("targets") or []
+    binary = manifest["napi"]["binaryName"]
+    targets = manifest["napi"].get("targets") or []
     failures: list[str] = []
 
     for path in (LOADER, TYPES):
@@ -79,6 +82,12 @@ def main() -> int:
     if not targets:
         failures.append(f"{PACKAGE_JSON} declares no `napi.targets`")
 
+    if "*.node" not in (manifest.get("files") or []):
+        failures.append(
+            f"{PACKAGE_JSON}'s `files` does not include `*.node`, so npm would publish the "
+            f"loader without any of the binaries it loads."
+        )
+
     for triple in targets:
         suffix = SUFFIX.get(triple)
         if suffix is None:
@@ -87,13 +96,29 @@ def main() -> int:
                 f"SUFFIX so the target is checked rather than silently skipped."
             )
             continue
+
+        # Generated from `name`, so it is the cheapest witness that this loader was built for
+        # THIS package rather than carried over from before a rename.
         expected = f"{name}-{suffix}"
         if expected not in loader:
             failures.append(
-                f"{LOADER} never references {expected!r}, which is the package that carries the "
-                f"{triple} binary. The loader was generated for a different package name, so "
-                f"`require` fails on that platform even when npm installed it correctly."
+                f"{LOADER} never references {expected!r}, which is how it names the {triple} "
+                f"binding. The loader was generated for a different package name, so `require` "
+                f"fails on that platform even when npm installed everything correctly."
             )
+
+        if not all_platforms:
+            continue
+
+        addon = LOADER.parent / f"{binary}.{suffix}.node"
+        if not addon.is_file():
+            failures.append(
+                f"{addon} is absent, so {triple} has no binary in the published package. The "
+                f"loader tries this path first and there is no per-platform package to fall "
+                f"back to."
+            )
+        elif addon.stat().st_size == 0:
+            failures.append(f"{addon} is empty")
 
     if failures:
         print("npm loader: FAIL", file=sys.stderr)
@@ -101,7 +126,8 @@ def main() -> int:
             print(f"  - {failure}", file=sys.stderr)
         return 1
 
-    print(f"npm loader: resolves all {len(targets)} platform packages under {name}")
+    scope = f" and all {len(targets)} addons are present" if all_platforms else ""
+    print(f"npm loader: names every configured platform under {name}{scope}")
     return 0
 
 
