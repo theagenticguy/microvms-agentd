@@ -498,9 +498,27 @@ def check(src: Source, model: dict[str, Any]) -> Checker:
     c = Checker(model, label=src.label)
 
     # The 4x documentation bug this script was written for.
+    #
+    # The shape is resolved through the member reference rather than named directly,
+    # because AWS renames synthetic string shapes without changing their constraints:
+    # botocore 1.43.82 (2026-08-28) renamed `RunMicrovmRequestRunHookPayloadString` to
+    # `RunHookPayload` with `max: 4096` intact, and the hardcoded name failed this gate
+    # on a model that still agreed with us. The member name `runHookPayload` is the wire
+    # contract and cannot be renamed compatibly, so it is the stable handle.
+    payload_shape = (
+        model["shapes"]["RunMicrovmRequest"]["members"]
+        .get("runHookPayload", {})
+        .get("shape", "")
+    )
+    if not payload_shape:
+        raise SystemExit(
+            "RunMicrovmRequest no longer has a runHookPayload member. That is not a "
+            "rename this script can follow — the wire contract changed; re-read the "
+            "constraint."
+        )
     c.bound(
         "runHookPayload max bytes",
-        "RunMicrovmRequestRunHookPayloadString",
+        payload_shape,
         "max",
         src.get("MAX_RUN_HOOK_PAYLOAD_BYTES"),
     )
