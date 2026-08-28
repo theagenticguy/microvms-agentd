@@ -260,7 +260,7 @@ pub const STREAM_RESPONSE: (&str, &[&str]) = (
 /// The MicroVM id `identifier` names, through the local registry when it is a bare name.
 ///
 /// The discrimination is total, and the name grammar is what makes it so: an identifier
-/// starting with `mvm-` is the service's own id shape (a legal name is refused that prefix
+/// starting with `microvm-` (the real service's prefix) or `mvm-` (the fixtures') is an id shape (a legal name is refused those prefixes
 /// at registration), and anything that fails the name grammar — an ARN's `:`, a path's `/`
 /// — cannot be in the registry, so it passes through verbatim for the service to answer.
 /// Only a legal name is looked up, and a legal name the registry does not hold fails
@@ -273,7 +273,10 @@ pub fn resolve_vm_identifier<O: Write, E: Write>(
     identifier: &str,
     state_dir_flag: Option<std::path::PathBuf>,
 ) -> Result<String, crate::exit::CliError> {
-    if identifier.starts_with("mvm-") || crate::ledger::validate_name(identifier).is_err() {
+    if identifier.starts_with("microvm-")
+        || identifier.starts_with("mvm-")
+        || crate::ledger::validate_name(identifier).is_err()
+    {
         return Ok(identifier.to_string());
     }
     let root = crate::seam::state_dir(state_dir_flag, ctx.env);

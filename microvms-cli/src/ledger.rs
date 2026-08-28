@@ -177,11 +177,14 @@ pub fn validate_name(name: &str) -> Result<(), String> {
             name.len()
         ));
     }
-    if name.starts_with("mvm-") {
+    // Both spellings: `microvm-` is the id prefix the real service answers (measured
+    // 2026-08-28, first live run of this feature — the fakes' `mvm-` fixture shape let a
+    // passthrough keyed on `mvm-` alone pass every scripted test and fail against AWS),
+    // and `mvm-` stays refused because it is the fixture shape every scripted body uses.
+    if name.starts_with("microvm-") || name.starts_with("mvm-") {
         return Err(format!(
-            "{name:?} starts with mvm-, which is the service's own id prefix — a name shaped \
-             like an id would make `microvm suspend <identifier>` ambiguous about which VM it \
-             addresses"
+            "{name:?} starts with a MicroVM id prefix — a name shaped like an id would make \
+             `microvm suspend <identifier>` ambiguous about which VM it addresses"
         ));
     }
     if let Some(bad) = name
@@ -580,6 +583,11 @@ mod tests {
         assert!(
             validate_name("mvm-lookalike").is_err(),
             "a name shaped like a MicroVM id would make resolution ambiguous"
+        );
+        assert!(
+            validate_name("microvm-9536a532").is_err(),
+            "the real service's id prefix is microvm-, measured on the first live run — \
+             only the test fixtures spell it mvm-"
         );
         for bad in ["with space", "dot.name", "slash/name", "colon:name"] {
             assert!(validate_name(bad).is_err(), "{bad:?} must be refused");

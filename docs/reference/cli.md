@@ -62,7 +62,7 @@ Flags:
 - `--artifact-uri <S3_URI>` — where the build artifact already is; `microvms-core` builds the artifact bytes and takes the URI but does not upload. `microvms-cli/src/cli.rs:368-369`.
 - `--exec <COMMAND>` — a shell command to run in the VM. When it is omitted, the run only launches and tears down, which is how you check that an image boots. `microvms-cli/src/cli.rs:374-375`.
 - `--name <NAME>` — image name; defaults to a per-invocation name, because reusing a name can trigger a `clientToken` replay that wedges the image. `microvms-cli/src/cli.rs:379-380`.
-- `--vm-name <NAME>` — register a local name for the kept VM, so later commands can say `--name <NAME>` (attached commands) or use the name as the positional (suspend, resume, terminate, history) instead of pasting identifiers. Requires `--keep`. The name is a purely local fact in the state directory's registry (`<state-dir>/names/<NAME>.json`, written owner-only because the record carries the agent token), costs zero AWS calls, and is released when a terminate is accepted. Names take ASCII letters, digits, `-` and `_`, at most 128 bytes, and never the `mvm-` prefix — that exclusion is what lets every identifier-taking command tell a name from a MicroVM id. A name registered to a live VM is refused locally with `ERR_NAME_TAKEN` (exit 14) before any billable call. `microvms-cli/src/cli.rs`, `RunArgs::vm_name`; registry in `microvms-cli/src/ledger.rs`, `Names`.
+- `--vm-name <NAME>` — register a local name for the kept VM, so later commands can say `--name <NAME>` (attached commands) or use the name as the positional (suspend, resume, terminate, history) instead of pasting identifiers. Requires `--keep`. The name is a purely local fact in the state directory's registry (`<state-dir>/names/<NAME>.json`, written owner-only because the record carries the agent token), costs zero AWS calls, and is released when a terminate is accepted. Names take ASCII letters, digits, `-` and `_`, at most 128 bytes, and never a MicroVM id prefix (`microvm-` is the service's real prefix, measured live; `mvm-` is the test fixtures') — that exclusion is what lets every identifier-taking command tell a name from a MicroVM id. A name registered to a live VM is refused locally with `ERR_NAME_TAKEN` (exit 14) before any billable call. `microvms-cli/src/cli.rs`, `RunArgs::vm_name`; registry in `microvms-cli/src/ledger.rs`, `Names`.
 - `--memory <MEMORY>` — baseline MiB, selecting a documented size class; default `2048`. Closed set: `512`, `1024`, `2048`, `4096`, `8192`. `microvms-cli/src/cli.rs:387-388`.
 - `--dockerfile <DOCKERFILE>` — a Dockerfile to use instead of the library's default; its `FROM` must match the base. `microvms-cli/src/cli.rs:391-392`.
 - `--repair-identity` — widen the guest so `sethostname` and the `boot_id` bind mount work. `microvms-cli/src/cli.rs:397-398`.
@@ -206,7 +206,7 @@ Freezes a MicroVM, which keeps its memory, filesystem, token, and endpoint. The 
 
 Flags:
 
-- `<MICROVM_ID>` — the MicroVM to freeze: an `mvm-` id, or a name `run --keep --vm-name` registered (resolved locally, zero extra calls; an unknown name fails with `ERR_PRECONDITION` before any call). Required.
+- `<MICROVM_ID>` — the MicroVM to freeze: a MicroVM id, or a name `run --keep --vm-name` registered (resolved locally, zero extra calls; an unknown name fails with `ERR_PRECONDITION` before any call). Required.
 - `--timeout <TIMEOUT>` — how long to wait for the state transition, in seconds; default `300`. `microvms-cli/src/cli.rs:681-682`.
 - Plus `RegionFlags`. `microvms-cli/src/cli.rs:684-685`.
 
@@ -222,7 +222,7 @@ Thaws a suspended MicroVM and reports its endpoint. Past the launch-time `suspen
 
 Flags:
 
-- `<MICROVM_ID>` — the MicroVM to thaw: an `mvm-` id, or a registered name (resolved locally). Required.
+- `<MICROVM_ID>` — the MicroVM to thaw: a MicroVM id, or a registered name (resolved locally). Required.
 - `--timeout <TIMEOUT>` — how long to wait for RUNNING, in seconds; default `300`. `microvms-cli/src/cli.rs:695-696`.
 - Plus `RegionFlags`. `microvms-cli/src/cli.rs:698-699`.
 
@@ -238,7 +238,7 @@ Tears down a MicroVM and optionally its image and build log group. When part of 
 
 Flags:
 
-- `<MICROVM_ID>` — the MicroVM to terminate: an `mvm-` id, or a registered name (resolved locally). An accepted terminate releases the VM's registered name whichever spelling addressed it, so the name is reusable. Required.
+- `<MICROVM_ID>` — the MicroVM to terminate: a MicroVM id, or a registered name (resolved locally). An accepted terminate releases the VM's registered name whichever spelling addressed it, so the name is reusable. Required.
 - `--image-identifier <IMAGE_IDENTIFIER>` — the image to delete, if `--delete-image` is given. `microvms-cli/src/cli.rs:709-710`.
 - `--image-name <IMAGE_NAME>` — the image's name, needed to name its build log group; the service created that group, so `terraform destroy` never removes it. `microvms-cli/src/cli.rs:715-716`.
 - `--delete-image` — also delete the image and name its build log group; requires `--image-identifier`. `microvms-cli/src/cli.rs:719-720`.
@@ -275,7 +275,7 @@ What the record does not prove: it shows what was asked of the VM and what the d
 
 Flags:
 
-- `<VM_ID>` — the MicroVM whose history to print: an `mvm-` id, or a registered name (resolved locally; an unregistered name reads as a clean empty history, this command's usual answer for an unseen VM). Required.
+- `<VM_ID>` — the MicroVM whose history to print: a MicroVM id, or a registered name (resolved locally; an unregistered name reads as a clean empty history, this command's usual answer for an unseen VM). Required.
 - `--state-dir <STATE_DIR>` — where the histories live; defaults to `$MICROVM_STATE_DIR` or `~/.microvm/runs`.
 
 ## logs

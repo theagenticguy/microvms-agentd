@@ -6,7 +6,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Live conformance run driving the **Rust** client stack through the `microvm` CLI.
 
-This is the only live suite, and it now expresses **every named check** — 85 of them, with
+This is the only live suite, and it now expresses **every named check** — 90 of them, with
 none recorded SKIP. `conformance/run.py` was the oracle — 56 checks through the Python
 client — and it went away with that client once both suites ran green against real AWS on
 the same commit (Python 56/56, this one 38/38 with 34 recorded SKIP). Those 34 were the
@@ -51,6 +51,13 @@ measurements plus its own teardown, counted for the same reason the log-group de
 is) against a second VM launched with the model's minimum idle window and deliberately
 run to the edge of it, twice. That section is the slow one and its own output says how
 long it takes.
+
+90 rather than 85: `drive_named_vm` adds five for issue #67 — register at launch,
+attach by name, the `ERR_NAME_TAKEN` collision, terminate-by-name with the resolved id,
+and the post-terminate release. Live rather than only scripted because the first live
+run of the feature caught a prefix the fakes could not: the service's ids start
+`microvm-`, the fixtures' start `mvm-`, and a passthrough keyed on the fixture prefix
+passed every local test while refusing every real id.
 
 A hybrid driver, and both lanes are deliberate
 ----------------------------------------------
@@ -1638,6 +1645,120 @@ def drive_token_rotation(cli: Cli, launched: Envelope, results: Results) -> None
     )
 
 
+def drive_named_vm(
+    cli: Cli, launched: Envelope, state_dir: Path, results: Results
+) -> None:
+    """Named VMs (issue #67): register at launch, address by name, collide, release.
+
+    Five checks against a VM this section launches and terminates itself, from the image
+    the suite already built (`run --image`, no second build). Its own VM rather than the
+    suite's because registration happens only at launch — the suite's VM was launched
+    before any name existed to give it.
+
+    The first live run of this feature is the reason this section exists: the client-side
+    passthrough was keyed on the fixtures' `mvm-` id prefix, every scripted test passed,
+    and the real service's `microvm-` prefix sent a raw id into the name registry and
+    refused a legal suspend. A prefix is exactly the kind of fact only the service can
+    state, so the resolution path stays under live coverage permanently.
+
+    `--state-dir` is this run's own temp dir, so the registry under test is this suite's
+    and a developer's `~/.microvm/runs` is never touched.
+    """
+    print("\n-- named VMs (register / resolve / collide / release) --")
+    vm_name = f"conformance-named-{secrets.token_hex(4)}"
+    named = cli.call(
+        "run",
+        "--image",
+        str(launched.data["imageIdentifier"]),
+        "--name",
+        f"microvm-cli-conformance-named-{secrets.token_hex(4)}",
+        "--memory",
+        str(BASELINE_MEMORY_MIB),
+        "--keep",
+        "--vm-name",
+        vm_name,
+        "--state-dir",
+        str(state_dir),
+        "--region",
+        cli.region,
+        "--max-idle-sec",
+        "600",
+        "--suspended-sec",
+        "600",
+        "--max-duration-sec",
+        "1800",
+        timeout=15 * 60,
+    )
+    microvm_id = str(named.data["microvmId"])
+    try:
+        results.eq(
+            "run --keep --vm-name registered the name it reported",
+            named.data.get("vmName"),
+            vm_name,
+        )
+
+        first = cli.call(
+            "exec", "echo named", "--name", vm_name, "--state-dir", str(state_dir)
+        )
+        results.check(
+            "exec --name attached with the registered record",
+            first.data.get("exitCode") == 0
+            and "named" in (first.data.get("stdout") or ""),
+            f"exit={first.data.get('exitCode')} stdout={first.data.get('stdout')!r}",
+        )
+
+        # The collision: a second launch under the live name must be refused locally,
+        # with the appended row, before anything is billed. The refusal arriving at all
+        # is the check; the zero-AWS-calls half is the behavioral guard's claim
+        # (`guards.rs`, RefusingSeam) because no live run can see an absent request.
+        try:
+            cli.call(
+                "run",
+                "--image",
+                str(launched.data["imageIdentifier"]),
+                "--keep",
+                "--vm-name",
+                vm_name,
+                "--state-dir",
+                str(state_dir),
+                "--region",
+                cli.region,
+            )
+            results.check(
+                "reusing a live name is refused with ERR_NAME_TAKEN",
+                False,
+                "no refusal",
+            )
+        except KindError as exc:
+            results.check(
+                "reusing a live name is refused with ERR_NAME_TAKEN",
+                exc.code == "ERR_NAME_TAKEN" and exc.exit_code == 14,
+                f"code={exc.code} exit={exc.exit_code}",
+            )
+    finally:
+        # Terminate **by the name**, which is itself the lifecycle-positional resolution
+        # under test — and never `--delete-image`, because the image is the suite's own.
+        gone = cli.call(
+            "terminate",
+            vm_name,
+            "--wait",
+            "--state-dir",
+            str(state_dir),
+            "--region",
+            cli.region,
+        )
+        results.check(
+            "terminate accepted the name and reported the id it resolved to",
+            gone.data.get("microvmId") == microvm_id and not gone.data.get("leaked"),
+            f"microvm={gone.data.get('microvmId')} leaked={gone.data.get('leaked')}",
+        )
+        results.check(
+            "an accepted terminate released the name for reuse",
+            not (state_dir / "names" / f"{vm_name}.json").exists(),
+            f"registry entry survives: {sorted(p.name for p in (state_dir / 'names').glob('*.json')) if (state_dir / 'names').exists() else []}",
+        )
+
+
 def drive_idle_keepalive(
     cli: Cli, launched: Envelope, aws: Any, results: Results
 ) -> None:
@@ -2503,6 +2624,9 @@ def main() -> int:
             # that changes the VM's state for forty seconds and every section above wants a
             # running one.
             drive_suspend_resume(cli, launched, results)
+            # Named VMs on their own VM (from the suite's image, no second build):
+            # registration only happens at launch, so the suite's VM cannot carry it.
+            drive_named_vm(cli, launched, Path(tmp) / "named-state", results)
             # The idle-keepalive section runs on its own VM (launched from the image this
             # suite already built, so no second build) and is the slowest section here —
             # its own output says how long. Last, so its four minutes of deliberate

@@ -540,7 +540,7 @@ pub struct RunArgs {
     /// token), costs zero AWS calls, and is released when `microvm terminate` is accepted.
     ///
     /// Names take ASCII letters, digits, `-` and `_` (the image-name pattern), at most 128
-    /// bytes, and never the service's `mvm-` prefix — that exclusion is what lets every
+    /// bytes, and never a MicroVM id prefix (`microvm-`, `mvm-`) — that exclusion is what lets every
     /// identifier-taking command tell a name from a MicroVM id without guessing. A name
     /// already registered to a live VM is refused locally with ERR_NAME_TAKEN before any
     /// billable call; terminate that VM or pick another name. Requires --keep, because a
