@@ -8,7 +8,7 @@
 //! matters: a denylist of forbidden crate names is defeated by the one crate nobody thought to
 //! write down, and `test_cli.py`'s three-legged static guard grew a leg at a time as each was
 //! defeated on purpose. An equality against a written-down set has no such gap — every addition to
-//! this crate's manifest is a diff against a test that names the six things allowed and says why.
+//! this crate's manifest is a diff against a test that names the eight things allowed and says why.
 //!
 //! The scan catches what a manifest cannot: a control-plane operation invoked through a crate that
 //! *is* allowed. `microvms-core` is allowed and re-exports plenty; a handler that reached past the
@@ -63,7 +63,7 @@ const RETIRED: [(&str, &str); 1] = [(
 /// An allowlist. See the module docs on why a denylist is not good enough. The reason strings are
 /// not decorative: this test asserts each is a real sentence, so a new entry cannot be added
 /// without someone writing down what it is for.
-const ALLOWED: [(&str, &str); 6] = [
+const ALLOWED: [(&str, &str); 8] = [
     (
         "microvms-core",
         "the product surface: every AWS call, every trap closure, the cost engine, the taxonomy — \
@@ -88,6 +88,20 @@ const ALLOWED: [(&str, &str); 6] = [
     (
         "tokio",
         "the runtime this crate is entitled to choose, and ctrl_c for CLI-6",
+    ),
+    (
+        "toml",
+        "the microvm.toml project config file (issue #73): a local file parse into a serde \
+         struct with deny_unknown_fields. Opens no socket, signs nothing — the parsed values \
+         still reach AWS only through microvms-core, and the file's domains are validated \
+         against the same closed sets the parser enforces",
+    ),
+    (
+        "globset",
+        "the artifacts glob grammar in microvm.toml (issues #73/#72): doctor compiles every \
+         declared glob so a bad pattern fails before a launch is paid for, and run <DIR> \
+         selects downloaded tar members with the same compiled set. Pure pattern matching \
+         over strings; no filesystem walk, no socket",
     ),
 ];
 

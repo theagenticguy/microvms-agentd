@@ -121,6 +121,12 @@ pub const RESPONSE_TYPES: [(&str, &str, &[&str]); 18] = [
             "vmName",
             "leaked",
             "cost",
+            // What each config-mergeable knob resolved to, as {value, source} with source
+            // one of flag/config/default — and which file supplied the config values
+            // (null when none did). Issue #73: a caller who stopped passing flags reads
+            // what the run actually used here rather than re-deriving the precedence.
+            "resolvedConfig",
+            "configPath",
         ],
     ),
     (

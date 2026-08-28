@@ -35,6 +35,12 @@ pub async fn doctor<O: std::io::Write, E: std::io::Write>(
 ) -> Result<Rendered, CliError> {
     let mut checks: Vec<Check> = Vec::new();
 
+    // The config file first: it is the one check that is entirely local, and a malformed
+    // file fails `run` before anything else would, so it should be the first line a reader
+    // sees. Fatal on a broken file, advisory-pass on an absent one — a project without a
+    // microvm.toml is configured by flags, which is not a finding.
+    checks.push(check_config(&args.config));
+
     // The region first among the AWS-adjacent ones, because it is the value a connector ARN is
     // interpolated into and a wrong one produces a null-message denial that reads as IAM.
     checks.push(check_region(
@@ -81,6 +87,59 @@ pub async fn doctor<O: std::io::Write, E: std::io::Write>(
         return Ok(rendered.reporting(Exit::Precondition));
     }
     Ok(rendered)
+}
+
+/// Whether the project config file loads, through the same loader `run` uses.
+///
+/// The same loader deliberately: a `doctor` that validated with its own parse would be a
+/// second opinion that can disagree with the refusal `run` actually issues. Fatal when the
+/// file exists and cannot be used — that is exactly the state in which `run` fails with
+/// `ERR_CONFIG` — and advisory-pass when no file is present, because flags-only is a
+/// configuration, not a gap.
+fn check_config(flags: &crate::cli::ConfigFlags) -> Check {
+    if flags.no_config {
+        return Check::pass("config", "--no-config: any microvm.toml is ignored");
+    }
+    match crate::config::load(flags.config.as_deref(), false, std::path::Path::new(".")) {
+        Ok(Some((path, config))) => {
+            let pinned = [
+                ("image", config.image.is_some()),
+                ("binary", config.binary.is_some()),
+                ("exec", config.exec.is_some()),
+                ("memory", config.memory.is_some()),
+                ("region", config.region.is_some()),
+                ("egress", config.egress.is_some()),
+                ("max-idle-sec", config.max_idle_sec.is_some()),
+                ("suspended-sec", config.suspended_sec.is_some()),
+                ("max-duration-sec", config.max_duration_sec.is_some()),
+                ("env", config.env.is_some()),
+                ("artifacts", config.artifacts.is_some()),
+            ]
+            .into_iter()
+            .filter_map(|(name, present)| present.then_some(name))
+            .collect::<Vec<_>>();
+            Check::pass(
+                "config",
+                if pinned.is_empty() {
+                    format!("{} is valid and pins nothing", path.display())
+                } else {
+                    format!("{} is valid; pins {}", path.display(), pinned.join(", "))
+                },
+            )
+        }
+        Ok(None) => Check::pass(
+            "config",
+            format!(
+                "no {} here — flags and built-in defaults apply",
+                crate::config::DEFAULT_FILE
+            ),
+        ),
+        Err(error) => Check::fail(
+            "config",
+            error.to_string(),
+            "fix the file, or pass --no-config; `run` refuses this file with ERR_CONFIG",
+        ),
+    }
 }
 
 /// Whether the region is one this client has seen carry MicroVMs.

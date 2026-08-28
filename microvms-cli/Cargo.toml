@@ -24,7 +24,7 @@ path = "src/main.rs"
 
 # ── the dependency set is the requirement under test (CLI-2, AC-5-4) ────────
 #
-# Six direct dependencies and no seventh. There is no `reqwest`, no `aws-*`, no
+# Eight direct dependencies and no ninth. There is no `reqwest`, no `aws-*`, no
 # `hyper`, no `aws-sigv4`, and there cannot be one: `tests/thinness.rs` reads this
 # manifest through `cargo metadata` and asserts the direct dependency set is *exactly*
 # the names below. An allowlist rather than a denylist, because a denylist is defeated
@@ -39,8 +39,10 @@ path = "src/main.rs"
 # the wrong shape: the dependency existed to advance a loop. Core grew
 # `ExecHandle::for_each_event`, a callback driver over the same state machine whose
 # signature is `FnMut(ExecEvent) -> ControlFlow<()>` — both `std` — and the entry came
-# out. The count is back to six and the honest reading of that is not "we removed a
-# dependency" but "the seam was in the wrong place and moving it removed one".
+# out. The count went back to six then, and the honest reading of that was not "we
+# removed a dependency" but "the seam was in the wrong place and moving it removed
+# one". `toml` and `globset` later made it eight (issue #73) — both local parsers,
+# neither able to open a socket, each with its reason beside its entry below.
 #
 # The CLI reaches AWS through `microvms-core` and through nothing else. That is
 # CLI-2, and the honest way to state it is a manifest a test can read.
@@ -76,6 +78,17 @@ tokio = { version = "1.53", features = [
     "signal",
     "time",
 ] }
+# The project config file (`microvm.toml`, issue #73). Parse-only in practice:
+# `toml::from_str` into a serde struct with `deny_unknown_fields`, so a typo'd key is
+# a refusal rather than a silently ignored setting. The config file is a CLI-surface
+# concern — core deliberately knows nothing about where its arguments come from —
+# which is why the dependency lands here rather than in `microvms-core`.
+toml = "1"
+# Artifact-glob validation and matching (`artifacts = ["dist/**"]` in microvm.toml,
+# issues #73/#72). `doctor` compiles every declared glob so a bad pattern is a finding
+# before a run spends a launch on it, and `run <DIR>` selects downloaded members with
+# the same compiled set — one grammar, validated and consumed by the same crate.
+globset = "0.4"
 
 [dev-dependencies]
 # The structural guards read the real dependency graph rather than parsing TOML:
@@ -83,9 +96,9 @@ tokio = { version = "1.53", features = [
 # added transitively or through a renamed key is still an edge this sees. Parsing
 # `Cargo.toml` by hand would check the file, not the build.
 cargo_metadata = "0.23.1"
-# The same tokio, with the test clock. **Not a seventh dependency** — it is the
-# sixth again, and `tests/thinness.rs`'s equality dedups the two edges, which is
-# why that guard still reads six names plus `cargo_metadata`.
+# The same tokio, with the test clock. **Not a ninth dependency** — it is the
+# same entry again, and `tests/thinness.rs`'s equality dedups the two edges, which
+# is why that guard still reads eight names plus `cargo_metadata`.
 #
 # `test-util` is what `#[tokio::test(start_paused = true)]` needs. One guard requires
 # it: the cut-stream test drives core's reconnect loop, which backs off up to four
