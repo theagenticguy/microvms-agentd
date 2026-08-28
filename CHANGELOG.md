@@ -6,7 +6,40 @@ Versions are [semantic](https://semver.org/spec/v2.0.0.html); the wire contract 
 
 ## Unreleased
 
+## [0.2.0] — 2026-08-28
+
 ### Added
+
+- **Named VMs (#67).** `run --keep --vm-name <NAME>` registers a local name→VM record
+  beside the run ledger; every identifier-taking command then accepts the name. The
+  lifecycle positionals (`suspend`, `resume`, `terminate`, `history`) resolve it
+  client-side following the `run --image <name>` pattern — prefix passthrough with zero
+  extra calls, a local `ERR_PRECONDITION` on a miss. The attached commands (`exec`,
+  `health`, `ack`, `stdin`, `cp`) take `--name` as a stand-in for the whole
+  `--endpoint`/`--agent-token`/`--microvm-id` triple, launch region included, so one word
+  replaces four pasted values.
+
+  Reusing a live name is refused locally with the **appended exit row 14 /
+  `ERR_NAME_TAKEN`** — its own row because the remedy differs from `ERR_INVALID_ARG`
+  (terminate the holder, or pick another name, rather than edit the flag), and the first
+  row with no core `ErrorKind` behind it, since the registry is the CLI's own file. The
+  refusal costs zero billable calls, asserted by a behavioral guard that counts seam
+  doors. An accepted terminate releases the name by VM id, whichever spelling addressed
+  it. The registry lives at `<state-dir>/names/<NAME>.json`, one file per live name,
+  owner-only on Unix because the record carries the agent token; a torn record reads as
+  *taken*, because its VM may still be billing.
+
+  Verified live (us-east-1, 2026-08-28): the full round trip — register, exec/health by
+  name, collision, suspend/resume by name, terminate-by-name with the name released —
+  and now covered permanently by `drive_named_vm` in `conformance/run_rs.py` (5 checks;
+  the suite is 90).
+
+  The first live run caught what every scripted test missed: the fixtures spell MicroVM
+  ids `mvm-*`, the real service spells them `microvm-*`, and a resolution path keyed on
+  the fixture prefix refused every real id. Both prefixes are now excluded from the name
+  grammar, the grammar test pins the real prefix with the measurement date, and
+  `CLAUDE.md` carries the policy this earned: the local gate is the definition of done
+  for a change, a live run is the definition of done for a task.
 
 - **Five `microvm` subcommands, and the live coverage they unlock.** `microvm health`,
   `microvm ack`, `microvm stdin`, `microvm cp` (with `--tar` and `--mode`), and five new

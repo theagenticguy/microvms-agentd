@@ -18,11 +18,11 @@ crate-type = ["cdylib"]
 
 [dependencies]
 # The only thing being wrapped. No edge to `microvms-cli` (BIND-1).
-microvms-core = { version = "0.1.1", path = "../microvms-core" }
+microvms-core = { version = "0.2.0", path = "../microvms-core" }
 # The wire types the core's public signatures already answer with. See the same
 # entry in `microvms-py/Cargo.toml` for why naming the crate beats re-declaring
 # the shapes (ARCH-2).
-protocol = { package = "microvms-protocol", version = "0.1.1", path = "../protocol" }
+protocol = { package = "microvms-protocol", version = "0.2.0", path = "../protocol" }
 # `async` pulls in `tokio_rt`: an exported `#[napi] pub async fn` then runs on
 # napi's managed runtime and returns a JavaScript Promise, with `Err` rejecting
 # it. That is why this side needs no `block_on` bridge at all — Node is
