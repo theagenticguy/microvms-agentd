@@ -118,6 +118,7 @@ pub const RESPONSE_TYPES: [(&str, &str, &[&str]); 18] = [
             "buildSeconds",
             "runningSeconds",
             "kept",
+            "vmName",
             "leaked",
             "cost",
         ],
@@ -255,6 +256,42 @@ pub const STREAM_RESPONSE: (&str, &[&str]) = (
         "gaps",
     ],
 );
+
+/// The MicroVM id `identifier` names, through the local registry when it is a bare name.
+///
+/// The discrimination is total, and the name grammar is what makes it so: an identifier
+/// starting with `mvm-` is the service's own id shape (a legal name is refused that prefix
+/// at registration), and anything that fails the name grammar — an ARN's `:`, a path's `/`
+/// — cannot be in the registry, so it passes through verbatim for the service to answer.
+/// Only a legal name is looked up, and a legal name the registry does not hold fails
+/// locally with `ERR_PRECONDITION` — the image-resolution precedent: the service's answer
+/// to a bare name is a 400 about malformed identifiers, which says nothing about names.
+///
+/// Zero AWS calls on every path: passthrough is a prefix check and resolution is a file read.
+pub fn resolve_vm_identifier<O: Write, E: Write>(
+    ctx: &Ctx<'_, O, E>,
+    identifier: &str,
+    state_dir_flag: Option<std::path::PathBuf>,
+) -> Result<String, crate::exit::CliError> {
+    if identifier.starts_with("mvm-") || crate::ledger::validate_name(identifier).is_err() {
+        return Ok(identifier.to_string());
+    }
+    let root = crate::seam::state_dir(state_dir_flag, ctx.env);
+    match crate::ledger::Names::new(&root).lookup(identifier) {
+        Some(record) => Ok(record.microvm_id),
+        None => Err(crate::exit::CliError::new(
+            Exit::Precondition,
+            format!(
+                "no VM named {identifier:?} in {}. Names are local: `run --keep --vm-name \
+                 {identifier}` registers one here, and a name registered on another machine \
+                 lives in that machine's state directory.",
+                root.join("names").display(),
+            ),
+        )
+        .suggest("`microvm ls` shows this state directory's outstanding runs")
+        .suggest("a MicroVM id (mvm-…) is accepted directly")),
+    }
+}
 
 /// The `type` and `data` keys for `name`, or empty when the table has no row.
 ///

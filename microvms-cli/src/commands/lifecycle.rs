@@ -131,6 +131,41 @@ pub async fn run<O: std::io::Write, E: std::io::Write>(
         .clone()
         .unwrap_or_else(|| format!("microvm-cli-{}", epoch_secs()));
 
+    // The VM name's two local refusals, before anything else: a credential resolution can
+    // hang, so even the zero-billable-call guarantee undersells why this goes first — a
+    // caller with a bad name should learn it instantly. Grammar first (an illegal name is
+    // ERR_INVALID_ARG, fixed by editing the flag), then the collision (ERR_NAME_TAKEN, its
+    // own row, fixed by terminating the holder or picking another name). Both cost one file
+    // read and zero AWS calls, which is the acceptance criterion on the registry itself.
+    if let Some(vm_name) = &args.vm_name {
+        if let Err(reason) = crate::ledger::validate_name(vm_name) {
+            return Err(crate::exit::CliError::new(Exit::InvalidArg, reason)
+                .suggest("names take ASCII letters, digits, `-` and `_`, up to 128 bytes"));
+        }
+        let names = crate::ledger::Names::new(&state_dir(args.state_dir.clone(), ctx.env));
+        if let Some(holder) = names.lookup(vm_name) {
+            return Err(crate::exit::CliError::new(
+                Exit::NameTaken,
+                format!(
+                    "the name {vm_name:?} is registered to {} — refused locally, before any \
+                     AWS call. A name addresses exactly one live VM; reusing it would point \
+                     every later `--name {vm_name}` at whichever registration came last.",
+                    if holder.microvm_id.is_empty() {
+                        "a torn record (a process died mid-register; inspect the file)".to_string()
+                    } else {
+                        holder.microvm_id.clone()
+                    },
+                ),
+            )
+            .suggest(format!(
+                "`microvm terminate {vm_name}` tears that VM down and frees the name"
+            ))
+            .suggest("or pick another name — the registry is one file per name")
+            .with_data("vmName", json!(vm_name))
+            .with_data("microvmId", json!(holder.microvm_id)));
+        }
+    }
+
     // What was resolved, before anything is attempted. Not decoration: the next thing that
     // happens is a credential resolution that can hang or fail, and an operator watching a stalled
     // command needs to know which region and which image name it stalled on. It goes *before* the
@@ -288,6 +323,38 @@ pub async fn run<O: std::io::Write, E: std::io::Write>(
         }
         failure = failure.with_data("terminateAccepted", json!(teardown.terminate_accepted));
         return Err(failure);
+    }
+
+    // The name registration, only now: the launch succeeded, the teardown was skipped
+    // (`--vm-name` requires `--keep`), and every field the record carries is the service's
+    // own answer read off the outcome. Registering before this point would leave a name
+    // pointing at a VM that failed to launch — and the collision check at the top already
+    // guaranteed the slot is free, so the one way `register` fails is the filesystem's.
+    // That failure is a hard error rather than a swallowed one, deliberately: the VM is up
+    // and billing either way, but a caller who was told "registered" and later finds
+    // `--name` answering "no VM named" has a phantom worse than a loud failure now.
+    if let Some(vm_name) = &args.vm_name
+        && let Some(record) = name_record_for_kept(vm_name, &outcome, &region_name)
+    {
+        let names = crate::ledger::Names::new(&state_dir(args.state_dir.clone(), ctx.env));
+        names.register(&record).map_err(|error| {
+            crate::exit::CliError::new(
+                Exit::Precondition,
+                format!(
+                    "the VM launched and is RUNNING, but its name could not be registered: \
+                     {error}. Address it by the identifiers below; they are in this \
+                     envelope's data.",
+                ),
+            )
+            .with_data("microvmId", json!(record.microvm_id))
+            .with_data("endpoint", json!(record.endpoint))
+            .with_data("vmName", json!(vm_name))
+        })?;
+        outcome.vm_name = Some(vm_name.clone());
+        ctx.out.progress(&format!(
+            "registered name {vm_name} for {}",
+            record.microvm_id
+        ));
     }
 
     let (kind, _) = response_type("run");
@@ -997,8 +1064,10 @@ pub async fn suspend<O: std::io::Write, E: std::io::Write>(
     args: &SuspendArgs,
 ) -> Result<Rendered, crate::exit::CliError> {
     let region = args.region.resolve(ctx.env)?;
+    let microvm_id =
+        crate::commands::resolve_vm_identifier(ctx, &args.microvm_id, args.state_dir.clone())?;
     let plane = ctx.seam.control_plane(region).await?;
-    let current = plane.get_microvm(&args.microvm_id).await?;
+    let current = plane.get_microvm(&microvm_id).await?;
     if current.state != "RUNNING" {
         return Err(crate::exit::CliError::new(
             Exit::InvalidArg,
@@ -1007,19 +1076,19 @@ pub async fn suspend<O: std::io::Write, E: std::io::Write>(
                  here rather than by the service, because the service's answer about a \
                  non-running id does not say which of the two things went wrong — and a suspend \
                  issued from SUSPENDED is a caller who believes they resumed.",
-                args.microvm_id, current.state,
+                microvm_id, current.state,
             ),
         )
         .with_data("state", json!(current.state)));
     }
 
-    ctx.out.progress(&format!("suspending {}", args.microvm_id));
-    plane.suspend(&args.microvm_id).await?;
+    ctx.out.progress(&format!("suspending {}", microvm_id));
+    plane.suspend(&microvm_id).await?;
     // TERMINATED is *wanted* rather than failed on: a VM that dies while suspending is a state
     // to report, not an error raised out of the middle of a teardown path.
     let settled = plane
         .wait_for_state(
-            &args.microvm_id,
+            &microvm_id,
             &microvms_core::control::microvm::SUSPEND_WANTED,
             &[],
             wait_opts(args.timeout),
@@ -1030,22 +1099,19 @@ pub async fn suspend<O: std::io::Write, E: std::io::Write>(
     // platform reported, and a freeze that settled TERMINATED is not a suspension however
     // the command exits.
     if settled.state == "SUSPENDED" {
-        History::for_vm(
-            &state_dir(args.state_dir.clone(), ctx.env),
-            &args.microvm_id,
-        )
-        .append(Event::Suspended);
+        History::for_vm(&state_dir(args.state_dir.clone(), ctx.env), &microvm_id)
+            .append(Event::Suspended);
     }
 
     let mut data = Map::new();
-    data.insert("microvmId".into(), json!(args.microvm_id));
+    data.insert("microvmId".into(), json!(microvm_id));
     data.insert("state".into(), json!(settled.state));
     let (kind, _) = response_type("suspend");
     let rendered = Rendered::ok(
         kind,
         data,
-        format!("{} is {}", args.microvm_id, settled.state),
-        format!("{}\t{}", args.microvm_id, settled.state),
+        format!("{} is {}", microvm_id, settled.state),
+        format!("{}\t{}", microvm_id, settled.state),
     );
     if settled.state != "SUSPENDED" {
         // The caller asked for SUSPENDED and did not get it. A success envelope, because the
@@ -1069,12 +1135,14 @@ pub async fn resume<O: std::io::Write, E: std::io::Write>(
     args: &ResumeArgs,
 ) -> Result<Rendered, crate::exit::CliError> {
     let region = args.region.resolve(ctx.env)?;
+    let microvm_id =
+        crate::commands::resolve_vm_identifier(ctx, &args.microvm_id, args.state_dir.clone())?;
     let plane = ctx.seam.control_plane(region).await?;
-    ctx.out.progress(&format!("resuming {}", args.microvm_id));
-    plane.resume(&args.microvm_id).await?;
+    ctx.out.progress(&format!("resuming {}", microvm_id));
+    plane.resume(&microvm_id).await?;
     let running = plane
         .wait_for_state(
-            &args.microvm_id,
+            &microvm_id,
             &["RUNNING"],
             &microvms_core::constants::DEAD_STATES,
             wait_opts(args.timeout),
@@ -1082,14 +1150,11 @@ pub async fn resume<O: std::io::Write, E: std::io::Write>(
         .await?;
 
     // The wait returned, so the service reported RUNNING — which is what `resumed` means.
-    History::for_vm(
-        &state_dir(args.state_dir.clone(), ctx.env),
-        &args.microvm_id,
-    )
-    .append(Event::Resumed);
+    History::for_vm(&state_dir(args.state_dir.clone(), ctx.env), &microvm_id)
+        .append(Event::Resumed);
 
     let mut data = Map::new();
-    data.insert("microvmId".into(), json!(args.microvm_id));
+    data.insert("microvmId".into(), json!(microvm_id));
     data.insert("state".into(), json!("RUNNING"));
     // The endpoint the service just reported rather than one the caller passed: it is measured
     // not to change across a cycle, and reading it from the response is what makes that a
@@ -1099,8 +1164,8 @@ pub async fn resume<O: std::io::Write, E: std::io::Write>(
     Ok(Rendered::ok(
         kind,
         data,
-        format!("{} is RUNNING at {}", args.microvm_id, running.endpoint),
-        format!("{}\tRUNNING\t{}", args.microvm_id, running.endpoint),
+        format!("{} is RUNNING at {}", microvm_id, running.endpoint),
+        format!("{}\tRUNNING\t{}", microvm_id, running.endpoint),
     ))
 }
 
@@ -1117,29 +1182,30 @@ pub async fn terminate<O: std::io::Write, E: std::io::Write>(
     args: &TerminateArgs,
 ) -> Result<Rendered, crate::exit::CliError> {
     let region = args.region.resolve(ctx.env)?;
+    let microvm_id =
+        crate::commands::resolve_vm_identifier(ctx, &args.microvm_id, args.state_dir.clone())?;
     let plane = ctx.seam.control_plane(region).await?;
 
-    ctx.out
-        .progress(&format!("terminating {}", args.microvm_id));
+    ctx.out.progress(&format!("terminating {}", microvm_id));
     let mut leaked: Vec<String> = Vec::new();
     let mut log_groups: Vec<String> = Vec::new();
     let mut state = "TERMINATING".to_string();
 
     // 1. The VM. A failure is recorded rather than raised, for the reason above.
-    match plane.terminate(&args.microvm_id).await {
+    match plane.terminate(&microvm_id).await {
         Ok(()) => {}
         Err(error) => {
-            leaked.push(args.microvm_id.clone());
+            leaked.push(microvm_id.clone());
             ctx.out.warn(&format!(
                 "the terminate call for {} failed: {error}. The VM is still billing; record \
                  this id.",
-                args.microvm_id
+                microvm_id
             ));
         }
     }
     if args.wait && leaked.is_empty() {
         match plane
-            .wait_for_state(&args.microvm_id, &["TERMINATED"], &[], wait_opts(300.0))
+            .wait_for_state(&microvm_id, &["TERMINATED"], &[], wait_opts(300.0))
             .await
         {
             Ok(settled) => state = settled.state,
@@ -1147,7 +1213,7 @@ pub async fn terminate<O: std::io::Write, E: std::io::Write>(
             // TERMINATING is the honest state to report.
             Err(error) => ctx.out.warn(&format!(
                 "{} did not reach TERMINATED before the deadline: {error}",
-                args.microvm_id
+                microvm_id
             )),
         }
     }
@@ -1206,17 +1272,28 @@ pub async fn terminate<O: std::io::Write, E: std::io::Write>(
     // the calls above went — a terminate that failed is exactly the run a caller will want
     // the record of — and the append swallows its own failures, because this is the
     // teardown path and a history error must not displace the real outcome.
-    History::for_vm(
-        &state_dir(args.state_dir.clone(), ctx.env),
-        &args.microvm_id,
-    )
-    .append(Event::Terminated {
-        terminate_accepted: !leaked.contains(&args.microvm_id),
-        undeleted: leaked.clone(),
-    });
+    History::for_vm(&state_dir(args.state_dir.clone(), ctx.env), &microvm_id).append(
+        Event::Terminated {
+            terminate_accepted: !leaked.contains(&microvm_id),
+            undeleted: leaked.clone(),
+        },
+    );
+
+    // The name is released only when the terminate was accepted, and by the VM id rather
+    // than by the spelling the caller used — `terminate mvm-…` on a VM that was named must
+    // still free the name, or the registry keeps refusing a name whose VM is gone. A
+    // terminate that failed keeps the registration, because the VM is still billing and the
+    // name still addresses it.
+    if !leaked.contains(&microvm_id) {
+        let names = crate::ledger::Names::new(&state_dir(args.state_dir.clone(), ctx.env));
+        if let Some(freed) = names.release_by_vm(&microvm_id) {
+            ctx.out
+                .progress(&format!("released name {freed} — it can be reused"));
+        }
+    }
 
     let mut data = Map::new();
-    data.insert("microvmId".into(), json!(args.microvm_id));
+    data.insert("microvmId".into(), json!(microvm_id));
     data.insert("imageIdentifier".into(), json!(args.image_identifier));
     data.insert("leaked".into(), json!(leaked));
     // Separate from `leaked` because they are different claims: `leaked` is "a delete was
@@ -1226,7 +1303,7 @@ pub async fn terminate<O: std::io::Write, E: std::io::Write>(
     data.insert("state".into(), json!(state));
 
     let (kind, _) = response_type("terminate");
-    let mut lines = vec![format!("terminated {} ({state})", args.microvm_id)];
+    let mut lines = vec![format!("terminated {} ({state})", microvm_id)];
     lines.extend(leaked.iter().map(|id| format!("LEAKED: {id}")));
     lines.extend(
         log_groups
@@ -1237,7 +1314,7 @@ pub async fn terminate<O: std::io::Write, E: std::io::Write>(
         kind,
         data,
         lines.join("\n"),
-        format!("{}\t{}\t{}", args.microvm_id, state, leaked.join(",")),
+        format!("{}\t{}\t{}", microvm_id, state, leaked.join(",")),
     );
     if !leaked.is_empty() {
         // A leak the caller must act on. The log group is *not* in this condition: it is a
@@ -1246,6 +1323,28 @@ pub async fn terminate<O: std::io::Write, E: std::io::Write>(
         return Ok(rendered.reporting(Exit::Platform));
     }
     Ok(rendered)
+}
+
+/// The registry record for a kept, named launch — or `None` when the outcome is missing an
+/// identifier, which means the launch did not fully succeed and no name should point at it.
+///
+/// Every field is the service's own answer read off the outcome, never the request's: the
+/// endpoint is what `RunMicrovm` reported and the token is the one the session minted. A
+/// record built from the request would be one the registry vouches for and the daemon
+/// refuses.
+fn name_record_for_kept(
+    vm_name: &str,
+    outcome: &RunOutcome,
+    region_name: &str,
+) -> Option<crate::ledger::NameRecord> {
+    Some(crate::ledger::NameRecord {
+        name: vm_name.to_string(),
+        microvm_id: outcome.microvm_id.clone()?,
+        endpoint: outcome.endpoint.clone()?,
+        agent_token: outcome.agent_token.clone()?,
+        region: region_name.to_string(),
+        at: epoch_secs(),
+    })
 }
 
 /// A lifecycle wait with the caller's deadline and core's poll interval.

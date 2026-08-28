@@ -25,14 +25,16 @@ Flags:
 - `--region <REGION>` — AWS region; defaults to `$AWS_REGION`, then `$AWS_DEFAULT_REGION`, then `us-east-1`. Closed set: `us-east-1`, `us-east-2`, `us-west-2`, `eu-west-1`, `ap-northeast-1`. `microvms-cli/src/cli.rs:292-293`, domain at `microvms-cli/src/cli.rs:258-270`.
 - `--unlisted-region <NAME>` — use a region this client has not seen carry MicroVMs; conflicts with `--region`. An unsupported region answers `AccessDeniedException` with a null message, which looks like an IAM denial, so the caller loses the real diagnostic. `microvms-cli/src/cli.rs:299-300`.
 
-`AttachFlags` — the three identifiers plus the port that address a VM this invocation did not launch. Carried by `exec`, `health`, `ack`, `stdin`, and `cp`. `microvms-cli/src/cli.rs:311-328`.
+`AttachFlags` — the identifiers that address a VM this invocation did not launch: the explicit triple, or a registered name standing in for it. Carried by `exec`, `health`, `ack`, `stdin`, and `cp`. `microvms-cli/src/cli.rs`, `AttachFlags`.
 
 Flags:
 
-- `--endpoint <ENDPOINT>` — the VM's endpoint, as reported by `run`. Required. `microvms-cli/src/cli.rs:314-315`.
-- `--agent-token <AGENT_TOKEN>` — the agent token delivered to the VM at launch. Required. `microvms-cli/src/cli.rs:318-319`.
-- `--microvm-id <MICROVM_ID>` — the MicroVM id, needed to mint the endpoint proxy token. Required. `microvms-cli/src/cli.rs:322-323`.
-- `--port <PORT>` — the daemon's port inside the guest. `microvms-cli/src/cli.rs:326-327`.
+- `--endpoint <ENDPOINT>` — the VM's endpoint, as reported by `run`. Required unless `--name` is given.
+- `--agent-token <AGENT_TOKEN>` — the agent token delivered to the VM at launch. Required unless `--name` is given.
+- `--microvm-id <MICROVM_ID>` — the MicroVM id, needed to mint the endpoint proxy token. Required unless `--name` is given.
+- `--name <NAME>` — the name `run --keep --vm-name` registered, standing in for the whole triple. Resolved through the local name registry with zero AWS calls: the record carries the endpoint, the agent token, the MicroVM id, and the launch region (used as the region default when no `--region` flag is given). Conflicts with the explicit triple. A name this state directory never registered fails locally with `ERR_PRECONDITION`.
+- `--port <PORT>` — the daemon's port inside the guest.
+- `--state-dir <STATE_DIR>` — where the local state lives: the name registry, and exec's per-VM history. Defaults to `$MICROVM_STATE_DIR` or `~/.microvm/runs`.
 
 `InfraFlags` — the three account-specific values the AWS commands need. Carried by `run`, `build`, and `doctor`. `microvms-cli/src/cli.rs:331-344`.
 
@@ -60,6 +62,7 @@ Flags:
 - `--artifact-uri <S3_URI>` — where the build artifact already is; `microvms-core` builds the artifact bytes and takes the URI but does not upload. `microvms-cli/src/cli.rs:368-369`.
 - `--exec <COMMAND>` — a shell command to run in the VM. When it is omitted, the run only launches and tears down, which is how you check that an image boots. `microvms-cli/src/cli.rs:374-375`.
 - `--name <NAME>` — image name; defaults to a per-invocation name, because reusing a name can trigger a `clientToken` replay that wedges the image. `microvms-cli/src/cli.rs:379-380`.
+- `--vm-name <NAME>` — register a local name for the kept VM, so later commands can say `--name <NAME>` (attached commands) or use the name as the positional (suspend, resume, terminate, history) instead of pasting identifiers. Requires `--keep`. The name is a purely local fact in the state directory's registry (`<state-dir>/names/<NAME>.json`, written owner-only because the record carries the agent token), costs zero AWS calls, and is released when a terminate is accepted. Names take ASCII letters, digits, `-` and `_`, at most 128 bytes, and never the `mvm-` prefix — that exclusion is what lets every identifier-taking command tell a name from a MicroVM id. A name registered to a live VM is refused locally with `ERR_NAME_TAKEN` (exit 14) before any billable call. `microvms-cli/src/cli.rs`, `RunArgs::vm_name`; registry in `microvms-cli/src/ledger.rs`, `Names`.
 - `--memory <MEMORY>` — baseline MiB, selecting a documented size class; default `2048`. Closed set: `512`, `1024`, `2048`, `4096`, `8192`. `microvms-cli/src/cli.rs:387-388`.
 - `--dockerfile <DOCKERFILE>` — a Dockerfile to use instead of the library's default; its `FROM` must match the base. `microvms-cli/src/cli.rs:391-392`.
 - `--repair-identity` — widen the guest so `sethostname` and the `boot_id` bind mount work. `microvms-cli/src/cli.rs:397-398`.
@@ -203,7 +206,7 @@ Freezes a MicroVM, which keeps its memory, filesystem, token, and endpoint. The 
 
 Flags:
 
-- `<MICROVM_ID>` — the MicroVM to freeze. Required. `microvms-cli/src/cli.rs:677-678`.
+- `<MICROVM_ID>` — the MicroVM to freeze: an `mvm-` id, or a name `run --keep --vm-name` registered (resolved locally, zero extra calls; an unknown name fails with `ERR_PRECONDITION` before any call). Required.
 - `--timeout <TIMEOUT>` — how long to wait for the state transition, in seconds; default `300`. `microvms-cli/src/cli.rs:681-682`.
 - Plus `RegionFlags`. `microvms-cli/src/cli.rs:684-685`.
 
@@ -219,7 +222,7 @@ Thaws a suspended MicroVM and reports its endpoint. Past the launch-time `suspen
 
 Flags:
 
-- `<MICROVM_ID>` — the MicroVM to thaw. Required. `microvms-cli/src/cli.rs:691-692`.
+- `<MICROVM_ID>` — the MicroVM to thaw: an `mvm-` id, or a registered name (resolved locally). Required.
 - `--timeout <TIMEOUT>` — how long to wait for RUNNING, in seconds; default `300`. `microvms-cli/src/cli.rs:695-696`.
 - Plus `RegionFlags`. `microvms-cli/src/cli.rs:698-699`.
 
@@ -235,7 +238,7 @@ Tears down a MicroVM and optionally its image and build log group. When part of 
 
 Flags:
 
-- `<MICROVM_ID>` — the MicroVM to terminate. Required. `microvms-cli/src/cli.rs:705-706`.
+- `<MICROVM_ID>` — the MicroVM to terminate: an `mvm-` id, or a registered name (resolved locally). An accepted terminate releases the VM's registered name whichever spelling addressed it, so the name is reusable. Required.
 - `--image-identifier <IMAGE_IDENTIFIER>` — the image to delete, if `--delete-image` is given. `microvms-cli/src/cli.rs:709-710`.
 - `--image-name <IMAGE_NAME>` — the image's name, needed to name its build log group; the service created that group, so `terraform destroy` never removes it. `microvms-cli/src/cli.rs:715-716`.
 - `--delete-image` — also delete the image and name its build log group; requires `--image-identifier`. `microvms-cli/src/cli.rs:719-720`.
@@ -272,7 +275,7 @@ What the record does not prove: it shows what was asked of the VM and what the d
 
 Flags:
 
-- `<VM_ID>` — the MicroVM whose history to print. Required.
+- `<VM_ID>` — the MicroVM whose history to print: an `mvm-` id, or a registered name (resolved locally; an unregistered name reads as a clean empty history, this command's usual answer for an unseen VM). Required.
 - `--state-dir <STATE_DIR>` — where the histories live; defaults to `$MICROVM_STATE_DIR` or `~/.microvm/runs`.
 
 ## logs
@@ -479,7 +482,7 @@ A stream that ended without an exit event was cut. `exitCode` is reported as `nu
 
 ## Exit codes
 
-The table has fourteen rows, 0 through 13, and is append-only because consumers branch on the values. The rows are split by what the caller should do next; a distinction that does not change the caller's next action does not get its own integer. `microvms-cli/src/exit.rs:171-256`, with the enum's explicit discriminants at `microvms-cli/src/exit.rs:76-100`.
+The table has fifteen rows, 0 through 14, and is append-only because consumers branch on the values. The rows are split by what the caller should do next; a distinction that does not change the caller's next action does not get its own integer. `microvms-cli/src/exit.rs:171-256`, with the enum's explicit discriminants at `microvms-cli/src/exit.rs:76-100`.
 
 | Exit | Code | Meaning | `docs/PLATFORM.md` finding |
 | --- | --- | --- | --- |
@@ -497,8 +500,11 @@ The table has fourteen rows, 0 through 13, and is append-only because consumers 
 | 11 | `ERR_INTERRUPTED` | interrupted after launch; teardown ran and any leak is named in the payload | The build log group survives Terraform |
 | 12 | `ERR_PRECONDITION` | a prerequisite is missing — run `microvm doctor` | |
 | 13 | `ERR_EXEC_FAILED` | the sandbox worked and the command in it exited non-zero | |
+| 14 | `ERR_NAME_TAKEN` | the VM name is registered to a live VM; refused locally, before any AWS call | |
 
 Row 0 is the only one with no `ERR_*` string, because a success envelope has no `code` field to put one in. `microvms-cli/src/exit.rs:50-53`.
+
+`ERR_NAME_TAKEN` is the first row with no core `ErrorKind` behind it: the name registry is the CLI's own file, so the collision can only arise locally. It is distinct from `ERR_INVALID_ARG` because the two demand different next actions — an invalid argument is fixed by editing the flag, a taken name by terminating the VM that holds it or picking another name.
 
 `ERR_EXEC_FAILED` has its own code because it is the one non-zero exit that means nothing is wrong with the platform, the credentials, or the CLI. A CI caller needs to tell "your tests failed" apart from "we never got a VM". `microvms-cli/src/exit.rs:94-99`.
 

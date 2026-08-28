@@ -196,6 +196,9 @@ pub struct RunOutcome {
     pub build_seconds: f64,
     pub running_seconds: f64,
     pub kept: bool,
+    /// The local name `--vm-name` registered, or `None` — present in the envelope either
+    /// way, so a consumer never guards against a missing key.
+    pub vm_name: Option<String>,
     pub leaked: Vec<String>,
     pub cost: Option<Value>,
 }
@@ -220,6 +223,7 @@ impl RunOutcome {
         data.insert("buildSeconds".into(), json!(self.build_seconds));
         data.insert("runningSeconds".into(), json!(self.running_seconds));
         data.insert("kept".into(), json!(self.kept));
+        data.insert("vmName".into(), json!(self.vm_name));
         data.insert("leaked".into(), json!(self.leaked));
         data.insert("cost".into(), self.cost.clone().unwrap_or(Value::Null));
         data

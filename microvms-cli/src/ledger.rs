@@ -157,6 +157,159 @@ impl Ledger {
     }
 }
 
+// ── the name registry ────────────────────────────────────────────────────────
+
+/// A VM name's shape: ASCII letters, digits, `-`, `_`, at most 128 bytes, and never the
+/// service's own `mvm-` prefix.
+///
+/// The charset is the image-name pattern (`[a-zA-Z0-9-_]+`), reused deliberately: it is what
+/// makes the prefix discrimination in [`resolve`] total — an identifier starting with `mvm-`
+/// can only be a MicroVM id, because a legal name is refused that prefix here, and an ARN
+/// cannot match because `:` is outside the set. It also makes every name a safe file name,
+/// which is what the registry stores it as.
+pub fn validate_name(name: &str) -> Result<(), String> {
+    if name.is_empty() {
+        return Err("a VM name cannot be empty".to_string());
+    }
+    if name.len() > 128 {
+        return Err(format!(
+            "a VM name is at most 128 bytes; this one is {}",
+            name.len()
+        ));
+    }
+    if name.starts_with("mvm-") {
+        return Err(format!(
+            "{name:?} starts with mvm-, which is the service's own id prefix — a name shaped \
+             like an id would make `microvm suspend <identifier>` ambiguous about which VM it \
+             addresses"
+        ));
+    }
+    if let Some(bad) = name
+        .chars()
+        .find(|c| !c.is_ascii_alphanumeric() && *c != '-' && *c != '_')
+    {
+        return Err(format!(
+            "{bad:?} is not a legal VM-name character: names take ASCII letters, digits, `-` \
+             and `_`, the image-name pattern"
+        ));
+    }
+    Ok(())
+}
+
+/// One kept VM's local name, and everything an attach needs to address it.
+///
+/// The endpoint, token, and region ride along with the id because a name that resolved to an
+/// id alone would still make the caller paste the rest of the triple — and the triple is the
+/// thing the name exists to replace. `camelCase` on the wire, the ledger's own convention.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NameRecord {
+    pub name: String,
+    pub microvm_id: String,
+    pub endpoint: String,
+    /// The launch's agent token. On disk so `exec --name` can attach without the caller
+    /// re-pasting it; the file is written owner-only on Unix for exactly that reason.
+    pub agent_token: String,
+    pub region: String,
+    /// Seconds since the epoch, the ledger's own clock.
+    pub at: u64,
+}
+
+/// The name→VM registry: one JSON file per live name, under `<root>/names/`.
+///
+/// A subdirectory rather than the state root, for history's reason: `read_all`'s `*.json`
+/// glob must never read a name record as a run ledger. Separate from [`Ledger`] itself
+/// because the two have opposite lifecycles — a ledger file is cleared the moment nothing is
+/// outstanding, and a name must live exactly as long as its VM: registered when `run --keep`
+/// succeeds, removed when a terminate is accepted, and *refused* for reuse in between. That
+/// refusal is the registry's whole job, and it costs zero AWS calls by construction: the
+/// collision check is a local file read.
+#[derive(Clone, Debug)]
+pub struct Names {
+    root: PathBuf,
+}
+
+impl Names {
+    /// The registry under `state_root/names`.
+    pub fn new(state_root: &Path) -> Self {
+        Self {
+            root: state_root.join("names"),
+        }
+    }
+
+    fn path_of(&self, name: &str) -> PathBuf {
+        self.root.join(format!("{name}.json"))
+    }
+
+    /// The record registered under `name`, or `None`.
+    ///
+    /// An unreadable file reads as registered — its name is taken by *something*, and
+    /// treating a torn record as free would let a second VM claim a name whose first holder
+    /// may still be billing. The caller sees the collision refusal and can inspect the file.
+    pub fn lookup(&self, name: &str) -> Option<NameRecord> {
+        let text = std::fs::read_to_string(self.path_of(name)).ok()?;
+        match serde_json::from_str::<NameRecord>(&text) {
+            Ok(record) => Some(record),
+            Err(_) => Some(NameRecord {
+                name: name.to_string(),
+                microvm_id: String::new(),
+                endpoint: String::new(),
+                agent_token: String::new(),
+                region: String::new(),
+                at: 0,
+            }),
+        }
+    }
+
+    /// Writes `record` under its name. The one registry write that reports failure,
+    /// because it runs on the success path: a name that silently failed to register would
+    /// make every later `exec --name` fail with "no VM named" while the VM bills on.
+    pub fn register(&self, record: &NameRecord) -> std::io::Result<()> {
+        std::fs::create_dir_all(&self.root)?;
+        let path = self.path_of(&record.name);
+        let text = serde_json::to_string_pretty(record)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        std::fs::write(&path, text)?;
+        // Owner-only, because the record carries the agent token — a bearer credential for
+        // the VM. Unix-only mechanics; the state dir under other platforms keeps the
+        // profile's own ACLs.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+        }
+        Ok(())
+    }
+
+    /// Releases whatever name is registered to `microvm_id`, returning it.
+    ///
+    /// By VM id rather than by name, because the terminate path resolves its identifier
+    /// before this runs — the id is the one spelling it always holds, whichever the caller
+    /// typed. Failures are swallowed (a registry error must not displace the teardown's
+    /// real outcome); a record that survives costs one stale collision refusal, whose
+    /// message names the file.
+    pub fn release_by_vm(&self, microvm_id: &str) -> Option<String> {
+        let entries = std::fs::read_dir(&self.root).ok()?;
+        for entry in entries.filter_map(Result::ok) {
+            let path = entry.path();
+            if path.extension().is_none_or(|ext| ext != "json") {
+                continue;
+            }
+            let Some(record) = std::fs::read_to_string(&path)
+                .ok()
+                .and_then(|text| serde_json::from_str::<NameRecord>(&text).ok())
+            else {
+                continue;
+            };
+            if record.microvm_id == microvm_id {
+                let _ = std::fs::remove_file(&path);
+                return Some(record.name);
+            }
+        }
+        None
+    }
+}
+
 /// Every ledger under `root`, oldest first.
 ///
 /// An unreadable file becomes a record naming itself rather than being skipped: a truncated
@@ -353,6 +506,105 @@ mod tests {
             .map(|value| value["runId"].as_str().unwrap_or_default().to_string())
             .collect();
         assert_eq!(ids, ["1754524800-1", "1754524801-2", "1754524802-3"]);
+    }
+
+    fn a_record(name: &str, id: &str) -> NameRecord {
+        NameRecord {
+            name: name.to_string(),
+            microvm_id: id.to_string(),
+            endpoint: format!("https://{id}.example"),
+            agent_token: "tok-1".to_string(),
+            region: "us-east-1".to_string(),
+            at: 1754524800,
+        }
+    }
+
+    /// A registered name resolves to its record, from a different `Names` value.
+    ///
+    /// Two values rather than one reused, for history's reason: `run --keep` registers and a
+    /// later `microvm exec --name` — a different process — looks up. The file is the handoff.
+    #[test]
+    fn a_registered_name_survives_into_a_later_lookup() {
+        let dir = TempDir::new("names-roundtrip");
+        Names::new(&dir.0)
+            .register(&a_record("ci-runner", "mvm-1"))
+            .expect("registers");
+
+        let found = Names::new(&dir.0).lookup("ci-runner").expect("registered");
+        assert_eq!(found, a_record("ci-runner", "mvm-1"));
+        assert!(Names::new(&dir.0).lookup("other").is_none());
+    }
+
+    /// A release by VM id frees exactly that VM's name and no other.
+    #[test]
+    fn a_release_by_vm_id_frees_that_name_and_no_other() {
+        let dir = TempDir::new("names-release");
+        let names = Names::new(&dir.0);
+        names.register(&a_record("a", "mvm-1")).expect("registers");
+        names.register(&a_record("b", "mvm-2")).expect("registers");
+
+        assert_eq!(names.release_by_vm("mvm-2").as_deref(), Some("b"));
+        assert!(names.lookup("b").is_none());
+        assert!(names.lookup("a").is_some(), "the other name is untouched");
+        assert_eq!(names.release_by_vm("mvm-99"), None, "nothing to release");
+    }
+
+    /// A torn record reads as taken rather than as free.
+    ///
+    /// A process killed mid-register leaves exactly this file, and its VM may be billing —
+    /// so letting a second VM claim the name would point every later command at the wrong
+    /// one. The refusal names the file; the operator deletes it deliberately.
+    #[test]
+    fn a_torn_name_record_reads_as_taken_not_free() {
+        let dir = TempDir::new("names-torn");
+        let names = Names::new(&dir.0);
+        std::fs::create_dir_all(dir.0.join("names")).expect("mkdir");
+        std::fs::write(dir.0.join("names").join("wedged.json"), "{\"name\": \"we").expect("writes");
+        assert!(
+            names.lookup("wedged").is_some(),
+            "a torn record is a taken name"
+        );
+    }
+
+    /// The name grammar: the image-name charset, no `mvm-` prefix, bounded length.
+    ///
+    /// The `mvm-` refusal is the one that makes bare-identifier resolution total: with it,
+    /// `mvm-*` can only be an id, anything else in the charset can only be a name, and the
+    /// two sets cannot collide.
+    #[test]
+    fn the_name_grammar_refuses_the_id_prefix_and_foreign_characters() {
+        assert!(validate_name("ci-runner_2").is_ok());
+        assert!(validate_name("a").is_ok());
+        assert!(validate_name("").is_err());
+        assert!(validate_name(&"x".repeat(129)).is_err());
+        assert!(
+            validate_name("mvm-lookalike").is_err(),
+            "a name shaped like a MicroVM id would make resolution ambiguous"
+        );
+        for bad in ["with space", "dot.name", "slash/name", "colon:name"] {
+            assert!(validate_name(bad).is_err(), "{bad:?} must be refused");
+        }
+    }
+
+    /// The name record's wire shape is `camelCase`, like every other file in the state dir.
+    #[test]
+    fn the_name_record_serializes_camel_case_and_round_trips() {
+        let value = serde_json::to_value(a_record("ci", "mvm-1")).expect("serializes");
+        let mut keys: Vec<&String> = value.as_object().expect("object").keys().collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            [
+                "agentToken",
+                "at",
+                "endpoint",
+                "microvmId",
+                "name",
+                "region"
+            ]
+        );
+        let back: NameRecord = serde_json::from_value(value).expect("round trips");
+        assert_eq!(back, a_record("ci", "mvm-1"));
     }
 
     /// The wire shape is `camelCase`, matching the Python's ledger key for key.
