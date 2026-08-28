@@ -78,11 +78,19 @@ pub fn history<O: std::io::Write, E: std::io::Write>(
     ctx: &mut Ctx<'_, O, E>,
     args: &HistoryArgs,
 ) -> Result<Rendered, CliError> {
+    // A registered name resolves to its VM id here too, so the one identifier grammar holds
+    // across the whole surface. An *unregistered* name still reads as a clean empty history
+    // — `resolve_vm_identifier`'s miss is a failure, and this command's contract is that
+    // asking about an unseen VM is a question, not a mistake — so the miss is mapped back
+    // to the identifier itself and the empty read below answers honestly.
+    let microvm_id =
+        crate::commands::resolve_vm_identifier(ctx, &args.microvm_id, args.state_dir.clone())
+            .unwrap_or_else(|_| args.microvm_id.clone());
     let root = state_dir(args.state_dir.clone(), ctx.env);
-    let events = history::read_events(&root, &args.microvm_id);
+    let events = history::read_events(&root, &microvm_id);
 
     let mut data = Map::new();
-    data.insert("microvmId".into(), json!(args.microvm_id));
+    data.insert("microvmId".into(), json!(microvm_id));
     data.insert("events".into(), json!(events));
     let (kind, _) = response_type("history");
 
@@ -127,7 +135,7 @@ pub fn history<O: std::io::Write, E: std::io::Write>(
         .collect::<Vec<_>>()
         .join("\n");
     let text = if events.is_empty() {
-        format!("no history for {} in this state dir", args.microvm_id)
+        format!("no history for {microvm_id} in this state dir")
     } else {
         events
             .iter()

@@ -351,20 +351,40 @@ impl RegionFlags {
 #[derive(Args, Debug, Default)]
 pub struct AttachFlags {
     /// The VM's endpoint, as reported by `run`.
-    #[arg(long)]
-    pub endpoint: String,
+    #[arg(long, required_unless_present = "name")]
+    pub endpoint: Option<String>,
 
     /// The agent token delivered to the VM at launch.
-    #[arg(long)]
-    pub agent_token: String,
+    #[arg(long, required_unless_present = "name")]
+    pub agent_token: Option<String>,
 
     /// The MicroVM id, needed to mint the endpoint proxy token.
-    #[arg(long)]
-    pub microvm_id: String,
+    #[arg(long, required_unless_present = "name")]
+    pub microvm_id: Option<String>,
+
+    /// The name `run --keep --vm-name` registered, standing in for the whole triple.
+    ///
+    /// Resolved through the local name registry (`--state-dir`, or $MICROVM_STATE_DIR, or
+    /// ~/.microvm/runs) with zero AWS calls: the record carries the endpoint, the agent
+    /// token, the MicroVM id, and the launch region, so `exec --name ci-runner` is the
+    /// triple without the pasting. A name this state directory never registered fails
+    /// locally with ERR_PRECONDITION. Conflicts with the explicit triple, because a name
+    /// *is* the triple and a caller supplying both is two answers to "which VM".
+    #[arg(long, value_name = "NAME", conflicts_with_all = ["endpoint", "agent_token", "microvm_id"])]
+    pub name: Option<String>,
 
     /// The daemon's port inside the guest.
     #[arg(long)]
     pub port: Option<u16>,
+
+    /// Where the local state lives — the name registry, and exec's per-VM history.
+    /// Defaults to $MICROVM_STATE_DIR or ~/.microvm/runs.
+    ///
+    /// On the shared struct rather than per command, so `--name` resolves against the same
+    /// directory on all five attached commands — a registry only `exec` could point at
+    /// would make `health --name` fail against a name `exec --name` just used.
+    #[arg(long)]
+    pub state_dir: Option<PathBuf>,
 }
 
 /// The three account-specific values the AWS commands need.
@@ -509,6 +529,24 @@ pub struct RunArgs {
     /// Leave the VM and image running. You are then paying for them.
     #[arg(long)]
     pub keep: bool,
+
+    /// Register a local name for the kept VM, so later commands can say `--name <NAME>`
+    /// instead of pasting the endpoint/agent-token/microvm-id triple.
+    ///
+    /// `--vm-name` rather than `--name`, because `--name` on this command already names the
+    /// *image* and repurposing it would silently change a shipped flag's meaning. The name
+    /// is a purely local fact: it lives in the state directory's registry
+    /// (`<state-dir>/names/<NAME>.json`, owner-only, since the record carries the agent
+    /// token), costs zero AWS calls, and is released when `microvm terminate` is accepted.
+    ///
+    /// Names take ASCII letters, digits, `-` and `_` (the image-name pattern), at most 128
+    /// bytes, and never a MicroVM id prefix (`microvm-`, `mvm-`) — that exclusion is what lets every
+    /// identifier-taking command tell a name from a MicroVM id without guessing. A name
+    /// already registered to a live VM is refused locally with ERR_NAME_TAKEN before any
+    /// billable call; terminate that VM or pick another name. Requires --keep, because a
+    /// VM torn down on the way out has nothing to address later.
+    #[arg(long, value_name = "NAME", requires = "keep")]
+    pub vm_name: Option<String>,
 
     /// How long to wait for the exec, in seconds.
     #[arg(long, default_value_t = 300.0)]
@@ -734,10 +772,6 @@ pub struct ExecArgs {
     /// nothing else closes the pipe — the daemon's copy outlives the child's own `wait()`.
     #[arg(long)]
     pub stdin: bool,
-
-    /// Where the VM's history is appended. Defaults to $MICROVM_STATE_DIR or ~/.microvm/runs.
-    #[arg(long)]
-    pub state_dir: Option<PathBuf>,
 
     #[command(flatten)]
     pub attach: AttachFlags,
@@ -1260,6 +1294,98 @@ mod tests {
             Cli::try_parse_from(["microvm", "history", "mvm-1", "--region", "us-east-1"]).is_err(),
             "a local read takes no region"
         );
+    }
+
+    /// `--vm-name` parses only beside `--keep`, and never collides with the image's `--name`.
+    ///
+    /// The `requires` is the flag's own contract: a VM torn down on the way out has nothing
+    /// to address later, so a name for it is a caller misunderstanding what `--keep` does —
+    /// refused at parse time, where the failure costs nothing.
+    #[test]
+    fn vm_name_requires_keep_and_is_distinct_from_the_image_name() {
+        let parsed = Cli::try_parse_from([
+            "microvm",
+            "run",
+            "--image",
+            "img",
+            "--keep",
+            "--vm-name",
+            "ci-runner",
+        ])
+        .expect("a kept run takes a VM name");
+        let Command::Run(args) = parsed.command else {
+            panic!("a run parses as a run");
+        };
+        assert_eq!(args.vm_name.as_deref(), Some("ci-runner"));
+        assert_eq!(args.name, None, "the image name is a different flag");
+
+        assert!(
+            Cli::try_parse_from(["microvm", "run", "--image", "img", "--vm-name", "x"]).is_err(),
+            "a name without --keep addresses a VM that will not exist"
+        );
+
+        // And both names together, because a caller building an image does use both.
+        let both = Cli::try_parse_from([
+            "microvm",
+            "run",
+            "./agentd",
+            "--keep",
+            "--name",
+            "img",
+            "--vm-name",
+            "vm",
+        ])
+        .expect("the image name and the VM name are different flags");
+        let Command::Run(args) = both.command else {
+            panic!("a run parses as a run");
+        };
+        assert_eq!(args.name.as_deref(), Some("img"));
+        assert_eq!(args.vm_name.as_deref(), Some("vm"));
+    }
+
+    /// `--name` on an attached command replaces the triple, and conflicts with it.
+    ///
+    /// The conflict is the declared kind of refusal: a caller supplying both has given two
+    /// answers to "which VM", and the resolution would be whichever the code read first.
+    #[test]
+    fn an_attached_name_replaces_the_triple_and_conflicts_with_it() {
+        let parsed = Cli::try_parse_from(["microvm", "exec", "true", "--name", "ci-runner"])
+            .expect("a name stands in for the whole triple");
+        let Command::Exec(args) = parsed.command else {
+            panic!("an exec parses as an exec");
+        };
+        assert_eq!(args.attach.name.as_deref(), Some("ci-runner"));
+        assert_eq!(args.attach.endpoint, None);
+
+        assert!(
+            Cli::try_parse_from(["microvm", "exec", "true"]).is_err(),
+            "no name and no triple is no VM at all"
+        );
+        assert!(
+            Cli::try_parse_from([
+                "microvm",
+                "exec",
+                "true",
+                "--name",
+                "ci-runner",
+                "--endpoint",
+                "https://x",
+            ])
+            .is_err(),
+            "a name plus a triple member is two answers to one question"
+        );
+
+        // Every attached command takes it, not just exec — the shared struct is the claim.
+        for command in ["health", "ack", "stdin", "cp"] {
+            let argv: Vec<&str> = match command {
+                "ack" => vec!["microvm", "ack", "x-1", "--name", "ci"],
+                "stdin" => vec!["microvm", "stdin", "x-1", "--eof", "--name", "ci"],
+                "cp" => vec!["microvm", "cp", "./a", "vm:/b", "--name", "ci"],
+                _ => vec!["microvm", command, "--name", "ci"],
+            };
+            Cli::try_parse_from(argv)
+                .unwrap_or_else(|error| panic!("{command} must take --name: {error}"));
+        }
     }
 
     /// **The attached triple is one struct, so all six commands publish the same three flags.**

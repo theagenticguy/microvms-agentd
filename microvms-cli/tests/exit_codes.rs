@@ -28,8 +28,18 @@ use support::{TempDir, run};
 #[test]
 fn every_locally_reachable_row_exits_with_its_own_integer_and_code() {
     let ledgers = TempDir::new("exit-rows");
+    // A live name in the registry, so the ERR_NAME_TAKEN row below is reachable. Written as
+    // the file the CLI itself writes, because the refusal under test is a local file read.
+    let names_dir = ledgers.0.join("names");
+    std::fs::create_dir_all(&names_dir).expect("a names dir");
+    std::fs::write(
+        names_dir.join("taken.json"),
+        r#"{"name": "taken", "microvmId": "mvm-live", "endpoint": "https://mvm-live.example",
+             "agentToken": "tok", "region": "us-east-1", "at": 1}"#,
+    )
+    .expect("a registered name");
     // (label, argv, expected integer, expected code, expected finding)
-    let rows: [(&str, Vec<&str>, i32, &str, &str); 6] = [
+    let rows: [(&str, Vec<&str>, i32, &str, &str); 7] = [
         (
             "success",
             vec!["ls", "--state-dir", ledgers.path(), "--json"],
@@ -78,6 +88,23 @@ fn every_locally_reachable_row_exits_with_its_own_integer_and_code() {
             ],
             12,
             "ERR_PRECONDITION",
+            "",
+        ),
+        (
+            "a VM name registered to a live VM",
+            vec![
+                "run",
+                "--image",
+                "arn:aws:lambda:us-east-1:123456789012:microvm-image:img",
+                "--keep",
+                "--vm-name",
+                "taken",
+                "--state-dir",
+                ledgers.path(),
+                "--json",
+            ],
+            14,
+            "ERR_NAME_TAKEN",
             "",
         ),
     ];

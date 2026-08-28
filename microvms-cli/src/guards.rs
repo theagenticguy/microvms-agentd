@@ -139,10 +139,12 @@ fn region_flags() -> RegionFlags {
 /// validation, which would make the door assertion pass for the wrong reason.
 fn attach_flags() -> AttachFlags {
     AttachFlags {
-        endpoint: "https://mvm-1.example".into(),
-        agent_token: "t".into(),
-        microvm_id: "mvm-1".into(),
+        endpoint: Some("https://mvm-1.example".into()),
+        agent_token: Some("t".into()),
+        microvm_id: Some("mvm-1".into()),
+        name: None,
         port: None,
+        state_dir: None,
     }
 }
 
@@ -218,6 +220,7 @@ fn aws_commands(binary: &std::path::Path) -> Vec<(&'static str, Command, Door)> 
                 user: None,
                 group: None,
                 keep: false,
+                vm_name: None,
                 timeout: 30.0,
                 max_idle_sec: 600,
                 suspended_sec: 600,
@@ -261,8 +264,10 @@ fn aws_commands(binary: &std::path::Path) -> Vec<(&'static str, Command, Door)> 
                 stream: false,
                 from_offset: None,
                 stdin: false,
-                state_dir: Some(std::env::temp_dir().join("microvm-guard-history")),
-                attach: attach_flags(),
+                attach: AttachFlags {
+                    state_dir: Some(std::env::temp_dir().join("microvm-guard-history")),
+                    ..attach_flags()
+                },
                 region: region_flags(),
             }),
             Door::AttachSession,
@@ -786,6 +791,7 @@ fn run_args_for_image(identifier: &str, state_dir: std::path::PathBuf) -> RunArg
         user: None,
         group: None,
         keep: false,
+        vm_name: None,
         timeout: 30.0,
         max_idle_sec: 600,
         suspended_sec: 600,
@@ -1960,12 +1966,14 @@ fn exec_command(shape: impl FnOnce(&mut ExecArgs)) -> Command {
         stream: false,
         from_offset: None,
         stdin: false,
-        state_dir: Some(std::env::temp_dir().join(format!(
-            "microvm-guard-exec-history-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ))),
-        attach: attach_flags(),
+        attach: AttachFlags {
+            state_dir: Some(std::env::temp_dir().join(format!(
+                "microvm-guard-exec-history-{}-{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ))),
+            ..attach_flags()
+        },
         region: region_flags(),
     };
     shape(&mut args);
@@ -2984,6 +2992,255 @@ impl Drop for TempFile {
 /// unchanged, which is why only this test catches it. Broken exactly so on 2026-08-25
 /// (block commented out, test red on `read.len()`), then restored.
 #[tokio::test]
+async fn a_taken_vm_name_is_refused_before_any_door_with_its_own_row() {
+    // The acceptance criterion, verbatim: collision on reuse of a live name is a local
+    // refusal with a stable ERR_* code and **zero billable calls**. The seam is the
+    // RefusingSeam, so any AWS reach shows up as an entered door — and the assertion below
+    // is that none was.
+    let dir = TempDir::new("name-collision");
+    crate::ledger::Names::new(&dir.0)
+        .register(&crate::ledger::NameRecord {
+            name: "ci-runner".into(),
+            microvm_id: "mvm-live".into(),
+            endpoint: "https://mvm-live.example".into(),
+            agent_token: "tok".into(),
+            region: "us-east-1".into(),
+            at: 1,
+        })
+        .expect("registers");
+
+    let seam = RefusingSeam::new();
+    let mut args = run_args_for_image(
+        "arn:aws:lambda:us-east-1:123456789012:microvm-image:img",
+        dir.0.clone(),
+    );
+    args.keep = true;
+    args.vm_name = Some("ci-runner".into());
+    let (result, _) = dispatch_with(&seam, &Command::Run(args), full_infra()).await;
+
+    let failure = result.expect_err("a taken name is a refusal");
+    assert_eq!(failure.exit, Exit::NameTaken);
+    assert_eq!(failure.code(), "ERR_NAME_TAKEN");
+    assert_eq!(failure.exit.as_u8(), 14);
+    assert!(
+        failure.message.contains("mvm-live"),
+        "the holder is named, so the remedy is actionable: {}",
+        failure.message
+    );
+    assert_eq!(
+        seam.doors(),
+        Vec::<Door>::new(),
+        "the refusal must cost zero AWS calls — no door may have been entered"
+    );
+
+    // And an illegal name is the *other* row: fixed by editing the flag, not by a terminate.
+    let seam = RefusingSeam::new();
+    let mut args = run_args_for_image(
+        "arn:aws:lambda:us-east-1:123456789012:microvm-image:img",
+        dir.0.clone(),
+    );
+    args.keep = true;
+    args.vm_name = Some("mvm-lookalike".into());
+    let (result, _) = dispatch_with(&seam, &Command::Run(args), full_infra()).await;
+    let failure = result.expect_err("an id-shaped name is refused");
+    assert_eq!(failure.exit, Exit::InvalidArg);
+    assert_eq!(seam.doors(), Vec::<Door>::new(), "still before any door");
+}
+
+/// **A registered name substitutes for the id on the lifecycle wire, and a raw-id terminate
+/// frees it.**
+///
+/// The suspend asserts the substitution where it matters — the `GetMicrovm` path the state
+/// read hits carries `mvm-live`, never the name. The terminate then addresses the same VM by
+/// its raw id and must release the registration anyway, because a registry that keeps
+/// claiming a name for a dead VM turns every later `--vm-name` into a false collision.
+#[tokio::test]
+async fn a_name_resolves_on_the_lifecycle_wire_and_a_terminate_by_id_frees_it() {
+    let dir = TempDir::new("name-lifecycle");
+    crate::ledger::Names::new(&dir.0)
+        .register(&crate::ledger::NameRecord {
+            name: "ci-runner".into(),
+            microvm_id: "mvm-live".into(),
+            endpoint: "https://mvm-live.example".into(),
+            agent_token: "tok".into(),
+            region: "us-east-1".into(),
+            at: 1,
+        })
+        .expect("registers");
+
+    // suspend by name: the wire carries the id.
+    let transport = Arc::new(ScriptedTransport::new());
+    transport
+        .answer(
+            "GetMicrovm",
+            200,
+            r#"{"microvmId": "mvm-live", "state": "RUNNING",
+                 "endpoint": "https://mvm-live.example",
+                 "imageArn": "arn:aws:lambda:us-east-1:123456789012:microvm-image:img",
+                 "imageVersion": "1", "maximumDurationInSeconds": 3600, "startedAt": 1}"#,
+        )
+        .answer("SuspendMicrovm", 200, "{}");
+    // The post-suspend wait re-reads the state; the second GetMicrovm answer repeats, so the
+    // wait sees RUNNING forever — script SUSPENDED as the settled answer instead.
+    transport.answer(
+        "GetMicrovm",
+        200,
+        r#"{"microvmId": "mvm-live", "state": "SUSPENDED",
+             "endpoint": "https://mvm-live.example",
+             "imageArn": "arn:aws:lambda:us-east-1:123456789012:microvm-image:img",
+             "imageVersion": "1", "maximumDurationInSeconds": 3600, "startedAt": 1}"#,
+    );
+    let seam = ScriptedSeam {
+        transport: Arc::clone(&transport),
+        clock: Arc::new(YieldingClock::default()),
+    };
+    let command = Command::Suspend(SuspendArgs {
+        microvm_id: "ci-runner".into(),
+        timeout: 30.0,
+        state_dir: Some(dir.0.clone()),
+        region: region_flags(),
+    });
+    let (result, _) = dispatch_with(&seam, &command, full_infra()).await;
+    result.expect("the suspend succeeds through the name");
+    let suspends = transport.paths_of("SuspendMicrovm");
+    assert!(
+        suspends[0].contains("mvm-live") && !suspends[0].contains("ci-runner"),
+        "the wire must carry the resolved id, never the local name: {}",
+        suspends[0]
+    );
+
+    // terminate by raw id: the name is freed.
+    let transport = Arc::new(ScriptedTransport::new());
+    transport.answer("TerminateMicrovm", 200, "{}");
+    let seam = ScriptedSeam {
+        transport: Arc::clone(&transport),
+        clock: Arc::new(YieldingClock::default()),
+    };
+    let command = Command::Terminate(TerminateArgs {
+        microvm_id: "mvm-live".into(),
+        image_identifier: None,
+        image_name: None,
+        delete_image: false,
+        wait: false,
+        state_dir: Some(dir.0.clone()),
+        region: region_flags(),
+    });
+    let (result, stderr) = dispatch_with(&seam, &command, full_infra()).await;
+    result.expect("the terminate succeeds");
+    assert!(
+        crate::ledger::Names::new(&dir.0)
+            .lookup("ci-runner")
+            .is_none(),
+        "a terminate by raw id must free the name its VM held"
+    );
+    assert!(
+        stderr.contains("released name ci-runner"),
+        "the release is said, so the operator knows the name is reusable: {stderr}"
+    );
+
+    // An unknown name on the same surface fails locally, before any call.
+    let transport = Arc::new(ScriptedTransport::new());
+    let seam = ScriptedSeam {
+        transport: Arc::clone(&transport),
+        clock: Arc::new(YieldingClock::default()),
+    };
+    let command = Command::Suspend(SuspendArgs {
+        microvm_id: "never-registered".into(),
+        timeout: 30.0,
+        state_dir: Some(dir.0.clone()),
+        region: region_flags(),
+    });
+    let (result, _) = dispatch_with(&seam, &command, full_infra()).await;
+    let failure = result.expect_err("an unknown name has nothing to suspend");
+    assert_eq!(failure.exit, Exit::Precondition);
+    assert_eq!(
+        transport.calls(),
+        Vec::<String>::new(),
+        "the miss is local: {:?}",
+        transport.calls()
+    );
+}
+
+/// **`exec --name` attaches with the registered record's triple.**
+///
+/// Asserted at the seam, which is where the substitution is observable: the `Attach` the
+/// handler passes carries the record's endpoint, token, and id, and the caller typed none of
+/// them.
+#[tokio::test]
+async fn an_attached_command_by_name_carries_the_registered_triple() {
+    let dir = TempDir::new("name-attach");
+    crate::ledger::Names::new(&dir.0)
+        .register(&crate::ledger::NameRecord {
+            name: "ci-runner".into(),
+            microvm_id: "mvm-named".into(),
+            endpoint: "https://mvm-named.example".into(),
+            agent_token: "tok-named".into(),
+            region: "us-west-2".into(),
+            at: 1,
+        })
+        .expect("registers");
+
+    /// A seam that records the `Attach` it was handed and then refuses.
+    struct AttachRecorder {
+        seen: Mutex<Vec<(Attach, String)>>,
+    }
+    impl CoreSeam for AttachRecorder {
+        fn control_plane(&self, _region: Region) -> BoxFuture<'_, Result<ControlPlane, Error>> {
+            panic!("an attached command never opens a control plane directly")
+        }
+        fn open_sandbox(
+            &self,
+            _region: Region,
+            _port: Option<u16>,
+        ) -> BoxFuture<'_, Result<Sandbox, Error>> {
+            panic!("an attached command never opens a sandbox")
+        }
+        fn attach_session(
+            &self,
+            region: Region,
+            attach: Attach,
+        ) -> BoxFuture<'_, Result<Session, Error>> {
+            self.seen
+                .lock()
+                .expect("not poisoned")
+                .push((attach, region.as_str().to_string()));
+            Box::pin(async move { Err(Error::new(ErrorKind::Platform, "recorded; stopping")) })
+        }
+        fn put_artifact(&self, _uri: &str, _bytes: Vec<u8>) -> BoxFuture<'_, Result<(), Error>> {
+            panic!("no artifact on this path")
+        }
+    }
+
+    let seam = AttachRecorder {
+        seen: Mutex::new(Vec::new()),
+    };
+    let command = Command::Health(HealthArgs {
+        attach: AttachFlags {
+            endpoint: None,
+            agent_token: None,
+            microvm_id: None,
+            name: Some("ci-runner".into()),
+            port: None,
+            state_dir: Some(dir.0.clone()),
+        },
+        region: RegionFlags::default(),
+    });
+    let (result, _) = dispatch_with(&seam, &command, full_infra()).await;
+    result.expect_err("the recorder refuses after recording");
+
+    let seen = seam.seen.lock().expect("not poisoned");
+    assert_eq!(seen.len(), 1, "exactly one attach was attempted");
+    let (attach, region) = &seen[0];
+    assert_eq!(attach.endpoint, "https://mvm-named.example");
+    assert_eq!(attach.agent_token, "tok-named");
+    assert_eq!(attach.microvm_id, "mvm-named");
+    assert_eq!(
+        region, "us-west-2",
+        "with no --region flag, the record's launch region is the default"
+    );
+}
+
+#[tokio::test]
 async fn a_terminate_appends_a_terminated_event_that_survives_the_command() {
     let dir = TempDir::new("history-terminate");
     let transport = Arc::new(ScriptedTransport::new());
@@ -3065,7 +3322,7 @@ async fn an_exec_appends_the_daemons_report_and_a_detached_one_appends_a_null_co
         .reply(200, &poll_body("acked", "4", "out", true));
     let command = exec_command(|args| {
         args.exec_id = Some("x-1".into());
-        args.state_dir = Some(dir.0.clone());
+        args.attach.state_dir = Some(dir.0.clone());
     });
     let (result, _, _) = against_daemon(&script, &command).await;
     result.expect("the exec completes");
@@ -3087,7 +3344,7 @@ async fn an_exec_appends_the_daemons_report_and_a_detached_one_appends_a_null_co
     let command = exec_command(|args| {
         args.detach = true;
         args.exec_id = Some("x-1".into());
-        args.state_dir = Some(dir.0.clone());
+        args.attach.state_dir = Some(dir.0.clone());
     });
     let (result, _, _) = against_daemon(&script, &command).await;
     result.expect("a detached start succeeds");

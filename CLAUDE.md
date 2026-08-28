@@ -68,6 +68,37 @@ Bindings: `microvms-py` builds via maturin (`maturin develop --uv`, pytest in
 `microvms-py/tests/`); `microvms-js` via `npm run build` / `npm test` in `microvms-js/`
 (napi-rs, Node >= 22.13).
 
+## Live verification — the rule that is not negotiable
+
+`mise run check` is the definition of done for a *change*. It is **not** the definition
+of done for a *task*. The local gate proves the code agrees with itself; it cannot prove
+the code agrees with AWS, and only a live run can. This repo's history is a list of
+things every local test passed while being wrong: the null-message unsupported-region
+trap, the clientToken replay that wedges an image, the 409 bootstrap replay against a
+token spelled "None", the proxy-token port scoping (2026-08-15) — and most recently the
+id-prefix defect (2026-08-28): the fixtures spell MicroVM ids `mvm-*`, the real service
+spells them `microvm-*`, and a resolution path keyed on the fixture prefix passed 196
+unit tests, every behavioral guard, and the process-boundary suite while refusing every
+real VM id on its first live run. A fixture convention is not a service fact.
+
+**A feature that touches the platform surface is not verified until it has run against
+real AWS.** The closing discipline for any such task:
+
+1. `mise run check` green. Necessary, never sufficient.
+2. A **live exercise of the new path itself** — the full suite (`mise run live`) or a
+   targeted round trip with the real binary against the conformance account
+   (`build --reuse` makes repeat image builds nearly free). Rebuild
+   `target/release/microvm` explicitly first: `check` does not, and a live run against
+   a stale binary verifies nothing.
+3. A **permanent named check in `conformance/run_rs.py`** for the new surface, so the
+   live tier covers it on every future run. A one-time manual pass decays; keep the
+   suite's count honest in its header and in `live:conformance-rs`'s description.
+4. `mise run live:verify-clean` (or `microvm ls`) after — leave the account clean.
+
+A PR that skips step 2 must say so in its body, in plain words, as an unverified claim.
+"The fakes pass" and "it works" are different sentences. Purely local changes
+(rendering, docs, `ls`/`history`/`cost`) are exempt; when in doubt, it is not exempt.
+
 ## Requirements workflow (symspec, EARS)
 
 `spec/core.symspec.json` — 51 formal requirements for microvms-core, with a state model
@@ -103,9 +134,9 @@ requirements sharing vocabulary with no peer need a glossary link, not a looser 
 - `agentd/` — the in-VM daemon (exec, file transfer, one-shot bootstrap)
 - `model/` — stateright models of daemon and client lifecycle
 - `microvms-core/` — the client library; the type system carries every trap closure
-- `microvms-cli/` — the `microvm` binary: 17 commands, JSON envelopes, `manifest`.
+- `microvms-cli/` — the `microvm` binary: 18 commands, JSON envelopes, `manifest`.
   No lib target; allowlisted deps (6), asserted by `tests/thinness.rs`. The count is
-  compile-enforced by `RESPONSE_TYPES: [_; 17]` in `src/commands/mod.rs`.
+  compile-enforced by `RESPONSE_TYPES: [_; 18]` in `src/commands/mod.rs`.
 - `microvms-py/`, `microvms-js/` — thin PyO3 / napi-rs bindings over core. Only the
   Python side has a drift gate: `microvms.pyi` is checked by `stubs:check`, while
   `microvms-js/index.d.ts` is gitignored and nothing compares it to the crate.

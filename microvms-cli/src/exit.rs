@@ -3,7 +3,7 @@
 //!
 //! # Append-only, because a consumer branches on these
 //!
-//! Fourteen rows, 0 through 13, byte-identical to the deleted Python client's
+//! Fifteen rows, 0 through 14. Rows 0-13 are byte-identical to the deleted Python client's
 //! `Exit`/`Code`/`EXIT_TABLE` trio (see git history). Split by *what the caller should do next*, which is the
 //! only distinction worth a separate integer: `ERR_RETRYABLE` means run it again unchanged,
 //! `ERR_CREDENTIALS` means fix an identity and no amount of waiting helps. The three
@@ -99,6 +99,16 @@ pub enum Exit {
     /// platform, the credentials, or this CLI — a CI caller needs to tell "your tests
     /// failed" from "we never got a VM", and one shared code cannot say both.
     ExecFailed = 13,
+    /// `run --keep --vm-name` named a name the local registry already holds for a live VM.
+    ///
+    /// Its own row rather than `ERR_INVALID_ARG`, because the two demand different next
+    /// actions: an invalid argument is fixed by editing the flag, and a taken name is fixed
+    /// by terminating the VM that holds it (or picking another name) — and the refusal is
+    /// purely local, before any billable call, so a script retrying it unchanged burns
+    /// nothing but must also never succeed by accident. The first exit code with no core
+    /// [`ErrorKind`] behind it: the registry is the CLI's own file, so core can never
+    /// produce this failure.
+    NameTaken = 14,
 }
 
 impl Exit {
@@ -162,7 +172,7 @@ impl fmt::Display for Exit {
     }
 }
 
-/// The fourteen rows, in exit-code order, so the rendered table reads like the contract it
+/// The fifteen rows, in exit-code order, so the rendered table reads like the contract it
 /// is.
 ///
 /// Meanings and findings transcribed from `cli.py:149`'s `EXIT_TABLE`, which is what
@@ -170,7 +180,7 @@ impl fmt::Display for Exit {
 /// out rather than generated from [`ErrorKind::code`], because a generated table would
 /// agree with a typo — the same reason `microvms-core/src/error.rs:432` spells its thirteen
 /// codes by hand.
-pub const EXIT_TABLE: [ExitRow; 14] = [
+pub const EXIT_TABLE: [ExitRow; 15] = [
     ExitRow {
         exit: Exit::Ok,
         code: None,
@@ -253,6 +263,12 @@ pub const EXIT_TABLE: [ExitRow; 14] = [
         exit: Exit::ExecFailed,
         code: Some("ERR_EXEC_FAILED"),
         meaning: "the sandbox worked and the command in it exited non-zero",
+        finding: "",
+    },
+    ExitRow {
+        exit: Exit::NameTaken,
+        code: Some("ERR_NAME_TAKEN"),
+        meaning: "the VM name is registered to a live VM; refused locally, before any AWS call",
         finding: "",
     },
 ];
@@ -389,7 +405,7 @@ pub fn from_parse_error(error: &clap::Error) -> CliError {
 mod tests {
     use super::*;
 
-    /// **CLI-3, the table-driven guard over every row.** All fourteen, each asserting the
+    /// **CLI-3, the table-driven guard over every row.** All fifteen, each asserting the
     /// integer, the `ERR_*` string, and the `docs/PLATFORM.md` finding together.
     ///
     /// All three per row is what makes collapsing impossible. A CLI that mapped every
@@ -403,7 +419,7 @@ mod tests {
     /// packet's guard proofs.
     #[test]
     fn every_row_carries_its_integer_its_code_and_its_finding() {
-        let expected: [(u8, Option<&str>, &str); 14] = [
+        let expected: [(u8, Option<&str>, &str); 15] = [
             (0, None, ""),
             (1, Some("ERR_UNEXPECTED"), ""),
             (2, Some("ERR_INVALID_ARG"), ""),
@@ -430,6 +446,7 @@ mod tests {
             ),
             (12, Some("ERR_PRECONDITION"), ""),
             (13, Some("ERR_EXEC_FAILED"), ""),
+            (14, Some("ERR_NAME_TAKEN"), ""),
         ];
         assert_eq!(EXIT_TABLE.len(), expected.len());
         for (row, (integer, code, finding)) in EXIT_TABLE.iter().zip(expected) {
@@ -456,14 +473,14 @@ mod tests {
         }
     }
 
-    /// Thirteen distinct non-zero codes for thirteen classes.
+    /// Fourteen distinct non-zero codes for fourteen classes.
     ///
     /// Two rows sharing a code makes the failure envelope ambiguous, which is the one thing
     /// the string beside the integer exists to prevent.
     #[test]
     fn no_two_rows_share_a_code_or_an_integer() {
         let mut codes: Vec<&str> = EXIT_TABLE.iter().filter_map(|row| row.code).collect();
-        assert_eq!(codes.len(), 13, "only row 0 has no code");
+        assert_eq!(codes.len(), 14, "only row 0 has no code");
         codes.sort_unstable();
         let before = codes.len();
         codes.dedup();
@@ -472,16 +489,19 @@ mod tests {
         let mut integers: Vec<u8> = EXIT_TABLE.iter().map(|row| row.exit.as_u8()).collect();
         integers.sort_unstable();
         integers.dedup();
-        assert_eq!(integers.len(), 14, "duplicate exit integer");
+        assert_eq!(integers.len(), 15, "duplicate exit integer");
     }
 
-    /// The CLI's table and core's taxonomy are the same thirteen classes, and the code
-    /// strings agree byte for byte.
+    /// The CLI's table starts with core's taxonomy — the same thirteen classes, code
+    /// strings agreeing byte for byte — and only then carries the CLI's own rows.
     ///
     /// The load-bearing cross-check. Two tables that must agree are one table that will
     /// not: core's `ErrorKind::code` is what a binding reports and this table is what a
     /// shell branches on, so a disagreement means one consumer is told `ERR_TIMEOUT` and
-    /// the other `ERR_PLATFORM` about the same failure.
+    /// the other `ERR_PLATFORM` about the same failure. `ERR_NAME_TAKEN` is past the
+    /// shared prefix deliberately: the name registry is the CLI's own file, so core has no
+    /// kind for it and never will — a core kind added *behind* it would break the prefix
+    /// equality here, which is the alarm this asymmetry needs.
     #[test]
     fn the_exit_table_and_cores_error_kinds_are_the_same_thirteen_classes() {
         let from_core: Vec<&str> = ErrorKind::ALL
@@ -489,7 +509,12 @@ mod tests {
             .map(|kind| Exit::for_kind(*kind).code().expect("no kind maps to row 0"))
             .collect();
         let from_table: Vec<&str> = EXIT_TABLE.iter().filter_map(|row| row.code).collect();
-        assert_eq!(from_core, from_table);
+        assert_eq!(from_core, from_table[..from_core.len()]);
+        assert_eq!(
+            &from_table[from_core.len()..],
+            &["ERR_NAME_TAKEN"],
+            "the CLI-only rows, none of which any core kind may map onto"
+        );
 
         // And each kind's own code string is the row's, so neither side is merely
         // consistently wrong.

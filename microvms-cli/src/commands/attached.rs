@@ -65,31 +65,98 @@ const VM_PREFIX: &str = "vm:";
 /// default leaves room for a deployment that lowered it.
 const STDIN_CHUNK_BYTES: usize = 256 * 1024;
 
-/// A session against the VM the flags name.
+/// A session against the VM the flags name, and the id it resolved to.
 ///
 /// The one helper every command in this file starts with, so the resolve-then-attach pair is
 /// written once. Not merely tidiness: `resolve_region` has to happen *before* the attach, because
 /// the region is what the proxy-token mint's ARN is derived for, and a command that attached first
 /// and resolved later would mint against the wrong region and read the refusal as a bad token.
+///
+/// # `--name` is the triple, read back from the registry
+///
+/// A name resolves through the local registry (`ledger::Names`) with zero AWS calls: the record
+/// `run --keep --vm-name` wrote carries the endpoint, the agent token, the MicroVM id, *and the
+/// launch region* — so the caller types one word where they pasted four values. The record's
+/// region is used only when no `--region` flag was given: a flag is the caller overriding the
+/// record, which is the same precedence every other flag-versus-recorded-value pair here has.
+/// A name this state directory never registered fails with `ERR_PRECONDITION` naming the
+/// registry it looked in, because the record may simply live in another machine's state dir.
+///
+/// The returned id is the one the session addresses, whichever spelling named it — the history
+/// append needs it, and reading it off the resolution here is what keeps a `--name` exec's
+/// history under the same id as a triple exec's.
 async fn attach<O: std::io::Write, E: std::io::Write>(
     ctx: &Ctx<'_, O, E>,
     region: &RegionFlags,
     flags: &AttachFlags,
-) -> Result<Session, CliError> {
-    let region = region.resolve(ctx.env)?;
-    let session = ctx
-        .seam
-        .attach_session(
-            region,
+) -> Result<(Session, String), CliError> {
+    let (attach, region) = resolve_attach(ctx, region, flags)?;
+    let microvm_id = attach.microvm_id.clone();
+    let session = ctx.seam.attach_session(region, attach).await?;
+    Ok((session, microvm_id))
+}
+
+/// The triple and region an attach will use, from either spelling. Zero AWS calls.
+///
+/// Split from [`attach`] so the resolution is testable without a seam: everything here is
+/// local — clap guarantees exactly one spelling is present, and the registry is a file read.
+fn resolve_attach<O: std::io::Write, E: std::io::Write>(
+    ctx: &Ctx<'_, O, E>,
+    region: &RegionFlags,
+    flags: &AttachFlags,
+) -> Result<(Attach, microvms_core::Region), CliError> {
+    if let Some(name) = &flags.name {
+        let root = state_dir(flags.state_dir.clone(), ctx.env);
+        let names = crate::ledger::Names::new(&root);
+        let Some(record) = names.lookup(name) else {
+            return Err(CliError::new(
+                Exit::Precondition,
+                format!(
+                    "no VM named {name:?} in {}. Names are local: `run --keep --vm-name {name}` \
+                     registers one here, and a name registered on another machine lives in that \
+                     machine's state directory.",
+                    root.join("names").display(),
+                ),
+            )
+            .suggest("`microvm ls` shows this state directory's outstanding runs")
+            .suggest("pass the --endpoint/--agent-token/--microvm-id triple directly"));
+        };
+        // The flag wins over the record, so `exec --name x --region us-west-2` means what it
+        // says; the record's region is the default that makes the flag unnecessary.
+        let resolved_region = if region.region.is_some() || region.unlisted_region.is_some() {
+            region.resolve(ctx.env)?
+        } else {
+            microvms_core::Region::unlisted(&record.region)
+        };
+        return Ok((
             Attach {
-                endpoint: flags.endpoint.clone(),
-                agent_token: flags.agent_token.clone(),
-                microvm_id: flags.microvm_id.clone(),
+                endpoint: record.endpoint,
+                agent_token: record.agent_token,
+                microvm_id: record.microvm_id,
                 port: flags.port,
             },
-        )
-        .await?;
-    Ok(session)
+            resolved_region,
+        ));
+    }
+    let expect = |value: &Option<String>, flag: &str| -> Result<String, CliError> {
+        value.clone().ok_or_else(|| {
+            // Unreachable through the parser — `required_unless_present = "name"` — but the
+            // struct is constructible in code, and a message beats a panic if it ever is.
+            CliError::new(
+                Exit::InvalidArg,
+                format!("--{flag} is required unless --name is given"),
+            )
+        })
+    };
+    Ok((
+        Attach {
+            endpoint: expect(&flags.endpoint, "endpoint")?,
+            agent_token: expect(&flags.agent_token, "agent-token")?,
+            microvm_id: expect(&flags.microvm_id, "microvm-id")?,
+            port: flags.port,
+        },
+        region.resolve(ctx.env)?,
+    ))
 }
 
 // ── exec ────────────────────────────────────────────────────────────────────
@@ -105,7 +172,7 @@ pub async fn exec<O: std::io::Write, E: std::io::Write>(
     ctx: &mut Ctx<'_, O, E>,
     args: &ExecArgs,
 ) -> Result<Rendered, CliError> {
-    let session = attach(ctx, &args.region, &args.attach).await?;
+    let (session, microvm_id) = attach(ctx, &args.region, &args.attach).await?;
 
     // `--poll` first, because it is the one shape that starts nothing. Clap's `conflicts_with_all`
     // has already refused it beside every writing flag, so this branch cannot be reached with a
@@ -156,12 +223,14 @@ pub async fn exec<O: std::io::Write, E: std::io::Write>(
     // publishes the same string.
     let exec_id = handle.exec_id().to_string();
 
-    // The VM's history, keyed by the id the caller attached with. Every append below carries
-    // the daemon's own report — the confirmed exec id and the outcome fields — and swallows
-    // its failures, so an unwritable state dir costs the record and never the exec.
+    // The VM's history, keyed by the id the attach resolved — the same id whichever spelling
+    // (`--microvm-id` or `--name`) the caller used, so one VM's record is one file. Every
+    // append below carries the daemon's own report — the confirmed exec id and the outcome
+    // fields — and swallows its failures, so an unwritable state dir costs the record and
+    // never the exec.
     let history = History::for_vm(
-        &state_dir(args.state_dir.clone(), ctx.env),
-        &args.attach.microvm_id,
+        &state_dir(args.attach.state_dir.clone(), ctx.env),
+        &microvm_id,
     );
 
     if let Some(bytes) = feed {
@@ -523,9 +592,8 @@ pub async fn health<O: std::io::Write, E: std::io::Write>(
     ctx: &mut Ctx<'_, O, E>,
     args: &HealthArgs,
 ) -> Result<Rendered, CliError> {
-    let session = attach(ctx, &args.region, &args.attach).await?;
-    ctx.out
-        .progress(&format!("health of {}", args.attach.microvm_id));
+    let (session, microvm_id) = attach(ctx, &args.region, &args.attach).await?;
+    ctx.out.progress(&format!("health of {microvm_id}"));
     let health = session.health().await?;
 
     let mut data = Map::new();
@@ -568,7 +636,7 @@ pub async fn health<O: std::io::Write, E: std::io::Write>(
     }
 
     let lines = [
-        format!("daemon {} on {}", health.version, args.attach.microvm_id),
+        format!("daemon {} on {microvm_id}", health.version),
         format!("bootstrapped: {}", health.bootstrapped),
         format!(
             "identity: {}",
@@ -648,7 +716,7 @@ pub async fn ack<O: std::io::Write, E: std::io::Write>(
     ctx: &mut Ctx<'_, O, E>,
     args: &AckArgs,
 ) -> Result<Rendered, CliError> {
-    let session = attach(ctx, &args.region, &args.attach).await?;
+    let (session, _) = attach(ctx, &args.region, &args.attach).await?;
     ctx.out.progress(&format!("acking {}", args.exec_id));
     // The ack response carries the released output; a poll issued after it reports `acked` with
     // none. Returning this one rather than re-polling is the whole reason core sequences it that
@@ -686,7 +754,7 @@ pub async fn stdin<O: std::io::Write, E: std::io::Write>(
     ctx: &mut Ctx<'_, O, E>,
     args: &StdinArgs,
 ) -> Result<Rendered, CliError> {
-    let session = attach(ctx, &args.region, &args.attach).await?;
+    let (session, _) = attach(ctx, &args.region, &args.attach).await?;
     let bytes = match args.data.as_deref() {
         // `-` reads this process's stdin, which is how a pipe feeds a detached exec. Read before
         // the write so a read failure is not reported as a write failure.
@@ -854,7 +922,7 @@ pub async fn cp<O: std::io::Write, E: std::io::Write>(
     args: &CpArgs,
 ) -> Result<Rendered, CliError> {
     let (direction, local, remote) = resolve_paths(&args.src, &args.dst)?;
-    let session = attach(ctx, &args.region, &args.attach).await?;
+    let (session, _) = attach(ctx, &args.region, &args.attach).await?;
 
     let bytes = match direction {
         Direction::Upload => {
