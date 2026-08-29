@@ -126,6 +126,18 @@ Versions are [semantic](https://semver.org/spec/v2.0.0.html); the wire contract 
   `ControlFrameTooBig` and the caller saw a transport error instead of the 4403 code. The
   wire reason is now short; the full sentence lives in `close::explanation`.
 
+  Verified live (us-east-1, 2026-08-29): `run --keep --identity` delivered the seed through
+  the real run hook and reported the pair on the envelope and in the registry;
+  `tunnel 18443:9000 --verify-identity` completed the Noise handshake through the real
+  endpoint proxy and served the daemon's schema document decrypted end to end (1 served,
+  0 refused, 1 mint); one flipped pin character mid-base64 failed closed with nothing
+  served and the handshake named in the error; the restored record verified again; a
+  seedless launch was refused locally with `ERR_PRECONDITION` when the record carried no
+  material, and refused by the daemon (close 4401, "launched without an identity seed")
+  when material was pasted at it anyway. Both VMs terminated with nothing leaked, the
+  account verified empty, and the smoke image deleted. `drive_tunnel_identity` keeps six
+  of these checks in the live suite permanently (104 checks total).
+
 ### Measured
 
 - **The endpoint proxy refuses an upgrade replayed over the HTTPS path, and carries binary
