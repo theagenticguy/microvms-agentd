@@ -24,6 +24,12 @@ Versions are [semantic](https://semver.org/spec/v2.0.0.html); the wire contract 
   pair. Raw TCP is deliberately not this command (issue #70 layer 2: it needs a guest-side
   relay agentd does not yet serve).
 
+  Verified live (us-east-1, 2026-08-29): a guest `python3 -m http.server 8080` answered
+  through `port-forward 18080:8080 --name pf-smoke` with the correct body, a guest 404
+  passed through unreinterpreted, one token minted across three connections, and a forward
+  to a dead port answered the local client with the 502 nothing-listening sentence.
+  Teardown confirmed by `live:verify-clean`.
+
 ## [0.3.0] — 2026-08-29
 
 ### Added
