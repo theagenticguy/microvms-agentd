@@ -1401,12 +1401,21 @@ async fn escalate(pgid: u32, grace: Duration, done: Arc<Shared>) -> bool {
         return false;
     }
 
+    // Subscribe before the first check, so a publish between the check and the
+    // wait is a buffered `Finished` rather than a missed wakeup. The waiter task
+    // sends `Frame::Finished` immediately after writing `result`, so the frame is
+    // the wakeup this loop used to poll for at 20 ms intervals. A lagged receiver
+    // only ever means missed *chunk* frames; re-checking `result` covers it.
+    let mut live = done.live.subscribe();
     let waited = tokio::time::timeout(grace, async {
         loop {
             if done.result.lock().await.is_some() {
                 return;
             }
-            tokio::time::sleep(Duration::from_millis(20)).await;
+            match live.recv().await {
+                Ok(Frame::Finished) | Err(broadcast::error::RecvError::Closed) => return,
+                Ok(Frame::Chunk { .. }) | Err(broadcast::error::RecvError::Lagged(_)) => {}
+            }
         }
     })
     .await;
