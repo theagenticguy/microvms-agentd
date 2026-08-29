@@ -74,13 +74,17 @@ async fn upper_server() -> SocketAddr {
 }
 
 /// Opens a tunnel WebSocket to `port`, with a bearer token unless `token` is `None`.
+///
+/// The error is boxed for clippy 1.98's `result_large_err`: `tungstenite::Error` is 136
+/// bytes, and the lint is right that every caller pays for the failure shape — even in a
+/// test helper, since `--all-targets` lints this file under `-D warnings`.
 async fn open_tunnel(
     daemon: SocketAddr,
     port: u16,
     token: Option<&str>,
 ) -> Result<
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<TcpStream>>,
-    tokio_tungstenite::tungstenite::Error,
+    Box<tokio_tungstenite::tungstenite::Error>,
 > {
     let mut request = format!("ws://{daemon}/v1/tcp?port={port}")
         .into_client_request()
@@ -91,7 +95,9 @@ async fn open_tunnel(
             format!("Bearer {token}").parse().expect("a header value"),
         );
     }
-    let (socket, _) = tokio_tungstenite::connect_async(request).await?;
+    let (socket, _) = tokio_tungstenite::connect_async(request)
+        .await
+        .map_err(Box::new)?;
     Ok(socket)
 }
 
@@ -282,7 +288,7 @@ async fn the_relay_refuses_an_unauthenticated_upgrade() {
         .await
         .expect_err("an unauthenticated upgrade must be refused");
     // tungstenite surfaces a non-101 as an HTTP error carrying the status.
-    match error {
+    match *error {
         tokio_tungstenite::tungstenite::Error::Http(response) => {
             assert_eq!(
                 response.status(),
@@ -303,7 +309,7 @@ async fn the_relay_refuses_a_wrong_token() {
     let error = open_tunnel(daemon, server.port(), Some("not-the-token"))
         .await
         .expect_err("a wrong token must be refused");
-    match error {
+    match *error {
         tokio_tungstenite::tungstenite::Error::Http(response) => {
             assert_eq!(response.status(), 401);
         }
