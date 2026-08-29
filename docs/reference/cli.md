@@ -420,6 +420,8 @@ CI = "1"
 
 Key names are the flag names with `-` for `_`, so the file reads like the command line it replaces. All keys are optional; an absent key means the flag or the built-in default decides. A relative `binary` path resolves against the config file's own directory, not the process cwd — `--config /repo/microvm.toml` exists precisely for the invoke-from-elsewhere case, and `target/agentd` must mean the same binary from anywhere. An unknown key is refused by name rather than silently ignored — `memroy = 4096` launching a 2 GB VM is the failure that closes. A value outside its flag's domain (`memory = 1500`, an artifact glob that will not compile) is refused with the same closed-set reasoning the parser enforces, so the file cannot be a side door past the flag domains.
 
+On Windows, two `binary` shapes are refused at load because they mean two things at once (issue #87): a rooted path with no drive (`/opt/agentd` — Windows parses it as relative, so the file-directory join would silently re-anchor it onto the config file's drive) and a drive with no root (`C:agentd` — resolves against that drive's current directory at spawn time). The remedy differs per intent — write the drive letter, or write a genuinely relative path — so the loader refuses rather than guesses. On Unix neither shape exists and `/opt/agentd` is simply absolute.
+
 `--timeout` is deliberately not a config key: it is a client-side wait, not a property of the VM the project wants to pin.
 
 A file that cannot be used is `ERR_CONFIG` (exit 15), refused locally before any billable call. The remedy differs from `ERR_INVALID_ARG`'s — edit (or `--no-config` bypass) a file the invocation may never have named, rather than edit the command line — which is why it has its own row.
