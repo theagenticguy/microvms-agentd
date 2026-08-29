@@ -170,7 +170,7 @@ fn the_cli_exports_no_library_target_at_all() {
     assert_eq!(binaries, ["microvm"], "{targets:?}");
 }
 
-/// The workspace's member list is the six crates the architecture describes.
+/// The workspace's member list is the seven crates the architecture describes.
 ///
 /// Pinned because the requirements above are equalities over a *known* set: a seventh crate that
 /// depended on the CLI would satisfy every assertion here while violating ARCH-5, since nothing

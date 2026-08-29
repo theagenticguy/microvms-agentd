@@ -43,3 +43,5 @@ lessons before starting work.
   trap, from adding SSE streaming plus stdin and the Python client library.
 - 2026-08-05 (session-bdf1bf): the first three, from building the axum daemon and
   its proptest + turmoil verification tiers.
+- [Exit-table pin web](solutions/repo-conventions/exit-table-pin-web.md) — appending a row touches five pinned copies; CLI-only rows need the prefix-equality rewrite
+- [Live verification is the definition of done](solutions/repo-conventions/live-verification-is-the-definition-of-done.md) — fixtures said mvm-, the service says microvm-; live run + permanent conformance check required per CLAUDE.md

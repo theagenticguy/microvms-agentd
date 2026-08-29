@@ -8,7 +8,7 @@
 //! onto the first room — it parses, it renders, and it exits with a code. Every AWS call and
 //! every trap guard belongs to the library, and that is a **checked** property rather than an
 //! intention: `tests/thinness.rs` asserts that the manifest's direct dependency set is exactly
-//! six crates, that no source file here names a transport or a control-plane operation, and that
+//! eight crates, that no source file here names a transport or a control-plane operation, and that
 //! every AWS-touching command fails when the library seam is made to refuse. Any one of those
 //! alone is defeatable, which is why there are three.
 //!
@@ -29,6 +29,7 @@
 
 mod cli;
 mod commands;
+mod config;
 mod envelope;
 mod exit;
 // The guards that have to reach inside the crate. See the module docs on why these three are
@@ -44,7 +45,7 @@ mod tui;
 
 use std::process::ExitCode;
 
-use clap::Parser;
+use clap::{CommandFactory, FromArgMatches};
 
 use crate::cli::{Cli, Command};
 use crate::commands::Ctx;
@@ -72,7 +73,22 @@ fn main() -> ExitCode {
     let wants = |flag: &str| tokens.iter().any(|token| token == flag);
     let mut out = Output::for_flags(wants("--json"), wants("--dense"), wants("--quiet"));
 
-    let parsed = match Cli::try_parse_from(std::env::args()) {
+    // Through `ArgMatches` rather than `Parser::try_parse_from`, because the matches carry
+    // the one fact the parsed struct cannot: `value_source`, which is how `run`'s config
+    // merge tells `--memory 2048` (typed, wins over the file) from the same value arriving
+    // as clap's default (loses to the file). The derive path is the same parser — this is
+    // its own two-step spelling, not a second grammar.
+    let parsed = match Cli::command()
+        .try_get_matches_from(std::env::args())
+        .and_then(|matches| {
+            let mut parsed = Cli::from_arg_matches(&matches)?;
+            if let (Command::Run(args), Some((_, sub))) =
+                (&mut parsed.command, matches.subcommand())
+            {
+                args.explicit = cli::Explicit::from_matches(sub);
+            }
+            Ok(parsed)
+        }) {
         Ok(parsed) => parsed,
         Err(error) => {
             // clap's help and version are successes that print themselves. Everything else is an

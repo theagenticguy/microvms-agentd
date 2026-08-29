@@ -118,12 +118,267 @@ pub fn on_ctrl_c() -> Interrupt<'static> {
 
 // ── run ─────────────────────────────────────────────────────────────────────
 
+/// `run`'s arguments after the config merge, plus the `resolvedConfig` report.
+///
+/// One struct so the merge happens exactly once, before anything is attempted, and the
+/// rest of `run` reads effective values without knowing a file exists. `resolved` is the
+/// envelope's `resolvedConfig`: each knob's winning value and the source it came from
+/// (`flag`, `config`, `env` — the region only — or `default`), because "which source won"
+/// is a question a caller should read off the answer rather than re-derive from the
+/// precedence rules.
+pub struct MergedRunArgs {
+    pub args: RunArgs,
+    pub config_path: Option<std::path::PathBuf>,
+    /// The compiled artifact globs from the file's `artifacts` key. Validated by the
+    /// loader; consumed by `run <DIR>`'s download selection (issue #72), which is the only
+    /// consumer a glob list has — a plain `run` brings nothing back.
+    #[allow(
+        dead_code,
+        reason = "wired by issue #72's run <DIR>; the loader already validates it, and \
+                  dropping it from the merge would re-derive the file there"
+    )]
+    pub artifacts: Vec<String>,
+    pub resolved: serde_json::Map<String, serde_json::Value>,
+}
+
+/// Applies `microvm.toml` to `run`'s arguments: flags win, then the file, then defaults.
+///
+/// Fails with `ERR_CONFIG` — before any billable call — when the file cannot be used, and
+/// with the *flag's* vocabulary when a file value is outside the flag's domain, because
+/// the file must not be a quieter side door past the parser's closed sets.
+///
+/// `env` is here for the report's sake, not the merge's: the region is the one knob whose
+/// chain continues past the file into `$AWS_REGION`/`$AWS_DEFAULT_REGION`, and a
+/// `resolvedConfig` that answered `default` while the launch went where the environment
+/// pointed would be the report re-deriving wrongly — the one thing it exists to prevent.
+pub fn merge_config(
+    args: &RunArgs,
+    env: &dyn Fn(&str) -> Option<String>,
+) -> Result<MergedRunArgs, crate::exit::CliError> {
+    let loaded = crate::config::load(
+        args.config.config.as_deref(),
+        args.config.no_config,
+        std::path::Path::new("."),
+    )
+    .map_err(config_error)?;
+    let (config_path, config) = match loaded {
+        Some((path, config)) => (Some(path), config),
+        None => (None, crate::config::ProjectConfig::default()),
+    };
+
+    let mut merged = args.clone();
+    let mut resolved = Map::new();
+    let mut report = |knob: &str, value: serde_json::Value, source: crate::config::Source| {
+        resolved.insert(
+            knob.to_string(),
+            json!({"value": value, "source": source.as_str()}),
+        );
+    };
+
+    // The Option-shaped knobs: typed is `is_some()`, and there is no built-in default to
+    // label — an absent one resolves to `null` from `default`.
+    //
+    // `image` and `binary` are one decision wearing two knobs: `run` builds exactly when
+    // the merged `image` is absent. So a *typed* BINARY positional with no typed `--image`
+    // suppresses the file's `image` — the caller who wrote `microvm run ./fresh-agentd` in
+    // a project whose file pins `image` asked to build and launch that binary, and a file
+    // that silently won would run their tests against the stale pinned image. This is the
+    // documented precedence, not an exception to it: the positional is the flag layer for
+    // the pair.
+    let image_config = if args.binary.is_some() && args.image.is_none() {
+        None
+    } else {
+        config.image.clone()
+    };
+    let image = crate::config::pick(
+        args.image.is_some(),
+        args.image.clone(),
+        image_config.map(Some),
+    );
+    report("image", json!(image.value), image.source);
+    merged.image = image.value;
+
+    // The typed positional also beats the file's `binary`; and when the file's `image`
+    // won (nothing typed for the pair), the file's `binary` is dead weight the launch
+    // ignores — merged anyway so the report stays honest about where each value came from.
+    let binary = crate::config::pick(
+        args.binary.is_some(),
+        args.binary.clone(),
+        config.binary.map(Some),
+    );
+    report(
+        "binary",
+        json!(binary.value.as_ref().map(|p| p.display().to_string())),
+        binary.source,
+    );
+    merged.binary = binary.value;
+
+    let exec = crate::config::pick(
+        args.exec.is_some(),
+        args.exec.clone(),
+        config.exec.map(Some),
+    );
+    report("exec", json!(exec.value), exec.source);
+    merged.exec = exec.value;
+
+    // The clap-defaulted knobs: typed is the `value_source` answer `args.explicit`
+    // carries, because the parsed field holds a value either way.
+    // Already validated by the loader; the expect documents the invariant.
+    let memory_config = config.memory.map(|mib| {
+        crate::cli::memory_from_mib(mib).expect("config::load validated the memory domain")
+    });
+    let memory = crate::config::pick(args.explicit.memory, args.memory, memory_config);
+    report(
+        "memory",
+        json!(memory.value.size_class().baseline_mib()),
+        memory.source,
+    );
+    merged.memory = memory.value;
+
+    let max_idle = crate::config::pick(
+        args.explicit.max_idle_sec,
+        args.max_idle_sec,
+        config.max_idle_sec,
+    );
+    report("maxIdleSec", json!(max_idle.value), max_idle.source);
+    merged.max_idle_sec = max_idle.value;
+
+    let suspended = crate::config::pick(
+        args.explicit.suspended_sec,
+        args.suspended_sec,
+        config.suspended_sec,
+    );
+    report("suspendedSec", json!(suspended.value), suspended.source);
+    merged.suspended_sec = suspended.value;
+
+    let max_duration = crate::config::pick(
+        args.explicit.max_duration_sec,
+        args.max_duration_sec,
+        config.max_duration_sec,
+    );
+    report(
+        "maxDurationSec",
+        json!(max_duration.value),
+        max_duration.source,
+    );
+    merged.max_duration_sec = max_duration.value;
+
+    // `--egress` is SetTrue: parsed `true` is the evidence it was typed, so the file can
+    // turn egress on for a project but a flag can only add it, never subtract — which is
+    // the direction a boolean flag can express, and `egress = false` in a file is the
+    // default restated rather than an override.
+    let egress = crate::config::pick(args.egress, args.egress, config.egress);
+    report("egress", json!(egress.value), egress.source);
+    merged.egress = egress.value;
+
+    // The region: a config value joins the flag chain *above* the environment, because the
+    // file is project state and the environment is machine state. The closed set only —
+    // the loader already refused an unlisted name with the flag's own remedy (and doctor
+    // validates through the same loader, so the two commands cannot disagree), which is
+    // why this is an expect rather than a second refusal.
+    let region_config = config.region.as_deref().map(|name| {
+        crate::cli::RegionArg::from_name(name).expect("config::load validated the region domain")
+    });
+    let region = crate::config::pick(
+        args.region.region.is_some() || args.region.unlisted_region.is_some(),
+        args.region.region,
+        region_config.map(Some),
+    );
+    if args.region.unlisted_region.is_none() {
+        merged.region.region = region.value;
+    }
+    // The report continues down the chain the run itself will walk: past the file sit
+    // `$AWS_REGION`/`$AWS_DEFAULT_REGION`, then the built-in. A report that said
+    // `default: null` while the launch went where the environment pointed would be the
+    // report lying about the one knob whose chain does not end at the file.
+    let (region_value, region_source) = match (
+        merged
+            .region
+            .region
+            .map(|r| r.region().as_str().to_string())
+            .or_else(|| merged.region.unlisted_region.clone()),
+        region.source,
+    ) {
+        (Some(value), source) => (Some(value), source),
+        (None, _) => match env("AWS_REGION").or_else(|| env("AWS_DEFAULT_REGION")) {
+            // Reported as the environment's word, unvalidated: `resolve` refuses an
+            // unlisted name later with the remedy attached, and this report must not
+            // pre-empt that refusal by pretending the value was something else.
+            Some(name) => (Some(name), crate::config::Source::Env),
+            None => (
+                Some(microvms_core::Region::UsEast1.as_str().to_string()),
+                crate::config::Source::Default,
+            ),
+        },
+    };
+    report("region", json!(region_value), region_source);
+
+    // The launch env, merged per key with the flag pair winning its own key.
+    let env_source = match (args.launch_env.is_empty(), &config.env) {
+        (false, _) => crate::config::Source::Flag,
+        (true, Some(_)) => crate::config::Source::Config,
+        (true, None) => crate::config::Source::Default,
+    };
+    merged.launch_env = crate::config::merge_env(&args.launch_env, config.env.as_ref());
+    report(
+        "launchEnv",
+        json!(
+            merged
+                .launch_env
+                .iter()
+                .map(|(key, value)| (key.clone(), json!(value)))
+                .collect::<Map<_, _>>()
+        ),
+        env_source,
+    );
+
+    // Artifact globs have no flag spelling, so the file is their only source.
+    let artifacts = config.artifacts.clone().unwrap_or_default();
+    report(
+        "artifacts",
+        json!(artifacts),
+        if config.artifacts.is_some() {
+            crate::config::Source::Config
+        } else {
+            crate::config::Source::Default
+        },
+    );
+
+    Ok(MergedRunArgs {
+        args: merged,
+        config_path,
+        artifacts,
+        resolved,
+    })
+}
+
+/// A [`crate::config::ConfigError`] as the `ERR_CONFIG` row, with the remedy attached.
+fn config_error(error: crate::config::ConfigError) -> crate::exit::CliError {
+    crate::exit::CliError::new(Exit::Config, error.to_string())
+        .suggest("`microvm doctor` validates the config file alongside every other prerequisite")
+        .suggest("--no-config ignores the file for this invocation")
+}
+
 /// Build, launch, exec, report, tear down — the whole thing, once.
 pub async fn run<O: std::io::Write, E: std::io::Write>(
     ctx: &mut Ctx<'_, O, E>,
-    args: &RunArgs,
+    caller_args: &RunArgs,
     interrupt: Interrupt<'_>,
 ) -> Result<Rendered, crate::exit::CliError> {
+    // The config merge, before anything else: a broken file must cost zero AWS calls, and
+    // everything below reads the effective values without knowing a file exists.
+    let MergedRunArgs {
+        args,
+        config_path,
+        artifacts: _,
+        resolved,
+    } = merge_config(caller_args, ctx.env)?;
+    let args = &args;
+    if let Some(path) = &config_path {
+        ctx.out
+            .progress(&format!("using project config {}", path.display()));
+    }
+
     let region = args.region.resolve(ctx.env)?;
     let size = args.memory.size_class();
     let name = args
@@ -360,7 +615,16 @@ pub async fn run<O: std::io::Write, E: std::io::Write>(
     let (kind, _) = response_type("run");
     let dense = outcome.render(true);
     let text = outcome.render(false);
-    let rendered = Rendered::ok(kind, outcome.to_data(), text, dense);
+    let mut data = outcome.to_data();
+    // What each knob resolved to and which source won — the file's whole value is that a
+    // caller can stop passing flags, so the envelope has to answer "what did this run
+    // actually use" without them re-deriving the precedence.
+    data.insert("resolvedConfig".into(), serde_json::Value::Object(resolved));
+    data.insert(
+        "configPath".into(),
+        json!(config_path.as_ref().map(|path| path.display().to_string())),
+    );
+    let rendered = Rendered::ok(kind, data, text, dense);
     // A failing workload keeps its success envelope and earns a non-zero code: the sandbox did
     // its job and the output the caller asked for is in `data`. Mapped onto one stable code
     // rather than passed through raw, because a workload exiting 4 must not be

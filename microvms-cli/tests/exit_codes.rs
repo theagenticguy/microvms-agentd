@@ -38,8 +38,13 @@ fn every_locally_reachable_row_exits_with_its_own_integer_and_code() {
              "agentToken": "tok", "region": "us-east-1", "at": 1}"#,
     )
     .expect("a registered name");
+    // A file toml cannot parse, so the ERR_CONFIG row below is reachable. Written under the
+    // temp dir because the refusal under test is a local file read, exactly like the name's.
+    let broken_config = ledgers.0.join("broken.toml");
+    std::fs::write(&broken_config, "memory = ").expect("a broken config");
+    let broken_config = broken_config.to_str().expect("utf-8 temp path");
     // (label, argv, expected integer, expected code, expected finding)
-    let rows: [(&str, Vec<&str>, i32, &str, &str); 7] = [
+    let rows: [(&str, Vec<&str>, i32, &str, &str); 8] = [
         (
             "success",
             vec!["ls", "--state-dir", ledgers.path(), "--json"],
@@ -105,6 +110,20 @@ fn every_locally_reachable_row_exits_with_its_own_integer_and_code() {
             ],
             14,
             "ERR_NAME_TAKEN",
+            "",
+        ),
+        (
+            "a config file that does not parse",
+            vec![
+                "run",
+                "--image",
+                "arn:aws:lambda:us-east-1:123456789012:microvm-image:img",
+                "--config",
+                broken_config,
+                "--json",
+            ],
+            15,
+            "ERR_CONFIG",
             "",
         ),
     ];

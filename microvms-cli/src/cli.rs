@@ -273,6 +273,24 @@ impl MemoryMib {
     }
 }
 
+/// The variant for a baseline arriving as a number — from `microvm.toml`'s `memory` key —
+/// or `None` when it is off the table.
+///
+/// The file boundary needs the same closed set the parser enforces, and this is the one
+/// mapping from the integer domain into it: a config-side check written as its own list
+/// would be a second place the five baselines are spelled, which is the drift CLI-5's
+/// domain-equality test exists to prevent.
+pub fn memory_from_mib(mib: u32) -> Option<MemoryMib> {
+    match mib {
+        512 => Some(MemoryMib::Mib512),
+        1024 => Some(MemoryMib::Mib1024),
+        2048 => Some(MemoryMib::Mib2048),
+        4096 => Some(MemoryMib::Mib4096),
+        8192 => Some(MemoryMib::Mib8192),
+        _ => None,
+    }
+}
+
 /// The five regions measured to carry MicroVMs.
 ///
 /// An unsupported region answers `AccessDeniedException` with a **null message**, which is
@@ -294,6 +312,23 @@ pub enum RegionArg {
 }
 
 impl RegionArg {
+    /// The variant for a region name arriving from `microvm.toml`, or `None` when the name
+    /// is not one of the five listed regions.
+    ///
+    /// The file boundary takes the closed set only — `--unlisted-region` remains the one
+    /// spelled-out opt-in to the null-message diagnostic, and a file must not be a quieter
+    /// second door to it.
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "us-east-1" => Some(RegionArg::UsEast1),
+            "us-east-2" => Some(RegionArg::UsEast2),
+            "us-west-2" => Some(RegionArg::UsWest2),
+            "eu-west-1" => Some(RegionArg::EuWest1),
+            "ap-northeast-1" => Some(RegionArg::ApNortheast1),
+            _ => None,
+        }
+    }
+
     pub fn region(self) -> Region {
         match self {
             RegionArg::UsEast1 => Region::UsEast1,
@@ -310,7 +345,7 @@ impl RegionArg {
 /// One struct rather than two fields per command, so the `conflicts_with` relationship
 /// between the closed set and the escape hatch is declared once and cannot be forgotten on
 /// the twelfth command.
-#[derive(Args, Debug, Default)]
+#[derive(Args, Clone, Debug, Default)]
 pub struct RegionFlags {
     /// AWS region. Defaults to $AWS_REGION, then $AWS_DEFAULT_REGION, then us-east-1.
     #[arg(long, value_enum)]
@@ -387,8 +422,65 @@ pub struct AttachFlags {
     pub state_dir: Option<PathBuf>,
 }
 
+/// The project config file's two flags, shared by `run` and `doctor`.
+///
+/// One struct for the same reason [`RegionFlags`] is one: the `conflicts_with`
+/// relationship between naming a file and refusing every file is declared once. `doctor`
+/// carries the pair so `doctor --config ci.toml` validates the same file `run --config
+/// ci.toml` would read — two commands resolving the file differently is two answers to
+/// "which config applies here".
+#[derive(Args, Clone, Debug, Default)]
+pub struct ConfigFlags {
+    /// Read this project config file instead of ./microvm.toml.
+    ///
+    /// Naming a file that does not exist is refused with ERR_CONFIG: a typed path that is
+    /// wrong must not silently become "no config". The implicit ./microvm.toml is the
+    /// opposite — its absence just means flags and built-in defaults apply.
+    #[arg(long, value_name = "PATH", conflicts_with = "no_config")]
+    pub config: Option<PathBuf>,
+
+    /// Ignore any microvm.toml, even a malformed one. Flags and defaults apply.
+    #[arg(long)]
+    pub no_config: bool,
+}
+
+/// Which of `run`'s clap-defaulted knobs the caller actually typed.
+///
+/// The parsed struct cannot answer this: `--memory` and the three policy windows carry
+/// clap defaults, so their fields hold a value either way, and a merge keyed on "differs
+/// from the default" would make `--memory 2048` unable to override a config that says
+/// `4096`. [`Explicit::from_matches`] reads the answer off `ArgMatches::value_source`
+/// instead — which is why `main.rs` parses through `FromArgMatches` rather than
+/// `Parser::parse` — and the dispatcher stores it here, a skipped field the parser never
+/// sees. `--egress` needs no entry: a `SetTrue` flag parsed `true` *is* the evidence it
+/// was typed.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct Explicit {
+    pub memory: bool,
+    pub max_idle_sec: bool,
+    pub suspended_sec: bool,
+    pub max_duration_sec: bool,
+}
+
+impl Explicit {
+    /// Reads "the caller typed it" off the parse for `run`'s defaulted knobs.
+    ///
+    /// `CommandLine` and nothing else: a value from clap's own default is exactly the
+    /// case that must *not* count, and there is no env fallback on any of these four.
+    pub fn from_matches(matches: &clap::ArgMatches) -> Self {
+        let typed =
+            |id: &str| matches.value_source(id) == Some(clap::parser::ValueSource::CommandLine);
+        Self {
+            memory: typed("memory"),
+            max_idle_sec: typed("max_idle_sec"),
+            suspended_sec: typed("suspended_sec"),
+            max_duration_sec: typed("max_duration_sec"),
+        }
+    }
+}
+
 /// The three account-specific values the AWS commands need.
-#[derive(Args, Debug, Default)]
+#[derive(Args, Clone, Debug, Default)]
 pub struct InfraFlags {
     /// S3 bucket for the build artifact. Defaults to $MICROVM_BUCKET.
     #[arg(long)]
@@ -405,7 +497,7 @@ pub struct InfraFlags {
 
 // ── per-command arguments ───────────────────────────────────────────────────
 
-#[derive(Args, Debug)]
+#[derive(Args, Clone, Debug)]
 pub struct RunArgs {
     /// The aarch64 agentd binary to bake in as the image CMD.
     ///
@@ -571,6 +663,16 @@ pub struct RunArgs {
     /// Where the run ledger is written. Defaults to $MICROVM_STATE_DIR or ~/.microvm/runs.
     #[arg(long)]
     pub state_dir: Option<PathBuf>,
+
+    #[command(flatten)]
+    pub config: ConfigFlags,
+
+    /// Which defaulted knobs were typed, read off the parse by the dispatcher.
+    ///
+    /// Skipped: the parser has no flag for this — it *is* the parse, carried here so the
+    /// handler's merge can tell `--memory 2048` from the default. See [`Explicit`].
+    #[arg(skip)]
+    pub explicit: Explicit,
 
     #[command(flatten)]
     pub region: RegionFlags,
@@ -1034,6 +1136,9 @@ pub struct DoctorArgs {
     pub infra_dir: Option<PathBuf>,
 
     #[command(flatten)]
+    pub config: ConfigFlags,
+
+    #[command(flatten)]
     pub region: RegionFlags,
 
     #[command(flatten)]
@@ -1208,6 +1313,30 @@ mod tests {
             "eu-central-1",
         ]);
         assert!(both.is_err(), "two answers to one question must not parse");
+    }
+
+    /// Naming a config file and refusing every config file cannot be combined.
+    ///
+    /// The same shape as the region pair above: `--config ci.toml --no-config` is two
+    /// answers to "which config applies here", and the resolution would be whichever
+    /// branch `config::load` happened to test first.
+    ///
+    /// **Falsification** — drop `conflicts_with = "no_config"` from `ConfigFlags::config`
+    /// and both command rows go red. Done on 2026-08-28; failed as stated; restored.
+    #[test]
+    fn naming_a_config_file_conflicts_with_refusing_every_config_file() {
+        Cli::try_parse_from(["microvm", "run", "--config", "ci.toml"])
+            .expect("--config parses on its own");
+        Cli::try_parse_from(["microvm", "run", "--no-config"])
+            .expect("--no-config parses on its own");
+        for command in ["run", "doctor"] {
+            let both =
+                Cli::try_parse_from(["microvm", command, "--config", "ci.toml", "--no-config"]);
+            assert!(
+                both.is_err(),
+                "{command}: two answers to one question must not parse"
+            );
+        }
     }
 
     /// The global flags parse before and after the subcommand.

@@ -75,7 +75,11 @@ Flags:
 - `--max-duration-sec <MAX_DURATION_SEC>` — hard ceiling on the VM's life; refused above 28800 before any call. Default `3600`. `microvms-cli/src/cli.rs:421-422`.
 - `--port <PORT>` — the daemon's port inside the guest. `microvms-cli/src/cli.rs:425-426`.
 - `--state-dir <STATE_DIR>` — where the run ledger is written; defaults to `$MICROVM_STATE_DIR` or `~/.microvm/runs`. `microvms-cli/src/cli.rs:429-430`.
+- `--config <PATH>` — read this project config file instead of `./microvm.toml`. Naming a file that does not exist is refused with `ERR_CONFIG`: a typed path that is wrong must not silently become "no config". Conflicts with `--no-config`. `microvms-cli/src/cli.rs`, `ConfigFlags`.
+- `--no-config` — ignore any `microvm.toml`, even a malformed one; flags and built-in defaults apply. `microvms-cli/src/cli.rs`, `ConfigFlags`.
 - Plus `RegionFlags` and `InfraFlags`. `microvms-cli/src/cli.rs:432-436`.
+
+Precedence, when a config file is in play: a typed flag beats the file, and the file beats the built-in default. "Typed" is read off the parse (`clap`'s `value_source`), not off the value, so `--memory 2048` overrides a file that says `4096` even though 2048 is also the default. The merge happens in exactly one place (`merge_config` in `microvms-cli/src/commands/lifecycle.rs`, per-knob precedence in `config::pick`) and its outcome is reported in the success envelope's `resolvedConfig` key — each knob's winning value and the source it came from (`flag`, `config`, `env`, or `default`; `env` appears only on the region, the one knob whose chain continues past the file into `$AWS_REGION`/`$AWS_DEFAULT_REGION`) — so a caller never has to re-derive which source won. One deliberate pairing rule: a typed `BINARY` positional with no typed `--image` suppresses the file's `image`, because `run` builds exactly when the merged image is absent, and a file that silently won that pair would run the caller's tests against a stale pinned image. See "Project config" below for the file itself.
 
 ## build
 
@@ -321,7 +325,9 @@ Flags:
 microvm doctor [OPTIONS]
 ```
 
-Checks every prerequisite and says which one is wrong. The checks cover credentials, the region, the three Terraform outputs, whether the stack is applied, the managed base images AWS publishes, and whether the daemon binary is aarch64.
+Checks every prerequisite and says which one is wrong. The checks cover the project config file, credentials, the region, the three Terraform outputs, whether the stack is applied, the managed base images AWS publishes, and whether the daemon binary is aarch64.
+
+The config check runs first because it is the one check that is entirely local, and a malformed file fails `run` before anything else would. `doctor --config ci.toml` validates the exact file `run --config ci.toml` would read, through the same loader, so the two commands cannot disagree about which config applies. A broken file — unparseable, an unknown key, a value outside its flag's domain — is a fatal fail naming the reason; an absent `./microvm.toml` is an advisory pass, because a project configured by flags is not a finding. A valid file's pass line names which knobs it pins. `microvms-cli/src/commands/doctor.rs`'s `check_config`.
 
 `microvms-cli/src/commands/doctor.rs:32`
 
@@ -386,6 +392,31 @@ Flags:
 The JSON envelope carries the stanza text plus the base image pair — `baseImageName` for deriving `baseImageArn` and `baseImageDockerRef` for the `FROM` — so a consumer holds both halves of the agreement the platform enforces. `microvms-cli/src/commands/mod.rs:207-217`.
 
 For the full recipe — appending tool layers, building, and driving the daemon from your own harness — see [docs/EMBEDDING.md](../EMBEDDING.md).
+
+## Project config: microvm.toml
+
+`run` and `doctor` read an optional `./microvm.toml` beside the invocation (or the file `--config <PATH>` names). Every key in it already exists as a `run` flag; the file adds no capability, only persistence — `microvm run` in a configured project needs zero flags. `microvms-cli/src/config.rs`.
+
+```toml
+image = "coding-agents"       # run --image
+binary = "target/agentd"     # run [BINARY]
+exec = "make test"           # run --exec
+memory = 4096                # run --memory; same closed set as the flag
+region = "us-west-2"         # any region string, resolved where the flag's is
+egress = true                # run --egress
+max-idle-sec = 600           # run --max-idle-sec
+suspended-sec = 600          # run --suspended-sec
+max-duration-sec = 3600      # run --max-duration-sec
+artifacts = ["dist/**"]      # run <DIR> artifact globs (issue #72); validated here
+[env]                        # run --launch-env, as a table; per-key merge, flag wins its key
+CI = "1"
+```
+
+Key names are the flag names with `-` for `_`, so the file reads like the command line it replaces. All keys are optional; an absent key means the flag or the built-in default decides. A relative `binary` path resolves against the config file's own directory, not the process cwd — `--config /repo/microvm.toml` exists precisely for the invoke-from-elsewhere case, and `target/agentd` must mean the same binary from anywhere. An unknown key is refused by name rather than silently ignored — `memroy = 4096` launching a 2 GB VM is the failure that closes. A value outside its flag's domain (`memory = 1500`, an artifact glob that will not compile) is refused with the same closed-set reasoning the parser enforces, so the file cannot be a side door past the flag domains.
+
+`--timeout` is deliberately not a config key: it is a client-side wait, not a property of the VM the project wants to pin.
+
+A file that cannot be used is `ERR_CONFIG` (exit 15), refused locally before any billable call. The remedy differs from `ERR_INVALID_ARG`'s — edit (or `--no-config` bypass) a file the invocation may never have named, rather than edit the command line — which is why it has its own row.
 
 ## The JSON envelope
 
@@ -482,7 +513,7 @@ A stream that ended without an exit event was cut. `exitCode` is reported as `nu
 
 ## Exit codes
 
-The table has fifteen rows, 0 through 14, and is append-only because consumers branch on the values. The rows are split by what the caller should do next; a distinction that does not change the caller's next action does not get its own integer. `microvms-cli/src/exit.rs:171-256`, with the enum's explicit discriminants at `microvms-cli/src/exit.rs:76-100`.
+The table has sixteen rows, 0 through 15, and is append-only because consumers branch on the values. The rows are split by what the caller should do next; a distinction that does not change the caller's next action does not get its own integer. `microvms-cli/src/exit.rs:171-256`, with the enum's explicit discriminants at `microvms-cli/src/exit.rs:76-100`.
 
 | Exit | Code | Meaning | `docs/PLATFORM.md` finding |
 | --- | --- | --- | --- |
@@ -501,10 +532,11 @@ The table has fifteen rows, 0 through 14, and is append-only because consumers b
 | 12 | `ERR_PRECONDITION` | a prerequisite is missing — run `microvm doctor` | |
 | 13 | `ERR_EXEC_FAILED` | the sandbox worked and the command in it exited non-zero | |
 | 14 | `ERR_NAME_TAKEN` | the VM name is registered to a live VM; refused locally, before any AWS call | |
+| 15 | `ERR_CONFIG` | the project config file is missing, malformed, or out of domain; refused locally — fix the file, or pass `--no-config` | |
 
 Row 0 is the only one with no `ERR_*` string, because a success envelope has no `code` field to put one in. `microvms-cli/src/exit.rs:50-53`.
 
-`ERR_NAME_TAKEN` is the first row with no core `ErrorKind` behind it: the name registry is the CLI's own file, so the collision can only arise locally. It is distinct from `ERR_INVALID_ARG` because the two demand different next actions — an invalid argument is fixed by editing the flag, a taken name by terminating the VM that holds it or picking another name.
+`ERR_NAME_TAKEN` and `ERR_CONFIG` are the rows with no core `ErrorKind` behind them: the name registry and the config file are the CLI's own files, so both refusals can only arise locally. Each is distinct from `ERR_INVALID_ARG` because the next actions differ — an invalid argument is fixed by editing the flag, a taken name by terminating the VM that holds it or picking another name, a broken config by editing (or `--no-config` bypassing) a file the invocation may never have named.
 
 `ERR_EXEC_FAILED` has its own code because it is the one non-zero exit that means nothing is wrong with the platform, the credentials, or the CLI. A CI caller needs to tell "your tests failed" apart from "we never got a VM". `microvms-cli/src/exit.rs:94-99`.
 
