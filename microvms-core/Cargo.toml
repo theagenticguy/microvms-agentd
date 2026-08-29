@@ -100,8 +100,17 @@ sha2 = "0.11"
 # ── the in-VM session (T-W2-5) ──────────────────────────────────────────────
 # Same pin as the daemon carries. `time` for the poll and deadline paths, `sync`
 # for the proxy-token refresh, `io-util` for the SSE reader; no `rt-multi-thread`,
-# because a library does not choose the caller's runtime.
-tokio = { version = "1.53", features = ["time", "sync", "io-util", "macros"] }
+# because a library does not choose the caller's runtime. `net` is the port
+# forwarder's listener (`session::forward`) — it lives here rather than in the CLI
+# because `microvms-cli/tests/thinness.rs` forbids an HTTP stack there, and a
+# forwarder is an HTTP server.
+tokio = { version = "1.53", features = [
+    "time",
+    "sync",
+    "io-util",
+    "macros",
+    "net",
+] }
 futures-util = "0.3"
 # Exec output and stdin are arbitrary bytes and a JSON string cannot hold
 # arbitrary bytes, so both sides of the wire carry base64. 0.23 to match agentd:

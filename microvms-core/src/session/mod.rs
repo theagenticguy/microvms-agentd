@@ -25,10 +25,12 @@
 //!
 //! [`proxy`] is the two-header auth and the mint schedule. [`http`] is the transport
 //! seam. [`sse`] is the frame parser and the typed events. [`exec`] is the handle and
-//! the cursor-driven stream. [`files`] is file and tar transfer.
+//! the cursor-driven stream. [`files`] is file and tar transfer. [`forward`] is the
+//! port-forwarder's listener and its 403-vs-502 diagnostic.
 
 pub mod exec;
 pub mod files;
+pub mod forward;
 pub mod http;
 pub mod proxy;
 pub mod sse;
@@ -37,6 +39,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 pub use exec::{EndReason, ExecHandle, ExecResult, StreamEnd, StreamOptions, mint_exec_id};
+pub use forward::{
+    DEFAULT_EXCHANGE_TIMEOUT, ForwardClient, ForwardEvent, ForwardSpec, forwards_request_header,
+    refusal_explanation, upstream_url,
+};
 pub use http::{
     ChunkSource, HttpBackend, HttpRequest, HttpResponse, OpenStream, ReqwestBackend, SharedBackend,
 };

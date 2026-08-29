@@ -277,8 +277,8 @@ mod tests {
         assert_eq!(listed, registered);
         assert_eq!(
             listed.len(),
-            18,
-            "the lifecycle six, the attached five, and the local seven"
+            19,
+            "the lifecycle six, the attached six, and the local seven"
         );
     }
 
@@ -540,6 +540,7 @@ mod tests {
             "ack",
             "stdin",
             "cp",
+            "port-forward",
             "manifest",
             "constants",
         ] {
@@ -548,11 +549,11 @@ mod tests {
         for code in ["ERR_INVALID_ARG", "ERR_EXEC_FAILED", "ERR_INTERRUPTED"] {
             assert!(rendered.contains(code), "{code} missing");
         }
-        assert!(rendered.contains("18 commands"), "{rendered}");
+        assert!(rendered.contains("19 commands"), "{rendered}");
 
         // The dense rendering is one line per command with its parameters.
         let dense = render(&manifest, true);
-        assert_eq!(dense.lines().count(), 18);
+        assert_eq!(dense.lines().count(), 19);
         assert!(
             dense
                 .lines()

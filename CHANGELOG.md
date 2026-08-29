@@ -6,6 +6,24 @@ Versions are [semantic](https://semver.org/spec/v2.0.0.html); the wire contract 
 
 ## Unreleased
 
+### Added
+
+- **`microvm port-forward` (#70, layer 1).** `port-forward LOCAL[:GUEST]` binds a local
+  listener and serves a guest port through the VM's endpoint: each connection is re-issued
+  with the port-scoped proxy headers minted per hop through the session's existing
+  `ProxyAuth` cache, which is what carries a tunnel across the platform's 60-minute token
+  ceiling — `proxyTokenMints` in the envelope is the observable that says a refresh
+  happened. A WebSocket upgrade relays the 101 (negotiated subprotocol included) and then
+  splices bytes both ways, so the forwarder frames nothing after the handshake. The proxy's
+  403-vs-502 pair — scope mistake vs nothing listening — is answered to the local client as
+  a readable response naming which one it was. The relay lives in
+  `microvms-core::session::forward` because the CLI's thinness guard forbids an HTTP stack
+  in the binary; the CLI reaches it through the `ForwardClient` newtype. Ctrl-C ends the
+  tunnel and exits 0, `--max-connections` bounds a scripted check, and the caller's own
+  `X-aws-proxy-*` headers are stripped rather than forwarded — the minted pair is the only
+  pair. Raw TCP is deliberately not this command (issue #70 layer 2: it needs a guest-side
+  relay agentd does not yet serve).
+
 ## [0.3.0] — 2026-08-29
 
 ### Added

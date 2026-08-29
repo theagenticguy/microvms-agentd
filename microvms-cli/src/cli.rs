@@ -80,13 +80,14 @@ pub struct Cli {
     pub quiet: bool,
 }
 
-/// The eighteen commands.
+/// The nineteen commands.
 ///
 /// Variant order is the order `microvm --help` and the manifest list them in, which is
 /// lifecycle order rather than alphabetical: a reader meeting this surface for the first time
-/// wants `run` first, not `build`. The five *attached* commands — `exec`, `health`, `ack`,
-/// `stdin`, `cp` — sit together after `build` because they share the same three identifiers and
-/// the same door ([`crate::seam::CoreSeam::attach_session`]), which is the distinction that
+/// wants `run` first, not `build`. The six *attached* commands — `exec`, `health`, `ack`,
+/// `stdin`, `cp`, `port-forward` — sit together after `build` because they share the same three
+/// identifiers and the same door ([`crate::seam::CoreSeam::attach_session`]), which is the
+/// distinction that
 /// matters when reading the list: everything above them creates or destroys, and everything in
 /// that block addresses a VM that already exists. `history` sits beside `ls` because they are
 /// the same kind of thing: a local read of what this machine's own state directory recorded.
@@ -147,6 +148,17 @@ pub enum Command {
     /// `microvms-core` carries a tar library, which keeps the daemon's confined extractor the only
     /// extractor in the system.
     Cp(CpArgs),
+
+    /// Serve a guest port on localhost, so a browser here reaches a server in the VM.
+    ///
+    /// Holds a local listener open until Ctrl-C and forwards each connection through the VM's
+    /// endpoint with a port-scoped proxy token minted per hop — which is what carries a tunnel
+    /// across the platform's sixty-minute token ceiling without the caller sequencing anything.
+    /// HTTP and WebSocket, because those are what the endpoint proxy carries; a WebSocket
+    /// upgrade is relayed and then spliced as bytes, so an application subprotocol survives.
+    /// Arbitrary TCP is not this command — it needs a guest-side relay, which is issue #70's
+    /// second layer.
+    PortForward(PortForwardArgs),
 
     /// Freeze a MicroVM. It keeps its memory, filesystem, token, and endpoint.
     ///
@@ -899,6 +911,65 @@ pub struct HealthArgs {
 }
 
 #[derive(Args, Debug)]
+pub struct PortForwardArgs {
+    /// The ports, as `LOCAL[:GUEST]`. A single number uses it on both sides.
+    ///
+    /// One positional rather than two, and the `:` spelling rather than a pair of flags, for
+    /// the reason [`microvms_core::session::ForwardSpec`] is a struct: both values are `u16`
+    /// and both are plausible in either position, so two bare positionals is how a tunnel ends
+    /// up pointing at the wrong end. `8080` is the common case and means 8080 to 8080.
+    #[arg(value_name = "LOCAL[:GUEST]")]
+    pub ports: String,
+
+    /// The local address to bind. Loopback by default, deliberately.
+    ///
+    /// A tunnel into a VM running untrusted code is not something to expose on a LAN by
+    /// accident, so widening it is a typed choice rather than the default.
+    #[arg(long, default_value = "127.0.0.1")]
+    pub bind: String,
+
+    /// Stop after serving this many connections, instead of running until Ctrl-C.
+    ///
+    /// For a scripted check — "does the dev server answer" — where an unbounded listener would
+    /// hang a CI job. Omitted means serve until interrupted.
+    #[arg(long, value_name = "N")]
+    pub max_connections: Option<u32>,
+
+    #[command(flatten)]
+    pub attach: AttachFlags,
+
+    #[command(flatten)]
+    pub region: RegionFlags,
+}
+
+/// The two ports a `LOCAL[:GUEST]` argument names.
+///
+/// Parsed here rather than in the handler so the refusals are unit-testable without a seam,
+/// and because a malformed pair must be refused before any AWS call — the ledger read that
+/// resolves `--name` is cheap, but minting a token for a port the caller mistyped is a
+/// billable call that fails at the proxy with a 403 naming the token.
+pub fn parse_port_pair(spec: &str) -> Result<(u16, u16), String> {
+    let (local, guest) = match spec.split_once(':') {
+        Some((local, guest)) => (local, guest),
+        None => (spec, spec),
+    };
+    let parse = |value: &str, side: &str| -> Result<u16, String> {
+        let port: u16 = value
+            .trim()
+            .parse()
+            .map_err(|_| format!("{side} port {value:?} is not a number between 1 and 65535"))?;
+        if port == 0 {
+            return Err(format!(
+                "{side} port 0 is not forwardable: the guest cannot listen on it, and on the \
+                 local side it would bind an OS-chosen port this command could not tell you about"
+            ));
+        }
+        Ok(port)
+    };
+    Ok((parse(local, "the local")?, parse(guest, "the guest")?))
+}
+
+#[derive(Args, Debug)]
 pub struct AckArgs {
     /// The exec whose output to release.
     #[arg(value_name = "EXEC_ID")]
@@ -1369,12 +1440,50 @@ mod tests {
         Cli::command().debug_assert();
     }
 
-    /// Eighteen subcommands, named as the manifest and the response table name them.
+    /// **A bare port means both sides; a pair means local-then-guest.**
     ///
-    /// The five after `exec` are the attached block — `health`, `ack`, `stdin`, `cp` beside it —
-    /// and their position is asserted rather than incidental, because `--help`'s reading order is
-    /// the only documentation of which commands need the identifier triple. `history` sits
-    /// beside `ls` because both are local reads of this machine's own state directory.
+    /// The order is the assertion worth making, because both values are `u16` and a transposed
+    /// pair produces a tunnel that binds the guest's number locally and asks the proxy for the
+    /// local one — which fails at the proxy with a 403 naming the token rather than the mistake.
+    #[test]
+    fn a_port_pair_reads_local_first_and_a_bare_number_means_both() {
+        assert_eq!(parse_port_pair("8080"), Ok((8080, 8080)));
+        assert_eq!(parse_port_pair("3000:8080"), Ok((3000, 8080)));
+        assert_eq!(parse_port_pair(" 3000 : 8080 "), Ok((3000, 8080)));
+    }
+
+    /// **Port 0 is refused on both sides, and the two refusals say different things.**
+    ///
+    /// A guest cannot listen on 0 at all, and locally it would bind an OS-chosen port this
+    /// command has no way to report — so "it worked" would leave the caller with a tunnel they
+    /// cannot address.
+    #[test]
+    fn port_zero_is_refused_by_name_on_whichever_side_it_appears() {
+        let local = parse_port_pair("0:8080").expect_err("local 0 is refused");
+        assert!(local.contains("local port 0"), "{local}");
+        let guest = parse_port_pair("8080:0").expect_err("guest 0 is refused");
+        assert!(guest.contains("guest port 0"), "{guest}");
+    }
+
+    /// A non-numeric or out-of-range port names the side and the value.
+    #[test]
+    fn an_unparseable_port_names_the_side_and_the_value() {
+        let word = parse_port_pair("http:8080").expect_err("not a number");
+        assert!(word.contains("the local port"), "{word}");
+        assert!(word.contains("\"http\""), "{word}");
+
+        let big = parse_port_pair("8080:70000").expect_err("out of u16 range");
+        assert!(big.contains("the guest port"), "{big}");
+        assert!(big.contains("65535"), "{big}");
+    }
+
+    /// Nineteen subcommands, named as the manifest and the response table name them.
+    ///
+    /// The six after `exec` are the attached block — `health`, `ack`, `stdin`, `cp`, and
+    /// `port-forward` beside it — and their position is asserted rather than incidental, because
+    /// `--help`'s reading order is the only documentation of which commands need the identifier
+    /// triple. `history` sits beside `ls` because both are local reads of this machine's own
+    /// state directory.
     #[test]
     fn the_tree_registers_the_lifecycle_commands_the_attached_block_and_the_local_ones() {
         let registered: Vec<String> = Cli::command()
@@ -1391,6 +1500,7 @@ mod tests {
                 "ack",
                 "stdin",
                 "cp",
+                "port-forward",
                 "suspend",
                 "resume",
                 "terminate",

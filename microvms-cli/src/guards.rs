@@ -30,8 +30,8 @@ use microvms_core::{Error, ErrorKind, Region};
 
 use crate::cli::{
     AckArgs, AttachFlags, BuildArgs, Cli, Command, CostArgs, CpArgs, DoctorArgs, ExecArgs,
-    Explicit, HealthArgs, InfraFlags, LogsArgs, LsArgs, MemoryMib, RegionFlags, ResumeArgs,
-    RunArgs, StdinArgs, SuspendArgs, TerminateArgs,
+    Explicit, HealthArgs, InfraFlags, LogsArgs, LsArgs, MemoryMib, PortForwardArgs, RegionFlags,
+    ResumeArgs, RunArgs, StdinArgs, SuspendArgs, TerminateArgs,
 };
 use crate::commands::{Ctx, Rendered};
 use crate::envelope::{Format, Output};
@@ -279,6 +279,20 @@ fn aws_commands(binary: &std::path::Path) -> Vec<(&'static str, Command, Door)> 
         (
             "health",
             Command::Health(HealthArgs {
+                attach: attach_flags(),
+                region: region_flags(),
+            }),
+            Door::AttachSession,
+        ),
+        (
+            "port-forward",
+            // `--max-connections 0` so the guard measures the door and returns: the seam fails
+            // before a listener is ever bound, and a guard entry that could serve a connection
+            // would be a guard that waits for one.
+            Command::PortForward(PortForwardArgs {
+                ports: "8080".into(),
+                bind: "127.0.0.1".into(),
+                max_connections: Some(0),
                 attach: attach_flags(),
                 region: region_flags(),
             }),
