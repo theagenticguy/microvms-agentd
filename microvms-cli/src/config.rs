@@ -221,46 +221,6 @@ fn validate(path: &Path, config: &ProjectConfig) -> Result<(), ConfigError> {
             }
         }
     }
-    // The two Windows path shapes that mean two things at once (issue #87). Windows
-    // parses both as *relative*, so [`load`]'s file-directory join would fire on them
-    // and silently rewrite what the caller wrote:
-    //
-    // - rooted with no drive (`/opt/agentd`): `join` keeps the joining directory's
-    //   drive, so the value becomes `C:/opt/agentd` — a path the caller never wrote,
-    //   reported by `resolvedConfig` as if the file had said it, possibly naming a
-    //   different binary that happens to exist there.
-    // - a drive with no root (`C:agentd`): `join` discards the directory entirely and
-    //   the value resolves against that drive's *current directory* at spawn time.
-    //
-    // Refused rather than guessed, because the remedies differ per intent — write the
-    // drive letter, or write a genuinely relative path — and only the caller knows
-    // which they meant. Same posture as the unknown-key refusal: a legal-looking value
-    // must not quietly mean something else. On Unix neither shape exists (a rooted
-    // path is absolute, and no prefix component is ever parsed), so this never fires
-    // there and `/opt/agentd` passes through as the absolute path it is.
-    if let Some(binary) = &config.binary
-        && binary.is_relative()
-    {
-        if binary.has_root() {
-            problems.push(format!(
-                "binary = {binary:?} is rooted but names no drive, which Windows reads \
-                 as relative — resolving it against this file's directory would \
-                 silently re-anchor it onto the file's drive. Write the drive letter \
-                 if you meant an absolute path, or drop the leading separator if you \
-                 meant a path relative to this file"
-            ));
-        } else if matches!(
-            binary.components().next(),
-            Some(std::path::Component::Prefix(_))
-        ) {
-            problems.push(format!(
-                "binary = {binary:?} names a drive but no root, which resolves against \
-                 that drive's current directory at spawn time. Write the root after \
-                 the drive if you meant an absolute path, or drop the drive if you \
-                 meant a path relative to this file"
-            ));
-        }
-    }
     if problems.is_empty() {
         return Ok(());
     }
