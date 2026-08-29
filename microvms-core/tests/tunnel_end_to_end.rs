@@ -286,9 +286,16 @@ async fn the_handshake_offers_the_platform_values_and_the_agent_token() {
         .expect("subprotocols were offered");
     assert!(offered.contains(WS_SUBPROTOCOL), "{offered}");
     assert!(offered.contains(WS_AUTH_SUBPROTOCOL_PREFIX), "{offered}");
+    // The port subprotocol names the DAEMON's port, because that is the port this request
+    // addresses — the guest port travels in the query string instead. See
+    // `the_token_is_scoped_to_the_daemon_port_not_the_guest_port`.
     assert!(
-        offered.contains(&format!("{WS_PORT_SUBPROTOCOL_PREFIX}5432")),
-        "the port subprotocol must name the guest port: {offered}"
+        offered.contains(&format!("{WS_PORT_SUBPROTOCOL_PREFIX}9000")),
+        "the port subprotocol must name the daemon's port: {offered}"
+    );
+    assert!(
+        !offered.contains(&format!("{WS_PORT_SUBPROTOCOL_PREFIX}5432")),
+        "naming the guest port here is the 2026-08-29 regression: {offered}"
     );
     assert_eq!(
         seen.authorization.as_deref(),
@@ -301,12 +308,60 @@ async fn the_handshake_offers_the_platform_values_and_the_agent_token() {
         "the daemon reads the target port from the query"
     );
 
-    // The mint asked for the guest port, not just the agent port — the 2026-08-15 defect.
+    // The scope is the DAEMON's port; see `the_token_is_scoped_to_the_daemon_port_not_the_guest_port`
+    // for why naming the guest port here would be the bug rather than the fix.
     let scopes = minter.scopes.lock().expect("not poisoned").clone();
     assert!(
-        scopes.iter().any(|ports| ports.contains(&5432)),
-        "the mint never asked for port 5432: {scopes:?}"
+        !scopes.is_empty(),
+        "the tunnel must mint a port-scoped token: {scopes:?}"
     );
+}
+
+/// **The minted token is scoped to the DAEMON's port, never to the guest port.**
+///
+/// The live regression from 2026-08-29. `subprotocols(guest_port)` reads correct — every other
+/// port-scoped call in the crate names the port it wants to reach — and is wrong here: the
+/// request terminates at the daemon, and the daemon dials the guest port from inside the VM. A
+/// token scoped to the guest port authorizes a port the request never addresses, and the
+/// proxy's refusal is close code 1006 with no reason, indistinguishable from a dead server.
+/// That ambiguity is exactly why this needs a test rather than a comment.
+///
+/// **Falsification:** change `auth.subprotocols(auth.port())` back to
+/// `auth.subprotocols(guest_port)` in `session::tunnel` and the scope assertion below fails.
+#[tokio::test]
+async fn the_token_is_scoped_to_the_daemon_port_not_the_guest_port() {
+    let guest = upper_server().await;
+    let (relay, _observed) = relay_server(Some(guest), None).await;
+    let (auth, minter) = auth();
+    let daemon_port = auth.port();
+
+    let (client, local) = tokio::io::duplex(4096);
+    let endpoint = format!("http://{relay}");
+    // A guest port deliberately different from the daemon's, so the two are distinguishable.
+    let pump =
+        tokio::spawn(
+            async move { relay_connection(local, &endpoint, 5432, AGENT_TOKEN, &auth).await },
+        );
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    drop(client);
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), pump).await;
+
+    let scopes = minter.scopes.lock().expect("not poisoned").clone();
+    assert!(
+        !scopes.is_empty(),
+        "the tunnel must mint a port-scoped token"
+    );
+    for ports in &scopes {
+        assert!(
+            ports.contains(&daemon_port),
+            "every mint must authorize the daemon's port {daemon_port}, got {ports:?}"
+        );
+        assert!(
+            !ports.contains(&5432),
+            "the guest port must NOT be in the token scope — the proxy never sees a request \
+             for it, and scoping to it produces an unexplainable 1006: {ports:?}"
+        );
+    }
 }
 
 /// **A payload larger than one chunk survives whole, in order, byte-exact.**

@@ -52,7 +52,22 @@ Versions are [semantic](https://semver.org/spec/v2.0.0.html); the wire contract 
   echoes it, and an offered-but-unechoed subprotocol makes an RFC 6455 client refuse the
   handshake outright.
 
-  Verified with 10 daemon-side tests over a real WebSocket against a real TCP server, and 7
+  Verified live (us-east-1, 2026-08-29) against a length-prefixed binary protocol in the
+  guest — deliberately not HTTP and not line-based, so framing, byte fidelity, and
+  request/response interleaving on one connection are all exercised. Through
+  `tunnel 15434:5432`: an ascii round trip, a `0x00`/`0xFF` payload byte-exact, 200 KiB across
+  the chunk boundary, and a second independent connection all passed on one minted token.
+
+  One bug the live run caught, which no local test would have: the client minted its token
+  scoped to the **guest** port. `subprotocols(guest_port)` reads correct — every other
+  port-scoped call in the crate names the port it wants to reach — but this request terminates
+  at the daemon, and the daemon dials the guest port from inside the VM, so the proxy only ever
+  sees a request for the daemon's port. A token scoped to 5432 authorized a port the request
+  never addressed, and the refusal was close code 1006 with no reason: indistinguishable from a
+  dead server. Fixed to `subprotocols(auth.port())`, with the reason recorded at the call site
+  and a regression test that fails if it is reverted.
+
+  Verified with 10 daemon-side tests over a real WebSocket against a real TCP server, and 8
   client-side end-to-end tests: bytes reach an upper-casing server and come back transformed
   (an echo could pass without leaving the process), a `0x00`/`0xFF` payload survives byte-exact
   in both directions, 200 KiB crosses the 64 KiB chunk boundary in order, an unauthenticated

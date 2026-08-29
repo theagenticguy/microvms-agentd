@@ -16,13 +16,21 @@
 //! module exists separately from [`crate::session::forward`], which is an HTTP relay and
 //! cannot carry one.
 //!
-//! # The credential is minted per connection, and the port scope is the load-bearing part
+//! # The token is scoped to the daemon's port, not to the guest port
 //!
-//! [`crate::session::Session::connect_subprotocols`] mints through the session's existing
-//! [`crate::session::ProxyAuth`] cache, so a tunnel held past the platform's sixty-minute
-//! token ceiling refreshes without a timer here. A token minted for the agent port answers
-//! close code 1006 with no reason on this path — indistinguishable from a dead server —
-//! which is exactly the defect the port-scoped mint exists to avoid.
+//! The inversion worth stating twice, because every other port-scoped call in this crate
+//! names the port it wants to reach. This request terminates at **the daemon**, and the daemon
+//! is what dials the guest port from inside the VM — so the proxy only ever sees a request for
+//! the daemon's port, and a token scoped to the guest port authorizes something this request
+//! never addresses. The guest port travels in the query string instead.
+//!
+//! Getting it backwards produces close code 1006 with no reason, which is indistinguishable
+//! from a dead server; it cost a live debugging session on 2026-08-29 and is why
+//! [`relay_connection`] carries the reason at the call site as well.
+//!
+//! The mint goes through the session's existing [`crate::session::ProxyAuth`] cache either
+//! way, so a tunnel held past the platform's sixty-minute token ceiling refreshes without a
+//! timer here.
 //!
 //! # One connection per WebSocket
 //!
@@ -129,7 +137,19 @@ pub async fn relay_connection<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let offered = auth.subprotocols(guest_port).await?;
+    // **The token is scoped to the DAEMON's port, not to `guest_port`, and that inversion is
+    // the whole subtlety of this route.**
+    //
+    // Every other port-scoped call in this crate names the port it wants to *reach*, so
+    // `subprotocols(guest_port)` reads correct and is wrong: this request terminates at the
+    // daemon, and it is the *daemon* that dials the guest port from inside the VM. The proxy
+    // only ever sees a request for the daemon's port. A token scoped to 5432 therefore
+    // authorizes a port this request never addresses, and the proxy's refusal is close code
+    // 1006 with no reason — indistinguishable from a dead server, which is exactly how this
+    // cost a live debugging session on 2026-08-29.
+    //
+    // `guest_port` still travels, in the query string, where the daemon reads it.
+    let offered = auth.subprotocols(auth.port()).await?;
     let url = tunnel_url(endpoint, guest_port);
 
     let mut request = url.as_str().into_client_request().map_err(|err| {

@@ -877,6 +877,21 @@ endpoint speaks" establishes binary frames on the `SHELL_INGRESS` path, but with
 guest server, but with **text** frames. Binary-through-port-scoped is the corner a
 TCP-over-WebSocket relay depends on, and it works.
 
+### A tunnel's token is scoped to the daemon's port, not to the port it reaches
+
+Measured 2026-08-29 while bringing up the TCP relay. A WebSocket to `/v1/tcp?port=5432`
+terminates at **the daemon**, and the daemon dials `127.0.0.1:5432` from inside the guest — so
+the proxy only ever sees a request for the daemon's port (9000). A token minted for 5432
+therefore authorizes a port the request never addresses, and the handshake is refused as close
+code **1006 with no reason**, which is indistinguishable from a dead guest server.
+
+This is worth recording as a platform-shaped trap rather than as a client bug, because the
+intuition it violates is the one the rest of this document teaches: every other port-scoped
+call names the port it wants to *reach*. On a relayed route the port travels in the request
+(here, the query string) and the credential belongs to the hop. Diagnosing it took a
+loopback-vs-proxy bisection — the same relay worked from inside the guest — because 1006
+carries no information at all.
+
 ## The guest kernel is 6.1, which `openat2` needs
 
 Measured 2026-08-14, us-east-1, `al2023-1` base: `uname -r` inside a running VM
