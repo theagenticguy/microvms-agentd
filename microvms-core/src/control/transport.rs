@@ -657,26 +657,19 @@ pub mod paths {
 
     /// Percent-encodes a URI path segment.
     ///
-    /// To be replaced by the `percent-encoding` crate in the dependency sweep, with an
-    /// AsciiSet that keeps this exact behavior.
-    /// **`/` is encoded**, which is the whole point: an image ARN's slashes would
-    /// otherwise split into extra path segments and address something else. `:` is
-    /// encoded too — legal unencoded in a path per the RFC, but AWS's own SDKs encode it
-    /// in labels and the signature must match whatever is sent.
+    /// Everything outside RFC 3986's unreserved set is escaped. **`/` is encoded**,
+    /// which is the whole point: an image ARN's slashes would otherwise split into
+    /// extra path segments and address something else. `:` is encoded too — legal
+    /// unencoded in a path per the RFC, but AWS's own SDKs encode it in labels and
+    /// the signature must match whatever is sent.
     pub fn encode_segment(segment: &str) -> String {
-        let mut encoded = String::with_capacity(segment.len());
-        for byte in segment.bytes() {
-            match byte {
-                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                    encoded.push(byte as char);
-                }
-                other => {
-                    use std::fmt::Write as _;
-                    let _ = write!(encoded, "%{other:02X}");
-                }
-            }
-        }
-        encoded
+        use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
+        const ESCAPED: &AsciiSet = &NON_ALPHANUMERIC
+            .remove(b'-')
+            .remove(b'_')
+            .remove(b'.')
+            .remove(b'~');
+        utf8_percent_encode(segment, ESCAPED).to_string()
     }
 
     /// `POST /2025-09-09/microvm-images`

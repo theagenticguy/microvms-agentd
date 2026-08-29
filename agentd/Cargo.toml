@@ -63,6 +63,13 @@ tokio-util = { version = "0.7", features = ["io"] }
 # 0.23 line, the current one; the `Engine` trait replaced the old free functions in
 # 0.21, so `encode`/`decode` are called through `general_purpose::STANDARD`.
 base64 = "0.23"
+# Hex rendering for the identity ids (machine-id, boot_id shapes). Encode-only use;
+# const-hex is the maintained, faster successor to `hex` with the same API surface.
+const-hex = "1.19"
+# The kernel CSPRNG behind one call. Replaces a hand-rolled /dev/urandom read; the
+# VMGenID-reseed soundness argument in identity.rs applies identically — getrandom
+# reaches the same pool.
+getrandom = "0.4"
 # The wire schema is *derived* from the same serde types the daemon serializes,
 # because a hand-written spec drifts from the code and a generated one cannot.
 # Pinned to 1.2.2, the current release: the 1.x line replaced `RootSchema` and

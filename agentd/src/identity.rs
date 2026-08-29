@@ -187,9 +187,9 @@ impl Platform for Host {
     /// have returned the same 16 bytes in every VM — which is worth stating,
     /// because the code looks correct either way.
     fn fresh_id(&self) -> io::Result<String> {
-        // `read_exact` on a bounded buffer, never `std::fs::read`: `/dev/urandom`
-        // is an infinite stream and reading it to EOF does not return.
-        Ok(hex(&read_exact_bytes(Path::new("/dev/urandom"), 16)?))
+        let mut bytes = [0u8; 16];
+        getrandom::fill(&mut bytes).map_err(io::Error::other)?;
+        Ok(const_hex::encode(bytes))
     }
 
     fn set_hostname(&self, name: &str) -> io::Result<()> {
@@ -208,19 +208,6 @@ impl Platform for Host {
         )
         .map_err(io::Error::from)
     }
-}
-
-/// Reads exactly `n` bytes. `std::fs::read` on `/dev/urandom` would never return.
-fn read_exact_bytes(path: &Path, n: usize) -> io::Result<Vec<u8>> {
-    use std::io::Read;
-    let mut file = std::fs::File::open(path)?;
-    let mut buf = vec![0u8; n];
-    file.read_exact(&mut buf)?;
-    Ok(buf)
-}
-
-fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// Runs every repair step, logging each outcome.

@@ -97,14 +97,7 @@ pub fn artifact_content_hash(binary: &[u8], dockerfile: &str) -> String {
     hasher.update(binary);
     hasher.update((dockerfile.len() as u64).to_be_bytes());
     hasher.update(dockerfile.as_bytes());
-    let digest = hasher.finalize();
-
-    let mut hex = String::with_capacity(digest.len() * 2);
-    for byte in digest {
-        use std::fmt::Write as _;
-        let _ = write!(hex, "{byte:02x}");
-    }
-    hex
+    const_hex::encode(hasher.finalize())
 }
 
 /// A base image: the platform ARN, the Dockerfile `FROM` that pairs with it, and whether

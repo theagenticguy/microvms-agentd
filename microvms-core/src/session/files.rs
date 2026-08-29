@@ -19,24 +19,20 @@ use crate::error::{Error, WireKind};
 
 use super::{HttpRequest, Transport};
 
-/// Percent-encodes a query value.
+/// Percent-encodes a query value: everything outside RFC 3986's unreserved set.
 ///
-/// To be replaced by the `percent-encoding` crate in the dependency sweep, together
-/// with `control::transport::paths::encode_segment`, its twin.
-/// Unreserved characters pass through and everything else is escaped,
-/// which is stricter than necessary and never wrong — a path with a space, a `#`, or a
-/// `&` in it is the case that silently truncates a query otherwise.
+/// Stricter than a query strictly needs and never wrong — a path with a space, a `#`,
+/// or a `&` in it is the case that silently truncates a query otherwise. The daemon
+/// decodes with the same grammar. `NON_ALPHANUMERIC` minus the four unreserved marks
+/// is exactly "escape everything but unreserved".
 fn encode(value: &str) -> String {
-    let mut out = String::with_capacity(value.len());
-    for byte in value.as_bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(*byte as char);
-            }
-            other => out.push_str(&format!("%{other:02X}")),
-        }
-    }
-    out
+    use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
+    const ESCAPED: &AsciiSet = &NON_ALPHANUMERIC
+        .remove(b'-')
+        .remove(b'_')
+        .remove(b'.')
+        .remove(b'~');
+    utf8_percent_encode(value, ESCAPED).to_string()
 }
 
 /// `/v1/fs/file` with a path and an optional mode.

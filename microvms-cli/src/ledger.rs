@@ -356,24 +356,15 @@ mod tests {
     ///
     /// To be replaced by the `tempfile` dev-dependency in the dependency sweep, along with
     /// the seven other copies of this pattern across the crate.
-    struct TempDir(PathBuf);
+    struct TempDir(PathBuf, #[allow(dead_code)] tempfile::TempDir);
 
     impl TempDir {
         fn new(label: &str) -> Self {
-            let path = std::env::temp_dir().join(format!(
-                "microvm-cli-{label}-{}-{:?}",
-                std::process::id(),
-                std::thread::current().id()
-            ));
-            let _ = std::fs::remove_dir_all(&path);
-            std::fs::create_dir_all(&path).expect("a temp dir");
-            Self(path)
-        }
-    }
-
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
+            let dir = tempfile::Builder::new()
+                .prefix(&format!("microvm-cli-{label}-"))
+                .tempdir()
+                .expect("a temp dir");
+            Self(dir.path().to_path_buf(), dir)
         }
     }
 
