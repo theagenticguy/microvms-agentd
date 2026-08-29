@@ -6,6 +6,47 @@ Versions are [semantic](https://semver.org/spec/v2.0.0.html); the wire contract 
 
 ## Unreleased
 
+## [0.3.0] — 2026-08-29
+
+### Added
+
+- **Project config file (#73).** A per-project `microvm.toml` beside the invocation (or
+  named via `--config <PATH>`; `--no-config` ignores any file): every key already exists
+  as a `run` flag, so the file adds no capability, only persistence — `microvm run` in a
+  configured project needs zero flags. Precedence is flag > file > built-in default,
+  decided per knob, with "the flag was typed" read off the parse rather than the value;
+  the success envelope's new `resolvedConfig` key reports each knob's winning value and
+  source (`flag`/`config`/`env`/`default`). Unknown keys are refused by name, and every
+  domain the matching flag enforces is validated in the loader — the memory size table,
+  the region closed set, the eight-hour duration ceiling, env key shapes, artifact-glob
+  compilation — so `doctor` (which validates through the same loader, as its new first
+  check) and `run` cannot disagree about a file. A file that cannot be used is the
+  **appended exit row 15 / `ERR_CONFIG`**, refused locally before any billable call. A
+  typed `BINARY` positional suppresses the file's `image` (a file that silently won that
+  pair would run the caller's tests against a stale pinned image), and a relative
+  `binary` in the file resolves against the file's own directory.
+
+- **`run <DIR>` sync mode (#72).** A positional that names a directory switches `run`
+  into pack-run-collect: the tree is packed deterministically (`.git`, `target`,
+  `node_modules`, `.venv` skipped whole; sockets/fifos/devices skipped individually;
+  symlinks preserved as links), uploaded to `/workspace`, the exec runs with
+  `/workspace` as its working directory, and the members matching the config file's
+  `artifacts` globs come back afterwards — including when the exec failed, because a
+  failing run's report is the artifact CI most wants. The pack is budgeted against the
+  daemon's own caps (512 MiB, 100 000 members) during the walk, refusing by name before
+  any archive bytes exist. Extraction writes only glob-matched regular-file members
+  through `unpack_in`'s traversal refusal — and never under `.git`, because a
+  workload-written hook would execute on the host. A download failure never discards the
+  exec's result (it lands in `sync.error`); with no globs configured the workdir is not
+  downloaded at all. Local pack/extract failures are the **appended exit row 16 /
+  `ERR_SYNC`**. The envelope gains a `sync` key. `microvms-core` gains
+  `Sandbox::with_session_backend`, the daemon-side sibling of `with_control_plane`'s
+  transport seam (test-only; the default backend is unchanged).
+
+  Both verified live (us-east-1, 2026-08-28) and under permanent conformance coverage:
+  `drive_config_and_sync` launches its VM entirely through a microvm.toml and asserts
+  the round trip in eight named checks (the suite is 98, no SKIP).
+
 ## [0.2.0] — 2026-08-28
 
 ### Added

@@ -1393,7 +1393,7 @@ def session_constants() -> dict:
 # `microvms_core::VERSION`, added by the module's `#[pymodule_init]`. The **core's**
 # version and not this crate's: what a caller needs to know is which client they are
 # talking through.
-__version__: Final[str] = "0.2.0"
+__version__: Final[str] = "0.3.0"
 
 class MicrovmError(Exception):
     """
