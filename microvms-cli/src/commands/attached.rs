@@ -1235,6 +1235,208 @@ pub async fn port_forward<O: std::io::Write, E: std::io::Write>(
     Ok(Rendered::ok(kind, data, text, dense))
 }
 
+// ── tunnel ──────────────────────────────────────────────────────────────────
+
+/// Tunnels arbitrary TCP to a guest port until Ctrl-C, or until `--max-connections`.
+///
+/// # Where this differs from `port-forward`, and why both exist
+///
+/// `port-forward` re-issues HTTP requests; this carries bytes. The split is forced by the
+/// platform rather than chosen: the endpoint proxy has no CONNECT method, and an upgrade
+/// replayed over its HTTPS path is answered 400 (measured 2026-08-29), so raw TCP has to ride
+/// inside WebSocket binary frames to a relay in the guest. A single command could not do both
+/// without deciding per connection whether the payload was HTTP, which is a guess about
+/// somebody else's protocol.
+///
+/// # One task per connection, and a spawn is the whole concurrency story
+///
+/// Each accepted connection gets its own WebSocket and its own task, matching the daemon's
+/// no-multiplexing decision. `psql` opens one connection and `ssh` opens one; a client that
+/// opens five gets five tunnels, and none of them can stall another.
+///
+/// # Ctrl-C is a success
+///
+/// Same reasoning as `port-forward`: a tunnel the user closed did its job, so the interrupt
+/// resolves into the reporting path and the exit code is 0.
+pub async fn tunnel<O: std::io::Write, E: std::io::Write>(
+    ctx: &mut Ctx<'_, O, E>,
+    args: &crate::cli::TunnelArgs,
+    interrupt: crate::commands::lifecycle::Interrupt<'_>,
+) -> Result<Rendered, CliError> {
+    use microvms_core::session::{forward, tunnel as core_tunnel};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    // Refused before the attach, so a mistyped pair costs no AWS call — the same ordering
+    // `port-forward` uses, and the same shared parser, so the two cannot disagree about what
+    // `15432:5432` means.
+    let (local_port, guest_port) = crate::cli::parse_port_pair(&args.ports).map_err(|detail| {
+        CliError::new(Exit::InvalidArg, detail)
+            .suggest("`microvm tunnel 5432` tunnels the guest's 5432 to local 5432")
+            .suggest("`microvm tunnel 15432:5432` moves it aside when something local holds 5432")
+    })?;
+
+    let bind: std::net::SocketAddr =
+        format!("{}:{local_port}", args.bind)
+            .parse()
+            .map_err(|err| {
+                CliError::new(
+                Exit::InvalidArg,
+                format!(
+                    "--bind {:?} with local port {local_port} is not an address this process can \
+                     listen on: {err}",
+                    args.bind
+                ),
+            )
+            .suggest("`--bind 127.0.0.1` is the default, and the right choice for a local client")
+            })?;
+
+    let (session, microvm_id) = attach(ctx, &args.region, &args.attach).await?;
+
+    let Some(auth) = session.proxy_auth().cloned() else {
+        return Err(CliError::new(
+            Exit::Precondition,
+            "this session reaches the daemon directly rather than through the endpoint proxy, so \
+             there is no port-scoped token to tunnel with. A tunnel exists to cross the proxy; a \
+             direct session is already on the other side of it."
+                .to_string(),
+        ));
+    };
+
+    // The listener is `forward`'s, because binding a local port and naming the collision is the
+    // same problem for both commands and a second copy would be a second error message.
+    let spec = forward::ForwardSpec::new(bind, guest_port, session.endpoint().to_string());
+    let listener = forward::bind(&spec).await?;
+    let bound = listener.local_addr().map_err(|err| {
+        Error::new(
+            ErrorKind::Unexpected,
+            format!("the listener has no address: {err}"),
+        )
+    })?;
+
+    ctx.out.progress(&format!(
+        "tunnelling localhost:{} -> {microvm_id} tcp/{guest_port} (ctrl-c to stop)",
+        bound.port()
+    ));
+
+    let endpoint = Arc::new(session.endpoint().to_string());
+    let agent_token = Arc::new(session.agent_token().to_string());
+    // Shared counters rather than returned values, because each connection lives in its own
+    // task and the envelope is written after the loop.
+    let served = Arc::new(AtomicU32::new(0));
+    let refused = Arc::new(AtomicU32::new(0));
+    let mut refusals: Vec<String> = Vec::new();
+    let mut interrupted = false;
+    let mut interrupt = interrupt;
+    let mut tasks = Vec::new();
+
+    loop {
+        if args
+            .max_connections
+            .is_some_and(|max| served.load(Ordering::SeqCst) >= max)
+        {
+            break;
+        }
+
+        let accepted = tokio::select! {
+            // Biased, so a pending interrupt wins over a connection that arrived in the same
+            // wakeup: the caller pressed the key, and accepting one more first looks like the
+            // key did nothing.
+            biased;
+            () = &mut interrupt => {
+                interrupted = true;
+                break;
+            }
+            accepted = forward::accept(&listener) => accepted,
+        };
+
+        let (local, peer) = match accepted {
+            Ok(pair) => pair,
+            Err(error) => {
+                ctx.out
+                    .warn(&format!("the local listener stopped: {error}"));
+                break;
+            }
+        };
+
+        served.fetch_add(1, Ordering::SeqCst);
+        let endpoint = Arc::clone(&endpoint);
+        let token = Arc::clone(&agent_token);
+        let auth = Arc::clone(&auth);
+        let refused = Arc::clone(&refused);
+        tasks.push(tokio::spawn(async move {
+            let outcome =
+                core_tunnel::relay_connection(local, &endpoint, guest_port, &token, &auth).await;
+            match outcome {
+                Ok(core_tunnel::TunnelEnd::Closed) => None,
+                Ok(core_tunnel::TunnelEnd::Refused { code, reason }) => {
+                    refused.fetch_add(1, Ordering::SeqCst);
+                    // The relay's own sentence when it sent one, and core's explanation of the
+                    // code otherwise — never a bare number, which tells a caller nothing about
+                    // which component refused.
+                    Some(if reason.is_empty() {
+                        core_tunnel::explain_close(code, guest_port)
+                            .unwrap_or_else(|| format!("the tunnel closed with code {code}"))
+                    } else {
+                        reason
+                    })
+                }
+                Err(error) => {
+                    refused.fetch_add(1, Ordering::SeqCst);
+                    Some(format!("the tunnel from {peer} failed: {error}"))
+                }
+            }
+        }));
+    }
+
+    // Drained rather than abandoned: a task still relaying when the loop ends holds bytes the
+    // caller's client is waiting for, and dropping the handle would truncate them.
+    for task in tasks {
+        if let Ok(Some(detail)) = task.await {
+            refusals.push(detail);
+        }
+    }
+    for detail in &refusals {
+        ctx.out.warn(detail);
+    }
+
+    let served = served.load(Ordering::SeqCst);
+    let refused = refused.load(Ordering::SeqCst);
+    let mints = auth.mint_count();
+
+    let mut data = Map::new();
+    data.insert("microvmId".into(), json!(microvm_id));
+    data.insert("localPort".into(), json!(bound.port()));
+    data.insert("localAddress".into(), json!(bound.to_string()));
+    data.insert("guestPort".into(), json!(guest_port));
+    data.insert("connectionsServed".into(), json!(served));
+    data.insert("connectionsRefused".into(), json!(refused));
+    // The same observable `port-forward` publishes, and for the same reason: a token cached
+    // forever and one refreshed on schedule produce identical successful tunnels.
+    data.insert("proxyTokenMints".into(), json!(mints));
+    data.insert("interrupted".into(), json!(interrupted));
+
+    let text = format!(
+        "tunnelled localhost:{} -> {microvm_id} tcp/{guest_port}\n\
+         connections: {served} served, {refused} refused\n\
+         proxy tokens minted: {mints}\n\
+         stopped: {}",
+        bound.port(),
+        if interrupted {
+            "ctrl-c"
+        } else {
+            "connection limit reached"
+        }
+    );
+    let dense = format!(
+        "tunnel {}->{guest_port} served={served} refused={refused} mints={mints}",
+        bound.port()
+    );
+
+    let (kind, _) = response_type("tunnel");
+    Ok(Rendered::ok(kind, data, text, dense))
+}
+
 /// Re-exported so [`ErrorKind`] is nameable in this module's documentation.
 #[allow(unused_imports, reason = "named in the documentation above")]
 use ErrorKind as _DocsOnly;

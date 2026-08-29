@@ -112,6 +112,18 @@ tokio = { version = "1.53", features = [
     "net",
 ] }
 futures-util = "0.3"
+# The WebSocket client behind `session::tunnel`. Required rather than convenient: the
+# endpoint proxy takes a WebSocket's credential as `Sec-WebSocket-Protocol` values and has
+# no CONNECT method, so an upgrade replayed over the HTTPS path is answered 400 by the proxy
+# (measured 2026-08-29, docs/PLATFORM.md). Carrying TCP therefore needs a real handshake,
+# which reqwest's client cannot perform. `rustls-tls-webpki-roots` matches the one TLS
+# implementation already in the tree — a native-tls build would need an OpenSSL the guest
+# image does not carry.
+tokio-tungstenite = { version = "0.24", default-features = false, features = [
+    "connect",
+    "handshake",
+    "rustls-tls-webpki-roots",
+] }
 # Exec output and stdin are arbitrary bytes and a JSON string cannot hold
 # arbitrary bytes, so both sides of the wire carry base64. 0.23 to match agentd:
 # one version in the tree means the client and the daemon cannot disagree about

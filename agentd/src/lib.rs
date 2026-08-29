@@ -38,6 +38,7 @@ pub mod routes;
 pub mod schema;
 pub mod serve;
 pub mod state;
+pub mod tunnel;
 
 pub use config::Config;
 pub use state::AppState;

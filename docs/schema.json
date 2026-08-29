@@ -462,6 +462,22 @@
         }
       },
       "type": "object"
+    },
+    "TunnelQuery": {
+      "description": "`?port=<n>` — the guest port to relay to.",
+      "properties": {
+        "port": {
+          "description": "The guest port. Dialled on `127.0.0.1` only.\n\n`0` parses and is refused *after* the upgrade with [`close::BAD_PORT`], rather than\nrejected as a parse error: a caller who named it gets a reason naming the port\ninstead of a 400 that could equally mean a missing parameter.",
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "port"
+      ],
+      "type": "object"
     }
   },
   "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -901,6 +917,42 @@
         }
       ],
       "summary": "SIGTERM then SIGKILL to the whole process group, not just the direct child — a shell that backgrounded a server leaves the interesting process outside the child pid"
+    },
+    {
+      "auth": "bearer",
+      "method": "GET",
+      "path": "/v1/tcp",
+      "query": {
+        "media_type": "application/x-www-form-urlencoded",
+        "schema": {
+          "$ref": "#/$defs/TunnelQuery"
+        }
+      },
+      "request": null,
+      "response": null,
+      "statuses": [
+        {
+          "code": 101,
+          "error": "",
+          "meaning": "the upgrade succeeded. The guest dial happens AFTER the upgrade, so a 101 does not yet mean the guest port answered: a refused dial arrives as close code 4502 with a reason naming the port. That ordering is deliberate — on the endpoint path every WebSocket failure a caller can observe is 1006 with no reason, so an HTTP 502 here would be invisible to the only client that matters."
+        },
+        {
+          "code": 400,
+          "error": "malformed_request",
+          "meaning": "?port is absent or is not a u16. Port 0 parses and is refused after the upgrade with close code 4400, because a caller that named it deserves a reason rather than a parse error."
+        },
+        {
+          "code": 401,
+          "error": "",
+          "meaning": "the presented bearer token does not match the installed one"
+        },
+        {
+          "code": 503,
+          "error": "",
+          "meaning": "no token is installed yet, so the control API is closed. Never 404: a client mapping 404 onto \"not found\" would report a phantom absent artifact."
+        }
+      ],
+      "summary": "upgrade to a WebSocket relayed to 127.0.0.1:<port> in the guest, so a caller outside the VM can speak an arbitrary TCP protocol to a server inside it. Binary frames carry bytes in both directions and a frame is a byte range rather than a message — TCP has no message boundaries and neither does this. The dial is loopback-only and never resolves a name: a relay that could reach another host would be an open proxy inside the VM reachable with the agent token. One connection per WebSocket, deliberately: multiplexing would reimplement per-stream ids, flow control, and close handshakes that the platform already provides per connection. Outcomes arrive as close codes — 4502 nothing listening, 4400 port 0, 4500 a mid-relay failure — because a WebSocket route leaves HTTP behind after its 101. Rests on a measured platform property: binary frames survive a port-scoped token byte-exact (docs/PLATFORM.md, 2026-08-29)."
     },
     {
       "auth": "bearer",

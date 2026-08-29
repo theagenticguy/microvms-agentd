@@ -18,7 +18,11 @@ description = "Exec and file-transfer daemon for AWS Lambda MicroVMs"
 # which is earlier and cheaper than the schema artifact catching it in CI, and far
 # earlier than a consumer catching it at runtime.
 protocol = { package = "microvms-protocol", version = "0.3.0", path = "../protocol" }
-axum = "0.8.9"
+# `ws` is the TCP relay (`tunnel.rs`): the endpoint proxy carries a WebSocket to a
+# guest port but has no CONNECT method, so arbitrary TCP rides inside binary frames
+# (measured 2026-08-29 — see docs/PLATFORM.md). axum's own extractor rather than a
+# second WebSocket stack, since the router already owns the upgrade path.
+axum = { version = "0.8.9", features = ["ws"] }
 # tower-http 0.7 is a breaking line; axum 0.8.9 pins ^0.6.8 internally, so we
 # stay on 0.6 to keep one version of the middleware types in the tree.
 # `catch-panic` turns a panicking handler into a 500 instead of a dropped
@@ -89,3 +93,9 @@ turmoil = "0.7.2"
 tower = "0.5"
 pin-project-lite = "0.2"
 tempfile = "3"
+# A real WebSocket client for the TCP relay's tests (`tests/tunnel_relay.rs`). The relay's
+# whole contract is byte fidelity and close codes over a live upgrade, and axum's own
+# extractor has no client half — a hand-rolled RFC 6455 client in a test would be a second
+# framing implementation whose bugs read as relay bugs. Dev-only: nothing that ships into a
+# guest image needs a WebSocket client.
+tokio-tungstenite = "0.24"

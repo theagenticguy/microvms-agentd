@@ -31,7 +31,7 @@ use microvms_core::{Error, ErrorKind, Region};
 use crate::cli::{
     AckArgs, AttachFlags, BuildArgs, Cli, Command, CostArgs, CpArgs, DoctorArgs, ExecArgs,
     Explicit, HealthArgs, InfraFlags, LogsArgs, LsArgs, MemoryMib, PortForwardArgs, RegionFlags,
-    ResumeArgs, RunArgs, StdinArgs, SuspendArgs, TerminateArgs,
+    ResumeArgs, RunArgs, StdinArgs, SuspendArgs, TerminateArgs, TunnelArgs,
 };
 use crate::commands::{Ctx, Rendered};
 use crate::envelope::{Format, Output};
@@ -279,6 +279,19 @@ fn aws_commands(binary: &std::path::Path) -> Vec<(&'static str, Command, Door)> 
         (
             "health",
             Command::Health(HealthArgs {
+                attach: attach_flags(),
+                region: region_flags(),
+            }),
+            Door::AttachSession,
+        ),
+        (
+            "tunnel",
+            // `--max-connections 0` for the reason port-forward's entry gives: the guard measures
+            // the door, and an entry that could serve a connection would wait for one.
+            Command::Tunnel(TunnelArgs {
+                ports: "5432".into(),
+                bind: "127.0.0.1".into(),
+                max_connections: Some(0),
                 attach: attach_flags(),
                 region: region_flags(),
             }),

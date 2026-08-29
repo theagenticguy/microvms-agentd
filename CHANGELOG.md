@@ -31,6 +31,36 @@ Versions are [semantic](https://semver.org/spec/v2.0.0.html); the wire contract 
   to a dead port answered the local client with the 502 nothing-listening sentence.
   Teardown confirmed by `live:verify-clean`.
 
+- **`microvm tunnel` — arbitrary TCP to a guest port (#70, layer 2).** Each local connection
+  becomes a WebSocket carrying raw TCP to a new bearer-authed `GET /v1/tcp?port=<n>` route on
+  the daemon, which dials `127.0.0.1:<port>` inside the guest. So `psql`, `ssh`, or any other
+  wire protocol reaches a server in the VM. The endpoint proxy has no CONNECT method and
+  refuses an upgrade replayed over its HTTPS path, so riding inside binary frames is the only
+  way arbitrary TCP crosses it — and that binary frames survive a port-scoped token byte-exact
+  is measured rather than assumed (see below).
+
+  Three deliberate limits, each with its reason in the code. **No multiplexing:** one
+  WebSocket carries one TCP connection, because a mux protocol would reimplement per-stream
+  ids, flow control, and close handshakes that the platform already provides per connection.
+  **Loopback only:** the relay never resolves a name, so a stolen agent token cannot turn the
+  daemon into an open proxy inside the VM. **The dial happens after the upgrade**, because on
+  the endpoint path every WebSocket failure a caller can observe is 1006 with no reason — an
+  HTTP 502 for a dead port would be invisible, so a refusal arrives as close code 4502 naming
+  the port instead. The codes live in `protocol::tunnel::close` (RFC 6455's private range, so
+  they cannot be confused with the platform's 1006), and the marker subprotocol is one `const`
+  aliased across crates rather than two that can drift — the client offers it and the daemon
+  echoes it, and an offered-but-unechoed subprotocol makes an RFC 6455 client refuse the
+  handshake outright.
+
+  Verified with 10 daemon-side tests over a real WebSocket against a real TCP server, and 7
+  client-side end-to-end tests: bytes reach an upper-casing server and come back transformed
+  (an echo could pass without leaving the process), a `0x00`/`0xFF` payload survives byte-exact
+  in both directions, 200 KiB crosses the 64 KiB chunk boundary in order, an unauthenticated
+  or wrong-token upgrade is refused 401, a dead port closes 4502, `?port=0` closes 4400, and
+  two tunnels to one port get independent connections. Four guards were deliberately broken to
+  confirm they fail: the route's `Auth::Bearer`, guest-to-client byte fidelity, framing
+  re-derivation, and upgrade detection.
+
 ### Measured
 
 - **The endpoint proxy refuses an upgrade replayed over the HTTPS path, and carries binary

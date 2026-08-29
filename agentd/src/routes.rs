@@ -133,6 +133,7 @@ fn handler_for(endpoint: &schema::Endpoint) -> axum::routing::MethodRouter<AppSt
         ("PUT", "/v1/fs/file") => axum::routing::put(fs::write_file),
         ("GET", "/v1/fs/tar") => get(fs::read_tar),
         ("PUT", "/v1/fs/tar") => axum::routing::put(fs::write_tar),
+        ("GET", "/v1/tcp") => get(crate::tunnel::open),
         ("GET", "/v1/health") => get(health),
         ("GET", "/v1/schema") => get(schema_route),
         (method, path) => panic!("{method} {path} is documented but has no handler"),
@@ -537,6 +538,29 @@ pub fn surface_docs() -> Vec<schema::Endpoint> {
                  direct child — a shell that backgrounded a server leaves the \
                  interesting process outside the child pid",
                 schema::EXEC_KILL,
+            )
+        },
+        schema::Endpoint {
+            query: Some(query::<crate::tunnel::TunnelQuery>()),
+            response: no_body(),
+            ..row(
+                "GET",
+                "/v1/tcp".into(),
+                Auth::Bearer,
+                "upgrade to a WebSocket relayed to 127.0.0.1:<port> in the guest, so a \
+                 caller outside the VM can speak an arbitrary TCP protocol to a server \
+                 inside it. Binary frames carry bytes in both directions and a frame is a \
+                 byte range rather than a message — TCP has no message boundaries and \
+                 neither does this. The dial is loopback-only and never resolves a name: a \
+                 relay that could reach another host would be an open proxy inside the VM \
+                 reachable with the agent token. One connection per WebSocket, deliberately: \
+                 multiplexing would reimplement per-stream ids, flow control, and close \
+                 handshakes that the platform already provides per connection. Outcomes \
+                 arrive as close codes — 4502 nothing listening, 4400 port 0, 4500 a \
+                 mid-relay failure — because a WebSocket route leaves HTTP behind after its \
+                 101. Rests on a measured platform property: binary frames survive a \
+                 port-scoped token byte-exact (docs/PLATFORM.md, 2026-08-29).",
+                schema::TUNNEL_OPEN,
             )
         },
         schema::Endpoint {

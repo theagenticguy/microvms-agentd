@@ -26,7 +26,8 @@
 //! [`proxy`] is the two-header auth and the mint schedule. [`http`] is the transport
 //! seam. [`sse`] is the frame parser and the typed events. [`exec`] is the handle and
 //! the cursor-driven stream. [`files`] is file and tar transfer. [`forward`] is the
-//! port-forwarder's listener and its 403-vs-502 diagnostic.
+//! port-forwarder's listener and its 403-vs-502 diagnostic. [`tunnel`] is the WebSocket
+//! client that carries raw TCP to the daemon's relay.
 
 pub mod exec;
 pub mod files;
@@ -34,6 +35,7 @@ pub mod forward;
 pub mod http;
 pub mod proxy;
 pub mod sse;
+pub mod tunnel;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -52,6 +54,7 @@ pub use proxy::{
     WS_PORT_SUBPROTOCOL_PREFIX, WS_SUBPROTOCOL,
 };
 pub use sse::{ExecEvent, Frame, SseParser};
+pub use tunnel::{TUNNEL_CHUNK_BYTES, TunnelEnd, explain_close, relay_connection, tunnel_url};
 
 use crate::error::{Error, ErrorKind, WireKind};
 

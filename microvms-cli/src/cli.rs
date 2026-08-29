@@ -80,7 +80,7 @@ pub struct Cli {
     pub quiet: bool,
 }
 
-/// The nineteen commands.
+/// The twenty commands.
 ///
 /// Variant order is the order `microvm --help` and the manifest list them in, which is
 /// lifecycle order rather than alphabetical: a reader meeting this surface for the first time
@@ -148,6 +148,16 @@ pub enum Command {
     /// `microvms-core` carries a tar library, which keeps the daemon's confined extractor the only
     /// extractor in the system.
     Cp(CpArgs),
+
+    /// Tunnel arbitrary TCP to a guest port, so `psql` or `ssh` here reaches a server in the VM.
+    ///
+    /// Where `port-forward` speaks HTTP, this speaks bytes: each local connection becomes a
+    /// WebSocket carrying raw TCP to the daemon's relay, which dials `127.0.0.1:<port>` inside
+    /// the guest. The endpoint proxy has no CONNECT method, so riding inside binary frames is
+    /// the only way arbitrary TCP crosses it — and that it crosses byte-exact is measured
+    /// rather than assumed (docs/PLATFORM.md, 2026-08-29). One connection per WebSocket, so a
+    /// client that opens five connections opens five tunnels.
+    Tunnel(TunnelArgs),
 
     /// Serve a guest port on localhost, so a browser here reaches a server in the VM.
     ///
@@ -910,6 +920,43 @@ pub struct HealthArgs {
     pub region: RegionFlags,
 }
 
+/// `tunnel`'s arguments, which are `port-forward`'s.
+///
+/// A separate struct rather than a shared one, because clap derives per-field help text and
+/// the two commands need different words for the same field — a `tunnel` user asking what
+/// `LOCAL[:GUEST]` means is asking about a database port, not a dev server. The *shapes* being
+/// identical is asserted in `tests/manifest.rs` instead, which is where a divergence would
+/// matter: the two commands must take the same identifier triple.
+#[derive(Args, Debug)]
+pub struct TunnelArgs {
+    /// The ports, as `LOCAL[:GUEST]`. A single number uses it on both sides.
+    ///
+    /// `5432` means the guest's 5432 on local 5432; `15432:5432` moves it aside when something
+    /// local already holds the well-known port, which for a database is the common case.
+    #[arg(value_name = "LOCAL[:GUEST]")]
+    pub ports: String,
+
+    /// The local address to bind. Loopback by default, deliberately.
+    ///
+    /// The same reasoning `port-forward` gives, and it matters more here: a raw-TCP tunnel into
+    /// a VM running untrusted code is not something to expose on a LAN by accident.
+    #[arg(long, default_value = "127.0.0.1")]
+    pub bind: String,
+
+    /// Stop after this many connections, instead of running until Ctrl-C.
+    ///
+    /// For a scripted check — "does the database answer" — where an unbounded listener hangs a
+    /// CI job. Omitted means serve until interrupted.
+    #[arg(long, value_name = "N")]
+    pub max_connections: Option<u32>,
+
+    #[command(flatten)]
+    pub attach: AttachFlags,
+
+    #[command(flatten)]
+    pub region: RegionFlags,
+}
+
 #[derive(Args, Debug)]
 pub struct PortForwardArgs {
     /// The ports, as `LOCAL[:GUEST]`. A single number uses it on both sides.
@@ -1477,10 +1524,10 @@ mod tests {
         assert!(big.contains("65535"), "{big}");
     }
 
-    /// Nineteen subcommands, named as the manifest and the response table name them.
+    /// Twenty subcommands, named as the manifest and the response table name them.
     ///
-    /// The six after `exec` are the attached block — `health`, `ack`, `stdin`, `cp`, and
-    /// `port-forward` beside it — and their position is asserted rather than incidental, because
+    /// The seven after `exec` are the attached block — `health`, `ack`, `stdin`, `cp`, `tunnel`,
+    /// and `port-forward` beside it — and their position is asserted rather than incidental, because
     /// `--help`'s reading order is the only documentation of which commands need the identifier
     /// triple. `history` sits beside `ls` because both are local reads of this machine's own
     /// state directory.
@@ -1500,6 +1547,7 @@ mod tests {
                 "ack",
                 "stdin",
                 "cp",
+                "tunnel",
                 "port-forward",
                 "suspend",
                 "resume",
