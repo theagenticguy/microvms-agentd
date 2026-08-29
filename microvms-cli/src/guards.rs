@@ -2325,7 +2325,7 @@ fn sse_exit(code: i32, total: u64) -> Vec<u8> {
 /// because the return value is the same either way.
 ///
 /// **Guard proof.** Change `spec.exec_id.unwrap_or_else(..)` in `lifecycle::start_request` to
-/// `format!("x-{:016x}", epoch_nanos())` — dropping the caller's key — and both bodies below carry
+/// `mint_exec_id()` — dropping the caller's key — and both bodies below carry
 /// generated ids: the first assertion goes red on the key, and the second on the two being equal.
 #[tokio::test]
 async fn a_supplied_exec_id_reaches_the_wire_unchanged_on_every_retry() {

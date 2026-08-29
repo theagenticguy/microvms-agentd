@@ -1445,7 +1445,7 @@ pub fn start_request(spec: StartSpec<'_>) -> microvms_core::protocol::exec::Star
         // without spawning a second child, which is the whole value of a key.
         exec_id: spec
             .exec_id
-            .unwrap_or_else(|| format!("x-{:016x}", epoch_nanos())),
+            .unwrap_or_else(microvms_core::session::mint_exec_id),
         command: vec![spec.command.to_string()],
         shell: true,
         cwd: spec.cwd,
@@ -1792,14 +1792,6 @@ fn epoch_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|since| since.as_secs())
-        .unwrap_or_default()
-}
-
-/// Nanoseconds since the epoch, for an exec id.
-fn epoch_nanos() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|since| since.as_nanos() as u64)
         .unwrap_or_default()
 }
 
