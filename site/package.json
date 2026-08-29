@@ -21,8 +21,8 @@
   },
   "dependencies": {
     "@astrojs/markdown-satteri": "0.3.8",
-    "@astrojs/starlight": "0.41.9",
-    "astro": "7.2.7",
+    "@astrojs/starlight": "0.41.10",
+    "astro": "7.2.9",
     "beautiful-mermaid": "1.1.3",
     "satteri": "0.10.5",
     "starlight-base-path": "0.2.1",

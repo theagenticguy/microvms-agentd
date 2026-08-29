@@ -179,7 +179,7 @@ async fn relay_server(
                 read = guest_read.read(&mut buffer) => match read {
                     Ok(0) | Err(_) => break,
                     Ok(count) => {
-                        if socket.send(Message::Binary(buffer[..count].to_vec())).await.is_err() {
+                        if socket.send(Message::Binary(buffer[..count].to_vec().into())).await.is_err() {
                             break
                         }
                     }
@@ -565,7 +565,7 @@ async fn verified_relay_server(
         }
         let written = responder.write_message(&[], &mut scratch).expect("writes");
         if socket
-            .send(Message::Binary(scratch[..written].to_vec()))
+            .send(Message::Binary(scratch[..written].to_vec().into()))
             .await
             .is_err()
         {
@@ -593,7 +593,7 @@ async fn verified_relay_server(
                     Ok(0) | Err(_) => break,
                     Ok(count) => {
                         let Ok(sealed) = noise.write_message(&buffer[..count], &mut plain) else { break };
-                        if socket.send(Message::Binary(plain[..sealed].to_vec())).await.is_err() {
+                        if socket.send(Message::Binary(plain[..sealed].to_vec().into())).await.is_err() {
                             break
                         }
                     }

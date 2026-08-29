@@ -119,7 +119,7 @@ futures-util = "0.3"
 # which reqwest's client cannot perform. `rustls-tls-webpki-roots` matches the one TLS
 # implementation already in the tree — a native-tls build would need an OpenSSL the guest
 # image does not carry.
-tokio-tungstenite = { version = "0.24", default-features = false, features = [
+tokio-tungstenite = { version = "0.30", default-features = false, features = [
     "connect",
     "handshake",
     "rustls-tls-webpki-roots",
@@ -157,6 +157,9 @@ snow = { version = "0.10", default-features = false, features = [
 # Deriving the public half of a launch-generated seed without a handshake — the pin
 # the ledger stores, and the value the daemon must independently agree on. The same
 # crate snow's resolver uses internally, so one x25519 implementation in the tree.
+# Held at 2.x on purpose while snow 0.10 pins curve25519-dalek 4: the 3.0 line moves to
+# curve25519-dalek 5, and taking it puts two copies of the same curve arithmetic in the
+# tree — the exact duplication this crate was chosen to avoid. Revisit when snow bumps.
 x25519-dalek = { version = "2", default-features = false, features = ["static_secrets"] }
 
 [dev-dependencies]

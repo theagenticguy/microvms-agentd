@@ -109,6 +109,9 @@ snow = { version = "0.10", default-features = false, features = [
 # caller can confirm the pin it holds before opening a tunnel. Same crate the Noise resolver
 # uses internally, so one x25519 implementation in the tree rather than two that could
 # disagree about a derivation both sides depend on.
+# Held at 2.x on purpose while snow 0.10 pins curve25519-dalek 4: the 3.0 line moves to
+# curve25519-dalek 5, and taking it puts two copies of the same curve arithmetic in the
+# tree — the exact duplication this crate was chosen to avoid. Revisit when snow bumps.
 x25519-dalek = { version = "2", default-features = false, features = ["static_secrets"] }
 
 [dev-dependencies]
@@ -124,4 +127,4 @@ tempfile = "3"
 # extractor has no client half — a hand-rolled RFC 6455 client in a test would be a second
 # framing implementation whose bugs read as relay bugs. Dev-only: nothing that ships into a
 # guest image needs a WebSocket client.
-tokio-tungstenite = "0.24"
+tokio-tungstenite = "0.30"
