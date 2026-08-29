@@ -2212,6 +2212,7 @@ dependencies = [
  "ratatui",
  "serde",
  "serde_json",
+ "tar",
  "tokio",
  "toml",
 ]

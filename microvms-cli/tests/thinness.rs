@@ -8,7 +8,7 @@
 //! matters: a denylist of forbidden crate names is defeated by the one crate nobody thought to
 //! write down, and `test_cli.py`'s three-legged static guard grew a leg at a time as each was
 //! defeated on purpose. An equality against a written-down set has no such gap — every addition to
-//! this crate's manifest is a diff against a test that names the eight things allowed and says why.
+//! this crate's manifest is a diff against a test that names the nine things allowed and says why.
 //!
 //! The scan catches what a manifest cannot: a control-plane operation invoked through a crate that
 //! *is* allowed. `microvms-core` is allowed and re-exports plenty; a handler that reached past the
@@ -63,7 +63,7 @@ const RETIRED: [(&str, &str); 1] = [(
 /// An allowlist. See the module docs on why a denylist is not good enough. The reason strings are
 /// not decorative: this test asserts each is a real sentence, so a new entry cannot be added
 /// without someone writing down what it is for.
-const ALLOWED: [(&str, &str); 8] = [
+const ALLOWED: [(&str, &str); 9] = [
     (
         "microvms-core",
         "the product surface: every AWS call, every trap closure, the cost engine, the taxonomy — \
@@ -102,6 +102,15 @@ const ALLOWED: [(&str, &str); 8] = [
          declared glob so a bad pattern fails before a launch is paid for, and run <DIR> \
          selects downloaded tar members with the same compiled set. Pure pattern matching \
          over strings; no filesystem walk, no socket",
+    ),
+    (
+        "tar",
+        "run <DIR>'s sync mode (issue #72): pack the project tree for upload, and unpack \
+         the glob-selected regular-file members of the returned archive via unpack_in's \
+         traversal refusal. The daemon stays the only tree extractor for uploads — its \
+         openat2 confinement is the trust story there — and this side never extracts a \
+         member it did not select. Same version agentd pins, so the lock gains no second \
+         copy. Opens no socket: the bytes ride microvms-core's session",
     ),
 ];
 

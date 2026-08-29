@@ -6,7 +6,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Live conformance run driving the **Rust** client stack through the `microvm` CLI.
 
-This is the only live suite, and it now expresses **every named check** — 90 of them, with
+This is the only live suite, and it now expresses **every named check** — 98 of them, with
 none recorded SKIP. `conformance/run.py` was the oracle — 56 checks through the Python
 client — and it went away with that client once both suites ran green against real AWS on
 the same commit (Python 56/56, this one 38/38 with 34 recorded SKIP). Those 34 were the
@@ -58,6 +58,13 @@ and the post-terminate release. Live rather than only scripted because the first
 run of the feature caught a prefix the fakes could not: the service's ids start
 `microvm-`, the fixtures' start `mvm-`, and a passthrough keyed on the fixture prefix
 passed every local test while refusing every real id.
+
+98 rather than 90: `drive_config_and_sync` adds eight for issues #73 and #72 — doctor
+validating the file, a launch driven entirely by microvm.toml, the exec running in
+/workspace, the uploaded tree arriving, `.git` staying home, `resolvedConfig` naming the
+file as each knob's source, the glob-matched artifact landing, and the unmatched member
+staying in the VM. Live for the named-VMs reason: the round trip crosses the daemon's
+real tar routes and the service's real launch.
 
 A hybrid driver, and both lanes are deliberate
 ----------------------------------------------
@@ -1759,6 +1766,104 @@ def drive_named_vm(
         )
 
 
+def drive_config_and_sync(
+    cli: Cli, launched: Envelope, project: Path, results: Results
+) -> None:
+    """microvm.toml (issue #73) and `run <DIR>` sync mode (issue #72), live.
+
+    Eight checks against one VM this section launches through the *config file* and
+    terminates itself, from the image the suite already built (`image` pinned in the
+    file, so no second build — and pinning it there is itself the check that a config
+    value reaches a real launch). Live rather than only scripted for the named-VMs
+    reason: the round trip crosses the daemon's real tar routes and the service's real
+    launch, and a fixture convention is not a service fact.
+
+    The project directory is this run's own temp dir: a `microvm.toml` pinning the
+    suite's image and one artifact glob, a source file to prove upload, and a `.git`
+    with a loose object to prove it stays home.
+    """
+    print("\n-- microvm.toml + run <DIR> (config to wire, sync round trip) --")
+    (project / ".git").mkdir(parents=True)
+    (project / ".git" / "loose-object").write_text("never uploaded")
+    (project / "hello.txt").write_text("from the host\n")
+    (project / "microvm.toml").write_text(
+        "\n".join(
+            [
+                f'image = "{launched.data["imageIdentifier"]}"',
+                'exec = "pwd; cat hello.txt; ls .git 2>&1; mkdir -p dist; '
+                'echo made-in-the-vm > dist/report.txt; echo secret > not-asked-for.txt"',
+                "max-idle-sec = 480",
+                'artifacts = ["dist/**"]',
+                "",
+            ]
+        )
+    )
+
+    # doctor validates the same file run reads, through the same loader.
+    checked = cli.call("doctor", "--config", str(project / "microvm.toml"))
+    config_check = next(
+        (row for row in checked.data.get("checks", []) if row.get("name") == "config"),
+        {},
+    )
+    results.check(
+        "doctor validated the config file and named what it pins",
+        config_check.get("ok") is True
+        and "pins" in str(config_check.get("detail", "")),
+        f"{config_check}",
+    )
+
+    synced = cli.call(
+        "run",
+        str(project),
+        "--config",
+        str(project / "microvm.toml"),
+        "--region",
+        cli.region,
+        "--max-duration-sec",
+        "1800",
+        timeout=15 * 60,
+    )
+    results.eq(
+        "a config-only launch ran the file's exec", synced.data.get("execExitCode"), 0
+    )
+    stdout = synced.data.get("stdout") or ""
+    results.check(
+        "the exec ran in /workspace, not the image WORKDIR",
+        stdout.startswith("/workspace"),
+        repr(stdout[:60]),
+    )
+    results.check(
+        "the uploaded tree reached the VM",
+        "from the host" in stdout,
+        repr(stdout[:120]),
+    )
+    results.check(
+        ".git stayed home",
+        "No such file" in stdout or "cannot access" in stdout,
+        repr(stdout[:200]),
+    )
+    resolved = synced.data.get("resolvedConfig") or {}
+    results.check(
+        "resolvedConfig reports the file as each knob's source",
+        resolved.get("image", {}).get("source") == "config"
+        and resolved.get("maxIdleSec", {}).get("value") == 480,
+        f"image={resolved.get('image')} maxIdleSec={resolved.get('maxIdleSec')}",
+    )
+    results.check(
+        "the glob-matched artifact came back",
+        (project / "dist" / "report.txt").exists()
+        and "made-in-the-vm" in (project / "dist" / "report.txt").read_text(),
+        f"dist exists: {(project / 'dist').exists()}",
+    )
+    results.check(
+        "an unmatched member stayed in the VM",
+        not (project / "not-asked-for.txt").exists(),
+        f"landed: {sorted(p.name for p in project.iterdir())}",
+    )
+    # No terminate here and no --keep above: sync mode tears down by default, which is
+    # itself part of what this section exercises — the teardown path after a download.
+
+
 def drive_idle_keepalive(
     cli: Cli, launched: Envelope, aws: Any, results: Results
 ) -> None:
@@ -2627,6 +2732,10 @@ def main() -> int:
             # Named VMs on their own VM (from the suite's image, no second build):
             # registration only happens at launch, so the suite's VM cannot carry it.
             drive_named_vm(cli, launched, Path(tmp) / "named-state", results)
+            # microvm.toml + run <DIR> on their own VM too (launched *through the config
+            # file*, from the suite's image): the config merge and the sync round trip
+            # both happen at launch, so the suite's VM cannot carry them either.
+            drive_config_and_sync(cli, launched, Path(tmp) / "sync-project", results)
             # The idle-keepalive section runs on its own VM (launched from the image this
             # suite already built, so no second build) and is the slowest section here —
             # its own output says how long. Last, so its four minutes of deliberate

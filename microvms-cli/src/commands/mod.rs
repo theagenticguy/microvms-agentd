@@ -127,6 +127,9 @@ pub const RESPONSE_TYPES: [(&str, &str, &[&str]); 18] = [
             // what the run actually used here rather than re-deriving the precedence.
             "resolvedConfig",
             "configPath",
+            // `run <DIR>`'s report: {workdir, uploadedBytes, uploadedMembers, artifacts:
+            // [{path, bytes}]} — null for a plain run. Issue #72.
+            "sync",
         ],
     ),
     (

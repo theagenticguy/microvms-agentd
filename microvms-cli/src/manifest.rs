@@ -333,10 +333,10 @@ mod tests {
 
     /// Every exit row reaches the manifest with its code, meaning, and finding.
     #[test]
-    fn the_manifest_carries_all_sixteen_exit_rows() {
+    fn the_manifest_carries_all_seventeen_exit_rows() {
         let manifest = build();
         let rows = manifest["exitCodes"].as_array().expect("an array");
-        assert_eq!(rows.len(), 16);
+        assert_eq!(rows.len(), 17);
         for (row, expected) in rows.iter().zip(EXIT_TABLE.iter()) {
             assert_eq!(row["exit"], expected.exit.as_u8());
             assert_eq!(row["code"], json!(expected.code));
