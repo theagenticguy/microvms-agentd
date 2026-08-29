@@ -21,9 +21,9 @@ use super::{HttpRequest, Transport};
 
 /// Percent-encodes a query value.
 ///
-/// Hand-rolled rather than a dependency because the character set is small and the
-/// alternative is pulling `url` or `percent-encoding` into a crate that has no other
-/// use for either. Unreserved characters pass through and everything else is escaped,
+/// To be replaced by the `percent-encoding` crate in the dependency sweep, together
+/// with `control::transport::paths::encode_segment`, its twin.
+/// Unreserved characters pass through and everything else is escaped,
 /// which is stricter than necessary and never wrong — a path with a space, a `#`, or a
 /// `&` in it is the case that silently truncates a query otherwise.
 fn encode(value: &str) -> String {

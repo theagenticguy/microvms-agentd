@@ -22,30 +22,16 @@ categories = ["command-line-utilities", "virtualization"]
 name = "microvm"
 path = "src/main.rs"
 
-# ── the dependency set is the requirement under test (CLI-2, AC-5-4) ────────
+# ── no second path to AWS (CLI-2, AC-5-4) ───────────────────────────────────
 #
-# Eight direct dependencies and no ninth. There is no `reqwest`, no `aws-*`, no
-# `hyper`, no `aws-sigv4`, and there cannot be one: `tests/thinness.rs` reads this
-# manifest through `cargo metadata` and asserts the direct dependency set is *exactly*
-# the names below. An allowlist rather than a denylist, because a denylist is defeated
-# by the one crate nobody thought to write down — which is the failure shape the
-# Python's three-legged static guard (`tests/test_cli.py:209`, `:261`, `:281`) was
-# built out of after each leg was defeated on purpose.
-#
-# It was seven for a while. `exec --stream` consumes a stream, `Stream` is not in
-# `std`, and `microvms-core` did not re-export the trait — so this crate named
-# `futures-util` in order to call `poll_next`, with a five-paragraph justification
-# beside it. That justification held (a trait definition opens no socket) and was still
-# the wrong shape: the dependency existed to advance a loop. Core grew
-# `ExecHandle::for_each_event`, a callback driver over the same state machine whose
-# signature is `FnMut(ExecEvent) -> ControlFlow<()>` — both `std` — and the entry came
-# out. The count went back to six then, and the honest reading of that was not "we
-# removed a dependency" but "the seam was in the wrong place and moving it removed
-# one". `toml` and `globset` later made it eight (issue #73) — both local parsers,
-# neither able to open a socket, each with its reason beside its entry below.
+# There is no `reqwest`, no `aws-*`, no `hyper`, no `aws-sigv4` here, and there cannot
+# be one: `tests/thinness.rs` reads this manifest through `cargo metadata` and refuses
+# any crate that could open a socket to AWS or sign a request outside `microvms-core`.
+# That is the whole rule. Dependencies are otherwise welcome — a maintained crate beats
+# hand-rolled code, and nothing polices this manifest's size.
 #
 # The CLI reaches AWS through `microvms-core` and through nothing else. That is
-# CLI-2, and the honest way to state it is a manifest a test can read.
+# CLI-2, and the honest way to state it is a denylist a test can read.
 [dependencies]
 # The whole product surface. Every AWS call, every trap closure, the cost engine,
 # and the error taxonomy the exit table is a rendering of.
@@ -102,9 +88,7 @@ tar = "0.4.46"
 # added transitively or through a renamed key is still an edge this sees. Parsing
 # `Cargo.toml` by hand would check the file, not the build.
 cargo_metadata = "0.23.1"
-# The same tokio, with the test clock. **Not a ninth dependency** — it is the
-# same entry again, and `tests/thinness.rs`'s equality dedups the two edges, which
-# is why that guard still reads eight names plus `cargo_metadata`.
+# The same tokio, with the test clock — the same entry again, not a new edge.
 #
 # `test-util` is what `#[tokio::test(start_paused = true)]` needs. One guard requires
 # it: the cut-stream test drives core's reconnect loop, which backs off up to four

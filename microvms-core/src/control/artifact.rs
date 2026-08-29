@@ -217,8 +217,9 @@ pub fn default_dockerfile(port: u16, workdir: Option<&str>, base: &BaseImage) ->
 /// decoration, because the check exists to catch a base that disagrees rather than to
 /// validate Dockerfile syntax.
 ///
-/// Hand-rolled rather than a regex: the pattern is "first token after FROM on a line whose
-/// first word is FROM", and a regex crate is a dependency this lane cannot add anyway.
+/// Split-and-scan rather than a regex: the pattern is "first token after FROM on a line
+/// whose first word is FROM", which `split_whitespace` states more directly than a
+/// pattern string would. (`regex-lite` is available if this ever grows.)
 pub fn dockerfile_from_ref(dockerfile: &str) -> Option<&str> {
     for line in dockerfile.lines() {
         let mut words = line.split_whitespace();
@@ -274,8 +275,8 @@ pub fn require_workdir(base: &BaseImage, dockerfile: Option<&str>) -> Result<(),
 /// `ENV AGENTD_PORT 9000` spelling, since both set the variable and a guard that only
 /// understands one form passes the file it cannot parse.
 ///
-/// Hand-rolled for the same reason [`dockerfile_from_ref`] is: the pattern is small and a
-/// regex crate is a dependency this lane cannot add.
+/// Split-and-scan for the same reason [`dockerfile_from_ref`] is: `split_whitespace`
+/// states the pattern more directly than a regex string would here.
 pub fn dockerfile_agentd_port(dockerfile: &str) -> Option<u16> {
     let mut found = None;
     for line in dockerfile.lines() {

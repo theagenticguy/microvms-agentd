@@ -204,8 +204,8 @@ fn epoch_secs() -> u64 {
 mod tests {
     use super::*;
 
-    /// A temporary directory that cleans itself up. Hand-rolled for the ledger's reason:
-    /// the file's exact contents are the requirement under test and this is six lines.
+    /// A temporary directory that cleans itself up. To be replaced by the `tempfile`
+    /// dev-dependency in the dependency sweep, with the crate's other copies.
     struct TempDir(PathBuf);
 
     impl TempDir {

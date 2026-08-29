@@ -189,10 +189,11 @@ impl Default for StreamOptions {
 /// copy of this function — and the id's shape is part of the session story ("the exec
 /// id is caller-minted"), so the crate that tells that story is the crate that mints.
 ///
-/// Not a crate: the id needs to be distinct rather than unguessable — it is an
-/// idempotency key, not a credential, and the daemon rejects an unknown one — so the
-/// nanosecond clock mixed with a counter is enough, and a CSPRNG dependency for it
-/// would not be.
+/// The id needs to be distinct rather than unguessable — it is an idempotency key,
+/// not a credential, and the daemon rejects an unknown one — so the nanosecond clock
+/// mixed with a counter is enough. (`uuid` v7 would also be enough and is on the
+/// dependency-sweep list; the shape below is the Python client's, kept for wire
+/// familiarity until that sweep decides.)
 pub fn mint_exec_id() -> String {
     use std::sync::atomic::{AtomicU64, Ordering};
     static SEQUENCE: AtomicU64 = AtomicU64::new(0);

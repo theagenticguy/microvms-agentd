@@ -92,8 +92,8 @@ pub fn run(args: &[&str], env: &[(&str, &str)]) -> Run {
 
 /// A temporary directory that cleans itself up.
 ///
-/// Hand-rolled rather than a `tempfile` dev-dependency, because the manifest's exact contents are
-/// the requirement under test and this is a dozen lines.
+/// To be replaced by the `tempfile` dev-dependency in the dependency sweep, with the
+/// crate's other copies of this pattern.
 pub struct TempDir(pub PathBuf);
 
 impl TempDir {

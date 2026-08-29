@@ -10,22 +10,16 @@ readme = "README.md"
 keywords = ["microvms", "lambda", "aws", "sandbox", "microvm"]
 categories = ["api-bindings", "virtualization"]
 
-# The complete dependency set, written once.
+# Dependencies are welcome here: a maintained, memory-safe crate beats hand-rolled
+# code, and nothing about this manifest is frozen. (An earlier phase pinned this set
+# up front so four parallel lanes could merge without manifest conflicts; that
+# constraint ended with the lanes. Comments elsewhere that cite "the frozen set" or
+# "T-W2-2 froze" describe that retired process, not a live rule.)
 #
-# Four lanes fill this crate in parallel (foundation, cost, control plane, session)
-# and every one of them would otherwise add a line here. A manifest three branches
-# edit is three conflicts on a file where a conflict is resolved by guessing which
-# version pin was intended, so the pins land up front and the later lanes add only
-# source files. That means some entries below are unused until their lane lands,
-# which is deliberate and visible: `cargo build` says nothing about an unused
-# dependency, so the cost of pinning early is zero and the cost of pinning late is
-# paid on merge.
-#
-# Every version is what the registry offered on 2026-08-08, checked with
-# `cargo info` rather than transcribed from a plan.
+# Versions are checked with `cargo info` against the registry at the time of adding.
 [dependencies]
 # The wire contract, shared with the daemon rather than mirrored (ARCH-2). This is
-# the one entry the dependency-freeze above missed, and it is not optional: the
+# not optional: the
 # alternative is a client that redefines `Phase`, `Outcome`, and the SSE event
 # payloads locally, which is precisely the drift the protocol crate was extracted to
 # make impossible. A field renamed in `protocol/` must break this crate's build.

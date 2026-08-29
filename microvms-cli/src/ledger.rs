@@ -354,8 +354,8 @@ mod tests {
 
     /// A temporary directory that cleans itself up.
     ///
-    /// Hand-rolled rather than a `tempfile` dependency, because the manifest's exact contents
-    /// are the requirement under test and this is six lines.
+    /// To be replaced by the `tempfile` dev-dependency in the dependency sweep, along with
+    /// the seven other copies of this pattern across the crate.
     struct TempDir(PathBuf);
 
     impl TempDir {

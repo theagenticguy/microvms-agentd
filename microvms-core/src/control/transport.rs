@@ -657,8 +657,9 @@ pub mod paths {
 
     /// Percent-encodes a URI path segment.
     ///
-    /// Hand-rolled against RFC 3986's unreserved set rather than pulling a dependency for
-    /// it. **`/` is encoded**, which is the whole point: an image ARN's slashes would
+    /// To be replaced by the `percent-encoding` crate in the dependency sweep, with an
+    /// AsciiSet that keeps this exact behavior.
+    /// **`/` is encoded**, which is the whole point: an image ARN's slashes would
     /// otherwise split into extra path segments and address something else. `:` is
     /// encoded too — legal unencoded in a path per the RFC, but AWS's own SDKs encode it
     /// in labels and the signature must match whatever is sent.

@@ -447,7 +447,7 @@ async fn stream_exec<O: std::io::Write, E: std::io::Write>(
 /// # Output arrives as text plus a byte count, not as base64, and that is a deliberate limit
 ///
 /// A child's stdout is bytes and JSON strings are UTF-8, so something has to give. The choices
-/// were base64 (needs a dependency this crate does not have and would not add for a rendering
+/// were base64 (a `base64` edge is fine to add if a caller ever needs the exact bytes; the
 /// concern), an array of integers (lossless and unreadable — `[99,104,117,110,107]` for
 /// `chunk`), or lossy text beside the true length. The third is chosen, and `lossy` is set when
 /// the conversion actually replaced anything — so a consumer is never silently handed altered

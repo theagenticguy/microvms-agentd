@@ -107,8 +107,7 @@ pub const MAX_IMAGE_NAME_LEN: usize = 64;
 ///
 /// No dots and no slashes, which rules out the two separators a caller reaching for a
 /// namespaced name writes first. Published as a string for the drift gate; the
-/// matcher is [`is_valid_image_name`], which is hand-rolled rather than a regex
-/// dependency because the character class is four ranges.
+/// matcher is [`is_valid_image_name`], a direct byte check over the four ranges.
 pub const IMAGE_NAME_PATTERN: &str = "[a-zA-Z0-9-_]+";
 
 /// `Version.max`, which is also `NonBlankString.max`.
@@ -456,9 +455,9 @@ pub const DEAD_STATES: [&str; 2] = ["TERMINATED", "TERMINATING"];
 
 /// Whether `name` satisfies [`IMAGE_NAME_PATTERN`] and [`MAX_IMAGE_NAME_LEN`].
 ///
-/// Hand-rolled: the pattern is `[a-zA-Z0-9-_]+`, four character ranges, and a regex
-/// crate for that is a dependency plus a compiled automaton plus a second place the
-/// pattern is written down. The length check is here too because a caller asking "is
+/// A direct byte check: the pattern is `[a-zA-Z0-9-_]+`, four character ranges, which
+/// `is_ascii_alphanumeric` states without a second place the pattern is written down.
+/// The length check is here too because a caller asking "is
 /// this name legal" means both constraints — they arrive from the same model shape and
 /// the service rejects on either.
 pub fn is_valid_image_name(name: &str) -> bool {

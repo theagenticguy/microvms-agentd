@@ -340,8 +340,10 @@ pub struct TeardownReport {
     ///
     /// Two things land here. A delete that was attempted and failed — an image whose twenty
     /// attempts all hit a conflict. And the build **log group**, which this crate cannot
-    /// delete at all, because CloudWatch is absent from the dependency set T-W2-2 froze and
-    /// this lane adds only source files. Naming it is strictly better than the
+    /// delete at all: no CloudWatch client exists anywhere in this workspace, and a logs
+    /// API for one delete call is a bigger surface than the leak it would hide (an
+    /// `aws-sdk-cloudwatchlogs` edge is a reasonable future add if teardown grows more
+    /// log-group work). Naming it is strictly better than the
     /// alternatives: deleting it is unavailable, and silently succeeding would report a
     /// clean teardown over six accumulated log groups — which is how the leak was found in
     /// the first place.
@@ -1097,13 +1099,12 @@ impl Drop for Sandbox {
 
 /// A fresh per-VM bearer token: 32 bytes of randomness as 64 hex characters.
 ///
-/// # Why `/dev/urandom` and not a crate
+/// # `/dev/urandom` directly, for now
 ///
-/// The dependency set T-W2-2 froze carries no CSPRNG and this lane adds only source files,
-/// so what remains is the kernel pool directly — which is what `getrandom` reaches on Linux
-/// anyway, and the daemon this drives is Linux-only. `control::token` reads it the same way
-/// for the same reason; the duplication is deliberate rather than shared, because unifying
-/// it would mean editing another lane's module for four lines.
+/// This reads the same kernel pool `getrandom` reaches on Linux, and the daemon this
+/// drives is Linux-only. Swapping to the `getrandom` crate (which also retires the
+/// fallback below) is queued in the dependency sweep; `control::token` reads it the
+/// same way and swaps with it.
 ///
 /// # Why the fallback is not silent
 ///

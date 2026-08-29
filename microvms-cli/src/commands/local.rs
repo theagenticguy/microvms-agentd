@@ -165,9 +165,9 @@ fn joined(value: &Value) -> String {
 /// # Why this fails rather than returning an empty list
 ///
 /// `cli.py:2041` reads the group through boto3. Neither `microvms-core` nor this crate has a
-/// CloudWatch client — T-W2-2 froze core's dependency set, and adding one *here* would give
-/// the CLI a second path to AWS, which is exactly what CLI-2 forbids and what the thinness
-/// guard is.
+/// CloudWatch client, and adding one *here* would give the CLI a second path to AWS, which
+/// is exactly what CLI-2 forbids and what the thinness guard is. If log reading matters,
+/// the client belongs in core behind the seam.
 ///
 /// # Adding a reader to core was assessed and refused, and not on grounds of size
 ///

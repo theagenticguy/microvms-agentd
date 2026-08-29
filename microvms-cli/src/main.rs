@@ -7,8 +7,8 @@
 //! test suite in *now* runs `microvm run ./agentd --exec pytest`. This binary is the second door
 //! onto the first room — it parses, it renders, and it exits with a code. Every AWS call and
 //! every trap guard belongs to the library, and that is a **checked** property rather than an
-//! intention: `tests/thinness.rs` asserts that the manifest's direct dependency set is exactly
-//! nine crates, that no source file here names a transport or a control-plane operation, and that
+//! intention: `tests/thinness.rs` asserts that no direct dependency is an HTTP or AWS crate,
+//! that no source file here names a transport or a control-plane operation, and that
 //! every AWS-touching command fails when the library seam is made to refuse. Any one of those
 //! alone is defeatable, which is why there are three.
 //!
