@@ -6,6 +6,32 @@ Versions are [semantic](https://semver.org/spec/v2.0.0.html); the wire contract 
 
 ## Unreleased
 
+### Changed
+
+- **Dependency rollup (2026-08-29).** 62 lockfile entries moved; two manifest bumps and one
+  deliberate hold, plus the toolchain:
+  - `tokio-tungstenite` 0.24 → 0.30 in `microvms-core` and agentd's dev-dependencies, which
+    also collapses the tree to one tungstenite line (axum already carried 0.29+). The 0.30
+    API takes `Bytes` in `Message::Binary`; call sites converted. Verified live: the layer-3
+    identity handshake and verified relay ran against a real VM through the real endpoint
+    proxy on the new client (1 served, 0 refused), and the account was left clean.
+  - `astro` 7.2.7 → 7.2.9 and `@astrojs/starlight` 0.41.9 → 0.41.10 in the docs site.
+  - **Held: `x25519-dalek` stays 2.x.** The 3.0 line moves to `curve25519-dalek` 5 while
+    `snow` 0.10 still pins 4.x, so taking it puts two copies of the same curve arithmetic in
+    the tree — the exact duplication the crate was chosen to avoid (one x25519
+    implementation shared with the Noise resolver). The hold is recorded in both manifests;
+    revisit when snow bumps. Tried, built green, and reverted on the tree shape rather than
+    on a failure.
+  - **Held: `typescript` stays 5.9.** Astro's language server (`@astrojs/check`) asserts a
+    compatible TypeScript major at startup and refuses 7.x outright — `docs:check` fails at
+    `AstroCheck.assertCompatibleTypeScript`. Tried and reverted on the measured refusal.
+  - `rustup update stable`: the local toolchain moved 1.97 → 1.98, closing the gap that let
+    two `result_large_err` lints reach CI before being visible locally.
+  - Notable transitives: `h2` 0.4.16 → 0.4.19, `rustls-webpki` 0.103.13 → 0.103.15,
+    `hyper` 1.11.0 → 1.11.1, the whole `icu` 2.2 → 2.3 family. `cargo deny check` green
+    (advisories, bans, licenses, sources); full local gate green; conformance self-test
+    41/41.
+
 ### Added
 
 - **`microvm port-forward` (#70, layer 1).** `port-forward LOCAL[:GUEST]` binds a local

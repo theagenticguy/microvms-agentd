@@ -299,7 +299,7 @@ where
                         Some(sealed) => sealed,
                         None => buffer[..count].to_vec(),
                     };
-                    if socket.send(Message::Binary(frame)).await.is_err() {
+                    if socket.send(Message::Binary(frame.into())).await.is_err() {
                         return Ok(TunnelEnd::Closed);
                     }
                 }
@@ -410,7 +410,7 @@ async fn initiate(
         )
     })?;
     if socket
-        .send(Message::Binary(scratch[..written].to_vec()))
+        .send(Message::Binary(scratch[..written].to_vec().into()))
         .await
         .is_err()
     {

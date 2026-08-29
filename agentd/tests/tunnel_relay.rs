@@ -132,7 +132,7 @@ async fn bytes_reach_the_guest_server_and_its_answer_comes_back() {
         .expect("the upgrade succeeds");
 
     socket
-        .send(Message::Binary(b"hello relay".to_vec()))
+        .send(Message::Binary(b"hello relay".to_vec().into()))
         .await
         .expect("the frame is sent");
 
@@ -175,7 +175,7 @@ async fn a_non_utf8_payload_survives_byte_exact() {
 
     let payload: Vec<u8> = vec![0x00, 0xff, 0xfe, 0x80, 0x7f, 0x00, 0xc0, 0x80];
     socket
-        .send(Message::Binary(payload.clone()))
+        .send(Message::Binary(payload.clone().into()))
         .await
         .expect("sent");
 
@@ -394,11 +394,11 @@ async fn two_tunnels_do_not_share_a_connection() {
         .expect("the second upgrade succeeds");
 
     first
-        .send(Message::Binary(b"first".to_vec()))
+        .send(Message::Binary(b"first".to_vec().into()))
         .await
         .expect("sent");
     second
-        .send(Message::Binary(b"second".to_vec()))
+        .send(Message::Binary(b"second".to_vec().into()))
         .await
         .expect("sent");
 
@@ -506,7 +506,7 @@ async fn initiate(
     let mut scratch = vec![0_u8; 65535];
     let written = initiator.write_message(&[], &mut scratch).expect("writes");
     socket
-        .send(Message::Binary(scratch[..written].to_vec()))
+        .send(Message::Binary(scratch[..written].to_vec().into()))
         .await
         .expect("sent");
 
@@ -559,7 +559,7 @@ async fn a_verified_tunnel_proves_the_vm_and_carries_encrypted_bytes() {
         .write_message(payload, &mut scratch)
         .expect("encrypts");
     socket
-        .send(Message::Binary(scratch[..written].to_vec()))
+        .send(Message::Binary(scratch[..written].to_vec().into()))
         .await
         .expect("sent");
 
