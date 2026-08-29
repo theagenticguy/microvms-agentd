@@ -525,9 +525,10 @@ CI = "1"
     /// every PR rather than existing as a comment about a platform nobody checks.
     ///
     /// **Falsification** — delete the ambiguity checks in `validate` and the first
-    /// assertion reads back a join result instead of a refusal. (Proof pending: to be
-    /// run on the windows-latest CI leg, since this machine cannot execute a
-    /// `cfg(windows)` test.)
+    /// assertion reads back a join result instead of a refusal. Done on 2026-08-29 on
+    /// the windows-latest CI leg (this test cannot execute on a dev Linux box): PR #89
+    /// carried the deletion, and its windows job failed on exactly this test while
+    /// ubuntu and macos stayed green. Failed as stated; the deletion was never merged.
     #[cfg(windows)]
     #[test]
     fn an_ambiguous_windows_binary_shape_is_refused_at_load() {
