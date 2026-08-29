@@ -13,8 +13,9 @@ Versions are [semantic](https://semver.org/spec/v2.0.0.html); the wire contract 
   with the port-scoped proxy headers minted per hop through the session's existing
   `ProxyAuth` cache, which is what carries a tunnel across the platform's 60-minute token
   ceiling — `proxyTokenMints` in the envelope is the observable that says a refresh
-  happened. A WebSocket upgrade relays the 101 (negotiated subprotocol included) and then
-  splices bytes both ways, so the forwarder frames nothing after the handshake. The proxy's
+  happened. HTTP is what this command carries today; the WebSocket upgrade path relays a 101
+  and splices bytes correctly against a local upstream but **does not yet reach a guest
+  server through the endpoint proxy** (see below). The proxy's
   403-vs-502 pair — scope mistake vs nothing listening — is answered to the local client as
   a readable response naming which one it was. The relay lives in
   `microvms-core::session::forward` because the CLI's thinness guard forbids an HTTP stack
@@ -29,6 +30,24 @@ Versions are [semantic](https://semver.org/spec/v2.0.0.html); the wire contract 
   passed through unreinterpreted, one token minted across three connections, and a forward
   to a dead port answered the local client with the 502 nothing-listening sentence.
   Teardown confirmed by `live:verify-clean`.
+
+### Measured
+
+- **The endpoint proxy refuses an upgrade replayed over the HTTPS path, and carries binary
+  frames on a port-scoped `wss://` handshake** (us-east-1, 2026-08-29, guest RFC 6455 echo
+  server on 8090). Re-issuing a client's `GET` with `Upgrade: websocket` as request headers
+  is answered `400` by the proxy, with the guest logging no handshake, while the identical
+  handshake from inside the guest to `127.0.0.1:8090` answers 101. On the endpoint the
+  WebSocket credential travels as `Sec-WebSocket-Protocol` values rather than as the two
+  proxy headers, so a working tunnel must open a real `wss://` handshake offering
+  `connect_subprotocols(port)`'s three values. Doing that: the handshake answers **101**,
+  the proxy consumes all three values (the guest saw no `sec-websocket-protocol` header),
+  and **binary** frames survive **byte-exact** both ways on a **port-scoped** token —
+  including a `0x00`/`0xFF` payload a silent utf-8 round trip would corrupt, and a 300-byte
+  frame exercising the extended-length header (guest observed opcode `2`). This closes the
+  open question `docs/PLATFORM.md` left between the SHELL_INGRESS binary-frame finding
+  (portless shell token) and the 2026-08-15 text-frame run, and it is the transport premise
+  the raw-TCP tunnel (#70 layer 2) rests on.
 
 ## [0.3.0] — 2026-08-29
 

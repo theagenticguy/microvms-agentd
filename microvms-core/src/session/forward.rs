@@ -30,10 +30,36 @@
 //!
 //! A WebSocket handshake is an ordinary GET whose response is 101. After that, neither end
 //! speaks HTTP, so this module stops parsing and copies bytes in both directions until one
-//! side closes. That is what makes the WebSocket path *work* rather than merely connect:
-//! this code frames nothing, so it cannot frame anything wrongly, and an application
-//! subprotocol passes through untouched (also measured — the platform strips only its own
-//! three).
+//! side closes. This code frames nothing after the handshake, so it cannot frame anything
+//! wrongly, and an application subprotocol passes through untouched.
+//!
+//! # The upgrade path does not reach a guest server through the endpoint proxy yet
+//!
+//! Measured 2026-08-29, us-east-1, against a guest RFC 6455 echo server on port 8090. An
+//! upgrade re-issued here as an ordinary HTTPS `GET` — `Upgrade: websocket` and
+//! `Connection: Upgrade` forwarded as request headers — is answered by the **proxy** with
+//! `400` (an `x-amzn-requestid` on the response, and the guest logged no handshake at all,
+//! while the same handshake sent from inside the guest to `127.0.0.1:8090` answers 101).
+//!
+//! The reason is in `docs/PLATFORM.md`: on the endpoint the WebSocket credential travels as
+//! **`Sec-WebSocket-Protocol` values**, not as the two proxy headers, because the browser
+//! `WebSocket` constructor cannot set a header. So a working tunnel has to open a real
+//! `wss://` handshake offering [`crate::session::Session::connect_subprotocols`]'s three
+//! values, rather than replay the client's `GET` over the HTTPS path. That is a genuine
+//! WebSocket client in this module, which the HTTP relay below is not.
+//!
+//! What *is* measured as working on that path, from the same run: a `wss://` handshake
+//! offering the three minted subprotocols reaches the guest, and **binary** frames survive
+//! byte-exact in both directions on a **port-scoped** token — including `0x00`/`0xFF`
+//! payloads that a silent utf-8 round trip would corrupt, and a 300-byte frame that
+//! exercises the extended-length header. The guest observed opcode `2` and no
+//! `sec-websocket-protocol` header, so the proxy consumed all three values as documented.
+//! That is the transport premise the raw-TCP tunnel (issue #70 layer 2) rests on, and it is
+//! also what this module needs in order to carry an upgrade.
+//!
+//! Until that client exists, [`is_upgrade`] and [`splice`] are exercised by the tests below
+//! against a local upstream, where the byte relay is correct — the untested edge is the
+//! handshake negotiation with the platform, not the splice.
 //!
 //! # What a failure says
 //!
