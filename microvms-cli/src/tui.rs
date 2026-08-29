@@ -169,15 +169,16 @@ fn render(frame: &mut ratatui::Frame<'_>, grid: &Grid) {
 /// nothing like each other — and a fixed layout truncates an identifier, which for a leaked
 /// resource is the one string that must survive intact.
 fn column_widths(grid: &Grid) -> Vec<Constraint> {
+    use unicode_width::UnicodeWidthStr as _;
     let mut widths: Vec<u16> = grid
         .headers
         .iter()
-        .map(|header| header.chars().count() as u16)
+        .map(|header| header.width() as u16)
         .collect();
     for row in &grid.rows {
         for (index, cell) in row.iter().enumerate() {
             if index < widths.len() {
-                widths[index] = widths[index].max(cell.chars().count() as u16);
+                widths[index] = widths[index].max(cell.width() as u16);
             }
         }
     }

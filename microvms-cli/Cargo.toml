@@ -81,6 +81,11 @@ globset = "0.4"
 # this side extracts only members it selected, via `unpack_in`'s traversal refusal.
 # Same version agentd carries, so the lock gains no second copy.
 tar = "0.4.46"
+# Terminal cell widths for the TUI's column sizing. Already in the tree under
+# ratatui; naming it directly is what lets column_widths measure display cells
+# rather than chars — a CJK glyph is two cells, and chars().count() under-sizes
+# the column it sits in.
+unicode-width = "0.2"
 
 [dev-dependencies]
 # Temp files/dirs for the test suites: random names with O_EXCL creation and

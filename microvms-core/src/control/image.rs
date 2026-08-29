@@ -1050,6 +1050,15 @@ impl ControlPlane {
     /// holds a reference. This loop is the difference between a clean account and a billed
     /// leak.
     ///
+    /// # Why not `backon`, unlike `transport::send_with_retry`
+    ///
+    /// Assessed for the dependency sweep (issue #91) and kept as a loop: the sleeps here
+    /// go through the injected [`Clock`] seam so tests drive them without real time, and
+    /// `Clock::sleep` returns a future borrowing `&self` — `backon`'s `Sleeper` needs a
+    /// future that owns its state, so bridging the seam costs an adapter bigger than the
+    /// five lines it would replace. The fixed interval is also the contract: teardown
+    /// polls a state that resolves on the service's schedule, not a growing backoff.
+    ///
     /// # Why the first version is kept
     ///
     /// The last remaining version cannot be deleted on its own, only together with the
