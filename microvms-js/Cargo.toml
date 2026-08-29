@@ -47,6 +47,9 @@ napi = { version = "3", default-features = false, features = [
     "web_stream",
 ] }
 napi-derive = "3"
+# JSON string quoting for the report's line-item rendering. Replaced a hand-written
+# escape loop; serde_json's writer is the definition of the grammar being emitted.
+serde_json = "1"
 # The core's own poll and deadline paths need a runtime with `time`; napi
 # provides the runtime, and this names the features the futures require. No
 # `rt-multi-thread` — napi owns the runtime, and a library does not choose it.

@@ -41,6 +41,9 @@ serde_json = "1"
 # a Decimal in the JSON envelope as `"0.0000276944"` rather than as an f64 that
 # has already lost the exactness the type exists to hold.
 rust_decimal = { version = "1.42", features = ["serde-with-str"] }
+# The calendar behind CalendarDate. `std` only — no tzdb: the one consumer measures
+# rate-table age in whole UTC days, so the timezone database would be dead weight.
+jiff = { version = "0.2", default-features = false, features = ["std"] }
 rust_decimal_macros = "1.40"
 
 # ── the control plane (T-W2-4) ──────────────────────────────────────────────

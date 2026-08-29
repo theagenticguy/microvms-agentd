@@ -346,29 +346,10 @@ fn line_json(item: &CoreLineItem) -> String {
     )
 }
 
-/// A JSON string literal.
-///
-/// Escapes the five things a JSON string cannot carry raw plus the C0 range. A
-/// `serde_json` edge would cover this and is fine to take; queued in the dependency
-/// sweep alongside the other binding cleanups.
+/// A JSON string literal, via serde_json — the writer that defines the grammar
+/// this string lands in.
 fn quote(value: &str) -> String {
-    let mut quoted = String::with_capacity(value.len() + 2);
-    quoted.push('"');
-    for character in value.chars() {
-        match character {
-            '"' => quoted.push_str("\\\""),
-            '\\' => quoted.push_str("\\\\"),
-            '\n' => quoted.push_str("\\n"),
-            '\r' => quoted.push_str("\\r"),
-            '\t' => quoted.push_str("\\t"),
-            control if control < '\u{20}' => {
-                quoted.push_str(&format!("\\u{:04x}", control as u32));
-            }
-            other => quoted.push(other),
-        }
-    }
-    quoted.push('"');
-    quoted
+    serde_json::to_string(value).expect("a string serializes")
 }
 
 // ── Total (COST-4) ───────────────────────────────────────────────────────────

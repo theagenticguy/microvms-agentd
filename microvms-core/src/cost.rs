@@ -194,57 +194,60 @@ fn render_quantity(quantity: Decimal) -> String {
     quantity.round_dp(6).normalize().to_string()
 }
 
-// ── dates, without a date crate ──────────────────────────────────────────────
+// ── dates, via jiff ───────────────────────────────────────────────────────────
 
 /// A calendar day, which is the only temporal resolution a rate table has.
 ///
-/// A `jiff` swap is queued in the dependency sweep; until it lands, the module needs
-/// exactly two operations — pin a retrieval date, and subtract two dates to get an
-/// age in days — and the whole date surface is the proleptic-Gregorian day number
-/// below, pinned by a test against three known values.
+/// A thin wrapper over [`jiff::civil::Date`] so the crate's public surface (and the
+/// py/js bindings behind it) keeps its own type. The wrapped crate replaced a
+/// hand-rolled proleptic-Gregorian day-number implementation (issue #91); the pinned
+/// tests that held that implementation to Python's `datetime` now hold jiff to the
+/// same three known values.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct CalendarDate {
-    year: i32,
-    month: u32,
-    day: u32,
-}
+pub struct CalendarDate(jiff::civil::Date);
 
 impl CalendarDate {
     /// A date from its parts, for the literals in this file.
     ///
-    /// `const` so [`pinned_rates`] can pin its retrieval date, which is also why it does
-    /// not validate: a `const fn` cannot return a `Result` a caller must handle at
-    /// compile time. The literals it is used on are pinned by
-    /// `the_pinned_dates_are_real_calendar_days`; anything arriving at runtime goes
-    /// through [`CalendarDate::try_from_ymd`].
+    /// `const` so [`pinned_rates`] can pin its retrieval date. jiff's `constant`
+    /// refuses an invalid literal at compile time when const-evaluated, which is
+    /// strictly better than the old non-validating constructor; anything arriving
+    /// at runtime goes through [`CalendarDate::try_from_ymd`].
     pub const fn from_ymd(year: i32, month: u32, day: u32) -> CalendarDate {
-        CalendarDate { year, month, day }
+        CalendarDate(jiff::civil::Date::constant(
+            year as i16,
+            month as i8,
+            day as i8,
+        ))
     }
 
     /// A date from parts that came from outside this crate.
     ///
     /// The S2 boundary: a `--today` flag or a JSON field is three integers, and
     /// `2026-02-30` would otherwise produce a day number for March 2nd and an age
-    /// two days out.
+    /// two days out. The range pre-checks keep the narrowing casts from wrapping
+    /// (`month = 257` must not arrive at jiff as `1`).
     pub fn try_from_ymd(year: i32, month: u32, day: u32) -> Result<CalendarDate, Error> {
-        let candidate = CalendarDate { year, month, day };
-        if !(1..=12).contains(&month) || day == 0 || day > days_in_month(year, month) {
-            return Err(Error::invalid_arg(format!(
+        let refusal = || {
+            Error::invalid_arg(format!(
                 "{year:04}-{month:02}-{day:02} is not a calendar day, so it cannot date a rate \
                  table: month must be 1-12 and day must be within that month"
-            )));
+            ))
+        };
+        if !(1..=12).contains(&month) || !(1..=31).contains(&day) || i16::try_from(year).is_err() {
+            return Err(refusal());
         }
-        Ok(candidate)
+        jiff::civil::Date::new(year as i16, month as i8, day as i8)
+            .map(CalendarDate)
+            .map_err(|_| refusal())
     }
 
     /// Today, UTC.
     ///
-    /// UTC rather than local, and no dependency: a rate table's age is measured in
-    /// ninety-day units, so the zone can only ever move the answer by a day and
-    /// carrying a timezone database to decide it would be absurd. Falls back to the
-    /// epoch if the clock is set before 1970, which is a machine whose age
-    /// arithmetic is already meaningless and is not worth a `Result` on every
-    /// report.
+    /// UTC rather than local, and no tzdb: a rate table's age is measured in
+    /// ninety-day units, so the zone can only ever move the answer by a day.
+    /// Falls back to the epoch if the clock is set before 1970, which is a machine
+    /// whose age arithmetic is already meaningless.
     pub fn today_utc() -> CalendarDate {
         let seconds = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -255,63 +258,30 @@ impl CalendarDate {
     }
 
     pub fn year(self) -> i32 {
-        self.year
+        i32::from(self.0.year())
     }
 
     pub fn month(self) -> u32 {
-        self.month
+        self.0.month() as u32
     }
 
     pub fn day(self) -> u32 {
-        self.day
+        self.0.day() as u32
     }
 
     /// Days since 1970-01-01, negative before it.
-    ///
-    /// Howard Hinnant's `days_from_civil`, which is the algorithm every date library
-    /// uses: it shifts the year to start in March so the leap day lands at the end
-    /// of a year and the month-length pattern becomes the linear `(153m + 2) / 5`.
-    /// Correct for every proleptic-Gregorian date, and pinned below against
-    /// 1970-01-01, a leap day, and this table's own retrieval date.
     pub fn day_number(self) -> i64 {
-        let month = i64::from(self.month);
-        let day = i64::from(self.day);
-        // March-based year, so February's variable length is the last month.
-        let year = i64::from(self.year) - i64::from(month <= 2);
-        let era = if year >= 0 { year } else { year - 399 } / 400;
-        let year_of_era = year - era * 400;
-        let shifted = if month > 2 { month - 3 } else { month + 9 };
-        let day_of_year = (153 * shifted + 2) / 5 + day - 1;
-        let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
-        // 719468 is the day number of 1970-01-01 in the era-based count.
-        era * 146_097 + day_of_era - 719_468
+        i64::from(self.0.since(EPOCH).expect("dates are in range").get_days())
     }
 
     /// The inverse of [`CalendarDate::day_number`], for [`CalendarDate::today_utc`].
     fn from_day_number(day_number: i64) -> CalendarDate {
-        let shifted = day_number + 719_468;
-        let era = if shifted >= 0 {
-            shifted
-        } else {
-            shifted - 146_096
-        } / 146_097;
-        let day_of_era = shifted - era * 146_097;
-        let year_of_era =
-            (day_of_era - day_of_era / 1460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
-        let year = year_of_era + era * 400;
-        let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
-        let month_shifted = (5 * day_of_year + 2) / 153;
-        let day = day_of_year - (153 * month_shifted + 2) / 5 + 1;
-        let month = if month_shifted < 10 {
-            month_shifted + 3
-        } else {
-            month_shifted - 9
-        };
-        CalendarDate {
-            year: (year + i64::from(month <= 2)) as i32,
-            month: month as u32,
-            day: day as u32,
-        }
+        let days = i32::try_from(day_number).unwrap_or_default();
+        CalendarDate(
+            EPOCH
+                .checked_add(jiff::Span::new().days(days))
+                .unwrap_or(EPOCH),
+        )
     }
 
     /// Days from `earlier` to `self`, negative when `self` is the earlier one.
@@ -320,22 +290,20 @@ impl CalendarDate {
     }
 }
 
+/// 1970-01-01, the zero of [`CalendarDate::day_number`]'s count.
+const EPOCH: jiff::civil::Date = jiff::civil::Date::constant(1970, 1, 1);
+
 /// ISO 8601, because that is what the Python client's `retrieved.isoformat()` puts
 /// in the report header and the two have to be diffable.
 impl fmt::Display for CalendarDate {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{:04}-{:02}-{:02}", self.year, self.month, self.day)
-    }
-}
-
-/// Days in a month, for [`CalendarDate::try_from_ymd`]'s validation only.
-fn days_in_month(year: i32, month: u32) -> u32 {
-    match month {
-        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
-        4 | 6 | 9 | 11 => 30,
-        2 if year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) => 29,
-        2 => 28,
-        _ => 0,
+        write!(
+            f,
+            "{:04}-{:02}-{:02}",
+            self.year(),
+            self.month(),
+            self.day()
+        )
     }
 }
 
