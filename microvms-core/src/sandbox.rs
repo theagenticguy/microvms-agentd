@@ -424,6 +424,13 @@ pub struct Sandbox {
     image: Option<Image>,
     microvm: Option<Microvm>,
     session: Option<Session>,
+    /// A backend for the session [`Sandbox::run`] builds, or `None` for the real HTTP one.
+    ///
+    /// The daemon-side sibling of `with_control_plane`'s transport seam: a test that
+    /// scripts the control plane can launch, but the session `run` then builds would dial
+    /// a real endpoint. This lets the same test script the daemon too. Never set in
+    /// production — `Session::builder` picks reqwest when no backend is given.
+    session_backend: Option<crate::session::SharedBackend>,
 
     // ── the symspec's five variables ─────────────────────────────────────────
     lifecycle: Lifecycle,
@@ -483,6 +490,7 @@ impl Sandbox {
             image: None,
             microvm: None,
             session: None,
+            session_backend: None,
             lifecycle: Lifecycle::Pending,
             token_installed: false,
             image_exists: false,
@@ -492,6 +500,16 @@ impl Sandbox {
             suspended_at: None,
             torn_down: false,
         }
+    }
+
+    /// Routes the session [`Sandbox::run`] builds through `backend` instead of real HTTP.
+    ///
+    /// The daemon-side half of the test seam `with_control_plane` opens: scripting the
+    /// control plane gets a test through the launch, and this gets it through everything
+    /// the launched session then does — uploads, execs, downloads — without a daemon.
+    pub fn with_session_backend(mut self, backend: crate::session::SharedBackend) -> Self {
+        self.session_backend = Some(backend);
+        self
     }
 
     // ── the symspec's five variables, readable ───────────────────────────────
@@ -729,12 +747,13 @@ impl Sandbox {
             control: Arc::clone(&self.control),
             microvm_id: id,
         });
-        self.session = Some(
-            Session::builder(endpoint, agent_token)
-                .with_minter(minter)
-                .with_port(self.control.port())
-                .build()?,
-        );
+        let mut builder = Session::builder(endpoint, agent_token)
+            .with_minter(minter)
+            .with_port(self.control.port());
+        if let Some(backend) = &self.session_backend {
+            builder = builder.with_backend(Arc::clone(backend));
+        }
+        self.session = Some(builder.build()?);
         Ok(self.session.as_mut().expect("just assigned"))
     }
 

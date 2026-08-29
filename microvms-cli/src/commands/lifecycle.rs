@@ -129,14 +129,9 @@ pub fn on_ctrl_c() -> Interrupt<'static> {
 pub struct MergedRunArgs {
     pub args: RunArgs,
     pub config_path: Option<std::path::PathBuf>,
-    /// The compiled artifact globs from the file's `artifacts` key. Validated by the
-    /// loader; consumed by `run <DIR>`'s download selection (issue #72), which is the only
+    /// The artifact globs from the file's `artifacts` key. Validated by the loader;
+    /// consumed by `run <DIR>`'s download selection (issue #72), which is the only
     /// consumer a glob list has — a plain `run` brings nothing back.
-    #[allow(
-        dead_code,
-        reason = "wired by issue #72's run <DIR>; the loader already validates it, and \
-                  dropping it from the merge would re-derive the file there"
-    )]
     pub artifacts: Vec<String>,
     pub resolved: serde_json::Map<String, serde_json::Value>,
 }
@@ -184,8 +179,11 @@ pub fn merge_config(
     // a project whose file pins `image` asked to build and launch that binary, and a file
     // that silently won would run their tests against the stale pinned image. This is the
     // documented precedence, not an exception to it: the positional is the flag layer for
-    // the pair.
-    let image_config = if args.binary.is_some() && args.image.is_none() {
+    // the pair. A positional that names a *directory* is sync mode (issue #72), which
+    // launches rather than builds — there the file's `image` is exactly what `run .`
+    // wants, so the suppression checks the path's shape.
+    let positional_is_binary = args.binary.as_deref().is_some_and(|path| !path.is_dir());
+    let image_config = if positional_is_binary && args.image.is_none() {
         None
     } else {
         config.image.clone()
@@ -359,6 +357,21 @@ fn config_error(error: crate::config::ConfigError) -> crate::exit::CliError {
         .suggest("--no-config ignores the file for this invocation")
 }
 
+/// A [`crate::sync::SyncError`] as the `ERR_SYNC` row.
+fn sync_error(error: crate::sync::SyncError) -> crate::exit::CliError {
+    crate::exit::CliError::new(Exit::Sync, error.to_string())
+        .suggest("the failure is on this machine's filesystem; the platform was not involved")
+}
+
+/// Everything `run <DIR>`'s sync needs past the launch: where the tree came from, its
+/// packed bytes, and which members to bring back.
+struct SyncPlan {
+    dir: std::path::PathBuf,
+    archive: Vec<u8>,
+    members: usize,
+    globs: Vec<String>,
+}
+
 /// Build, launch, exec, report, tear down — the whole thing, once.
 pub async fn run<O: std::io::Write, E: std::io::Write>(
     ctx: &mut Ctx<'_, O, E>,
@@ -368,16 +381,50 @@ pub async fn run<O: std::io::Write, E: std::io::Write>(
     // The config merge, before anything else: a broken file must cost zero AWS calls, and
     // everything below reads the effective values without knowing a file exists.
     let MergedRunArgs {
-        args,
+        mut args,
         config_path,
-        artifacts: _,
+        artifacts,
         resolved,
     } = merge_config(caller_args, ctx.env)?;
-    let args = &args;
     if let Some(path) = &config_path {
         ctx.out
             .progress(&format!("using project config {}", path.display()));
     }
+
+    // `run <DIR>` (issue #72): a positional that names a directory is a project to sync,
+    // not a binary to bake. Decided on the *typed* positional, never a config `binary` —
+    // a file key is a path to a daemon binary by schema, and a directory it accidentally
+    // names should fail the binary check loudly rather than silently switch modes. Packed
+    // here, before anything is attempted: a tree the pack cannot read must cost zero AWS
+    // calls, exactly like a broken config file.
+    let sync_dir = match &caller_args.binary {
+        Some(path) if path.is_dir() => Some(path.clone()),
+        _ => None,
+    };
+    let mut packed: Option<crate::sync::Packed> = None;
+    if let Some(dir) = &sync_dir {
+        args.binary = None; // the positional was a directory, not a binary to build from
+        if args.image.is_none() {
+            return Err(crate::exit::CliError::new(
+                Exit::Precondition,
+                format!(
+                    "{} is a directory (sync mode), and sync mode launches an existing image: \
+                     there is no binary to build one from.",
+                    dir.display()
+                ),
+            )
+            .suggest("pass --image <arn-or-name>, or pin `image` in microvm.toml"));
+        }
+        let work = crate::sync::pack(dir).map_err(sync_error)?;
+        ctx.out.progress(&format!(
+            "packed {} ({} member(s), {} byte(s))",
+            dir.display(),
+            work.members,
+            work.archive.len()
+        ));
+        packed = Some(work);
+    }
+    let args = &args;
 
     let region = args.region.resolve(ctx.env)?;
     let size = args.memory.size_class();
@@ -467,6 +514,17 @@ pub async fn run<O: std::io::Write, E: std::io::Write>(
         ..RunOutcome::default()
     };
     let mut exec_report: Option<ExecReport> = None;
+    let sync_plan = sync_dir
+        .as_ref()
+        .zip(packed.take())
+        .map(|(dir, packed)| SyncPlan {
+            dir: dir.clone(),
+            archive: packed.archive,
+            members: packed.members,
+            globs: artifacts.clone(),
+        });
+    let mut downloaded: Option<Vec<u8>> = None;
+    let mut download_error: Option<String> = None;
 
     // The launch, raced against the interrupt. `Box::pin` so the two arms are the same shape
     // and the select does not need the body to be a named future.
@@ -480,6 +538,9 @@ pub async fn run<O: std::io::Write, E: std::io::Write>(
             size,
             &mut outcome,
             &mut exec_report,
+            sync_plan.as_ref(),
+            &mut downloaded,
+            &mut download_error,
         ));
         tokio::select! {
             result = body => result,
@@ -580,6 +641,56 @@ pub async fn run<O: std::io::Write, E: std::io::Write>(
         return Err(failure);
     }
 
+    // The artifact extraction, only now: the archive is the VM's word and the VM is gone
+    // (or kept, but either way past teardown), so a failure *here* is purely this
+    // machine's filesystem — `ERR_SYNC`, its own row, and the run around it was fine.
+    // `extract_artifacts` writes only glob-selected regular files (never under `.git`)
+    // through `unpack_in`'s traversal refusal; anything else in the archive is skipped.
+    //
+    // The report covers all three shapes a sync run can end in, because each has a
+    // different next action: artifacts listed (read them), `error` set (the download
+    // failed; the exec result above is still real), or `note` set (no globs configured,
+    // so nothing was ever going to come back and nothing was transferred).
+    if let Some(plan) = &sync_plan {
+        let mut report = Map::new();
+        report.insert("workdir".into(), json!(crate::sync::REMOTE_WORKDIR));
+        report.insert("uploadedBytes".into(), json!(plan.archive.len()));
+        report.insert("uploadedMembers".into(), json!(plan.members));
+        let artifacts = match &downloaded {
+            Some(archive) => {
+                let artifacts = crate::sync::extract_artifacts(archive, &plan.globs, &plan.dir)
+                    .map_err(sync_error)?;
+                ctx.out.progress(&format!(
+                    "brought back {} artifact(s) into {}",
+                    artifacts.len(),
+                    plan.dir.display()
+                ));
+                artifacts
+            }
+            None => {
+                if let Some(error) = &download_error {
+                    report.insert("error".into(), json!(error));
+                } else {
+                    report.insert(
+                        "note".into(),
+                        json!("no artifacts globs configured; the workdir was not downloaded"),
+                    );
+                }
+                Vec::new()
+            }
+        };
+        report.insert(
+            "artifacts".into(),
+            json!(
+                artifacts
+                    .iter()
+                    .map(|artifact| json!({"path": artifact.path, "bytes": artifact.bytes}))
+                    .collect::<Vec<_>>()
+            ),
+        );
+        outcome.sync = Some(serde_json::Value::Object(report));
+    }
+
     // The name registration, only now: the launch succeeded, the teardown was skipped
     // (`--vm-name` requires `--keep`), and every field the record carries is the service's
     // own answer read off the outcome. Registering before this point would leave a name
@@ -667,6 +778,9 @@ async fn launch_and_exec<O: std::io::Write, E: std::io::Write>(
     size: microvms_core::SizeClass,
     outcome: &mut RunOutcome,
     exec_report: &mut Option<ExecReport>,
+    sync: Option<&SyncPlan>,
+    downloaded: &mut Option<Vec<u8>>,
+    download_error: &mut Option<String>,
 ) -> Result<(), Error> {
     let started = std::time::Instant::now();
 
@@ -740,6 +854,21 @@ async fn launch_and_exec<O: std::io::Write, E: std::io::Write>(
         .wait_until_ready(microvms_core::session::DEFAULT_READY_TIMEOUT)
         .await?;
 
+    // The synced tree goes up before any exec: the daemon extracts it (its openat2
+    // confinement is the upload's whole trust story), and the exec below runs *in* it.
+    if let Some(plan) = sync {
+        ctx.out.progress(&format!(
+            "uploading {} member(s) to {}",
+            plan.members,
+            crate::sync::REMOTE_WORKDIR
+        ));
+        sandbox
+            .session()
+            .expect("run() built one")
+            .upload_tar(crate::sync::REMOTE_WORKDIR, &plan.archive)
+            .await?;
+    }
+
     let exec = args.exec.clone();
     let timeout = Duration::from_secs_f64(args.timeout.max(0.0));
     if let Some(command) = exec {
@@ -752,6 +881,10 @@ async fn launch_and_exec<O: std::io::Write, E: std::io::Write>(
         let request = start_request(StartSpec {
             user: args.user,
             group: args.group,
+            // The synced tree is the working directory: `run . --exec "make test"` means
+            // "run make test in my project", and an exec that started in the image's own
+            // WORKDIR would make every command spell the path itself.
+            cwd: sync.map(|_| crate::sync::REMOTE_WORKDIR.to_string()),
             ..StartSpec::command(&command)
         });
         let result = sandbox
@@ -777,6 +910,38 @@ async fn launch_and_exec<O: std::io::Write, E: std::io::Write>(
                 .as_ref()
                 .map(|outcome| outcome.writers_may_be_alive),
         });
+    }
+
+    // The workdir comes back *here*, after the exec block rather than inside its success
+    // arm: an exec that exited non-zero is exactly when CI wants the logs and reports the
+    // globs name, and `run_sync`'s `?` above only fires when the exec never ran at all —
+    // nothing to collect in that case. Raw bytes only: the *extraction* is local work with
+    // its own exit row (`ERR_SYNC`), so it happens back in `run`.
+    //
+    // Two deliberate non-`?`s. The download is skipped entirely when no glob could
+    // select anything — a `run .` with no `artifacts` key would otherwise pull the whole
+    // post-build workdir over the wire to extract zero files. And a download *failure* is
+    // recorded rather than propagated: by this line the exec has run and its result is in
+    // `outcome`, and a `?` here would convert a green test run whose workload deleted its
+    // own cwd (`make clean`) into a failure envelope with the passing output discarded.
+    // The caller reads what happened in the envelope's `sync.error`.
+    if let Some(plan) = sync
+        && !plan.globs.is_empty()
+    {
+        match sandbox
+            .session()
+            .expect("run() built one")
+            .download_tar(crate::sync::REMOTE_WORKDIR)
+            .await
+        {
+            Ok(bytes) => *downloaded = Some(bytes),
+            Err(error) => {
+                ctx.out.warn(&format!(
+                    "the workdir could not be downloaded, so no artifacts came back: {error}"
+                ));
+                *download_error = Some(error.to_string());
+            }
+        }
     }
     outcome.running_seconds = run_started.elapsed().as_secs_f64();
     outcome.endpoint = Some(endpoint.clone());

@@ -161,7 +161,7 @@ fn every_published_domain_is_the_domain_the_parser_enforces() {
 fn the_published_exit_table_agrees_with_what_the_binary_exits() {
     let manifest = manifest();
     let rows = manifest["exitCodes"].as_array().expect("an array");
-    assert_eq!(rows.len(), 16);
+    assert_eq!(rows.len(), 17);
 
     let code_for = |integer: i64| -> String {
         rows.iter()

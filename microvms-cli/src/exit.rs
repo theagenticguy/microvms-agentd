@@ -3,7 +3,7 @@
 //!
 //! # Append-only, because a consumer branches on these
 //!
-//! Sixteen rows, 0 through 15. Rows 0-13 are byte-identical to the deleted Python client's
+//! Seventeen rows, 0 through 16. Rows 0-13 are byte-identical to the deleted Python client's
 //! `Exit`/`Code`/`EXIT_TABLE` trio (see git history). Split by *what the caller should do next*, which is the
 //! only distinction worth a separate integer: `ERR_RETRYABLE` means run it again unchanged,
 //! `ERR_CREDENTIALS` means fix an identity and no amount of waiting helps. The three
@@ -121,6 +121,14 @@ pub enum Exit {
     /// the same file. The second CLI-only row: the config file is the CLI's own surface, so
     /// core can never produce this failure.
     Config = 15,
+    /// `run <DIR>` could not pack the directory or could not write an artifact back.
+    ///
+    /// Its own row because the remedy is local — a file the pack could not read, a disk
+    /// the extraction could not write — while the run around it may have been fine; a CI
+    /// caller needs to tell "the sync plumbing failed here" from "the platform failed"
+    /// and from "your tests failed". The third CLI-only row: packing and extraction are
+    /// this binary's own filesystem work, so core can never produce this failure.
+    Sync = 16,
 }
 
 impl Exit {
@@ -184,7 +192,7 @@ impl fmt::Display for Exit {
     }
 }
 
-/// The sixteen rows, in exit-code order, so the rendered table reads like the contract it
+/// The seventeen rows, in exit-code order, so the rendered table reads like the contract it
 /// is.
 ///
 /// Meanings and findings transcribed from `cli.py:149`'s `EXIT_TABLE`, which is what
@@ -192,7 +200,7 @@ impl fmt::Display for Exit {
 /// out rather than generated from [`ErrorKind::code`], because a generated table would
 /// agree with a typo — the same reason `microvms-core/src/error.rs:432` spells its thirteen
 /// codes by hand.
-pub const EXIT_TABLE: [ExitRow; 16] = [
+pub const EXIT_TABLE: [ExitRow; 17] = [
     ExitRow {
         exit: Exit::Ok,
         code: None,
@@ -288,6 +296,13 @@ pub const EXIT_TABLE: [ExitRow; 16] = [
         code: Some("ERR_CONFIG"),
         meaning: "the project config file is missing, malformed, or out of domain; refused \
                   locally — fix the file, or pass --no-config",
+        finding: "",
+    },
+    ExitRow {
+        exit: Exit::Sync,
+        code: Some("ERR_SYNC"),
+        meaning: "run <DIR> could not pack the directory or write an artifact back; the \
+                  failure is on this machine's filesystem, not the platform's",
         finding: "",
     },
 ];
@@ -424,7 +439,7 @@ pub fn from_parse_error(error: &clap::Error) -> CliError {
 mod tests {
     use super::*;
 
-    /// **CLI-3, the table-driven guard over every row.** All sixteen, each asserting the
+    /// **CLI-3, the table-driven guard over every row.** All seventeen, each asserting the
     /// integer, the `ERR_*` string, and the `docs/PLATFORM.md` finding together.
     ///
     /// All three per row is what makes collapsing impossible. A CLI that mapped every
@@ -438,7 +453,7 @@ mod tests {
     /// packet's guard proofs.
     #[test]
     fn every_row_carries_its_integer_its_code_and_its_finding() {
-        let expected: [(u8, Option<&str>, &str); 16] = [
+        let expected: [(u8, Option<&str>, &str); 17] = [
             (0, None, ""),
             (1, Some("ERR_UNEXPECTED"), ""),
             (2, Some("ERR_INVALID_ARG"), ""),
@@ -467,6 +482,7 @@ mod tests {
             (13, Some("ERR_EXEC_FAILED"), ""),
             (14, Some("ERR_NAME_TAKEN"), ""),
             (15, Some("ERR_CONFIG"), ""),
+            (16, Some("ERR_SYNC"), ""),
         ];
         assert_eq!(EXIT_TABLE.len(), expected.len());
         for (row, (integer, code, finding)) in EXIT_TABLE.iter().zip(expected) {
@@ -493,14 +509,14 @@ mod tests {
         }
     }
 
-    /// Fifteen distinct non-zero codes for fifteen classes.
+    /// Sixteen distinct non-zero codes for sixteen classes — seventeen rows less row 0.
     ///
     /// Two rows sharing a code makes the failure envelope ambiguous, which is the one thing
     /// the string beside the integer exists to prevent.
     #[test]
     fn no_two_rows_share_a_code_or_an_integer() {
         let mut codes: Vec<&str> = EXIT_TABLE.iter().filter_map(|row| row.code).collect();
-        assert_eq!(codes.len(), 15, "only row 0 has no code");
+        assert_eq!(codes.len(), 16, "only row 0 has no code");
         codes.sort_unstable();
         let before = codes.len();
         codes.dedup();
@@ -509,7 +525,7 @@ mod tests {
         let mut integers: Vec<u8> = EXIT_TABLE.iter().map(|row| row.exit.as_u8()).collect();
         integers.sort_unstable();
         integers.dedup();
-        assert_eq!(integers.len(), 16, "duplicate exit integer");
+        assert_eq!(integers.len(), 17, "duplicate exit integer");
     }
 
     /// The CLI's table starts with core's taxonomy — the same thirteen classes, code
@@ -532,7 +548,7 @@ mod tests {
         assert_eq!(from_core, from_table[..from_core.len()]);
         assert_eq!(
             &from_table[from_core.len()..],
-            &["ERR_NAME_TAKEN", "ERR_CONFIG"],
+            &["ERR_NAME_TAKEN", "ERR_CONFIG", "ERR_SYNC"],
             "the CLI-only rows, none of which any core kind may map onto"
         );
 

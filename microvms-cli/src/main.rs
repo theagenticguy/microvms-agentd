@@ -8,7 +8,7 @@
 //! onto the first room — it parses, it renders, and it exits with a code. Every AWS call and
 //! every trap guard belongs to the library, and that is a **checked** property rather than an
 //! intention: `tests/thinness.rs` asserts that the manifest's direct dependency set is exactly
-//! eight crates, that no source file here names a transport or a control-plane operation, and that
+//! nine crates, that no source file here names a transport or a control-plane operation, and that
 //! every AWS-touching command fails when the library seam is made to refuse. Any one of those
 //! alone is defeatable, which is why there are three.
 //!
@@ -41,6 +41,7 @@ mod ledger;
 mod manifest;
 mod render;
 mod seam;
+mod sync;
 mod tui;
 
 use std::process::ExitCode;

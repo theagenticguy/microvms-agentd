@@ -89,6 +89,12 @@ toml = "1"
 # before a run spends a launch on it, and `run <DIR>` selects downloaded members with
 # the same compiled set — one grammar, validated and consumed by the same crate.
 globset = "0.4"
+# `run <DIR>` sync mode (issue #72): pack the project directory for upload, and unpack
+# the glob-selected *regular-file* members of the returned archive. The daemon stays
+# the only tree extractor for uploads (its openat2 confinement, `agentd/src/fs.rs`);
+# this side extracts only members it selected, via `unpack_in`'s traversal refusal.
+# Same version agentd carries, so the lock gains no second copy.
+tar = "0.4.46"
 
 [dev-dependencies]
 # The structural guards read the real dependency graph rather than parsing TOML:

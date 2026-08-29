@@ -201,6 +201,10 @@ pub struct RunOutcome {
     pub vm_name: Option<String>,
     pub leaked: Vec<String>,
     pub cost: Option<Value>,
+    /// `run <DIR>`'s sync report — workdir, uploaded size, and the artifacts brought
+    /// back — or `Null` for a plain run. Always present, so a consumer never guards
+    /// against a missing key.
+    pub sync: Option<Value>,
 }
 
 impl RunOutcome {
@@ -226,6 +230,7 @@ impl RunOutcome {
         data.insert("vmName".into(), json!(self.vm_name));
         data.insert("leaked".into(), json!(self.leaked));
         data.insert("cost".into(), self.cost.clone().unwrap_or(Value::Null));
+        data.insert("sync".into(), self.sync.clone().unwrap_or(Value::Null));
         data
     }
 

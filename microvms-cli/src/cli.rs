@@ -499,10 +499,17 @@ pub struct InfraFlags {
 
 #[derive(Args, Clone, Debug)]
 pub struct RunArgs {
-    /// The aarch64 agentd binary to bake in as the image CMD.
+    /// The aarch64 agentd binary to bake in — or a directory to sync (issue #72).
     ///
-    /// Ignored when --image names an image to launch instead of building one.
-    #[arg(value_name = "BINARY")]
+    /// A positional that names a *directory* switches run into sync mode: the tree is
+    /// packed (skipping `.git`, symlinks preserved), uploaded to /workspace in the VM,
+    /// the exec runs with /workspace as its working directory, and the members matching
+    /// the config's `artifacts` globs are brought back into the directory afterwards —
+    /// `microvm run .` is the headline spelling. A positional that names a file is the
+    /// daemon binary to bake in as the image CMD, ignored when --image names an image
+    /// to launch instead of building one. The two readings cannot collide: a path is a
+    /// directory or it is not.
+    #[arg(value_name = "BINARY_OR_DIR")]
     pub binary: Option<PathBuf>,
 
     /// Launch this existing image instead of building one. Takes an ARN or a name.
