@@ -216,6 +216,21 @@ pub struct NameRecord {
     pub region: String,
     /// Seconds since the epoch, the ledger's own clock.
     pub at: u64,
+    /// The launching host's identity secret, base64, when `run --identity` generated one.
+    ///
+    /// In this file for the reason the agent token is: `tunnel --name --verify-identity`
+    /// runs in a later process, and a secret that did not persist would make the flag work
+    /// only in the launching shell. The file is already 0600 and already a credential store
+    /// — this raises what a stolen record can do from "call the VM" to "call the VM and
+    /// impersonate the launching host to it", which is the same trust domain.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity_host_seed: Option<String>,
+    /// The VM's public key, base64 — the pin `--verify-identity` checks the far end against.
+    ///
+    /// Deliberately the *public* half: the VM's secret was dropped at launch
+    /// (`LaunchIdentity::keep`), so no record anywhere lets anyone impersonate the VM.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity_vm_public_key: Option<String>,
 }
 
 /// The name→VM registry: one JSON file per live name, under `<root>/names/`.
@@ -260,6 +275,8 @@ impl Names {
                 agent_token: String::new(),
                 region: String::new(),
                 at: 0,
+                identity_host_seed: None,
+                identity_vm_public_key: None,
             }),
         }
     }
@@ -510,6 +527,8 @@ mod tests {
             agent_token: "tok-1".to_string(),
             region: "us-east-1".to_string(),
             at: 1754524800,
+            identity_host_seed: None,
+            identity_vm_public_key: None,
         }
     }
 

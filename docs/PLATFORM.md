@@ -838,6 +838,60 @@ listening. That HTTPS request is the only way to tell a scope mistake from a dea
 which is why a client offering `connect_subprotocols` should offer `connect_headers`
 beside it.
 
+## Binary frames survive a port-scoped WebSocket, and an upgrade cannot be replayed over HTTPS
+
+Measured 2026-08-29, us-east-1, API version `2025-09-09`, against a guest RFC 6455 echo
+server (stdlib Python, hand-rolled framing) on port 8090. Two findings, and the second is
+the one that closes an open question in the sections above.
+
+**An upgrade re-issued as an ordinary HTTPS `GET` is refused by the proxy.** Forwarding a
+client's handshake with `Upgrade: websocket` and `Connection: Upgrade` as request headers —
+the shape an HTTP reverse proxy would use — answers **400** with an `x-amzn-requestid` on
+the response, and the guest logs **no handshake at all**. The same handshake sent from
+inside the guest to `127.0.0.1:8090` answers 101, so the guest server is not the variable.
+This is consistent with "Endpoint authentication" above rather than a new rule: on the
+endpoint the WebSocket credential travels as `Sec-WebSocket-Protocol` values because the
+browser `WebSocket` constructor cannot set a header, so the HTTPS request path has no way to
+express a WebSocket upgrade. A client wanting a tunnel must open a real `wss://` handshake.
+
+**Binary frames survive byte-exact on a port-scoped token.** Opening `wss://<endpoint>/`
+with the three values from `Session::connect_subprotocols(8090)`:
+
+| Question | Observation |
+| --- | --- |
+| Handshake status | **101 Switching Protocols** |
+| Offered subprotocol lengths | 15, 884, 25 — the marker, the JWE, the port |
+| Client-visible `ws.protocol` | `lambda-microvms` (the proxy's, not the guest's) |
+| What reached the guest | **No `sec-websocket-protocol` header**, so all three were consumed by the proxy |
+| Frame opcode the guest received | **`2` (binary)** on all three frames |
+| Byte fidelity | **Byte-exact** both directions, including a `0x00 0xFF 0xFE 0x80 0x7F 0x00` payload |
+| Extended-length path | A 300-byte frame round-tripped, so the 126-length header form works |
+
+The `0x00`/`0xFF` payload is the load-bearing case: a proxy that silently round-tripped
+binary through utf-8 would return the correct *length* for an ascii payload and corrupt
+those bytes, so an ascii-only probe cannot distinguish the two.
+
+This settles what the two prior WebSocket sections left open between them. "What the
+endpoint speaks" establishes binary frames on the `SHELL_INGRESS` path, but with a
+**portless** shell token; the 2026-08-15 run establishes a port-scoped WebSocket reaching a
+guest server, but with **text** frames. Binary-through-port-scoped is the corner a
+TCP-over-WebSocket relay depends on, and it works.
+
+### A tunnel's token is scoped to the daemon's port, not to the port it reaches
+
+Measured 2026-08-29 while bringing up the TCP relay. A WebSocket to `/v1/tcp?port=5432`
+terminates at **the daemon**, and the daemon dials `127.0.0.1:5432` from inside the guest — so
+the proxy only ever sees a request for the daemon's port (9000). A token minted for 5432
+therefore authorizes a port the request never addresses, and the handshake is refused as close
+code **1006 with no reason**, which is indistinguishable from a dead guest server.
+
+This is worth recording as a platform-shaped trap rather than as a client bug, because the
+intuition it violates is the one the rest of this document teaches: every other port-scoped
+call names the port it wants to *reach*. On a relayed route the port travels in the request
+(here, the query string) and the credential belongs to the hop. Diagnosing it took a
+loopback-vs-proxy bisection — the same relay worked from inside the guest — because 1006
+carries no information at all.
+
 ## The guest kernel is 6.1, which `openat2` needs
 
 Measured 2026-08-14, us-east-1, `al2023-1` base: `uname -r` inside a running VM

@@ -304,6 +304,47 @@ unit tests could not have caught this. They inject a `Layout` inside a tempdir a
 fake platform, which is correct for testing the logic but structurally unable to
 observe a capability the real VM lacks.
 
+## Tunnel identity: proving which VM answered
+
+Everything above trusts the endpoint proxy to route a request to the VM its JWE names.
+That trust is usually fine — the JWE is scoped to one `microvmId` and the proxy
+enforces the scope (measured: a wrong-port token is refused) — but it is trust in
+AWS-operated middleware, and TLS terminates *at* that middleware. A caller who wants
+the binding to hold without the proxy in the loop can ask for it:
+`microvm run --keep --identity` and then `microvm tunnel --verify-identity`.
+
+The mechanism is a Noise KK handshake inside the tunnel's WebSocket, terminated in the
+daemon rather than at the proxy. At launch the host generates two x25519 seeds and
+delivers the VM's seed plus the host's public key in the `runHookPayload`, beside the
+agent token and under the same one-shot bootstrap rule — only the winning bootstrap
+installs identity, so a losing racer cannot substitute a key. Each side then pins the
+other's public half before the first byte moves: `KK` means a wrong key on either side
+fails the handshake's own decryption, so there is no verifier code that could forget
+to check. Everything after the handshake is ChaCha20-Poly1305 ciphertext, opaque to
+the proxy that carries it.
+
+Why not TLS: the service model has no client-certificate parameter
+(`CreateMicrovmAuthToken` takes an identifier, ports, and an expiry — nothing else),
+so platform-layer mTLS is unavailable, and tunnel-layer rustls is unavailable to the
+*daemon* because both of its crypto providers compile C that the
+`aarch64-unknown-linux-musl` shipping build cannot link (measured 2026-08-29:
+`cc-rs` requires `aarch64-linux-musl-gcc`, absent locally and in CI). Noise KK is the
+same proof shape with pure-Rust primitives, and `protocol/src/identity.rs` carries the
+full argument.
+
+What a stolen record buys is deliberately narrow. The registry keeps the host's secret
+and the VM's *public* pin; the VM's own secret is dropped on the host side the moment
+the launch payload is built. So a copied `NameRecord` lets its holder check a VM's
+identity and open tunnels — which the agent token in the same file already allowed —
+and lets no one impersonate the VM to its launcher.
+
+**The honest limit.** The handshake proves the far end is *agentd in the VM you
+launched*. It does not prove the VM is uncompromised: the workload runs as uid 0 and
+can read the daemon's memory through `ptrace` or `/proc/<pid>/mem`, taking the derived
+key with it. That is the same boundary the whole contract states at the top — the
+daemon is *distinct from* the workload, never *protected from* it. Same class as the
+unenforced-list entries; documented, not overclaimed.
+
 ## What this contract does not cover
 
 **Egress.** Nothing here constrains what the workload can reach. Egress is a

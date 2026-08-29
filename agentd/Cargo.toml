@@ -18,7 +18,11 @@ description = "Exec and file-transfer daemon for AWS Lambda MicroVMs"
 # which is earlier and cheaper than the schema artifact catching it in CI, and far
 # earlier than a consumer catching it at runtime.
 protocol = { package = "microvms-protocol", version = "0.3.0", path = "../protocol" }
-axum = "0.8.9"
+# `ws` is the TCP relay (`tunnel.rs`): the endpoint proxy carries a WebSocket to a
+# guest port but has no CONNECT method, so arbitrary TCP rides inside binary frames
+# (measured 2026-08-29 — see docs/PLATFORM.md). axum's own extractor rather than a
+# second WebSocket stack, since the router already owns the upgrade path.
+axum = { version = "0.8.9", features = ["ws"] }
 # tower-http 0.7 is a breaking line; axum 0.8.9 pins ^0.6.8 internally, so we
 # stay on 0.6 to keep one version of the middleware types in the tree.
 # `catch-panic` turns a panicking handler into a 500 instead of a dropped
@@ -80,6 +84,32 @@ getrandom = "0.4"
 # `BTreeMap` for insertion order, and the committed artifact is compared byte for
 # byte, so key order has to be a function of the types rather than of derive order.
 schemars = { version = "1.2.2", default-features = false, features = ["derive", "std"] }
+# The tunnel's identity proof (#70 layer 3): a Noise KK handshake inside the relay, so a
+# caller can prove the far end is the VM it launched without trusting the endpoint proxy.
+# snow is the most-used Noise implementation in the ecosystem, and `noise-rust-crypto` — the
+# obvious alternative — last released in 2023.
+#
+# **`default-features = false` is load-bearing, not tidiness.** snow's `std` feature reads
+# `ring/std` rather than `ring?/std`, so enabling it force-enables `ring`, whose build script
+# drives `cc-rs` looking for `aarch64-linux-musl-gcc`. That tool exists neither on the devbox
+# nor in CI (`.github/workflows/ci.yml` installs the *gnu* cross compiler), so the shipping
+# `aarch64-unknown-linux-musl` build fails outright: `error occurred in cc-rs: failed to find
+# tool "aarch64-linux-musl-gcc"`. Measured 2026-08-29, and it is the same wall that ruled out
+# rustls for this crate — both of its crypto providers (`aws-lc-sys`, `ring`) compile C.
+# The features below select snow's pure-Rust resolver, which cross-compiles with no C at all.
+snow = { version = "0.10", default-features = false, features = [
+    "default-resolver",
+    "use-curve25519",
+    "use-chacha20poly1305",
+    "use-blake2",
+    "use-sha2",
+    "use-getrandom",
+] }
+# The public half of a seed, derived without a handshake: the daemon reports its own key so a
+# caller can confirm the pin it holds before opening a tunnel. Same crate the Noise resolver
+# uses internally, so one x25519 implementation in the tree rather than two that could
+# disagree about a derivation both sides depend on.
+x25519-dalek = { version = "2", default-features = false, features = ["static_secrets"] }
 
 [dev-dependencies]
 proptest = "1.11"
@@ -89,3 +119,9 @@ turmoil = "0.7.2"
 tower = "0.5"
 pin-project-lite = "0.2"
 tempfile = "3"
+# A real WebSocket client for the TCP relay's tests (`tests/tunnel_relay.rs`). The relay's
+# whole contract is byte fidelity and close codes over a live upgrade, and axum's own
+# extractor has no client half — a hand-rolled RFC 6455 client in a test would be a second
+# framing implementation whose bugs read as relay bugs. Dev-only: nothing that ships into a
+# guest image needs a WebSocket client.
+tokio-tungstenite = "0.24"

@@ -30,6 +30,8 @@ pub mod exec;
 pub mod fs;
 pub mod health;
 pub mod hook;
+pub mod identity;
+pub mod tunnel;
 
 /// Protocol version, distinct from the daemon version.
 ///

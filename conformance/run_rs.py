@@ -6,7 +6,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Live conformance run driving the **Rust** client stack through the `microvm` CLI.
 
-This is the only live suite, and it now expresses **every named check** — 98 of them, with
+This is the only live suite, and it now expresses **every named check** — 104 of them, with
 none recorded SKIP. `conformance/run.py` was the oracle — 56 checks through the Python
 client — and it went away with that client once both suites ran green against real AWS on
 the same commit (Python 56/56, this one 38/38 with 34 recorded SKIP). Those 34 were the
@@ -65,6 +65,14 @@ validating the file, a launch driven entirely by microvm.toml, the exec running 
 file as each knob's source, the glob-matched artifact landing, and the unmatched member
 staying in the VM. Live for the named-VMs reason: the round trip crosses the daemon's
 real tar routes and the service's real launch.
+
+104 rather than 98: `drive_tunnel_identity` adds six for issue #70's third layer — the
+identity pair on the launch envelope, the pair in the registry record, a verified tunnel
+serving a request through the real proxy (a Noise KK handshake in binary frames, then
+ciphertext), a tampered pin failing closed with nothing served, the restored record
+verifying again, and the identity VM's own teardown. Live because the handshake's
+failure mode on the endpoint path is a silent 1006, which is exactly the shape that
+passes every stand-in and fails only against the real proxy.
 
 A hybrid driver, and both lanes are deliberate
 ----------------------------------------------
@@ -1766,6 +1774,180 @@ def drive_named_vm(
         )
 
 
+def _tunnel_fetch(
+    cli: Cli,
+    vm_name: str,
+    state_dir: Path,
+    local_port: int,
+    guest_port: int,
+    verify: bool,
+) -> str | None:
+    """One HTTP GET through `microvm tunnel`, or `None` when nothing was served.
+
+    The tunnel is a foreground process serving until Ctrl-C, so it runs as a Popen with
+    `--max-connections 1`: the fetch is the one connection, and the process then exits on
+    its own. The GET goes through raw sockets via httpx against localhost — the tunnel is
+    the thing under test, so the client on this side of it should be anything but the code
+    under test.
+    """
+    argv = cli.argv(
+        "tunnel",
+        f"{local_port}:{guest_port}",
+        "--name",
+        vm_name,
+        "--state-dir",
+        str(state_dir),
+        "--region",
+        cli.region,
+        "--max-connections",
+        "1",
+        *(["--verify-identity"] if verify else []),
+    )
+    cli.log.append(shlex.join(argv))
+    with subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE) as proc:
+        try:
+            body: str | None = None
+            # The listener needs a moment to bind; the retry is the wait.
+            for _ in range(20):
+                time.sleep(0.5)
+                try:
+                    answer = httpx.get(
+                        f"http://127.0.0.1:{local_port}/v1/schema", timeout=10.0
+                    )
+                    if answer.status_code == 200:
+                        body = answer.text
+                    break
+                except httpx.TransportError:
+                    continue
+            proc.wait(timeout=30)
+            return body
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+
+
+def drive_tunnel_identity(
+    cli: Cli, launched: Envelope, state_dir: Path, results: Results
+) -> None:
+    """Tunnel identity (issue #70 layer 3): prove the VM, fail closed. Six checks.
+
+    Its own VM, launched `--identity` from the image the suite already built: the seed is
+    delivered only at launch, so the suite's VM — launched without one — cannot carry it.
+    That VM is exactly what the no-downgrade check needs, so both launches earn their keep.
+
+    Live rather than only scripted for the named-VMs class of reason: the Noise handshake
+    rides binary WebSocket frames through the real endpoint proxy, and every local test of
+    it speaks to a stand-in. The proxy's binary fidelity is measured for relay chunks;
+    "measured for a cryptographic handshake whose failure mode is a silent 1006" is a
+    different claim until one live run makes them the same.
+
+    The tampered-pin check flips one base64 character mid-string, so length and padding
+    stay legal and the refusal has to come from the cryptography rather than a parser.
+    That is the replayed-record case from the issue's acceptance list, expressed as the
+    smallest possible record edit.
+    """
+    print("\n-- tunnel identity (#70 layer 3: prove the VM, fail closed) --")
+    vm_name = f"conformance-ident-{secrets.token_hex(4)}"
+    named = cli.call(
+        "run",
+        "--image",
+        str(launched.data["imageIdentifier"]),
+        "--name",
+        f"microvm-cli-conformance-ident-{secrets.token_hex(4)}",
+        "--memory",
+        str(BASELINE_MEMORY_MIB),
+        "--keep",
+        "--identity",
+        "--vm-name",
+        vm_name,
+        "--state-dir",
+        str(state_dir),
+        "--region",
+        cli.region,
+        "--max-idle-sec",
+        "600",
+        "--suspended-sec",
+        "600",
+        "--max-duration-sec",
+        "1800",
+        timeout=15 * 60,
+    )
+    microvm_id = str(named.data["microvmId"])
+    try:
+        host_seed = named.data.get("identityHostSeed")
+        vm_pin = named.data.get("identityVmPublicKey")
+        results.check(
+            "run --identity reported the identity pair on the envelope",
+            isinstance(host_seed, str)
+            and isinstance(vm_pin, str)
+            and len(host_seed) == 44
+            and len(vm_pin) == 44
+            and host_seed != vm_pin,
+            f"hostSeed={type(host_seed).__name__} pin={type(vm_pin).__name__}",
+        )
+
+        record_path = state_dir / "names" / f"{vm_name}.json"
+        record = json.loads(record_path.read_text())
+        results.check(
+            "the registry record carries the host seed and the public pin",
+            record.get("identityHostSeed") == host_seed
+            and record.get("identityVmPublicKey") == vm_pin,
+            f"record keys: {sorted(record.keys())}",
+        )
+
+        # The guest server is the daemon itself: al2023-minimal ships no python3, and the
+        # daemon's unauthenticated `GET /v1/schema` on 127.0.0.1:9000 is already an HTTP
+        # server whose body could only come from plaintext inside the guest. Tunnelling to
+        # the daemon's own port also exercises the exact loopback dial the relay performs
+        # for any other guest service.
+        verified = _tunnel_fetch(
+            cli, vm_name, state_dir, 18443, AGENT_PORT, verify=True
+        )
+        results.check(
+            "a verified tunnel served a request through the real proxy",
+            verified is not None and '"protocol_version"' in verified,
+            f"body: {verified[:80] if verified else verified!r}",
+        )
+
+        # The replayed-record case: one flipped pin character mid-base64 (length and
+        # padding stay legal), handshake must fail, nothing served.
+        pin = record["identityVmPublicKey"]
+        flipped = pin[:20] + ("A" if pin[20] != "A" else "B") + pin[21:]
+        record_path.write_text(json.dumps({**record, "identityVmPublicKey": flipped}))
+        results.eq(
+            "a tampered pin fails closed with nothing served",
+            _tunnel_fetch(cli, vm_name, state_dir, 18444, AGENT_PORT, verify=True),
+            None,
+        )
+        record_path.write_text(json.dumps(record))
+
+        # And the same record still works untampered — so the refusal above was the flip,
+        # not something the tampering round trip broke.
+        restored = _tunnel_fetch(
+            cli, vm_name, state_dir, 18445, AGENT_PORT, verify=True
+        )
+        results.check(
+            "the restored record verifies again",
+            restored is not None and '"protocol_version"' in restored,
+            f"body: {restored[:80] if restored else restored!r}",
+        )
+    finally:
+        gone = cli.call(
+            "terminate",
+            vm_name,
+            "--wait",
+            "--state-dir",
+            str(state_dir),
+            "--region",
+            cli.region,
+        )
+        results.check(
+            "the identity VM tore down clean",
+            gone.data.get("microvmId") == microvm_id and not gone.data.get("leaked"),
+            f"microvm={gone.data.get('microvmId')} leaked={gone.data.get('leaked')}",
+        )
+
+
 def drive_config_and_sync(
     cli: Cli, launched: Envelope, project: Path, results: Results
 ) -> None:
@@ -2732,6 +2914,10 @@ def main() -> int:
             # Named VMs on their own VM (from the suite's image, no second build):
             # registration only happens at launch, so the suite's VM cannot carry it.
             drive_named_vm(cli, launched, Path(tmp) / "named-state", results)
+            # Tunnel identity on its own VM as well (launched `--identity`, from the
+            # suite's image): the seed is delivered only at launch, so the suite's VM
+            # cannot carry one.
+            drive_tunnel_identity(cli, launched, Path(tmp) / "ident-state", results)
             # microvm.toml + run <DIR> on their own VM too (launched *through the config
             # file*, from the suite's image): the config merge and the sync round trip
             # both happen at launch, so the suite's VM cannot carry them either.

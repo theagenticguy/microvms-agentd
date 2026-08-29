@@ -408,6 +408,13 @@ async fn handle<O: std::io::Write, E: std::io::Write>(
         Command::Ack(args) => commands::attached::ack(ctx, args).await,
         Command::Stdin(args) => commands::attached::stdin(ctx, args).await,
         Command::Cp(args) => commands::attached::cp(ctx, args).await,
+        // The second command that races the interrupt, and the only one for which the
+        // interrupt is the *expected* ending rather than an abort: a tunnel runs until the
+        // caller stops it. See `attached::port_forward` on why that exits 0.
+        // Both long-running commands take the interrupt, and for both it is the expected
+        // ending rather than an abort.
+        Command::Tunnel(args) => commands::attached::tunnel(ctx, args, interrupt).await,
+        Command::PortForward(args) => commands::attached::port_forward(ctx, args, interrupt).await,
         Command::Suspend(args) => commands::lifecycle::suspend(ctx, args).await,
         Command::Resume(args) => commands::lifecycle::resume(ctx, args).await,
         Command::Terminate(args) => commands::lifecycle::terminate(ctx, args).await,

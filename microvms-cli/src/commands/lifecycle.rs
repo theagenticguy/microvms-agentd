@@ -840,6 +840,9 @@ async fn launch_and_exec<O: std::io::Write, E: std::io::Write>(
     for (key, value) in &args.launch_env {
         request = request.with_launch_env(key, value);
     }
+    if args.identity {
+        request = request.with_identity();
+    }
     if args.egress {
         request = request.with_egress();
     }
@@ -952,6 +955,13 @@ async fn launch_and_exec<O: std::io::Write, E: std::io::Write>(
     outcome.agent_token = sandbox
         .session()
         .map(|session| session.agent_token().to_string());
+    // The identity pair, when --identity generated one. Core's own base64 helpers rather
+    // than an encoding crate here, so the envelope, the registry, and the tunnel flags all
+    // read one spelling that `from_encoded_parts` is guaranteed to accept back.
+    if let Some(identity) = sandbox.tunnel_identity() {
+        outcome.identity_host_seed = Some(identity.host_seed_base64());
+        outcome.identity_vm_public_key = Some(identity.vm_public_key_base64());
+    }
     if let Some(vm) = sandbox.microvm() {
         outcome.microvm_id = Some(vm.id.clone());
         ledger.record_microvm(&vm.id);
@@ -1773,6 +1783,11 @@ fn name_record_for_kept(
         agent_token: outcome.agent_token.clone()?,
         region: region_name.to_string(),
         at: epoch_secs(),
+        // Present exactly when `--identity` generated material; `tunnel --name
+        // --verify-identity` reads them back in a later process. Not `?`-propagated:
+        // their absence is a launch without the flag, never a failed launch.
+        identity_host_seed: outcome.identity_host_seed.clone(),
+        identity_vm_public_key: outcome.identity_vm_public_key.clone(),
     })
 }
 

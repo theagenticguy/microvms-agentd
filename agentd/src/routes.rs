@@ -133,6 +133,7 @@ fn handler_for(endpoint: &schema::Endpoint) -> axum::routing::MethodRouter<AppSt
         ("PUT", "/v1/fs/file") => axum::routing::put(fs::write_file),
         ("GET", "/v1/fs/tar") => get(fs::read_tar),
         ("PUT", "/v1/fs/tar") => axum::routing::put(fs::write_tar),
+        ("GET", "/v1/tcp") => get(crate::tunnel::open),
         ("GET", "/v1/health") => get(health),
         ("GET", "/v1/schema") => get(schema_route),
         (method, path) => panic!("{method} {path} is documented but has no handler"),
@@ -210,13 +211,32 @@ async fn run_hook(
         }
     };
 
-    match state.bootstrap(hook.agent_token.as_bytes(), hook.env) {
+    // The tunnel's identity material, when the payload carries it. Read before the
+    // bootstrap so a self-contradictory payload — one half of a mutual proof — is a
+    // 400 rather than a VM that launches and then refuses every handshake. Absence
+    // is not an error: a launch must never fail because a caller did not ask for a
+    // feature, and this route's 400 makes the platform terminate the VM.
+    let tunnel_identity = match crate::tunnel_identity::Material::from_payload(&hook) {
+        Ok(material) => material.map(std::sync::Arc::new),
+        Err(err) => {
+            // Safe to log for the same reason `RunHookError` is: every variant names
+            // a key or a shape, never the key material itself.
+            tracing::warn!(%err, "tunnel identity material rejected");
+            return (StatusCode::BAD_REQUEST, err.to_string()).into_response();
+        }
+    };
+
+    let identity_delivered = tunnel_identity.is_some();
+    match state.bootstrap_with_identity(hook.agent_token.as_bytes(), hook.env, tunnel_identity) {
         Bootstrap::Installed => {
             // The count and the keys, never the values: a launch env is where a
             // caller puts a credential, and the whole reason it travels in this
-            // payload is that the payload is not logged.
+            // payload is that the payload is not logged. `tunnel_identity` is a
+            // boolean for the same reason and one step further: there is no
+            // rendering of a private key that belongs in a log line.
             tracing::info!(
                 launch_env_vars = state.launch_env().len(),
+                tunnel_identity = identity_delivered,
                 "agent token installed"
             );
             StatusCode::OK.into_response()
@@ -537,6 +557,35 @@ pub fn surface_docs() -> Vec<schema::Endpoint> {
                  direct child — a shell that backgrounded a server leaves the \
                  interesting process outside the child pid",
                 schema::EXEC_KILL,
+            )
+        },
+        schema::Endpoint {
+            query: Some(query::<crate::tunnel::TunnelQuery>()),
+            response: no_body(),
+            ..row(
+                "GET",
+                "/v1/tcp".into(),
+                Auth::Bearer,
+                "upgrade to a WebSocket relayed to 127.0.0.1:<port> in the guest, so a \
+                 caller outside the VM can speak an arbitrary TCP protocol to a server \
+                 inside it. Binary frames carry bytes in both directions and a frame is a \
+                 byte range rather than a message — TCP has no message boundaries and \
+                 neither does this. The dial is loopback-only and never resolves a name: a \
+                 relay that could reach another host would be an open proxy inside the VM \
+                 reachable with the agent token. One connection per WebSocket, deliberately: \
+                 multiplexing would reimplement per-stream ids, flow control, and close \
+                 handshakes that the platform already provides per connection. Outcomes \
+                 arrive as close codes — 4502 nothing listening, 4400 port 0, 4500 a \
+                 mid-relay failure — because a WebSocket route leaves HTTP behind after its \
+                 101. Rests on a measured platform property: binary frames survive a \
+                 port-scoped token byte-exact (docs/PLATFORM.md, 2026-08-29). With \
+                 `identity=1` the relay first completes a Noise KK handshake against the \
+                 per-VM key delivered in the launch payload, which proves the far end is \
+                 this VM without trusting the endpoint proxy and makes every later frame \
+                 ciphertext; 4401 means this VM was launched without a seed and 4403 means \
+                 the handshake was refused. The handshake runs before the dial, so a refused \
+                 caller never reaches a guest service.",
+                schema::TUNNEL_OPEN,
             )
         },
         schema::Endpoint {

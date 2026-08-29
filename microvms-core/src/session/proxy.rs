@@ -86,7 +86,14 @@ pub const DEFAULT_AGENT_PORT: u16 = 9000;
 ///
 /// Bare, with no suffix: it is the marker that says the other two values in the list are
 /// the platform's rather than the application's.
-pub const WS_SUBPROTOCOL: &str = "lambda-microvms";
+///
+/// Re-exported from the `protocol` crate rather than spelled again here, because the daemon
+/// needs the same string for the opposite reason — this client *offers* it and `agentd`
+/// *echoes* it on the direct path, where an offered-but-unechoed subprotocol makes an RFC
+/// 6455 client refuse the handshake. Two definitions would let the offer and the echo drift,
+/// and the failure would name neither side. One `const` aliasing the other makes the
+/// disagreement unrepresentable instead of merely asserted.
+pub const WS_SUBPROTOCOL: &str = protocol::tunnel::WS_MARKER_SUBPROTOCOL;
 
 /// The prefix the JWE rides behind in a WebSocket handshake.
 ///

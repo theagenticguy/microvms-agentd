@@ -174,6 +174,18 @@ pub struct RunRequest {
     /// matters here more than for the token, because one bearer token has always fit
     /// with room to spare and a map of credentials does not.
     pub launch_env: std::collections::HashMap<String, String>,
+    /// Whether to generate and deliver a tunnel identity (#70 layer 3).
+    ///
+    /// On, the launch generates two fresh x25519 seeds, delivers the VM's seed and the
+    /// host's public key in the same payload as the token, and [`RunOutcome`]-equivalent
+    /// state on the session keeps the [`crate::identity::TunnelIdentity`] — the host secret
+    /// and the VM's public pin — for `tunnel --verify-identity` to prove the far end.
+    /// Off (the default) sends byte-for-byte the payload this client always sent.
+    ///
+    /// A flag rather than always-on, deliberately: the material spends 137 bytes of the
+    /// payload's measured 4096-byte budget, and a caller near the ceiling with a launch env
+    /// deserves to choose which feature gets the room.
+    pub identity: bool,
     /// Whether to request the egress connector. Off means no outbound network.
     pub egress: bool,
     /// `idlePolicy.maxIdleDurationSeconds`.
@@ -198,6 +210,7 @@ impl Default for RunRequest {
             execution_role_arn: None,
             agent_token: None,
             launch_env: std::collections::HashMap::new(),
+            identity: false,
             egress: false,
             max_idle_sec: 600,
             suspended_sec: 600,
@@ -248,6 +261,16 @@ impl RunRequest {
     #[must_use]
     pub fn with_agent_token(mut self, token: impl Into<String>) -> Self {
         self.agent_token = Some(token.into());
+        self
+    }
+
+    /// Generates and delivers a tunnel identity with the launch (#70 layer 3).
+    ///
+    /// After a `run` with this set, [`Sandbox::tunnel_identity`] holds what
+    /// `tunnel --verify-identity` needs: the host's secret and the VM's public pin.
+    #[must_use]
+    pub fn with_identity(mut self) -> Self {
+        self.identity = true;
         self
     }
 
@@ -448,6 +471,12 @@ pub struct Sandbox {
     /// Set by [`Sandbox::terminate`], so `Drop` can tell an abandoned VM from a torn-down
     /// one.
     torn_down: bool,
+    /// The launch's tunnel identity, when [`RunRequest::identity`] asked for one.
+    ///
+    /// Holds the host secret and the VM's *public* pin — the VM's own secret was dropped
+    /// the moment the payload was built ([`crate::identity::LaunchIdentity::keep`]), so
+    /// nothing on the host side can impersonate the VM it launched.
+    tunnel_identity: Option<crate::identity::TunnelIdentity>,
 }
 
 impl std::fmt::Debug for Sandbox {
@@ -501,6 +530,7 @@ impl Sandbox {
             suspended_window: None,
             suspended_at: None,
             torn_down: false,
+            tunnel_identity: None,
         }
     }
 
@@ -559,6 +589,15 @@ impl Sandbox {
     /// The suspended window this sandbox asked for at launch, once it has launched.
     pub fn suspended_window(&self) -> Option<Duration> {
         self.suspended_window
+    }
+
+    /// The tunnel identity, when the launch asked for one ([`RunRequest::identity`]).
+    ///
+    /// What `tunnel --verify-identity` verifies with: the host's secret and the VM's public
+    /// pin. `None` on a launch that did not ask, and the tunnel route then refuses an
+    /// identity request with close code 4401 rather than downgrading.
+    pub fn tunnel_identity(&self) -> Option<&crate::identity::TunnelIdentity> {
+        self.tunnel_identity.as_ref()
     }
 
     // ── build ────────────────────────────────────────────────────────────────
@@ -693,13 +732,25 @@ impl Sandbox {
         };
 
         let agent_token = request.agent_token.clone().unwrap_or_else(mint_agent_token);
+        // Generated before the payload because the payload carries its two public-facing
+        // fields. The VM's secret half lives exactly as long as this binding: `keep()` below
+        // drops it before the launch call returns.
+        let launch_identity = if request.identity {
+            Some(crate::identity::LaunchIdentity::generate()?)
+        } else {
+            None
+        };
         // Checked even though this builds the JSON itself, because neither half is ours:
         // the token may be caller-supplied, so someone passing a signed blob rather than a
         // bearer token is exactly who this catches (TRAP-5), and the launch env is entirely
         // the caller's. This is the pre-flight refusal — over-ceiling fails here with the
         // byte count, before the launch, rather than as a `ValidationException` on a member
         // the caller did not know they were filling.
-        let payload = RunHookPayload::for_launch(&agent_token, &request.launch_env)?;
+        let payload = RunHookPayload::for_launch_with_identity(
+            &agent_token,
+            &request.launch_env,
+            launch_identity.as_ref(),
+        )?;
 
         let mut wire = RunMicrovmRequest::new(&identifier, payload);
         wire.image_version = request.image_version.clone();
@@ -714,6 +765,11 @@ impl Sandbox {
         }
 
         let launched = self.control.run_microvm(wire).await?;
+
+        // The durable half of the identity, kept the moment the launch is accepted: the host
+        // secret and the VM's public pin. The VM's own secret ends here — `keep` drops it —
+        // so from this line on the host can verify its VM and impersonate it never.
+        self.tunnel_identity = launch_identity.map(crate::identity::LaunchIdentity::keep);
 
         // STATE-1: the launch was accepted.
         self.lifecycle = Lifecycle::Pending;

@@ -100,9 +100,30 @@ sha2 = "0.11"
 # ── the in-VM session (T-W2-5) ──────────────────────────────────────────────
 # Same pin as the daemon carries. `time` for the poll and deadline paths, `sync`
 # for the proxy-token refresh, `io-util` for the SSE reader; no `rt-multi-thread`,
-# because a library does not choose the caller's runtime.
-tokio = { version = "1.53", features = ["time", "sync", "io-util", "macros"] }
+# because a library does not choose the caller's runtime. `net` is the port
+# forwarder's listener (`session::forward`) — it lives here rather than in the CLI
+# because `microvms-cli/tests/thinness.rs` forbids an HTTP stack there, and a
+# forwarder is an HTTP server.
+tokio = { version = "1.53", features = [
+    "time",
+    "sync",
+    "io-util",
+    "macros",
+    "net",
+] }
 futures-util = "0.3"
+# The WebSocket client behind `session::tunnel`. Required rather than convenient: the
+# endpoint proxy takes a WebSocket's credential as `Sec-WebSocket-Protocol` values and has
+# no CONNECT method, so an upgrade replayed over the HTTPS path is answered 400 by the proxy
+# (measured 2026-08-29, docs/PLATFORM.md). Carrying TCP therefore needs a real handshake,
+# which reqwest's client cannot perform. `rustls-tls-webpki-roots` matches the one TLS
+# implementation already in the tree — a native-tls build would need an OpenSSL the guest
+# image does not carry.
+tokio-tungstenite = { version = "0.24", default-features = false, features = [
+    "connect",
+    "handshake",
+    "rustls-tls-webpki-roots",
+] }
 # Exec output and stdin are arbitrary bytes and a JSON string cannot hold
 # arbitrary bytes, so both sides of the wire carry base64. 0.23 to match agentd:
 # one version in the tree means the client and the daemon cannot disagree about
@@ -119,6 +140,24 @@ getrandom = "0.4"
 # hand-rolled encoders; the AsciiSets keep their exact behavior (everything outside
 # the unreserved set is escaped, including `/` and `:` in path segments).
 percent-encoding = "2.3"
+# The initiator half of the tunnel identity proof (#70 layer 3): Noise KK against
+# the per-VM key the launch delivered, so `--verify-identity` proves the far end is
+# the VM this host launched without trusting the endpoint proxy. The same feature
+# selection as agentd's, for the same measured reason (see agentd/Cargo.toml): the
+# `std` feature force-enables `ring`, whose build script needs a musl cross C
+# compiler this repo's targets do not assume.
+snow = { version = "0.10", default-features = false, features = [
+    "default-resolver",
+    "use-curve25519",
+    "use-chacha20poly1305",
+    "use-blake2",
+    "use-sha2",
+    "use-getrandom",
+] }
+# Deriving the public half of a launch-generated seed without a handshake — the pin
+# the ledger stores, and the value the daemon must independently agree on. The same
+# crate snow's resolver uses internally, so one x25519 implementation in the tree.
+x25519-dalek = { version = "2", default-features = false, features = ["static_secrets"] }
 
 [dev-dependencies]
 # The size-class and region guards are table-shaped, which is exactly where a

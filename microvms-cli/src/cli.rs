@@ -80,13 +80,14 @@ pub struct Cli {
     pub quiet: bool,
 }
 
-/// The eighteen commands.
+/// The twenty commands.
 ///
 /// Variant order is the order `microvm --help` and the manifest list them in, which is
 /// lifecycle order rather than alphabetical: a reader meeting this surface for the first time
-/// wants `run` first, not `build`. The five *attached* commands — `exec`, `health`, `ack`,
-/// `stdin`, `cp` — sit together after `build` because they share the same three identifiers and
-/// the same door ([`crate::seam::CoreSeam::attach_session`]), which is the distinction that
+/// wants `run` first, not `build`. The six *attached* commands — `exec`, `health`, `ack`,
+/// `stdin`, `cp`, `port-forward` — sit together after `build` because they share the same three
+/// identifiers and the same door ([`crate::seam::CoreSeam::attach_session`]), which is the
+/// distinction that
 /// matters when reading the list: everything above them creates or destroys, and everything in
 /// that block addresses a VM that already exists. `history` sits beside `ls` because they are
 /// the same kind of thing: a local read of what this machine's own state directory recorded.
@@ -147,6 +148,27 @@ pub enum Command {
     /// `microvms-core` carries a tar library, which keeps the daemon's confined extractor the only
     /// extractor in the system.
     Cp(CpArgs),
+
+    /// Tunnel arbitrary TCP to a guest port, so `psql` or `ssh` here reaches a server in the VM.
+    ///
+    /// Where `port-forward` speaks HTTP, this speaks bytes: each local connection becomes a
+    /// WebSocket carrying raw TCP to the daemon's relay, which dials `127.0.0.1:<port>` inside
+    /// the guest. The endpoint proxy has no CONNECT method, so riding inside binary frames is
+    /// the only way arbitrary TCP crosses it — and that it crosses byte-exact is measured
+    /// rather than assumed (docs/PLATFORM.md, 2026-08-29). One connection per WebSocket, so a
+    /// client that opens five connections opens five tunnels.
+    Tunnel(TunnelArgs),
+
+    /// Serve a guest port on localhost, so a browser here reaches a server in the VM.
+    ///
+    /// Holds a local listener open until Ctrl-C and forwards each connection through the VM's
+    /// endpoint with a port-scoped proxy token minted per hop — which is what carries a tunnel
+    /// across the platform's sixty-minute token ceiling without the caller sequencing anything.
+    /// HTTP and WebSocket, because those are what the endpoint proxy carries; a WebSocket
+    /// upgrade is relayed and then spliced as bytes, so an application subprotocol survives.
+    /// Arbitrary TCP is not this command — it needs a guest-side relay, which is issue #70's
+    /// second layer.
+    PortForward(PortForwardArgs),
 
     /// Freeze a MicroVM. It keeps its memory, filesystem, token, and endpoint.
     ///
@@ -629,6 +651,22 @@ pub struct RunArgs {
     #[arg(long)]
     pub keep: bool,
 
+    /// Generate a per-VM identity, so `tunnel --verify-identity` can prove the far end.
+    ///
+    /// The launch generates two x25519 seeds and delivers the VM's seed plus this host's
+    /// public key in the run-hook payload beside the agent token. What persists is the
+    /// least-privilege pair — this host's secret and the VM's *public* pin — in the name
+    /// registry when `--vm-name` is given, and on the success envelope either way. A later
+    /// `microvm tunnel --name <NAME> --verify-identity 5432` then completes a Noise KK
+    /// handshake with the daemon before relaying a byte: proof the far end is this exact
+    /// VM, independent of the platform proxy, with every frame encrypted end to end.
+    ///
+    /// Costs 137 bytes of the launch payload's measured 4096-byte budget (the same budget
+    /// as --launch-env). Requires --keep for --vm-name's reason: a VM torn down on the way
+    /// out has no identity worth proving.
+    #[arg(long, requires = "keep")]
+    pub identity: bool,
+
     /// Register a local name for the kept VM, so later commands can say `--name <NAME>`
     /// instead of pasting the endpoint/agent-token/microvm-id triple.
     ///
@@ -896,6 +934,133 @@ pub struct HealthArgs {
 
     #[command(flatten)]
     pub region: RegionFlags,
+}
+
+/// `tunnel`'s arguments, which are `port-forward`'s.
+///
+/// A separate struct rather than a shared one, because clap derives per-field help text and
+/// the two commands need different words for the same field — a `tunnel` user asking what
+/// `LOCAL[:GUEST]` means is asking about a database port, not a dev server. The *shapes* being
+/// identical is asserted in `tests/manifest.rs` instead, which is where a divergence would
+/// matter: the two commands must take the same identifier triple.
+#[derive(Args, Debug)]
+pub struct TunnelArgs {
+    /// The ports, as `LOCAL[:GUEST]`. A single number uses it on both sides.
+    ///
+    /// `5432` means the guest's 5432 on local 5432; `15432:5432` moves it aside when something
+    /// local already holds the well-known port, which for a database is the common case.
+    #[arg(value_name = "LOCAL[:GUEST]")]
+    pub ports: String,
+
+    /// The local address to bind. Loopback by default, deliberately.
+    ///
+    /// The same reasoning `port-forward` gives, and it matters more here: a raw-TCP tunnel into
+    /// a VM running untrusted code is not something to expose on a LAN by accident.
+    #[arg(long, default_value = "127.0.0.1")]
+    pub bind: String,
+
+    /// Stop after this many connections, instead of running until Ctrl-C.
+    ///
+    /// For a scripted check — "does the database answer" — where an unbounded listener hangs a
+    /// CI job. Omitted means serve until interrupted.
+    #[arg(long, value_name = "N")]
+    pub max_connections: Option<u32>,
+
+    /// Prove the far end is the VM this record was created for, before relaying a byte.
+    ///
+    /// Runs a Noise KK handshake against the per-VM key that `run --identity` delivered at
+    /// launch: the daemon proves it holds the VM's seed, this side proves it holds the
+    /// launching host's secret, and every frame after the handshake is encrypted end to
+    /// end — opaque to the endpoint proxy that carries it. Fails closed: a VM launched
+    /// without `--identity` refuses (close code 4401) rather than downgrading, a wrong pin
+    /// or a record replayed from another VM fails the handshake itself (4403 or a pin
+    /// diagnosis), and no guest connection is ever made for a refused caller.
+    ///
+    /// Needs the identity material, so it works with `--name <NAME>` (the registry record
+    /// carries it) or with the two `--identity-*` flags pasted from `run`'s envelope.
+    ///
+    /// What it proves, honestly: that the far end is agentd in the VM you launched. The
+    /// workload in that VM runs as root and could in principle read the daemon's memory, so
+    /// this is "the right VM", not "an uncompromised VM" — docs/TRUST.md carries the full
+    /// statement.
+    #[arg(long)]
+    pub verify_identity: bool,
+
+    /// The launching host's identity secret, base64, from `run --identity`'s envelope.
+    ///
+    /// For the attach-by-triple path; `--name` reads it from the registry instead. Implies
+    /// nothing alone — only read when --verify-identity is set.
+    #[arg(long, value_name = "BASE64", requires = "verify_identity")]
+    pub identity_host_seed: Option<String>,
+
+    /// The VM's public key, base64, from `run --identity`'s envelope. The pin.
+    #[arg(long, value_name = "BASE64", requires = "verify_identity")]
+    pub identity_vm_public_key: Option<String>,
+
+    #[command(flatten)]
+    pub attach: AttachFlags,
+
+    #[command(flatten)]
+    pub region: RegionFlags,
+}
+
+#[derive(Args, Debug)]
+pub struct PortForwardArgs {
+    /// The ports, as `LOCAL[:GUEST]`. A single number uses it on both sides.
+    ///
+    /// One positional rather than two, and the `:` spelling rather than a pair of flags, for
+    /// the reason [`microvms_core::session::ForwardSpec`] is a struct: both values are `u16`
+    /// and both are plausible in either position, so two bare positionals is how a tunnel ends
+    /// up pointing at the wrong end. `8080` is the common case and means 8080 to 8080.
+    #[arg(value_name = "LOCAL[:GUEST]")]
+    pub ports: String,
+
+    /// The local address to bind. Loopback by default, deliberately.
+    ///
+    /// A tunnel into a VM running untrusted code is not something to expose on a LAN by
+    /// accident, so widening it is a typed choice rather than the default.
+    #[arg(long, default_value = "127.0.0.1")]
+    pub bind: String,
+
+    /// Stop after serving this many connections, instead of running until Ctrl-C.
+    ///
+    /// For a scripted check — "does the dev server answer" — where an unbounded listener would
+    /// hang a CI job. Omitted means serve until interrupted.
+    #[arg(long, value_name = "N")]
+    pub max_connections: Option<u32>,
+
+    #[command(flatten)]
+    pub attach: AttachFlags,
+
+    #[command(flatten)]
+    pub region: RegionFlags,
+}
+
+/// The two ports a `LOCAL[:GUEST]` argument names.
+///
+/// Parsed here rather than in the handler so the refusals are unit-testable without a seam,
+/// and because a malformed pair must be refused before any AWS call — the ledger read that
+/// resolves `--name` is cheap, but minting a token for a port the caller mistyped is a
+/// billable call that fails at the proxy with a 403 naming the token.
+pub fn parse_port_pair(spec: &str) -> Result<(u16, u16), String> {
+    let (local, guest) = match spec.split_once(':') {
+        Some((local, guest)) => (local, guest),
+        None => (spec, spec),
+    };
+    let parse = |value: &str, side: &str| -> Result<u16, String> {
+        let port: u16 = value
+            .trim()
+            .parse()
+            .map_err(|_| format!("{side} port {value:?} is not a number between 1 and 65535"))?;
+        if port == 0 {
+            return Err(format!(
+                "{side} port 0 is not forwardable: the guest cannot listen on it, and on the \
+                 local side it would bind an OS-chosen port this command could not tell you about"
+            ));
+        }
+        Ok(port)
+    };
+    Ok((parse(local, "the local")?, parse(guest, "the guest")?))
 }
 
 #[derive(Args, Debug)]
@@ -1369,12 +1534,50 @@ mod tests {
         Cli::command().debug_assert();
     }
 
-    /// Eighteen subcommands, named as the manifest and the response table name them.
+    /// **A bare port means both sides; a pair means local-then-guest.**
     ///
-    /// The five after `exec` are the attached block — `health`, `ack`, `stdin`, `cp` beside it —
-    /// and their position is asserted rather than incidental, because `--help`'s reading order is
-    /// the only documentation of which commands need the identifier triple. `history` sits
-    /// beside `ls` because both are local reads of this machine's own state directory.
+    /// The order is the assertion worth making, because both values are `u16` and a transposed
+    /// pair produces a tunnel that binds the guest's number locally and asks the proxy for the
+    /// local one — which fails at the proxy with a 403 naming the token rather than the mistake.
+    #[test]
+    fn a_port_pair_reads_local_first_and_a_bare_number_means_both() {
+        assert_eq!(parse_port_pair("8080"), Ok((8080, 8080)));
+        assert_eq!(parse_port_pair("3000:8080"), Ok((3000, 8080)));
+        assert_eq!(parse_port_pair(" 3000 : 8080 "), Ok((3000, 8080)));
+    }
+
+    /// **Port 0 is refused on both sides, and the two refusals say different things.**
+    ///
+    /// A guest cannot listen on 0 at all, and locally it would bind an OS-chosen port this
+    /// command has no way to report — so "it worked" would leave the caller with a tunnel they
+    /// cannot address.
+    #[test]
+    fn port_zero_is_refused_by_name_on_whichever_side_it_appears() {
+        let local = parse_port_pair("0:8080").expect_err("local 0 is refused");
+        assert!(local.contains("local port 0"), "{local}");
+        let guest = parse_port_pair("8080:0").expect_err("guest 0 is refused");
+        assert!(guest.contains("guest port 0"), "{guest}");
+    }
+
+    /// A non-numeric or out-of-range port names the side and the value.
+    #[test]
+    fn an_unparseable_port_names_the_side_and_the_value() {
+        let word = parse_port_pair("http:8080").expect_err("not a number");
+        assert!(word.contains("the local port"), "{word}");
+        assert!(word.contains("\"http\""), "{word}");
+
+        let big = parse_port_pair("8080:70000").expect_err("out of u16 range");
+        assert!(big.contains("the guest port"), "{big}");
+        assert!(big.contains("65535"), "{big}");
+    }
+
+    /// Twenty subcommands, named as the manifest and the response table name them.
+    ///
+    /// The seven after `exec` are the attached block — `health`, `ack`, `stdin`, `cp`, `tunnel`,
+    /// and `port-forward` beside it — and their position is asserted rather than incidental, because
+    /// `--help`'s reading order is the only documentation of which commands need the identifier
+    /// triple. `history` sits beside `ls` because both are local reads of this machine's own
+    /// state directory.
     #[test]
     fn the_tree_registers_the_lifecycle_commands_the_attached_block_and_the_local_ones() {
         let registered: Vec<String> = Cli::command()
@@ -1391,6 +1594,8 @@ mod tests {
                 "ack",
                 "stdin",
                 "cp",
+                "tunnel",
+                "port-forward",
                 "suspend",
                 "resume",
                 "terminate",

@@ -650,6 +650,34 @@ pub const HEALTH: &[Status] = &[Status::new(
      terminates outside the guest.",
 )];
 
+/// The TCP relay's statuses. Its real outcomes are **close codes**, not statuses.
+///
+/// A WebSocket route has exactly one success status and then leaves HTTP behind, so the
+/// interesting failures — nothing listening, a bad port, a mid-relay error — arrive as close
+/// codes in `tunnel::close`. Recorded here rather than left implicit, because a consumer
+/// reading only this table would otherwise conclude the route has no failure modes.
+pub const TUNNEL_OPEN: &[Status] = &[
+    Status::new(
+        StatusCode::SWITCHING_PROTOCOLS,
+        "",
+        "the upgrade succeeded. The guest dial happens AFTER the upgrade, so a 101 \
+         does not yet mean the guest port answered: a refused dial arrives as close \
+         code 4502 with a reason naming the port. That ordering is deliberate — on the \
+         endpoint path every WebSocket failure a caller can observe is 1006 with no \
+         reason, so an HTTP 502 here would be invisible to the only client that \
+         matters.",
+    ),
+    Status::new(
+        StatusCode::BAD_REQUEST,
+        "malformed_request",
+        "?port is absent or is not a u16. Port 0 parses and is refused after the \
+         upgrade with close code 4400, because a caller that named it deserves a \
+         reason rather than a parse error.",
+    ),
+    UNAUTHORIZED,
+    NOT_BOOTSTRAPPED,
+];
+
 pub const SCHEMA: &[Status] = &[Status::new(
     StatusCode::OK,
     "",

@@ -133,6 +133,20 @@ struct Inner {
     /// env as a separate argument, so there is no struct field a future refactor
     /// could accidentally forward.
     launch_env: Mutex<HashMap<String, String>>,
+    /// The tunnel's identity material, delivered in the same run-hook payload.
+    ///
+    /// `None` until a run hook carrying both identity halves arrives, and `None`
+    /// forever if none does — which the tunnel route turns into close code 4401
+    /// rather than an unverified tunnel.
+    ///
+    /// A third slot rather than a field on either neighbour, and the reason is the
+    /// same one that keeps `launch_env` separate from `token`: this holds a private
+    /// key, and `launch_env` is the map that reaches every child process by design.
+    /// One struct holding both would be one refactor away from putting a private
+    /// key in a child's environment. Written under the token lock on the winning
+    /// bootstrap for the reason `launch_env` is — a racer that loses the token must
+    /// not win the identity.
+    tunnel_identity: Mutex<crate::tunnel_identity::Shared>,
     execs: Mutex<HashMap<String, ExecEntry>>,
     /// How free space is measured. Held here rather than called directly from the
     /// write paths so a test can inject a filesystem that is full, or one that
@@ -160,6 +174,7 @@ impl AppState {
                 config,
                 token: Mutex::new(None),
                 launch_env: Mutex::new(HashMap::new()),
+                tunnel_identity: Mutex::new(None),
                 execs: Mutex::new(HashMap::new()),
                 space_probe,
                 identity,
@@ -200,6 +215,28 @@ impl AppState {
     /// holding a different credential, which is precisely the one-shot property
     /// stated for the other half of the payload.
     pub fn bootstrap(&self, presented: &[u8], launch_env: HashMap<String, String>) -> Bootstrap {
+        self.bootstrap_with_identity(presented, launch_env, None)
+    }
+
+    /// [`AppState::bootstrap`], also installing the tunnel's identity material.
+    ///
+    /// A separate entry point rather than a third parameter on the old one, because
+    /// every existing caller and test passes exactly two arguments and a third
+    /// positional `HashMap`-adjacent value is how a launch env and a key get
+    /// swapped. The run-hook route calls this one; `bootstrap` stays the shape the
+    /// model and the tests already check.
+    ///
+    /// The identity follows the launch env's rule exactly: installed only on the
+    /// *winning* bootstrap, under the token lock. A racer that loses the token must
+    /// not win the identity — otherwise a second caller could replace the key the
+    /// first VM's owner pinned, and every later handshake would prove the wrong
+    /// thing while looking correct.
+    pub fn bootstrap_with_identity(
+        &self,
+        presented: &[u8],
+        launch_env: HashMap<String, String>,
+        tunnel_identity: crate::tunnel_identity::Shared,
+    ) -> Bootstrap {
         let mut slot = recover(&self.inner.token, "token");
         match slot.as_deref() {
             None => {
@@ -208,6 +245,7 @@ impl AppState {
                 // the environment: the winner's map is in place before any other
                 // caller can observe a token installed.
                 *recover(&self.inner.launch_env, "launch_env") = launch_env;
+                *recover(&self.inner.tunnel_identity, "tunnel_identity") = tunnel_identity;
                 Bootstrap::Installed
             }
             Some(installed) => {
@@ -231,6 +269,15 @@ impl AppState {
     /// one having been delivered. Nothing branches on the difference.
     pub fn launch_env(&self) -> HashMap<String, String> {
         recover(&self.inner.launch_env, "launch_env").clone()
+    }
+
+    /// The tunnel's identity material, or `None` on a VM launched without it.
+    ///
+    /// Cloned out behind an `Arc` rather than handed out behind the guard, because
+    /// the caller is an async handler that holds it across a handshake and a
+    /// `std::sync::Mutex` guard is not `Send`.
+    pub fn tunnel_identity(&self) -> crate::tunnel_identity::Shared {
+        recover(&self.inner.tunnel_identity, "tunnel_identity").clone()
     }
 
     /// Whether bootstrap has completed. Control routes answer 503 until it has.

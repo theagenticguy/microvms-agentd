@@ -6,6 +6,156 @@ Versions are [semantic](https://semver.org/spec/v2.0.0.html); the wire contract 
 
 ## Unreleased
 
+### Added
+
+- **`microvm port-forward` (#70, layer 1).** `port-forward LOCAL[:GUEST]` binds a local
+  listener and serves a guest port through the VM's endpoint: each connection is re-issued
+  with the port-scoped proxy headers minted per hop through the session's existing
+  `ProxyAuth` cache, which is what carries a tunnel across the platform's 60-minute token
+  ceiling — `proxyTokenMints` in the envelope is the observable that says a refresh
+  happened. HTTP is what this command carries today; the WebSocket upgrade path relays a 101
+  and splices bytes correctly against a local upstream but **does not yet reach a guest
+  server through the endpoint proxy** (see below). The proxy's
+  403-vs-502 pair — scope mistake vs nothing listening — is answered to the local client as
+  a readable response naming which one it was. The relay lives in
+  `microvms-core::session::forward` because the CLI's thinness guard forbids an HTTP stack
+  in the binary; the CLI reaches it through the `ForwardClient` newtype. Ctrl-C ends the
+  tunnel and exits 0, `--max-connections` bounds a scripted check, and the caller's own
+  `X-aws-proxy-*` headers are stripped rather than forwarded — the minted pair is the only
+  pair. Raw TCP is deliberately not this command (issue #70 layer 2: it needs a guest-side
+  relay agentd does not yet serve).
+
+  Verified live (us-east-1, 2026-08-29): a guest `python3 -m http.server 8080` answered
+  through `port-forward 18080:8080 --name pf-smoke` with the correct body, a guest 404
+  passed through unreinterpreted, one token minted across three connections, and a forward
+  to a dead port answered the local client with the 502 nothing-listening sentence.
+  Teardown confirmed by `live:verify-clean`.
+
+- **`microvm tunnel` — arbitrary TCP to a guest port (#70, layer 2).** Each local connection
+  becomes a WebSocket carrying raw TCP to a new bearer-authed `GET /v1/tcp?port=<n>` route on
+  the daemon, which dials `127.0.0.1:<port>` inside the guest. So `psql`, `ssh`, or any other
+  wire protocol reaches a server in the VM. The endpoint proxy has no CONNECT method and
+  refuses an upgrade replayed over its HTTPS path, so riding inside binary frames is the only
+  way arbitrary TCP crosses it — and that binary frames survive a port-scoped token byte-exact
+  is measured rather than assumed (see below).
+
+  Three deliberate limits, each with its reason in the code. **No multiplexing:** one
+  WebSocket carries one TCP connection, because a mux protocol would reimplement per-stream
+  ids, flow control, and close handshakes that the platform already provides per connection.
+  **Loopback only:** the relay never resolves a name, so a stolen agent token cannot turn the
+  daemon into an open proxy inside the VM. **The dial happens after the upgrade**, because on
+  the endpoint path every WebSocket failure a caller can observe is 1006 with no reason — an
+  HTTP 502 for a dead port would be invisible, so a refusal arrives as close code 4502 naming
+  the port instead. The codes live in `protocol::tunnel::close` (RFC 6455's private range, so
+  they cannot be confused with the platform's 1006), and the marker subprotocol is one `const`
+  aliased across crates rather than two that can drift — the client offers it and the daemon
+  echoes it, and an offered-but-unechoed subprotocol makes an RFC 6455 client refuse the
+  handshake outright.
+
+  Verified live (us-east-1, 2026-08-29) against a length-prefixed binary protocol in the
+  guest — deliberately not HTTP and not line-based, so framing, byte fidelity, and
+  request/response interleaving on one connection are all exercised. Through
+  `tunnel 15434:5432`: an ascii round trip, a `0x00`/`0xFF` payload byte-exact, 200 KiB across
+  the chunk boundary, and a second independent connection all passed on one minted token.
+
+  One bug the live run caught, which no local test would have: the client minted its token
+  scoped to the **guest** port. `subprotocols(guest_port)` reads correct — every other
+  port-scoped call in the crate names the port it wants to reach — but this request terminates
+  at the daemon, and the daemon dials the guest port from inside the VM, so the proxy only ever
+  sees a request for the daemon's port. A token scoped to 5432 authorized a port the request
+  never addressed, and the refusal was close code 1006 with no reason: indistinguishable from a
+  dead server. Fixed to `subprotocols(auth.port())`, with the reason recorded at the call site
+  and a regression test that fails if it is reverted.
+
+  Verified with 10 daemon-side tests over a real WebSocket against a real TCP server, and 8
+  client-side end-to-end tests: bytes reach an upper-casing server and come back transformed
+  (an echo could pass without leaving the process), a `0x00`/`0xFF` payload survives byte-exact
+  in both directions, 200 KiB crosses the 64 KiB chunk boundary in order, an unauthenticated
+  or wrong-token upgrade is refused 401, a dead port closes 4502, `?port=0` closes 4400, and
+  two tunnels to one port get independent connections. Four guards were deliberately broken to
+  confirm they fail: the route's `Auth::Bearer`, guest-to-client byte fidelity, framing
+  re-derivation, and upgrade detection.
+
+- **Tunnel identity: `run --identity` + `tunnel --verify-identity` (#70, layer 3).** The
+  tunnel can now prove, cryptographically and without trusting the endpoint proxy, that the
+  far end is the exact VM the caller launched — with every frame after the proof encrypted
+  end to end. At launch the host generates two x25519 seeds and delivers the VM's seed plus
+  the host's public key in the `runHookPayload` beside the agent token (137 bytes of the
+  measured 4096-byte budget, asserted by test against the real composition). The daemon
+  derives its key in memory, installs it under the same one-shot bootstrap rule as the token
+  — only the winning bootstrap installs identity — and `?identity=true` on `/v1/tcp` runs a
+  Noise KK handshake before the guest dial. What persists on the host is least-privilege by
+  construction: the registry record and the `run` envelope carry the host's secret and the
+  VM's **public** pin, and the VM's own secret is dropped the moment the payload is built,
+  so nothing outside the VM can ever impersonate it.
+
+  **The issue specified rustls with SPKI pinning; this ships Noise KK instead, on a measured
+  constraint.** Both rustls crypto providers (`aws-lc-sys` and `ring`) compile C through
+  `cc-rs`, which requires `aarch64-linux-musl-gcc` for the daemon's static
+  `aarch64-unknown-linux-musl` shipping target — a tool absent on the devbox and in CI,
+  whose workflow installs the *gnu* cross compiler (measured 2026-08-29: both providers fail
+  the release build outright). snow's pure-Rust resolver cross-compiles with no C at all,
+  and `KK` is the stronger fit anyway: both static keys are pre-known (the host *generated*
+  them), a wrong key fails the handshake's own decryption rather than depending on verifier
+  code that could forget a check, and there is no CA, hostname, or certificate machinery to
+  hold wrong. `default-features = false` on snow is load-bearing — its `std` feature spells
+  `ring/std`, not `ring?/std`, so enabling it force-enables the C dependency. The full
+  argument lives in `protocol/src/identity.rs`; the honest ptrace limit ("this proves the
+  right VM, not an uncompromised VM") is in `docs/TRUST.md`'s new tunnel-identity section.
+
+  Fails closed on every path in #70's acceptance list, each pinned by a test: a VM launched
+  without a seed refuses `identity=true` with close code 4401 rather than downgrading; a
+  caller holding the agent token but not the host key is refused 4403 (the token is a bearer
+  credential the proxy transports — it must not be enough); a pin from a different VM — the
+  replayed-record case — fails the handshake with a diagnosis naming the pin; and a refused
+  caller never causes a guest connection (the handshake runs before the dial, asserted by an
+  accept-counting listener). Key material stays out of the image artifact by construction —
+  the seed is delivered at launch, after the snapshot — and out of child environments via
+  the existing `env_clear` guarantee; `Debug` renderings of every identity-bearing type are
+  tested to print no key bytes.
+
+  Verified with 5 daemon-side end-to-end tests over real WebSockets (encrypted round trip
+  through an upper-casing server, both refusal codes, no-downgrade, no-dial-on-refusal), 2
+  client-side tests against a wire-contract stand-in (verified round trip, wrong-pin
+  fail-closed), 8 unit tests of the host-side material lifecycle, and a compile-time guard
+  proven able to fail: raising the verified chunk to 64 KiB — which would make every
+  encrypted send return `Error::Input` at runtime, since plaintext plus the 16-byte tag must
+  fit one 65535-byte Noise message — is a build error, watched red before shipping. One
+  RFC 6455 trap found by test: a close frame's reason is capped at 125 bytes, and the
+  daemon's original refusal sentence exceeded it, so tungstenite reported
+  `ControlFrameTooBig` and the caller saw a transport error instead of the 4403 code. The
+  wire reason is now short; the full sentence lives in `close::explanation`.
+
+  Verified live (us-east-1, 2026-08-29): `run --keep --identity` delivered the seed through
+  the real run hook and reported the pair on the envelope and in the registry;
+  `tunnel 18443:9000 --verify-identity` completed the Noise handshake through the real
+  endpoint proxy and served the daemon's schema document decrypted end to end (1 served,
+  0 refused, 1 mint); one flipped pin character mid-base64 failed closed with nothing
+  served and the handshake named in the error; the restored record verified again; a
+  seedless launch was refused locally with `ERR_PRECONDITION` when the record carried no
+  material, and refused by the daemon (close 4401, "launched without an identity seed")
+  when material was pasted at it anyway. Both VMs terminated with nothing leaked, the
+  account verified empty, and the smoke image deleted. `drive_tunnel_identity` keeps six
+  of these checks in the live suite permanently (104 checks total).
+
+### Measured
+
+- **The endpoint proxy refuses an upgrade replayed over the HTTPS path, and carries binary
+  frames on a port-scoped `wss://` handshake** (us-east-1, 2026-08-29, guest RFC 6455 echo
+  server on 8090). Re-issuing a client's `GET` with `Upgrade: websocket` as request headers
+  is answered `400` by the proxy, with the guest logging no handshake, while the identical
+  handshake from inside the guest to `127.0.0.1:8090` answers 101. On the endpoint the
+  WebSocket credential travels as `Sec-WebSocket-Protocol` values rather than as the two
+  proxy headers, so a working tunnel must open a real `wss://` handshake offering
+  `connect_subprotocols(port)`'s three values. Doing that: the handshake answers **101**,
+  the proxy consumes all three values (the guest saw no `sec-websocket-protocol` header),
+  and **binary** frames survive **byte-exact** both ways on a **port-scoped** token —
+  including a `0x00`/`0xFF` payload a silent utf-8 round trip would corrupt, and a 300-byte
+  frame exercising the extended-length header (guest observed opcode `2`). This closes the
+  open question `docs/PLATFORM.md` left between the SHELL_INGRESS binary-frame finding
+  (portless shell token) and the 2026-08-15 text-frame run, and it is the transport premise
+  the raw-TCP tunnel (#70 layer 2) rests on.
+
 ## [0.3.0] — 2026-08-29
 
 ### Added

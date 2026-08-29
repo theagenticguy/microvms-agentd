@@ -123,11 +123,44 @@ impl RunHookPayload {
         agent_token: &str,
         env: &std::collections::HashMap<String, String>,
     ) -> Result<Self, Error> {
-        let payload = if env.is_empty() {
+        Self::for_launch_with_identity(agent_token, env, None)
+    }
+
+    /// [`RunHookPayload::for_launch`], optionally carrying the tunnel identity material.
+    ///
+    /// The two identity fields are the VM's own seed and the launching host's public key,
+    /// under the keys `protocol::identity` declares — the daemon pins one and derives from
+    /// the other, which is what makes `microvm tunnel --verify-identity` able to prove the
+    /// far end without trusting the endpoint proxy. `None` produces byte-for-byte the
+    /// payload the other constructors always built, so a caller who never asks for identity
+    /// cannot be affected by the field existing (the same compatibility rule `env` follows).
+    ///
+    /// The material costs [`protocol::identity::IDENTITY_PAYLOAD_BYTES`] of the shared
+    /// 4096-byte budget — two 44-character base64 values plus JSON framing — and the ceiling
+    /// check below covers it like everything else in the payload.
+    pub fn for_launch_with_identity(
+        agent_token: &str,
+        env: &std::collections::HashMap<String, String>,
+        identity: Option<&crate::identity::LaunchIdentity>,
+    ) -> Result<Self, Error> {
+        let mut payload = if env.is_empty() {
             serde_json::json!({ "agent_token": agent_token })
         } else {
             serde_json::json!({ "agent_token": agent_token, "env": env })
         };
+        if let Some(identity) = identity {
+            let object = payload
+                .as_object_mut()
+                .expect("the payload is built as an object two lines up");
+            object.insert(
+                protocol::identity::SEED_KEY.to_string(),
+                serde_json::Value::String(identity.seed_field()),
+            );
+            object.insert(
+                protocol::identity::HOST_PUBLIC_KEY_KEY.to_string(),
+                serde_json::Value::String(identity.host_public_field()),
+            );
+        }
         let text = serde_json::to_string(&payload).map_err(|error| {
             Error::new(
                 ErrorKind::Unexpected,
@@ -737,6 +770,46 @@ mod tests {
         let exact = "é".repeat(2048);
         assert_eq!(exact.len(), 4096);
         RunHookPayload::new(exact).expect("exactly at the ceiling");
+    }
+
+    /// The identity material costs exactly its declared budget, and a launch without it is
+    /// byte-for-byte what the older constructors built.
+    ///
+    /// Measured by difference rather than trusted from the constant's comment, the same
+    /// discipline `env_contribution` applies: the ceiling is on the serialized string, so
+    /// only the serialized string can say what the material costs. The compatibility half
+    /// matters just as much — a pinned daemon that has never heard of identity must see no
+    /// change from a client that did not ask for it.
+    #[test]
+    fn the_identity_material_costs_its_declared_budget_and_absence_costs_nothing() {
+        let env = std::collections::HashMap::new();
+        let without = RunHookPayload::for_launch("tok", &env).expect("fits");
+        let none_asked = RunHookPayload::for_launch_with_identity("tok", &env, None).expect("fits");
+        assert_eq!(
+            without.as_str(),
+            none_asked.as_str(),
+            "no identity must produce byte-for-byte the payload this client always sent"
+        );
+
+        let identity = crate::identity::LaunchIdentity::from_seeds([7_u8; 32], [9_u8; 32]);
+        let with =
+            RunHookPayload::for_launch_with_identity("tok", &env, Some(&identity)).expect("fits");
+        assert_eq!(
+            with.len() - without.len(),
+            protocol::identity::IDENTITY_PAYLOAD_BYTES,
+            "the budget constant must equal what the material really costs on the wire"
+        );
+
+        // And the payload parses as the daemon parses it, with both halves present.
+        let parsed = protocol::hook::RunHook::parse(with.as_str()).expect("the daemon can read it");
+        assert_eq!(
+            parsed.identity_seed.as_deref(),
+            Some(identity.seed_field().as_str())
+        );
+        assert_eq!(
+            parsed.identity_host_public_key.as_deref(),
+            Some(identity.host_public_field().as_str())
+        );
     }
 
     /// The agent-token payload is the shape the daemon parses, and an oversized token is
