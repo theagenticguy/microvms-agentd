@@ -202,7 +202,7 @@ async fn verified_relay(socket: WebSocket, port: u16, material: crate::tunnel_id
             // exact diagnostic this code exists to deliver. The full sentence lives in
             // `close::explanation`, which the client renders from the code alone.
             close_with(
-                socket,
+                *socket,
                 close::IDENTITY_REFUSED,
                 "identity handshake refused: wrong pin or wrong caller",
             )
@@ -428,9 +428,23 @@ mod handshake {
     /// The socket is returned rather than dropped because the close code *is* the diagnostic on
     /// this path: every platform-side WebSocket failure is 1006 with no reason, so a dropped
     /// socket would tell the caller nothing about why it was refused.
+    ///
+    /// Boxed because this struct rides the `Err` side of `respond`'s `Result`, and a
+    /// `WebSocket` by value puts ~400 bytes into every return — clippy's `result_large_err`
+    /// (1.98, the CI toolchain) refuses that, correctly: the happy path pays for the failure
+    /// shape on every call.
     pub struct Failed {
-        pub socket: WebSocket,
+        pub socket: Box<WebSocket>,
         pub error: String,
+    }
+
+    impl Failed {
+        fn new(socket: WebSocket, error: impl Into<String>) -> Self {
+            Self {
+                socket: Box::new(socket),
+                error: error.into(),
+            }
+        }
     }
 
     /// Completes the responder side, returning the transport-mode channel.
@@ -446,22 +460,19 @@ mod handshake {
         let first = match socket.recv().await {
             Some(Ok(Message::Binary(bytes))) => bytes,
             Some(Ok(Message::Close(_))) | None => {
-                return Err(Failed {
+                return Err(Failed::new(
                     socket,
-                    error: "the caller closed before sending a handshake".to_string(),
-                });
+                    "the caller closed before sending a handshake",
+                ));
             }
             Some(Ok(_)) => {
-                return Err(Failed {
+                return Err(Failed::new(
                     socket,
-                    error: "the handshake must arrive as a binary frame".to_string(),
-                });
+                    "the handshake must arrive as a binary frame",
+                ));
             }
             Some(Err(error)) => {
-                return Err(Failed {
-                    socket,
-                    error: error.to_string(),
-                });
+                return Err(Failed::new(socket, error.to_string()));
             }
         };
 
@@ -469,19 +480,13 @@ mod handshake {
         // hash, so a caller pinning the wrong VM or holding the wrong host key fails *here*,
         // in a decryption that cannot be skipped by a verifier that forgot a check.
         if let Err(error) = responder.read_message(&first, &mut scratch) {
-            return Err(Failed {
-                socket,
-                error: error.to_string(),
-            });
+            return Err(Failed::new(socket, error.to_string()));
         }
 
         let written = match responder.write_message(&[], &mut scratch) {
             Ok(written) => written,
             Err(error) => {
-                return Err(Failed {
-                    socket,
-                    error: error.to_string(),
-                });
+                return Err(Failed::new(socket, error.to_string()));
             }
         };
         if socket
@@ -489,10 +494,7 @@ mod handshake {
             .await
             .is_err()
         {
-            return Err(Failed {
-                socket,
-                error: "the caller went away mid-handshake".to_string(),
-            });
+            return Err(Failed::new(socket, "the caller went away mid-handshake"));
         }
 
         match responder.into_transport_mode() {
@@ -501,10 +503,7 @@ mod handshake {
                 transport,
                 scratch,
             }),
-            Err(error) => Err(Failed {
-                socket,
-                error: error.to_string(),
-            }),
+            Err(error) => Err(Failed::new(socket, error.to_string())),
         }
     }
 
