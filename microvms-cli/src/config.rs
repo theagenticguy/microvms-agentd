@@ -454,13 +454,21 @@ CI = "1"
         let expected = file.0.parent().expect("a parent").join("target/agentd");
         assert_eq!(config.binary.as_deref(), Some(expected.as_path()));
 
-        let absolute = TempFile::new("absbin", "binary = \"/opt/agentd\"\n");
+        // A platform-absolute path, because "/opt/agentd" is not absolute on Windows —
+        // no drive letter makes it rooted-but-relative there, so `join` keeps the temp
+        // drive and CI read `C:/opt/agentd`. TOML's literal (single-quoted) string
+        // spares the backslashes any escaping.
+        let absolute_path = std::env::temp_dir().join("agentd-absolute");
+        let absolute = TempFile::new(
+            "absbin",
+            &format!("binary = '{}'\n", absolute_path.display()),
+        );
         let (_, config) = load(Some(&absolute.0), false, Path::new("."))
             .expect("loads")
             .expect("present");
         assert_eq!(
             config.binary.as_deref(),
-            Some(Path::new("/opt/agentd")),
+            Some(absolute_path.as_path()),
             "an absolute path passes through untouched"
         );
     }
