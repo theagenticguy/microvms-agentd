@@ -522,6 +522,10 @@ impl Sandbox {
             execution_role_arn: options.execution_role_arn,
             agent_token: options.agent_token,
             launch_env: options.launch_env.unwrap_or(defaults.launch_env),
+            // The tunnel identity is a CLI/daemon surface (`microvm tunnel
+            // --verify-identity`); the bindings keep the default (off) until a
+            // binding-level verify API exists to consume the material.
+            identity: defaults.identity,
             egress: options.egress.unwrap_or(defaults.egress),
             max_idle_sec: options.max_idle_sec.unwrap_or(defaults.max_idle_sec),
             suspended_sec: options.suspended_sec.unwrap_or(defaults.suspended_sec),

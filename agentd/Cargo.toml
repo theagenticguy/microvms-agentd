@@ -84,6 +84,32 @@ getrandom = "0.4"
 # `BTreeMap` for insertion order, and the committed artifact is compared byte for
 # byte, so key order has to be a function of the types rather than of derive order.
 schemars = { version = "1.2.2", default-features = false, features = ["derive", "std"] }
+# The tunnel's identity proof (#70 layer 3): a Noise KK handshake inside the relay, so a
+# caller can prove the far end is the VM it launched without trusting the endpoint proxy.
+# snow is the most-used Noise implementation in the ecosystem, and `noise-rust-crypto` — the
+# obvious alternative — last released in 2023.
+#
+# **`default-features = false` is load-bearing, not tidiness.** snow's `std` feature reads
+# `ring/std` rather than `ring?/std`, so enabling it force-enables `ring`, whose build script
+# drives `cc-rs` looking for `aarch64-linux-musl-gcc`. That tool exists neither on the devbox
+# nor in CI (`.github/workflows/ci.yml` installs the *gnu* cross compiler), so the shipping
+# `aarch64-unknown-linux-musl` build fails outright: `error occurred in cc-rs: failed to find
+# tool "aarch64-linux-musl-gcc"`. Measured 2026-08-29, and it is the same wall that ruled out
+# rustls for this crate — both of its crypto providers (`aws-lc-sys`, `ring`) compile C.
+# The features below select snow's pure-Rust resolver, which cross-compiles with no C at all.
+snow = { version = "0.10", default-features = false, features = [
+    "default-resolver",
+    "use-curve25519",
+    "use-chacha20poly1305",
+    "use-blake2",
+    "use-sha2",
+    "use-getrandom",
+] }
+# The public half of a seed, derived without a handshake: the daemon reports its own key so a
+# caller can confirm the pin it holds before opening a tunnel. Same crate the Noise resolver
+# uses internally, so one x25519 implementation in the tree rather than two that could
+# disagree about a derivation both sides depend on.
+x25519-dalek = { version = "2", default-features = false, features = ["static_secrets"] }
 
 [dev-dependencies]
 proptest = "1.11"

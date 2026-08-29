@@ -67,6 +67,7 @@ pub mod control;
 pub mod cost;
 pub mod error;
 pub mod hooks;
+pub mod identity;
 pub mod region;
 pub mod sandbox;
 pub mod session;

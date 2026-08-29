@@ -220,6 +220,7 @@ fn aws_commands(binary: &std::path::Path) -> Vec<(&'static str, Command, Door)> 
                 user: None,
                 group: None,
                 keep: false,
+                identity: false,
                 vm_name: None,
                 timeout: 30.0,
                 max_idle_sec: 600,
@@ -292,6 +293,9 @@ fn aws_commands(binary: &std::path::Path) -> Vec<(&'static str, Command, Door)> 
                 ports: "5432".into(),
                 bind: "127.0.0.1".into(),
                 max_connections: Some(0),
+                verify_identity: false,
+                identity_host_seed: None,
+                identity_vm_public_key: None,
                 attach: attach_flags(),
                 region: region_flags(),
             }),
@@ -823,6 +827,7 @@ fn run_args_for_image(identifier: &str, state_dir: std::path::PathBuf) -> RunArg
         user: None,
         group: None,
         keep: false,
+        identity: false,
         vm_name: None,
         timeout: 30.0,
         max_idle_sec: 600,
@@ -3310,6 +3315,8 @@ async fn a_taken_vm_name_is_refused_before_any_door_with_its_own_row() {
             agent_token: "tok".into(),
             region: "us-east-1".into(),
             at: 1,
+            identity_host_seed: None,
+            identity_vm_public_key: None,
         })
         .expect("registers");
 
@@ -3369,6 +3376,8 @@ async fn a_name_resolves_on_the_lifecycle_wire_and_a_terminate_by_id_frees_it() 
             agent_token: "tok".into(),
             region: "us-east-1".into(),
             at: 1,
+            identity_host_seed: None,
+            identity_vm_public_key: None,
         })
         .expect("registers");
 
@@ -3481,6 +3490,8 @@ async fn an_attached_command_by_name_carries_the_registered_triple() {
             agent_token: "tok-named".into(),
             region: "us-west-2".into(),
             at: 1,
+            identity_host_seed: None,
+            identity_vm_public_key: None,
         })
         .expect("registers");
 

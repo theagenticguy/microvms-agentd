@@ -64,6 +64,17 @@ pub const TUNNEL_CHUNK_BYTES: usize = 64 * 1024;
 /// The daemon's tunnel route.
 const TUNNEL_PATH: &str = "/v1/tcp";
 
+/// Bytes read from the local connection per Noise message on a verified tunnel.
+///
+/// Matches the daemon's `NOISE_CHUNK_BYTES`, and both are below the plain 64 KiB for the
+/// same arithmetic: a Noise transport message carries the ciphertext plus a 16-byte tag
+/// inside one 65535-byte ceiling, and `write_message` refuses a plaintext that does not fit
+/// rather than fragmenting it.
+pub const VERIFIED_CHUNK_BYTES: usize = 32 * 1024;
+
+/// The Noise message ceiling, from the spec's two-byte length prefix.
+const NOISE_MAX_MESSAGE_BYTES: usize = 65535;
+
 /// What ended a tunnel, and whether the caller should treat it as a failure.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TunnelEnd {
@@ -83,6 +94,11 @@ pub enum TunnelEnd {
 /// hostname, and defaulting to plaintext on a missing prefix would put a bearer credential
 /// on the wire in clear.
 pub fn tunnel_url(endpoint: &str, guest_port: u16) -> String {
+    tunnel_url_with_identity(endpoint, guest_port, false)
+}
+
+/// [`tunnel_url`], with the `identity=true` flag when a Noise handshake is wanted.
+pub fn tunnel_url_with_identity(endpoint: &str, guest_port: u16, identity: bool) -> String {
     let host = endpoint
         .trim_end_matches('/')
         .trim_start_matches("https://")
@@ -96,7 +112,8 @@ pub fn tunnel_url(endpoint: &str, guest_port: u16) -> String {
     } else {
         "wss"
     };
-    format!("{scheme}://{host}{TUNNEL_PATH}?port={guest_port}")
+    let flag = if identity { "&identity=true" } else { "" };
+    format!("{scheme}://{host}{TUNNEL_PATH}?port={guest_port}{flag}")
 }
 
 /// A sentence for a close code, or `None` when the code explains nothing.
@@ -128,11 +145,55 @@ pub fn explain_close(code: u16, guest_port: u16) -> Option<String> {
 /// an error for [`TunnelEnd::Closed`]: a finished tunnel is a success, and a caller that
 /// treated it as a failure would retry a completed request.
 pub async fn relay_connection<S>(
+    local: S,
+    endpoint: &str,
+    guest_port: u16,
+    agent_token: &str,
+    auth: &Arc<ProxyAuth>,
+) -> Result<TunnelEnd, Error>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    relay_connection_inner(local, endpoint, guest_port, agent_token, auth, None).await
+}
+
+/// [`relay_connection`], first proving the far end is the VM `identity` was minted for.
+///
+/// The Noise KK handshake runs before any local byte moves: the initiator's message goes
+/// out, the daemon's reply is verified against the pinned VM key, and only then does the
+/// relay start — with every subsequent frame encrypted under the session the handshake
+/// keyed. A refused handshake surfaces as [`TunnelEnd::Refused`] with the daemon's close
+/// code (4403), or as an error naming the failed verification when the daemon's *reply*
+/// does not authenticate — which is the wrong-pin case observed from this side.
+pub async fn relay_connection_verified<S>(
+    local: S,
+    endpoint: &str,
+    guest_port: u16,
+    agent_token: &str,
+    auth: &Arc<ProxyAuth>,
+    identity: &crate::identity::TunnelIdentity,
+) -> Result<TunnelEnd, Error>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    relay_connection_inner(
+        local,
+        endpoint,
+        guest_port,
+        agent_token,
+        auth,
+        Some(identity),
+    )
+    .await
+}
+
+async fn relay_connection_inner<S>(
     mut local: S,
     endpoint: &str,
     guest_port: u16,
     agent_token: &str,
     auth: &Arc<ProxyAuth>,
+    identity: Option<&crate::identity::TunnelIdentity>,
 ) -> Result<TunnelEnd, Error>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -150,7 +211,7 @@ where
     //
     // `guest_port` still travels, in the query string, where the daemon reads it.
     let offered = auth.subprotocols(auth.port()).await?;
-    let url = tunnel_url(endpoint, guest_port);
+    let url = tunnel_url_with_identity(endpoint, guest_port, identity.is_some());
 
     let mut request = url.as_str().into_client_request().map_err(|err| {
         Error::new(
@@ -200,7 +261,28 @@ where
                 )
             })?;
 
-    let mut buffer = vec![0_u8; TUNNEL_CHUNK_BYTES];
+    // The identity handshake, before any local byte moves. Its failure modes split by who
+    // detected them: the daemon's refusal arrives as a close frame (returned as `Refused` so
+    // the CLI renders the code's explanation), and a reply that fails *our* verification is
+    // an error naming the pin — that is the wrong-pin case as seen from this side, and the
+    // one piece of diagnosis the daemon cannot do.
+    let mut noise = match identity {
+        None => None,
+        Some(identity) => match initiate(&mut socket, identity, guest_port).await? {
+            Initiated::Transport(transport) => Some(transport),
+            Initiated::Refused(end) => return Ok(end),
+        },
+    };
+
+    // The verified path reads smaller chunks so plaintext plus the 16-byte tag fits one
+    // Noise message; `write_message` refuses an oversize payload rather than splitting it.
+    let chunk = if noise.is_some() {
+        VERIFIED_CHUNK_BYTES
+    } else {
+        TUNNEL_CHUNK_BYTES
+    };
+    let mut buffer = vec![0_u8; chunk];
+    let mut scratch = vec![0_u8; NOISE_MAX_MESSAGE_BYTES];
     loop {
         tokio::select! {
             // Read from the local client, frame it, send it.
@@ -213,11 +295,11 @@ where
                     return Ok(TunnelEnd::Closed);
                 }
                 Ok(count) => {
-                    if socket
-                        .send(Message::Binary(buffer[..count].to_vec()))
-                        .await
-                        .is_err()
-                    {
+                    let frame = match seal(&mut noise, &buffer[..count], &mut scratch)? {
+                        Some(sealed) => sealed,
+                        None => buffer[..count].to_vec(),
+                    };
+                    if socket.send(Message::Binary(frame)).await.is_err() {
                         return Ok(TunnelEnd::Closed);
                     }
                 }
@@ -231,13 +313,38 @@ where
             // Read a frame from the tunnel, write it to the local client.
             frame = socket.next() => match frame {
                 Some(Ok(Message::Binary(bytes))) => {
-                    if local.write_all(&bytes).await.is_err() {
+                    let plain: &[u8] = match noise.as_mut() {
+                        None => &bytes,
+                        Some(transport) => {
+                            let count = transport.read_message(&bytes, &mut scratch).map_err(|err| {
+                                // Failing rather than skipping, because a frame that does not
+                                // authenticate on a verified tunnel is a forged or corrupted
+                                // frame — writing it to the local client would hand the
+                                // application attacker-controlled bytes on the one path that
+                                // promised otherwise.
+                                Error::new(
+                                    ErrorKind::Unexpected,
+                                    format!("a tunnel frame did not authenticate: {err}"),
+                                )
+                            })?;
+                            &scratch[..count]
+                        }
+                    };
+                    if local.write_all(plain).await.is_err() {
                         return Ok(TunnelEnd::Closed);
                     }
                 }
-                // Text is not produced by the daemon, but a caller that got it meant those
-                // bytes; passing them through beats inventing a protocol error.
+                // Text is not produced by the daemon. On a plain tunnel a caller that got it
+                // meant those bytes; on a verified one it cannot be a Noise message, so it is
+                // refused for the same reason a bad frame is.
                 Some(Ok(Message::Text(text))) => {
+                    if noise.is_some() {
+                        return Err(Error::new(
+                            ErrorKind::Unexpected,
+                            "a verified tunnel received a text frame, which cannot be a Noise \
+                             message".to_string(),
+                        ));
+                    }
                     if local.write_all(text.as_bytes()).await.is_err() {
                         return Ok(TunnelEnd::Closed);
                     }
@@ -253,6 +360,112 @@ where
                 Some(Err(_)) => return Ok(TunnelEnd::Closed),
                 None => return Ok(TunnelEnd::Closed),
             },
+        }
+    }
+}
+
+/// Encrypts one chunk when the tunnel is verified, or reports `None` to send plaintext.
+///
+/// A helper so the send path above stays one expression per arm; the error is a local
+/// encryption failure, which is unreachable for chunk sizes the `const` checks admit but is
+/// reported honestly rather than unwrapped.
+fn seal(
+    noise: &mut Option<snow::TransportState>,
+    plain: &[u8],
+    scratch: &mut [u8],
+) -> Result<Option<Vec<u8>>, Error> {
+    let Some(transport) = noise.as_mut() else {
+        return Ok(None);
+    };
+    let count = transport.write_message(plain, scratch).map_err(|err| {
+        Error::new(
+            ErrorKind::Unexpected,
+            format!("encrypting a tunnel chunk failed: {err}"),
+        )
+    })?;
+    Ok(Some(scratch[..count].to_vec()))
+}
+
+/// How the identity handshake ended: a keyed transport, or the daemon's refusal.
+enum Initiated {
+    Transport(snow::TransportState),
+    Refused(TunnelEnd),
+}
+
+/// Runs the initiator's half of the Noise KK handshake over the open WebSocket.
+async fn initiate(
+    socket: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+    identity: &crate::identity::TunnelIdentity,
+    guest_port: u16,
+) -> Result<Initiated, Error> {
+    let mut initiator = identity.initiator()?;
+    let mut scratch = vec![0_u8; NOISE_MAX_MESSAGE_BYTES];
+
+    let written = initiator.write_message(&[], &mut scratch).map_err(|err| {
+        Error::new(
+            ErrorKind::Unexpected,
+            format!("writing the identity handshake failed: {err}"),
+        )
+    })?;
+    if socket
+        .send(Message::Binary(scratch[..written].to_vec()))
+        .await
+        .is_err()
+    {
+        return Err(Error::new(
+            ErrorKind::Unexpected,
+            "the tunnel closed before the identity handshake could be sent".to_string(),
+        ));
+    }
+
+    // The daemon answers with its handshake message, or refuses with a close frame whose
+    // code says why (4401 no seed at launch, 4403 refused). Anything else mid-handshake is a
+    // transport fault.
+    loop {
+        match socket.next().await {
+            Some(Ok(Message::Binary(reply))) => {
+                initiator.read_message(&reply, &mut scratch).map_err(|_| {
+                    // *Our* verification failed on the daemon's reply: the far end is not the
+                    // VM the pin was minted for. This is the diagnosis the daemon cannot make
+                    // — it does not know which key we pinned — and the one the caller most
+                    // needs, because the likely cause is a record replayed from another VM.
+                    Error::new(
+                        ErrorKind::Unexpected,
+                        format!(
+                            "the identity handshake reply did not verify against the pinned \
+                             key for this VM. The far end holds a different seed than the \
+                             one this record was created with — a record copied from another \
+                             VM, or a VM relaunched with a fresh seed, would both do this. \
+                             (guest port {guest_port})"
+                        ),
+                    )
+                })?;
+                let transport = initiator.into_transport_mode().map_err(|err| {
+                    Error::new(
+                        ErrorKind::Unexpected,
+                        format!("entering transport mode failed: {err}"),
+                    )
+                })?;
+                return Ok(Initiated::Transport(transport));
+            }
+            Some(Ok(Message::Close(frame))) => {
+                return Ok(Initiated::Refused(classify_close(frame.as_ref())));
+            }
+            Some(Ok(_)) => continue,
+            Some(Err(err)) => {
+                return Err(Error::new(
+                    ErrorKind::Unexpected,
+                    format!("the tunnel failed mid-handshake: {err}"),
+                ));
+            }
+            None => {
+                return Err(Error::new(
+                    ErrorKind::Unexpected,
+                    "the tunnel closed mid-handshake with no close frame".to_string(),
+                ));
+            }
         }
     }
 }

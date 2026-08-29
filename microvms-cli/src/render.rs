@@ -205,6 +205,15 @@ pub struct RunOutcome {
     /// back — or `Null` for a plain run. Always present, so a consumer never guards
     /// against a missing key.
     pub sync: Option<Value>,
+    /// The launching host's identity secret, base64, when `--identity` generated one.
+    ///
+    /// In the payload for the agent token's reason: `run --keep --identity` without
+    /// `--vm-name` has no ledger record, so this envelope is the only place the caller can
+    /// collect what `tunnel --verify-identity` needs. Never in a progress line, never in a
+    /// `Debug`.
+    pub identity_host_seed: Option<String>,
+    /// The VM's public key, base64 — the pin. Public by construction.
+    pub identity_vm_public_key: Option<String>,
 }
 
 impl RunOutcome {
@@ -231,6 +240,14 @@ impl RunOutcome {
         data.insert("leaked".into(), json!(self.leaked));
         data.insert("cost".into(), self.cost.clone().unwrap_or(Value::Null));
         data.insert("sync".into(), self.sync.clone().unwrap_or(Value::Null));
+        // Same reasoning as the agent token above: without `--vm-name` this envelope is the
+        // only place the identity material exists once the process exits. Always present as
+        // keys (null when `--identity` was not asked), so a consumer never guards.
+        data.insert("identityHostSeed".into(), json!(self.identity_host_seed));
+        data.insert(
+            "identityVmPublicKey".into(),
+            json!(self.identity_vm_public_key),
+        );
         data
     }
 

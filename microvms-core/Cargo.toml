@@ -140,6 +140,24 @@ getrandom = "0.4"
 # hand-rolled encoders; the AsciiSets keep their exact behavior (everything outside
 # the unreserved set is escaped, including `/` and `:` in path segments).
 percent-encoding = "2.3"
+# The initiator half of the tunnel identity proof (#70 layer 3): Noise KK against
+# the per-VM key the launch delivered, so `--verify-identity` proves the far end is
+# the VM this host launched without trusting the endpoint proxy. The same feature
+# selection as agentd's, for the same measured reason (see agentd/Cargo.toml): the
+# `std` feature force-enables `ring`, whose build script needs a musl cross C
+# compiler this repo's targets do not assume.
+snow = { version = "0.10", default-features = false, features = [
+    "default-resolver",
+    "use-curve25519",
+    "use-chacha20poly1305",
+    "use-blake2",
+    "use-sha2",
+    "use-getrandom",
+] }
+# Deriving the public half of a launch-generated seed without a handshake — the pin
+# the ledger stores, and the value the daemon must independently agree on. The same
+# crate snow's resolver uses internally, so one x25519 implementation in the tree.
+x25519-dalek = { version = "2", default-features = false, features = ["static_secrets"] }
 
 [dev-dependencies]
 # The size-class and region guards are table-shaped, which is exactly where a

@@ -51,6 +51,24 @@ pub struct RunHook {
     /// sending `"env": {}` that omitting the key does not already say.
     #[serde(default)]
     pub env: HashMap<String, String>,
+    /// The VM's own identity seed, base64 of 32 bytes, or `None`.
+    ///
+    /// An `Option` rather than a defaulted value because the absence *is*
+    /// information here, unlike `env`: a VM launched without a seed has no key to
+    /// prove anything with, and the tunnel must refuse `--verify-identity` against
+    /// it (close code 4401) rather than downgrade silently. See
+    /// [`super::identity`] for why the material travels on this channel at all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity_seed: Option<String>,
+    /// The launching host's public key, base64 of 32 bytes, or `None`.
+    ///
+    /// The other half of mutual authentication: the daemon pins this, so a
+    /// handshake proves the peer is the host that launched this VM rather than
+    /// anyone who came to hold the agent token. Separate from the seed because a
+    /// caller could deliver one without the other, and the daemon reports which
+    /// half is missing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity_host_public_key: Option<String>,
 }
 
 /// Why a `runHookPayload` string could not be read as a [`RunHook`].
@@ -75,6 +93,9 @@ pub enum RunHookError {
     /// `env` holds a value that is not a string, under this key. Only the key is
     /// named — a value is where a secret would be.
     EnvValueNotAString(String),
+    /// An identity key is present but is not a string. Names the key, never the
+    /// value: both identity values are key material.
+    IdentityNotAString(&'static str),
 }
 
 impl std::fmt::Display for RunHookError {
@@ -99,6 +120,11 @@ impl std::fmt::Display for RunHookError {
                  because an environment variable is a string — a number or a nested object \
                  would have to be stringified by someone, and guessing which spelling the \
                  caller meant is how a credential arrives mangled"
+            ),
+            RunHookError::IdentityNotAString(key) => write!(
+                f,
+                "{key} must be a string: standard base64 of exactly 32 bytes. The value is \
+                 not quoted here because it is key material"
             ),
         }
     }
@@ -143,9 +169,22 @@ impl RunHook {
             }
         }
 
+        // Both identity halves are optional and read the same way, so one closure rather than
+        // two blocks: a second spelling is a second place for the "absent means None, present
+        // but wrong means refuse" distinction to be got wrong.
+        let identity_value = |key: &'static str| -> Result<Option<String>, RunHookError> {
+            match object.get(key) {
+                None | Some(serde_json::Value::Null) => Ok(None),
+                Some(serde_json::Value::String(text)) => Ok(Some(text.clone())),
+                Some(_) => Err(RunHookError::IdentityNotAString(key)),
+            }
+        };
+
         Ok(Self {
             agent_token: agent_token.to_string(),
             env,
+            identity_seed: identity_value(crate::identity::SEED_KEY)?,
+            identity_host_public_key: identity_value(crate::identity::HOST_PUBLIC_KEY_KEY)?,
         })
     }
 }
@@ -195,6 +234,84 @@ mod tests {
         assert_eq!(hook.env.get("A").map(String::as_str), Some("1"));
         assert_eq!(hook.env.get("EMPTY").map(String::as_str), Some(""));
         assert_eq!(hook.env.len(), 2);
+    }
+
+    /// The identity halves arrive when sent, and are `None` when not.
+    ///
+    /// The absence is the case that matters: a VM launched without a seed has no key, and the
+    /// tunnel refuses `--verify-identity` against it rather than downgrading. Parsing a
+    /// missing seed as `Some("")` would make that refusal fire as a handshake failure instead,
+    /// which points a reader at the wrong VM.
+    #[test]
+    fn the_identity_material_parses_when_present_and_is_none_when_absent() {
+        let with = RunHook::parse(
+            r#"{"agent_token":"tok","identity_seed":"c2VlZA==","identity_host_public_key":"aG9zdA=="}"#,
+        )
+        .expect("parses");
+        assert_eq!(with.identity_seed.as_deref(), Some("c2VlZA=="));
+        assert_eq!(with.identity_host_public_key.as_deref(), Some("aG9zdA=="));
+
+        let without = RunHook::parse(r#"{"agent_token":"tok"}"#).expect("parses");
+        assert!(without.identity_seed.is_none());
+        assert!(without.identity_host_public_key.is_none());
+
+        // An explicit null is the same as absent, for the reason `env: null` is: a generator
+        // that fills unset optional fields with null must not fail the launch.
+        let nulled =
+            RunHook::parse(r#"{"agent_token":"tok","identity_seed":null}"#).expect("parses");
+        assert!(nulled.identity_seed.is_none());
+    }
+
+    /// The struct's field names are the wire keys the identity module declares.
+    ///
+    /// Serde derives the wire spelling from the field name, and the *host* composes its
+    /// payload from [`crate::identity`]'s constants. So a field renamed here without the
+    /// constant — or the reverse — makes the daemon silently read no identity from a payload
+    /// that carries one, and the symptom is close code 4401 against a VM that was launched
+    /// correctly. This asserts the two spellings are one.
+    #[test]
+    fn the_identity_field_names_are_the_declared_wire_keys() {
+        let hook = RunHook {
+            agent_token: "tok".to_string(),
+            env: HashMap::new(),
+            identity_seed: Some("seed".to_string()),
+            identity_host_public_key: Some("host".to_string()),
+        };
+        let value = serde_json::to_value(&hook).expect("serializes");
+        assert_eq!(
+            value
+                .get(crate::identity::SEED_KEY)
+                .and_then(|v| v.as_str()),
+            Some("seed"),
+            "the seed field must serialize under identity::SEED_KEY"
+        );
+        assert_eq!(
+            value
+                .get(crate::identity::HOST_PUBLIC_KEY_KEY)
+                .and_then(|v| v.as_str()),
+            Some("host"),
+            "the host-key field must serialize under identity::HOST_PUBLIC_KEY_KEY"
+        );
+    }
+
+    /// An identity value of the wrong JSON *type* is refused, naming the key and not the value.
+    #[test]
+    fn an_identity_value_that_is_not_a_string_is_refused_by_key() {
+        let refusal = RunHook::parse(r#"{"agent_token":"tok","identity_seed":7}"#)
+            .expect_err("a number is not a base64 string");
+        assert_eq!(
+            refusal,
+            RunHookError::IdentityNotAString(crate::identity::SEED_KEY)
+        );
+        assert!(refusal.to_string().contains("identity_seed"));
+
+        let host =
+            RunHook::parse(r#"{"agent_token":"tok","identity_host_public_key":{"nested":true}}"#)
+                .expect_err("an object is not a base64 string");
+        assert_eq!(
+            host,
+            RunHookError::IdentityNotAString(crate::identity::HOST_PUBLIC_KEY_KEY)
+        );
     }
 
     /// An unknown key is ignored rather than refused. A 400 at the run hook makes

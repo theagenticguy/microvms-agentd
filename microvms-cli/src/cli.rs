@@ -651,6 +651,22 @@ pub struct RunArgs {
     #[arg(long)]
     pub keep: bool,
 
+    /// Generate a per-VM identity, so `tunnel --verify-identity` can prove the far end.
+    ///
+    /// The launch generates two x25519 seeds and delivers the VM's seed plus this host's
+    /// public key in the run-hook payload beside the agent token. What persists is the
+    /// least-privilege pair — this host's secret and the VM's *public* pin — in the name
+    /// registry when `--vm-name` is given, and on the success envelope either way. A later
+    /// `microvm tunnel --name <NAME> --verify-identity 5432` then completes a Noise KK
+    /// handshake with the daemon before relaying a byte: proof the far end is this exact
+    /// VM, independent of the platform proxy, with every frame encrypted end to end.
+    ///
+    /// Costs 137 bytes of the launch payload's measured 4096-byte budget (the same budget
+    /// as --launch-env). Requires --keep for --vm-name's reason: a VM torn down on the way
+    /// out has no identity worth proving.
+    #[arg(long, requires = "keep")]
+    pub identity: bool,
+
     /// Register a local name for the kept VM, so later commands can say `--name <NAME>`
     /// instead of pasting the endpoint/agent-token/microvm-id triple.
     ///
@@ -949,6 +965,37 @@ pub struct TunnelArgs {
     /// CI job. Omitted means serve until interrupted.
     #[arg(long, value_name = "N")]
     pub max_connections: Option<u32>,
+
+    /// Prove the far end is the VM this record was created for, before relaying a byte.
+    ///
+    /// Runs a Noise KK handshake against the per-VM key that `run --identity` delivered at
+    /// launch: the daemon proves it holds the VM's seed, this side proves it holds the
+    /// launching host's secret, and every frame after the handshake is encrypted end to
+    /// end — opaque to the endpoint proxy that carries it. Fails closed: a VM launched
+    /// without `--identity` refuses (close code 4401) rather than downgrading, a wrong pin
+    /// or a record replayed from another VM fails the handshake itself (4403 or a pin
+    /// diagnosis), and no guest connection is ever made for a refused caller.
+    ///
+    /// Needs the identity material, so it works with `--name <NAME>` (the registry record
+    /// carries it) or with the two `--identity-*` flags pasted from `run`'s envelope.
+    ///
+    /// What it proves, honestly: that the far end is agentd in the VM you launched. The
+    /// workload in that VM runs as root and could in principle read the daemon's memory, so
+    /// this is "the right VM", not "an uncompromised VM" — docs/TRUST.md carries the full
+    /// statement.
+    #[arg(long)]
+    pub verify_identity: bool,
+
+    /// The launching host's identity secret, base64, from `run --identity`'s envelope.
+    ///
+    /// For the attach-by-triple path; `--name` reads it from the registry instead. Implies
+    /// nothing alone — only read when --verify-identity is set.
+    #[arg(long, value_name = "BASE64", requires = "verify_identity")]
+    pub identity_host_seed: Option<String>,
+
+    /// The VM's public key, base64, from `run --identity`'s envelope. The pin.
+    #[arg(long, value_name = "BASE64", requires = "verify_identity")]
+    pub identity_vm_public_key: Option<String>,
 
     #[command(flatten)]
     pub attach: AttachFlags,

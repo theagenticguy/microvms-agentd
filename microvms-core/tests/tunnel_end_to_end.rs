@@ -512,3 +512,213 @@ async fn the_helpers_agree_on_the_daemon_route() {
     assert!(url.ends_with("/v1/tcp?port=5432"), "{url}");
     let _ = HashMap::<String, String>::new();
 }
+
+// ── layer 3: the verified tunnel, both halves in one process ─────────────────
+
+/// A stand-in for the daemon's verified path: upgrades, runs the Noise KK responder with
+/// `vm_seed` pinning `host_public`, then relays to `target` inside the session.
+///
+/// The same honest limit as `relay_server`: it speaks the wire contract from the `protocol`
+/// crate rather than being agentd (ARCH-1 keeps the dependency one-way), and
+/// `agentd/tests/tunnel_relay.rs` pins the daemon's real route from the other side.
+async fn verified_relay_server(
+    target: SocketAddr,
+    vm_seed: [u8; 32],
+    host_public: [u8; 32],
+) -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("a free port");
+    let addr = listener.local_addr().expect("bound");
+
+    tokio::spawn(async move {
+        let Ok((stream, _)) = listener.accept().await else {
+            return;
+        };
+        let recorder = Arc::new(std::sync::Mutex::new(Observed::default()));
+        let socket = tokio_tungstenite::accept_hdr_async(stream, Recorder { recorder }).await;
+        let Ok(mut socket) = socket else { return };
+
+        let mut responder =
+            snow::Builder::new(protocol::identity::NOISE_PATTERN.parse().expect("parses"))
+                .local_private_key(&vm_seed)
+                .expect("a 32-byte secret")
+                .remote_public_key(&host_public)
+                .expect("a 32-byte key")
+                .build_responder()
+                .expect("builds");
+
+        // The handshake: read the initiator's message, answer with ours.
+        let mut scratch = vec![0_u8; 65535];
+        let first = loop {
+            match socket.next().await {
+                Some(Ok(Message::Binary(bytes))) => break bytes,
+                Some(Ok(_)) => continue,
+                _ => return,
+            }
+        };
+        if responder.read_message(&first, &mut scratch).is_err() {
+            let frame = tokio_tungstenite::tungstenite::protocol::CloseFrame {
+                code: protocol::tunnel::close::IDENTITY_REFUSED.into(),
+                reason: "identity handshake refused".into(),
+            };
+            let _ = socket.send(Message::Close(Some(frame))).await;
+            return;
+        }
+        let written = responder.write_message(&[], &mut scratch).expect("writes");
+        if socket
+            .send(Message::Binary(scratch[..written].to_vec()))
+            .await
+            .is_err()
+        {
+            return;
+        }
+        let mut noise = responder.into_transport_mode().expect("transport");
+
+        let Ok(guest) = tokio::net::TcpStream::connect(target).await else {
+            return;
+        };
+        let (mut guest_read, mut guest_write) = guest.into_split();
+        let mut buffer = vec![0_u8; 32 * 1024];
+        let mut plain = vec![0_u8; 65535];
+        loop {
+            tokio::select! {
+                inbound = socket.next() => match inbound {
+                    Some(Ok(Message::Binary(bytes))) => {
+                        let Ok(count) = noise.read_message(&bytes, &mut plain) else { break };
+                        if guest_write.write_all(&plain[..count]).await.is_err() { break }
+                    }
+                    Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break,
+                    Some(Ok(_)) => continue,
+                },
+                read = guest_read.read(&mut buffer) => match read {
+                    Ok(0) | Err(_) => break,
+                    Ok(count) => {
+                        let Ok(sealed) = noise.write_message(&buffer[..count], &mut plain) else { break };
+                        if socket.send(Message::Binary(plain[..sealed].to_vec())).await.is_err() {
+                            break
+                        }
+                    }
+                },
+            }
+        }
+        let _ = socket.send(Message::Close(None)).await;
+    });
+
+    addr
+}
+
+/// **Layer 3 end to end: the client's verified relay proves the VM and carries plaintext
+/// through an encrypted channel.**
+///
+/// The identities are built exactly as a launch builds them — `LaunchIdentity` emits the
+/// payload fields, the stand-in daemon decodes them its way — so this also pins the
+/// derivation agreement between what `run --identity` sends and what `tunnel
+/// --verify-identity` later verifies against.
+#[tokio::test]
+async fn a_verified_tunnel_completes_and_carries_bytes() {
+    use base64::Engine as _;
+    let b64 = base64::engine::general_purpose::STANDARD;
+
+    let launch = microvms_core::identity::LaunchIdentity::generate().expect("the pool works");
+    let vm_seed: [u8; 32] = b64
+        .decode(launch.seed_field())
+        .expect("valid")
+        .try_into()
+        .expect("32 bytes");
+    let host_public: [u8; 32] = b64
+        .decode(launch.host_public_field())
+        .expect("valid")
+        .try_into()
+        .expect("32 bytes");
+    let kept = launch.keep();
+
+    let guest = upper_server().await;
+    let relay = verified_relay_server(guest, vm_seed, host_public).await;
+    let (auth, _minter) = auth();
+
+    let (mut client, local) = tokio::io::duplex(64 * 1024);
+    let endpoint = format!("http://{relay}");
+    let pump = tokio::spawn(async move {
+        microvms_core::session::tunnel::relay_connection_verified(
+            local,
+            &endpoint,
+            8080,
+            AGENT_TOKEN,
+            &auth,
+            &kept,
+        )
+        .await
+    });
+
+    client.write_all(b"verified bytes").await.expect("written");
+    let mut answer = vec![0_u8; 14];
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        client.read_exact(&mut answer),
+    )
+    .await
+    .expect("an answer arrives")
+    .expect("read");
+    assert_eq!(&answer, b"VERIFIED BYTES");
+
+    drop(client);
+    let ended = tokio::time::timeout(std::time::Duration::from_secs(5), pump)
+        .await
+        .expect("the pump finishes")
+        .expect("the task joins")
+        .expect("no transport error");
+    assert_eq!(ended, TunnelEnd::Closed);
+}
+
+/// **A wrong pin fails closed, before any local byte moves.**
+///
+/// The far end here is a *different* VM — a fresh seed — which is exactly what a replayed
+/// ledger record produces. The client must report the pin mismatch, and the guest server
+/// behind the relay must never be reached (the stand-in refuses before dialing).
+#[tokio::test]
+async fn a_wrong_pin_fails_closed_with_a_diagnosis() {
+    use base64::Engine as _;
+    let b64 = base64::engine::general_purpose::STANDARD;
+
+    // The VM that is actually running: its own seed, pinning the caller's host key.
+    let launch = microvms_core::identity::LaunchIdentity::generate().expect("the pool works");
+    let host_public: [u8; 32] = b64
+        .decode(launch.host_public_field())
+        .expect("valid")
+        .try_into()
+        .expect("32 bytes");
+    // A DIFFERENT VM's seed behind the endpoint.
+    let other_vm_seed = [0x42_u8; 32];
+
+    let guest = upper_server().await;
+    let relay = verified_relay_server(guest, other_vm_seed, host_public).await;
+    let (auth, _minter) = auth();
+
+    let kept = launch.keep();
+    let (_client, local) = tokio::io::duplex(64 * 1024);
+    let endpoint = format!("http://{relay}");
+    let outcome = microvms_core::session::tunnel::relay_connection_verified(
+        local,
+        &endpoint,
+        8080,
+        AGENT_TOKEN,
+        &auth,
+        &kept,
+    )
+    .await;
+
+    // Either side may detect it first (both statics are in the handshake hash): the daemon
+    // refuses with 4403, or our own verification of its reply fails with the pin diagnosis.
+    match outcome {
+        Ok(TunnelEnd::Refused { code, .. }) => {
+            assert_eq!(code, protocol::tunnel::close::IDENTITY_REFUSED);
+        }
+        Err(error) => {
+            let text = error.to_string();
+            assert!(
+                text.contains("pinned key"),
+                "the error must name the pin: {text}"
+            );
+        }
+        Ok(other) => panic!("a wrong pin must not produce a working tunnel: {other:?}"),
+    }
+}

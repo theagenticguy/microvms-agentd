@@ -76,6 +76,56 @@ Versions are [semantic](https://semver.org/spec/v2.0.0.html); the wire contract 
   confirm they fail: the route's `Auth::Bearer`, guest-to-client byte fidelity, framing
   re-derivation, and upgrade detection.
 
+- **Tunnel identity: `run --identity` + `tunnel --verify-identity` (#70, layer 3).** The
+  tunnel can now prove, cryptographically and without trusting the endpoint proxy, that the
+  far end is the exact VM the caller launched — with every frame after the proof encrypted
+  end to end. At launch the host generates two x25519 seeds and delivers the VM's seed plus
+  the host's public key in the `runHookPayload` beside the agent token (137 bytes of the
+  measured 4096-byte budget, asserted by test against the real composition). The daemon
+  derives its key in memory, installs it under the same one-shot bootstrap rule as the token
+  — only the winning bootstrap installs identity — and `?identity=true` on `/v1/tcp` runs a
+  Noise KK handshake before the guest dial. What persists on the host is least-privilege by
+  construction: the registry record and the `run` envelope carry the host's secret and the
+  VM's **public** pin, and the VM's own secret is dropped the moment the payload is built,
+  so nothing outside the VM can ever impersonate it.
+
+  **The issue specified rustls with SPKI pinning; this ships Noise KK instead, on a measured
+  constraint.** Both rustls crypto providers (`aws-lc-sys` and `ring`) compile C through
+  `cc-rs`, which requires `aarch64-linux-musl-gcc` for the daemon's static
+  `aarch64-unknown-linux-musl` shipping target — a tool absent on the devbox and in CI,
+  whose workflow installs the *gnu* cross compiler (measured 2026-08-29: both providers fail
+  the release build outright). snow's pure-Rust resolver cross-compiles with no C at all,
+  and `KK` is the stronger fit anyway: both static keys are pre-known (the host *generated*
+  them), a wrong key fails the handshake's own decryption rather than depending on verifier
+  code that could forget a check, and there is no CA, hostname, or certificate machinery to
+  hold wrong. `default-features = false` on snow is load-bearing — its `std` feature spells
+  `ring/std`, not `ring?/std`, so enabling it force-enables the C dependency. The full
+  argument lives in `protocol/src/identity.rs`; the honest ptrace limit ("this proves the
+  right VM, not an uncompromised VM") is in `docs/TRUST.md`'s new tunnel-identity section.
+
+  Fails closed on every path in #70's acceptance list, each pinned by a test: a VM launched
+  without a seed refuses `identity=true` with close code 4401 rather than downgrading; a
+  caller holding the agent token but not the host key is refused 4403 (the token is a bearer
+  credential the proxy transports — it must not be enough); a pin from a different VM — the
+  replayed-record case — fails the handshake with a diagnosis naming the pin; and a refused
+  caller never causes a guest connection (the handshake runs before the dial, asserted by an
+  accept-counting listener). Key material stays out of the image artifact by construction —
+  the seed is delivered at launch, after the snapshot — and out of child environments via
+  the existing `env_clear` guarantee; `Debug` renderings of every identity-bearing type are
+  tested to print no key bytes.
+
+  Verified with 5 daemon-side end-to-end tests over real WebSockets (encrypted round trip
+  through an upper-casing server, both refusal codes, no-downgrade, no-dial-on-refusal), 2
+  client-side tests against a wire-contract stand-in (verified round trip, wrong-pin
+  fail-closed), 8 unit tests of the host-side material lifecycle, and a compile-time guard
+  proven able to fail: raising the verified chunk to 64 KiB — which would make every
+  encrypted send return `Error::Input` at runtime, since plaintext plus the 16-byte tag must
+  fit one 65535-byte Noise message — is a build error, watched red before shipping. One
+  RFC 6455 trap found by test: a close frame's reason is capped at 125 bytes, and the
+  daemon's original refusal sentence exceeded it, so tungstenite reported
+  `ControlFrameTooBig` and the caller saw a transport error instead of the 4403 code. The
+  wire reason is now short; the full sentence lives in `close::explanation`.
+
 ### Measured
 
 - **The endpoint proxy refuses an upgrade replayed over the HTTPS path, and carries binary

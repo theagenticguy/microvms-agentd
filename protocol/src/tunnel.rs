@@ -14,7 +14,7 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-/// `?port=<n>` — the guest port to relay to.
+/// `?port=<n>[&identity=true]` — the guest port to relay to, and whether to prove identity.
 #[derive(Debug, Default, Deserialize, JsonSchema, Serialize)]
 pub struct TunnelQuery {
     /// The guest port. Dialled on `127.0.0.1` only.
@@ -23,6 +23,19 @@ pub struct TunnelQuery {
     /// rejected as a parse error: a caller who named it gets a reason naming the port
     /// instead of a 400 that could equally mean a missing parameter.
     pub port: u16,
+    /// Whether to run a Noise KK handshake before relaying any bytes.
+    ///
+    /// On this struct rather than in a second query type because one route has one query
+    /// contract, and the schema is generated from exactly that: a separate type would need a
+    /// second extractor and would not appear in `docs/schema.json` at all.
+    ///
+    /// Absent means `false`, which is what keeps every layer-2 client working unchanged. True
+    /// against a VM launched without a seed is refused with [`close::NO_IDENTITY`] rather than
+    /// silently downgraded — a caller who asked to verify identity and got an unverified
+    /// tunnel would believe a proof it never received. See [`super::identity`] for what the
+    /// handshake proves and its honest limit.
+    #[serde(default)]
+    pub identity: bool,
 }
 
 /// The bare marker subprotocol a MicroVM WebSocket handshake offers first.
@@ -53,6 +66,21 @@ pub mod close {
     pub const BAD_PORT: u16 = 4400;
     /// A read on an established guest connection failed mid-relay.
     pub const RELAY_FAILED: u16 = 4500;
+    /// `?identity=1` against a VM launched without an identity seed.
+    ///
+    /// Its own code rather than a generic refusal, and it is the difference between a
+    /// diagnosable mistake and a mystery: the fix is at *launch* time, in a VM that no longer
+    /// exists by the time anyone reads this. A downgrade to an unverified tunnel would be
+    /// worse than either — the caller asked for proof and would believe one it never got.
+    pub const NO_IDENTITY: u16 = 4401;
+    /// The Noise handshake failed: a wrong pin, a replayed record, or a corrupted stream.
+    ///
+    /// Deliberately one code for all three. Under `KK` both static keys are mixed into the
+    /// handshake hash, so the daemon cannot distinguish "the caller pinned the wrong VM" from
+    /// "the caller is not the launching host" — both arrive as a decryption failure, and a
+    /// code that claimed to tell them apart would be guessing. The client knows which key it
+    /// offered and can say more; the daemon cannot.
+    pub const IDENTITY_REFUSED: u16 = 4403;
 
     /// A human-readable explanation for a close code this relay may have sent.
     ///
@@ -71,6 +99,21 @@ pub mod close {
             RELAY_FAILED => Some(format!(
                 "the connection to 127.0.0.1:{port} failed after it had been established"
             )),
+            NO_IDENTITY => Some(
+                "this VM was launched without an identity seed, so there is no key to prove \
+                 anything with. The seed is delivered in the run-hook payload at launch and \
+                 cannot be added to a running VM — relaunch with identity enabled, or drop \
+                 --verify-identity to use an unverified tunnel."
+                    .to_string(),
+            ),
+            IDENTITY_REFUSED => Some(
+                "the identity handshake failed. Either the pinned key is not this VM's — a \
+                 record copied from another launch would do that — or the caller does not hold \
+                 the launching host's private key. The daemon cannot tell those apart: both \
+                 static keys are mixed into the handshake hash, so both arrive as one \
+                 decryption failure."
+                    .to_string(),
+            ),
             _ => None,
         }
     }
@@ -84,7 +127,13 @@ mod tests {
     fn every_failure_code_is_in_the_rfc_private_range_and_distinct() {
         // 4000-4999 is RFC 6455's application range, which is what keeps these from
         // colliding with the platform's 1006.
-        let failures = [close::NO_LISTENER, close::BAD_PORT, close::RELAY_FAILED];
+        let failures = [
+            close::NO_LISTENER,
+            close::BAD_PORT,
+            close::RELAY_FAILED,
+            close::NO_IDENTITY,
+            close::IDENTITY_REFUSED,
+        ];
         for code in failures {
             assert!(
                 (4000..5000).contains(&code),
@@ -107,6 +156,34 @@ mod tests {
         // all collapse to. Explaining it would be a guess presented as a diagnosis.
         assert!(close::explanation(1006, 8080).is_none());
         assert!(close::explanation(4999, 8080).is_none());
+    }
+
+    /// The two identity refusals are told apart, and each names where the fix is.
+    ///
+    /// They are the pair most likely to be confused, because both read as "identity did not
+    /// work". 4401 is fixable only at launch, in a VM that no longer exists by the time anyone
+    /// reads the message; 4403 is a wrong pin or a wrong caller against a VM that is fine. A
+    /// reader sent to the wrong one relaunches a healthy VM or debugs a key that was never
+    /// delivered.
+    #[test]
+    fn the_identity_refusals_point_at_different_fixes() {
+        let missing = close::explanation(close::NO_IDENTITY, 5432).expect("4401 explains itself");
+        assert!(
+            missing.contains("relaunch"),
+            "the fix for a missing seed is at launch time: {missing}"
+        );
+        assert!(missing.contains("run-hook payload"), "{missing}");
+
+        let refused =
+            close::explanation(close::IDENTITY_REFUSED, 5432).expect("4403 explains itself");
+        assert!(
+            refused.contains("pinned key"),
+            "a failed handshake is about the key, not the launch: {refused}"
+        );
+        // The daemon genuinely cannot distinguish the two causes, and the message must say so
+        // rather than pick one and sound certain.
+        assert!(refused.contains("cannot tell those apart"), "{refused}");
+        assert_ne!(missing, refused);
     }
 
     #[test]

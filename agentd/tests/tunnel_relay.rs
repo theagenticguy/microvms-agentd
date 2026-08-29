@@ -427,3 +427,255 @@ async fn two_tunnels_do_not_share_a_connection() {
         "the second tunnel got another's bytes"
     );
 }
+
+// ── the identity handshake, end to end ──────────────────────────────────────
+
+/// A daemon bootstrapped with identity material derived from `vm_seed`, pinning
+/// the public half of `host_seed`.
+async fn identity_daemon(vm_seed: [u8; 32], host_seed: [u8; 32]) -> SocketAddr {
+    use base64::Engine as _;
+    let b64 = base64::engine::general_purpose::STANDARD;
+    let host_public =
+        *x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(host_seed)).as_bytes();
+    let hook = protocol::hook::RunHook {
+        agent_token: TOKEN.to_string(),
+        env: HashMap::new(),
+        identity_seed: Some(b64.encode(vm_seed)),
+        identity_host_public_key: Some(b64.encode(host_public)),
+    };
+    let material = agentd::tunnel_identity::Material::from_payload(&hook)
+        .expect("valid")
+        .expect("present");
+
+    let state = AppState::new(Config::default());
+    state.bootstrap_with_identity(
+        TOKEN.as_bytes(),
+        HashMap::new(),
+        Some(std::sync::Arc::new(material)),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("a free port");
+    let addr = listener.local_addr().expect("bound");
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, routes::app(state)).await;
+    });
+    addr
+}
+
+/// Opens a tunnel with `identity=true` in the query.
+async fn open_identity_tunnel(
+    daemon: SocketAddr,
+    port: u16,
+) -> tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<TcpStream>> {
+    let mut request = format!("ws://{daemon}/v1/tcp?port={port}&identity=true")
+        .into_client_request()
+        .expect("a well-formed request");
+    request.headers_mut().insert(
+        "authorization",
+        format!("Bearer {TOKEN}").parse().expect("a header value"),
+    );
+    let (socket, _) = tokio_tungstenite::connect_async(request)
+        .await
+        .expect("the upgrade succeeds");
+    socket
+}
+
+/// Runs the initiator's half of the Noise KK handshake over an open WebSocket.
+///
+/// Returns the transport state, or the daemon's close outcome when the handshake was
+/// refused — which is itself an assertable result rather than a test failure.
+async fn initiate(
+    socket: &mut tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<TcpStream>>,
+    host_seed: [u8; 32],
+    pinned_vm_public: [u8; 32],
+) -> Result<snow::TransportState, Option<(u16, String)>> {
+    let mut initiator =
+        snow::Builder::new(protocol::identity::NOISE_PATTERN.parse().expect("parses"))
+            .local_private_key(&host_seed)
+            .expect("a 32-byte secret")
+            .remote_public_key(&pinned_vm_public)
+            .expect("a 32-byte key")
+            .build_initiator()
+            .expect("builds");
+
+    let mut scratch = vec![0_u8; 65535];
+    let written = initiator.write_message(&[], &mut scratch).expect("writes");
+    socket
+        .send(Message::Binary(scratch[..written].to_vec()))
+        .await
+        .expect("sent");
+
+    // The daemon either answers with its handshake message or closes with a refusal code.
+    loop {
+        match tokio::time::timeout(std::time::Duration::from_secs(5), socket.next())
+            .await
+            .expect("an answer arrives")
+        {
+            Some(Ok(Message::Binary(reply))) => {
+                initiator
+                    .read_message(&reply, &mut scratch)
+                    .expect("the daemon's reply authenticates");
+                return Ok(initiator.into_transport_mode().expect("transport"));
+            }
+            Some(Ok(Message::Close(Some(CloseFrame { code, reason })))) => {
+                return Err(Some((code.into(), reason.to_string())));
+            }
+            Some(Ok(Message::Close(None))) => return Err(Some((1000, String::new()))),
+            Some(Ok(_)) => continue,
+            Some(Err(_)) | None => return Err(None),
+        }
+    }
+}
+
+/// **The full layer-3 property: a verified tunnel carries encrypted bytes to a real
+/// server, and the plaintext round-trips exactly.**
+///
+/// The upper-casing server is what proves the daemon really decrypted: the transformed
+/// bytes could only have been produced from plaintext the guest side saw.
+#[tokio::test]
+async fn a_verified_tunnel_proves_the_vm_and_carries_encrypted_bytes() {
+    let vm_seed = [7_u8; 32];
+    let host_seed = [9_u8; 32];
+    let vm_public =
+        *x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(vm_seed)).as_bytes();
+
+    let server = upper_server().await;
+    let daemon = identity_daemon(vm_seed, host_seed).await;
+    let mut socket = open_identity_tunnel(daemon, server.port()).await;
+
+    let mut noise = initiate(&mut socket, host_seed, vm_public)
+        .await
+        .expect("the launching host's handshake completes");
+
+    // Binary-unsafe bytes through the encrypted path, so a UTF-8 lossy hop cannot hide.
+    let payload = b"proof: \x00\xff mixed case";
+    let mut scratch = vec![0_u8; 65535];
+    let written = noise
+        .write_message(payload, &mut scratch)
+        .expect("encrypts");
+    socket
+        .send(Message::Binary(scratch[..written].to_vec()))
+        .await
+        .expect("sent");
+
+    loop {
+        match tokio::time::timeout(std::time::Duration::from_secs(5), socket.next())
+            .await
+            .expect("an answer arrives")
+            .expect("a message")
+            .expect("not an error")
+        {
+            Message::Binary(frame) => {
+                let count = noise
+                    .read_message(&frame, &mut scratch)
+                    .expect("the answer authenticates");
+                assert_eq!(
+                    &scratch[..count],
+                    b"PROOF: \x00\xff MIXED CASE",
+                    "the guest saw the plaintext and its answer came back encrypted"
+                );
+                return;
+            }
+            _ => continue,
+        }
+    }
+}
+
+/// **A caller who does not hold the launching host's key is refused with 4403.**
+///
+/// The agent token alone must not be enough: it is a bearer credential the proxy carries
+/// on every request, and this test connects with a perfectly valid token and a wrong key.
+#[tokio::test]
+async fn a_valid_token_with_the_wrong_host_key_is_refused() {
+    let vm_seed = [7_u8; 32];
+    let host_seed = [9_u8; 32];
+    let vm_public =
+        *x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(vm_seed)).as_bytes();
+
+    let server = upper_server().await;
+    let daemon = identity_daemon(vm_seed, host_seed).await;
+    let mut socket = open_identity_tunnel(daemon, server.port()).await;
+
+    let refusal = initiate(&mut socket, [1_u8; 32], vm_public)
+        .await
+        .expect_err("a wrong host key must not complete");
+    let (code, reason) = refusal.expect("the daemon closes with a code, not a hangup");
+    assert_eq!(code, protocol::tunnel::close::IDENTITY_REFUSED);
+    assert!(reason.contains("handshake"), "{reason}");
+}
+
+/// **A caller pinning the wrong VM key is refused the same way.**
+///
+/// The replayed-record case from #70's acceptance list: a ledger record copied from a
+/// different VM carries a different public key, and the handshake must fail rather than
+/// silently connect to the wrong machine.
+#[tokio::test]
+async fn a_pin_from_a_different_vm_is_refused() {
+    let vm_seed = [7_u8; 32];
+    let host_seed = [9_u8; 32];
+    let other_vm_public =
+        *x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from([2_u8; 32])).as_bytes();
+
+    let server = upper_server().await;
+    let daemon = identity_daemon(vm_seed, host_seed).await;
+    let mut socket = open_identity_tunnel(daemon, server.port()).await;
+
+    let refusal = initiate(&mut socket, host_seed, other_vm_public)
+        .await
+        .expect_err("a wrong pin must not complete");
+    let (code, _) = refusal.expect("the daemon closes with a code");
+    assert_eq!(code, protocol::tunnel::close::IDENTITY_REFUSED);
+}
+
+/// **`identity=true` against a VM launched without a seed is 4401, not a downgrade.**
+#[tokio::test]
+async fn identity_against_a_seedless_vm_is_refused_not_downgraded() {
+    let server = upper_server().await;
+    // The plain daemon: bootstrapped with no identity material.
+    let daemon = daemon().await;
+    let mut socket = open_identity_tunnel(daemon, server.port()).await;
+
+    // No handshake to send — the daemon must close first with 4401.
+    let outcome = close_outcome(&mut socket).await;
+    let (code, reason) = outcome.expect("a close frame with the refusal");
+    assert_eq!(code, protocol::tunnel::close::NO_IDENTITY);
+    assert!(reason.contains("launched without"), "{reason}");
+}
+
+/// **The identity handshake runs before the dial: a refused caller never reaches a guest.**
+///
+/// Asserted by pointing the verified tunnel at a listener that records connections: after a
+/// refused handshake, the listener must have seen none.
+#[tokio::test]
+async fn a_refused_caller_never_causes_a_guest_connection() {
+    let vm_seed = [7_u8; 32];
+    let host_seed = [9_u8; 32];
+    let vm_public =
+        *x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(vm_seed)).as_bytes();
+
+    // A listener that counts accepts rather than serving anything.
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("a free port");
+    let guest = listener.local_addr().expect("bound");
+    let accepted = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = accepted.clone();
+    tokio::spawn(async move {
+        loop {
+            let Ok((_socket, _)) = listener.accept().await else {
+                return;
+            };
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    });
+
+    let daemon = identity_daemon(vm_seed, host_seed).await;
+    let mut socket = open_identity_tunnel(daemon, guest.port()).await;
+    let refusal = initiate(&mut socket, [1_u8; 32], vm_public).await;
+    assert!(refusal.is_err(), "the wrong key must be refused");
+
+    // The refusal already arrived, so any dial would have happened by now.
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert_eq!(
+        accepted.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "a refused caller must never cause a connection to the guest service"
+    );
+}

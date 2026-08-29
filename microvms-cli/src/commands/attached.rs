@@ -1291,6 +1291,57 @@ pub async fn tunnel<O: std::io::Write, E: std::io::Write>(
             .suggest("`--bind 127.0.0.1` is the default, and the right choice for a local client")
             })?;
 
+    // The identity material, resolved before the attach so a caller missing it pays no AWS
+    // call. Explicit flags win over the registry record for the region flag's reason: the
+    // caller who typed them means them, and the record is the default that makes them
+    // unnecessary. Fails closed — `--verify-identity` with material nowhere is a refusal,
+    // never a silent downgrade to an unverified tunnel.
+    let identity = if args.verify_identity {
+        let (host_seed, vm_public_key) = match (
+            &args.identity_host_seed,
+            &args.identity_vm_public_key,
+            &args.attach.name,
+        ) {
+            (Some(seed), Some(pin), _) => (seed.clone(), pin.clone()),
+            (None, None, Some(name)) => {
+                let root = state_dir(args.attach.state_dir.clone(), ctx.env);
+                let record = crate::ledger::Names::new(&root).lookup(name);
+                match record
+                    .and_then(|record| record.identity_host_seed.zip(record.identity_vm_public_key))
+                {
+                    Some(pair) => pair,
+                    None => {
+                        return Err(CliError::new(
+                            Exit::Precondition,
+                            format!(
+                                "the record for {name:?} carries no identity material, so there \
+                                 is nothing to verify the VM against. Identity is generated at \
+                                 launch and cannot be added to a running VM."
+                            ),
+                        )
+                        .suggest("relaunch with `microvm run --keep --vm-name <NAME> --identity`")
+                        .suggest("drop --verify-identity to use an unverified tunnel"));
+                    }
+                }
+            }
+            _ => {
+                return Err(CliError::new(
+                    Exit::InvalidArg,
+                    "--verify-identity needs the identity pair: --name <NAME> whose record \
+                     carries it, or both --identity-host-seed and --identity-vm-public-key \
+                     from `run --identity`'s envelope."
+                        .to_string(),
+                ));
+            }
+        };
+        Some(microvms_core::identity::TunnelIdentity::from_encoded_parts(
+            &host_seed,
+            &vm_public_key,
+        )?)
+    } else {
+        None
+    };
+
     let (session, microvm_id) = attach(ctx, &args.region, &args.attach).await?;
 
     let Some(auth) = session.proxy_auth().cloned() else {
@@ -1364,9 +1415,19 @@ pub async fn tunnel<O: std::io::Write, E: std::io::Write>(
         let token = Arc::clone(&agent_token);
         let auth = Arc::clone(&auth);
         let refused = Arc::clone(&refused);
+        let identity = identity.clone();
         tasks.push(tokio::spawn(async move {
-            let outcome =
-                core_tunnel::relay_connection(local, &endpoint, guest_port, &token, &auth).await;
+            let outcome = match &identity {
+                None => {
+                    core_tunnel::relay_connection(local, &endpoint, guest_port, &token, &auth).await
+                }
+                Some(identity) => {
+                    core_tunnel::relay_connection_verified(
+                        local, &endpoint, guest_port, &token, &auth, identity,
+                    )
+                    .await
+                }
+            };
             match outcome {
                 Ok(core_tunnel::TunnelEnd::Closed) => None,
                 Ok(core_tunnel::TunnelEnd::Refused { code, reason }) => {
