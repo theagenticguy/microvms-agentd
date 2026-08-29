@@ -42,8 +42,6 @@
 //! 142-character token, over the 128 ceiling, and botocore does not check `max`, so it
 //! would have gone to the wire and failed a launch on a field the caller never set.
 
-use std::fmt::Write as _;
-
 use crate::constants::MAX_CLIENT_TOKEN_LEN;
 
 /// Bytes of randomness folded into every token: eight, so two attempts one second
@@ -129,11 +127,9 @@ fn mint(verb: Verb, scope: &str, nonce: &[u8]) -> String {
     token.push('-');
     token.push_str(label);
     token.push('-');
-    for byte in nonce {
-        // Two lowercase hex digits per byte, so the rendered width is exactly
-        // 2 * nonce.len() and the ceiling arithmetic below holds.
-        let _ = write!(token, "{byte:02x}");
-    }
+    // Two lowercase hex digits per byte, so the rendered width is exactly
+    // 2 * nonce.len() and the ceiling arithmetic below holds.
+    token.push_str(&const_hex::encode(nonce));
 
     debug_assert!(
         token.len() <= MAX_CLIENT_TOKEN_LEN,
@@ -160,48 +156,16 @@ fn tail(text: &str, max_bytes: usize) -> &str {
     }
 }
 
-/// Eight bytes of fresh randomness per call.
+/// Eight bytes of fresh randomness per call, from the kernel CSPRNG via `getrandom`.
 ///
-/// # `/dev/urandom` directly, for now
-///
-/// The same kernel pool `getrandom` reaches on Linux, and the daemon this client
-/// drives is Linux-only. Swapping to the `getrandom` crate is queued in the
-/// dependency sweep, together with `sandbox.rs`'s twin of this read.
-///
-/// # Why the fallback is not a silent one
-///
-/// If the read fails, the fallback mixes `RandomState` (which is seeded from the same
-/// kernel pool at process start and is randomised per process — verified 2026-08-08:
-/// five draws distinct within a process, and different across processes) with the
-/// nanosecond clock and the address of a stack local. That is weaker than
-/// `/dev/urandom` and it is still per-attempt distinct, which is the property TRAP-1
-/// needs: the token must not repeat across two attempts, and it does not have to be
-/// unguessable by an adversary. A caller cannot reach this path deliberately, and the
-/// alternative — failing the build for want of eight bytes — turns an unreadable
-/// `/dev/urandom` into an unusable client.
+/// TRAP-1 needs per-attempt distinctness — the token must not repeat across two
+/// attempts; it does not have to be unguessable. `getrandom` gives the stronger
+/// property anyway, and fails only when the OS pool is genuinely unavailable, in
+/// which state a clock-derived nonce (the old fallback here) risks the exact
+/// collision TRAP-1 exists to prevent.
 fn nonce_bytes() -> [u8; TOKEN_NONCE_BYTES] {
-    use std::io::Read as _;
-
     let mut bytes = [0u8; TOKEN_NONCE_BYTES];
-    if let Ok(mut urandom) = std::fs::File::open("/dev/urandom")
-        && urandom.read_exact(&mut bytes).is_ok()
-    {
-        return bytes;
-    }
-
-    // The fallback. Three independent sources so no single one has to be good.
-    use std::collections::hash_map::RandomState;
-    use std::hash::{BuildHasher as _, Hasher as _};
-
-    let mut hasher = RandomState::new().build_hasher();
-    hasher.write_usize(&bytes as *const u8 as usize);
-    hasher.write_u128(
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|since| since.as_nanos())
-            .unwrap_or_default(),
-    );
-    bytes.copy_from_slice(&hasher.finish().to_le_bytes());
+    getrandom::fill(&mut bytes).expect("the OS random pool is available");
     bytes
 }
 

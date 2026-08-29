@@ -353,24 +353,20 @@ pub fn merge_env(
 mod tests {
     use super::*;
 
-    /// Writes a file and removes it on drop.
-    struct TempFile(PathBuf);
+    /// Writes a file and removes it on drop. The second field is the `tempfile`
+    /// guard that owns the deletion; `.0` stays a plain path for the tests.
+    struct TempFile(PathBuf, #[allow(dead_code)] tempfile::TempPath);
 
     impl TempFile {
         fn new(label: &str, text: &str) -> Self {
-            let path = std::env::temp_dir().join(format!(
-                "microvm-config-{label}-{}-{:?}.toml",
-                std::process::id(),
-                std::thread::current().id()
-            ));
-            std::fs::write(&path, text).expect("writes");
-            Self(path)
-        }
-    }
-
-    impl Drop for TempFile {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_file(&self.0);
+            let file = tempfile::Builder::new()
+                .prefix(&format!("microvm-config-{label}-"))
+                .suffix(".toml")
+                .tempfile()
+                .expect("a temp file");
+            std::fs::write(file.path(), text).expect("writes");
+            let path = file.into_temp_path();
+            Self(path.to_path_buf(), path)
         }
     }
 

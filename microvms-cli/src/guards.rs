@@ -820,24 +820,15 @@ fn no_config() -> crate::cli::ConfigFlags {
 }
 
 /// A state directory that cleans itself up.
-struct TempDir(std::path::PathBuf);
+struct TempDir(std::path::PathBuf, #[allow(dead_code)] tempfile::TempDir);
 
 impl TempDir {
     fn new(label: &str) -> Self {
-        let path = std::env::temp_dir().join(format!(
-            "microvm-guard-{label}-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        let _ = std::fs::remove_dir_all(&path);
-        std::fs::create_dir_all(&path).expect("a temp dir");
-        Self(path)
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
+        let dir = tempfile::Builder::new()
+            .prefix(&format!("microvm-guard-{label}-"))
+            .tempdir()
+            .expect("a temp dir");
+        Self(dir.path().to_path_buf(), dir)
     }
 }
 
@@ -3243,27 +3234,21 @@ async fn an_unbootstrapped_daemon_is_reported_with_a_non_zero_code_and_a_null_di
 }
 
 /// A file that cleans itself up, for the two `cp` tests that need real bytes on disk.
-struct TempFile(std::path::PathBuf);
+struct TempFile(std::path::PathBuf, #[allow(dead_code)] tempfile::TempPath);
 
 impl TempFile {
     fn new(label: &str, bytes: &[u8]) -> Self {
-        let path = std::env::temp_dir().join(format!(
-            "microvm-guard-{label}-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        std::fs::write(&path, bytes).expect("writes");
-        Self(path)
+        let file = tempfile::Builder::new()
+            .prefix(&format!("microvm-guard-{label}-"))
+            .tempfile()
+            .expect("a temp file");
+        std::fs::write(file.path(), bytes).expect("writes");
+        let path = file.into_temp_path();
+        Self(path.to_path_buf(), path)
     }
 
     fn path(&self) -> &std::path::Path {
         &self.0
-    }
-}
-
-impl Drop for TempFile {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
     }
 }
 

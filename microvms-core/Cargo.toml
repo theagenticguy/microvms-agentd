@@ -105,6 +105,17 @@ futures-util = "0.3"
 # one version in the tree means the client and the daemon cannot disagree about
 # padding or alphabet.
 base64 = "0.23"
+# Hex rendering for tokens and the artifact content hash. Encode-only.
+const-hex = "1.19"
+# The kernel CSPRNG behind one call, for the agent token and idempotency nonces.
+# Replaces two hand-rolled /dev/urandom reads and their clock-mixing fallbacks —
+# getrandom's own failure story (it aborts only if the OS pool is truly unavailable,
+# which on Linux means the kernel is broken) is stronger than the fallback was.
+getrandom = "0.4"
+# RFC 3986 percent-encoding for query values and path segments. Replaces two
+# hand-rolled encoders; the AsciiSets keep their exact behavior (everything outside
+# the unreserved set is escaped, including `/` and `:` in path segments).
+percent-encoding = "2.3"
 
 [dev-dependencies]
 # The size-class and region guards are table-shaped, which is exactly where a

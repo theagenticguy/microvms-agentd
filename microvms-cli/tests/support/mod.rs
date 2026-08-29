@@ -94,27 +94,18 @@ pub fn run(args: &[&str], env: &[(&str, &str)]) -> Run {
 ///
 /// To be replaced by the `tempfile` dev-dependency in the dependency sweep, with the
 /// crate's other copies of this pattern.
-pub struct TempDir(pub PathBuf);
+pub struct TempDir(pub PathBuf, #[allow(dead_code)] tempfile::TempDir);
 
 impl TempDir {
     pub fn new(label: &str) -> Self {
-        let path = std::env::temp_dir().join(format!(
-            "microvm-it-{label}-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        let _ = std::fs::remove_dir_all(&path);
-        std::fs::create_dir_all(&path).expect("a temp dir");
-        Self(path)
+        let dir = tempfile::Builder::new()
+            .prefix(&format!("microvm-it-{label}-"))
+            .tempdir()
+            .expect("a temp dir");
+        Self(dir.path().to_path_buf(), dir)
     }
 
     pub fn path(&self) -> &str {
         self.0.to_str().expect("utf8 temp path")
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
     }
 }

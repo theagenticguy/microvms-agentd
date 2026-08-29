@@ -83,6 +83,10 @@ globset = "0.4"
 tar = "0.4.46"
 
 [dev-dependencies]
+# Temp files/dirs for the test suites: random names with O_EXCL creation and
+# guaranteed cleanup on drop. Replaces eight hand-rolled pid+thread-id helpers
+# that deleted-then-created by fixed name.
+tempfile = "3"
 # The structural guards read the real dependency graph rather than parsing TOML:
 # `cargo metadata` resolves path dependencies and workspace inheritance, so an edge
 # added transitively or through a renamed key is still an edge this sees. Parsing

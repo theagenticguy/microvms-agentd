@@ -1099,52 +1099,14 @@ impl Drop for Sandbox {
 
 /// A fresh per-VM bearer token: 32 bytes of randomness as 64 hex characters.
 ///
-/// # `/dev/urandom` directly, for now
-///
-/// This reads the same kernel pool `getrandom` reaches on Linux, and the daemon this
-/// drives is Linux-only. Swapping to the `getrandom` crate (which also retires the
-/// fallback below) is queued in the dependency sweep; `control::token` reads it the
-/// same way and swaps with it.
-///
-/// # Why the fallback is not silent
-///
-/// A failed read falls back to `RandomState` mixed with the nanosecond clock and a stack
-/// address, which is weaker and still per-VM distinct. That is the property that matters
-/// here — this token is delivered once, over a channel the platform does not forward until
-/// the hook returns 200, to a daemon that installs it at most once — and the alternative,
-/// failing a launch for want of 32 bytes, turns an unreadable `/dev/urandom` into an
-/// unusable client.
+/// `getrandom` reaches the kernel CSPRNG directly. The hand-rolled `/dev/urandom`
+/// read this replaces carried a clock-mixing fallback for a failed read; getrandom
+/// fails only when the OS pool is genuinely unavailable, and minting a bearer token
+/// from a clock in that state would be worse than refusing the launch.
 fn mint_agent_token() -> String {
-    use std::fmt::Write as _;
-    use std::io::Read as _;
-
     let mut bytes = [0u8; 32];
-    let read = std::fs::File::open("/dev/urandom")
-        .ok()
-        .and_then(|mut file| file.read_exact(&mut bytes).ok())
-        .is_some();
-    if !read {
-        use std::collections::hash_map::RandomState;
-        use std::hash::{BuildHasher as _, Hasher as _};
-        for chunk in bytes.chunks_mut(8) {
-            let mut hasher = RandomState::new().build_hasher();
-            hasher.write_usize(chunk.as_ptr() as usize);
-            hasher.write_u128(
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|since| since.as_nanos())
-                    .unwrap_or_default(),
-            );
-            let mixed = hasher.finish().to_le_bytes();
-            chunk.copy_from_slice(&mixed[..chunk.len()]);
-        }
-    }
-
-    let mut token = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        let _ = write!(token, "{byte:02x}");
-    }
-    token
+    getrandom::fill(&mut bytes).expect("the OS random pool is available");
+    const_hex::encode(bytes)
 }
 
 #[cfg(test)]

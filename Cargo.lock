@@ -15,7 +15,9 @@ dependencies = [
  "axum",
  "base64 0.23.1",
  "bytes",
+ "const-hex",
  "futures-util",
+ "getrandom 0.4.3",
  "http-body-util",
  "hyper",
  "hyper-util",
@@ -1007,6 +1009,18 @@ dependencies = [
  "rustversion",
  "ryu",
  "static_assertions",
+]
+
+[[package]]
+name = "const-hex"
+version = "1.19.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "33e2a781ebdf4467d1428dc4593067825fb646f6871475098d8577421af73558"
+dependencies = [
+ "cfg-if",
+ "cpufeatures 0.2.17",
+ "proptest",
+ "serde_core",
 ]
 
 [[package]]
@@ -2213,6 +2227,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tar",
+ "tempfile",
  "tokio",
  "toml",
 ]
@@ -2226,11 +2241,14 @@ dependencies = [
  "aws-sigv4",
  "backon",
  "base64 0.23.1",
+ "const-hex",
  "futures-util",
+ "getrandom 0.4.3",
  "http 1.5.0",
  "hyper",
  "hyper-util",
  "microvms-protocol",
+ "percent-encoding",
  "proptest",
  "reqwest",
  "rust_decimal",

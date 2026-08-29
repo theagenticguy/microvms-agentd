@@ -528,25 +528,17 @@ mod tests {
     use super::*;
 
     /// Writes a file and removes it on drop.
-    struct TempFile(std::path::PathBuf);
+    struct TempFile(std::path::PathBuf, #[allow(dead_code)] tempfile::TempPath);
 
     impl TempFile {
         fn new(label: &str, bytes: &[u8]) -> Self {
-            let path = std::env::temp_dir().join(format!(
-                "microvm-doctor-{label}-{}-{:?}",
-                std::process::id(),
-                std::thread::current().id()
-            ));
-            std::fs::write(&path, bytes).expect("writes");
-            Self(path)
-        }
-    }
-
-    impl Drop for TempFile {
-        fn drop(&mut self) {
-            // A leaked temp file in a test is noise, and a panic inside Drop
-            // during unwind is an abort — swallowing is the only correct choice.
-            let _ = std::fs::remove_file(&self.0);
+            let file = tempfile::Builder::new()
+                .prefix(&format!("microvm-doctor-{label}-"))
+                .tempfile()
+                .expect("a temp file");
+            std::fs::write(file.path(), bytes).expect("writes");
+            let path = file.into_temp_path();
+            Self(path.to_path_buf(), path)
         }
     }
 

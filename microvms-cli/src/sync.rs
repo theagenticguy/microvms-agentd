@@ -238,23 +238,15 @@ mod tests {
     use super::*;
 
     /// A tree under a temp dir, removed on drop.
-    struct TempTree(std::path::PathBuf);
+    struct TempTree(std::path::PathBuf, #[allow(dead_code)] tempfile::TempDir);
 
     impl TempTree {
         fn new(label: &str) -> Self {
-            let path = std::env::temp_dir().join(format!(
-                "microvm-sync-{label}-{}-{:?}",
-                std::process::id(),
-                std::thread::current().id()
-            ));
-            std::fs::create_dir_all(&path).expect("creates");
-            Self(path)
-        }
-    }
-
-    impl Drop for TempTree {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
+            let dir = tempfile::Builder::new()
+                .prefix(&format!("microvm-sync-{label}-"))
+                .tempdir()
+                .expect("a temp dir");
+            Self(dir.path().to_path_buf(), dir)
         }
     }
 
