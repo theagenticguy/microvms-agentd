@@ -155,6 +155,9 @@ pub fn load(
     // place that knows where the file is — rather than against wherever the process
     // happens to stand. `--config /repo/microvm.toml` from another directory is the
     // flag's flagship case, and cwd-relative resolution would break exactly that one.
+    // `is_relative` here means *genuinely* relative: `validate` above already refused
+    // the two Windows shapes (`/x`, `C:x`) that answer `is_relative()` while meaning
+    // something `join` would rewrite (issue #87).
     if let (Some(binary), Some(parent)) = (&config.binary, path.parent())
         && binary.is_relative()
     {
@@ -216,6 +219,46 @@ fn validate(path: &Path, config: &ProjectConfig) -> Result<(), ConfigError> {
             if let Err(error) = globset::Glob::new(glob) {
                 problems.push(format!("artifacts glob {glob:?} does not compile: {error}"));
             }
+        }
+    }
+    // The two Windows path shapes that mean two things at once (issue #87). Windows
+    // parses both as *relative*, so [`load`]'s file-directory join would fire on them
+    // and silently rewrite what the caller wrote:
+    //
+    // - rooted with no drive (`/opt/agentd`): `join` keeps the joining directory's
+    //   drive, so the value becomes `C:/opt/agentd` — a path the caller never wrote,
+    //   reported by `resolvedConfig` as if the file had said it, possibly naming a
+    //   different binary that happens to exist there.
+    // - a drive with no root (`C:agentd`): `join` discards the directory entirely and
+    //   the value resolves against that drive's *current directory* at spawn time.
+    //
+    // Refused rather than guessed, because the remedies differ per intent — write the
+    // drive letter, or write a genuinely relative path — and only the caller knows
+    // which they meant. Same posture as the unknown-key refusal: a legal-looking value
+    // must not quietly mean something else. On Unix neither shape exists (a rooted
+    // path is absolute, and no prefix component is ever parsed), so this never fires
+    // there and `/opt/agentd` passes through as the absolute path it is.
+    if let Some(binary) = &config.binary
+        && binary.is_relative()
+    {
+        if binary.has_root() {
+            problems.push(format!(
+                "binary = {binary:?} is rooted but names no drive, which Windows reads \
+                 as relative — resolving it against this file's directory would \
+                 silently re-anchor it onto the file's drive. Write the drive letter \
+                 if you meant an absolute path, or drop the leading separator if you \
+                 meant a path relative to this file"
+            ));
+        } else if matches!(
+            binary.components().next(),
+            Some(std::path::Component::Prefix(_))
+        ) {
+            problems.push(format!(
+                "binary = {binary:?} names a drive but no root, which resolves against \
+                 that drive's current directory at spawn time. Write the root after \
+                 the drive if you meant an absolute path, or drop the drive if you \
+                 meant a path relative to this file"
+            ));
         }
     }
     if problems.is_empty() {
@@ -469,6 +512,87 @@ CI = "1"
         assert_eq!(
             config.binary.as_deref(),
             Some(absolute_path.as_path()),
+            "an absolute path passes through untouched"
+        );
+    }
+
+    /// The two ambiguous Windows shapes are refused at load, before the join could
+    /// rewrite them (issue #87).
+    ///
+    /// `cfg(windows)` because the shapes only parse as ambiguous there — on Unix
+    /// `/opt/agentd` is simply absolute and `C:agentd` is an ordinary relative
+    /// component. CI's windows-latest leg runs this crate's tests, so this executes on
+    /// every PR rather than existing as a comment about a platform nobody checks.
+    ///
+    /// **Falsification** — delete the ambiguity checks in `validate` and the first
+    /// assertion reads back a join result instead of a refusal. (Proof pending: to be
+    /// run on the windows-latest CI leg, since this machine cannot execute a
+    /// `cfg(windows)` test.)
+    #[cfg(windows)]
+    #[test]
+    fn an_ambiguous_windows_binary_shape_is_refused_at_load() {
+        // Rooted, no drive: the shape CI caught re-anchoring onto the temp drive.
+        let rooted = TempFile::new("rooted", "binary = '/opt/agentd'\n");
+        let message = load(Some(&rooted.0), false, Path::new("."))
+            .expect_err("refused")
+            .to_string();
+        assert!(message.contains("/opt/agentd"), "{message}");
+        assert!(message.contains("drive"), "{message}");
+
+        // Drive, no root: joins by *replacing* the file's directory entirely, then
+        // resolves against that drive's current directory at spawn time.
+        let drive_relative = TempFile::new("driverel", "binary = 'C:agentd'\n");
+        let message = load(Some(&drive_relative.0), false, Path::new("."))
+            .expect_err("refused")
+            .to_string();
+        assert!(message.contains("C:agentd"), "{message}");
+        assert!(message.contains("current directory"), "{message}");
+
+        // The unambiguous neighbours still load: fully absolute passes through
+        // untouched, and genuinely relative resolves against the file's directory.
+        let absolute = TempFile::new("winabs", "binary = 'C:\\opt\\agentd'\n");
+        let (_, config) = load(Some(&absolute.0), false, Path::new("."))
+            .expect("loads")
+            .expect("present");
+        assert_eq!(
+            config.binary.as_deref(),
+            Some(Path::new("C:\\opt\\agentd")),
+            "a drive-plus-root path is not ambiguous and passes through"
+        );
+        let relative = TempFile::new("winrel", "binary = 'target\\agentd'\n");
+        let (_, config) = load(Some(&relative.0), false, Path::new("."))
+            .expect("loads")
+            .expect("present");
+        assert_eq!(
+            config.binary.as_deref(),
+            Some(
+                relative
+                    .0
+                    .parent()
+                    .expect("a parent")
+                    .join("target\\agentd")
+                    .as_path()
+            ),
+            "a genuinely relative path still resolves against the file's directory"
+        );
+    }
+
+    /// On Unix the issue-#87 refusal never fires: `/opt/agentd` is absolute there, and
+    /// there is no such thing as a drive prefix to be missing a root.
+    ///
+    /// The guard this pins: the ambiguity check runs unconditionally (no `cfg` in
+    /// `validate`), so a predicate mistake that made it fire on Unix would refuse
+    /// every absolute `binary` on the platforms the daemon actually ships to.
+    #[cfg(unix)]
+    #[test]
+    fn a_rooted_binary_on_unix_is_absolute_and_passes_through() {
+        let file = TempFile::new("unixabs", "binary = '/opt/agentd'\n");
+        let (_, config) = load(Some(&file.0), false, Path::new("."))
+            .expect("loads: no ambiguity exists on unix")
+            .expect("present");
+        assert_eq!(
+            config.binary.as_deref(),
+            Some(Path::new("/opt/agentd")),
             "an absolute path passes through untouched"
         );
     }
