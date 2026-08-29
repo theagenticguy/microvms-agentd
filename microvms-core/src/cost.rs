@@ -198,13 +198,10 @@ fn render_quantity(quantity: Decimal) -> String {
 
 /// A calendar day, which is the only temporal resolution a rate table has.
 ///
-/// Deliberately not a dependency. `cargo tree` shows `time 0.3` in this workspace,
-/// but only as a transitive dependency of `aws-smithy-runtime` — taking it here
-/// would mean adding a direct dependency, and the module needs exactly two
-/// operations: pin a retrieval date, and subtract two dates to get an age in days.
-/// No parsing, no formatting, no zones, no arithmetic on months. So the whole date
-/// surface is the proleptic-Gregorian day number below, which is twelve lines and
-/// has a pinned test against three known values.
+/// A `jiff` swap is queued in the dependency sweep; until it lands, the module needs
+/// exactly two operations — pin a retrieval date, and subtract two dates to get an
+/// age in days — and the whole date surface is the proleptic-Gregorian day number
+/// below, pinned by a test against three known values.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct CalendarDate {
     year: i32,

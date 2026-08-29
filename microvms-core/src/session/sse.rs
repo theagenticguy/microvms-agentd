@@ -13,12 +13,13 @@
 //! `retry:` are ignored rather than half-supported — the daemon does not send them, and
 //! the byte offset is the resume cursor rather than `Last-Event-ID`.
 //!
-//! # Hand-rolled rather than a dependency
+//! # Why not an eventsource crate
 //!
 //! The daemon's SSE is two field names and three event names, and the interesting part
 //! of a client's stream handling is the cursor rather than the framing. An eventsource
 //! crate would bring a reconnect policy keyed on `Last-Event-ID`, which is the wrong
-//! cursor: it resumes at an event, and this protocol resumes at a byte.
+//! cursor: it resumes at an event, and this protocol resumes at a byte. The framing
+//! parser below is first-party for that reason, not from any aversion to dependencies.
 
 use base64::Engine as _;
 

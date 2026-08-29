@@ -162,14 +162,11 @@ fn tail(text: &str, max_bytes: usize) -> &str {
 
 /// Eight bytes of fresh randomness per call.
 ///
-/// # Why `/dev/urandom` rather than a crate
+/// # `/dev/urandom` directly, for now
 ///
-/// The dependency set T-W2-2 pinned carries no CSPRNG — `backon` vendors `fastrand`,
-/// which is a deliberately non-cryptographic PRNG and is not re-exported — and this
-/// lane adds source files only, so adding one is not available. Reading
-/// `/dev/urandom` directly is what remains, and it is the same kernel pool
-/// `getrandom` reaches on Linux; the daemon this client drives is Linux-only, so no
-/// second platform needs a branch.
+/// The same kernel pool `getrandom` reaches on Linux, and the daemon this client
+/// drives is Linux-only. Swapping to the `getrandom` crate is queued in the
+/// dependency sweep, together with `sandbox.rs`'s twin of this read.
 ///
 /// # Why the fallback is not a silent one
 ///

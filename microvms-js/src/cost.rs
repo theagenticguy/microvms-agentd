@@ -348,10 +348,9 @@ fn line_json(item: &CoreLineItem) -> String {
 
 /// A JSON string literal.
 ///
-/// Escapes the five things a JSON string cannot carry raw plus the C0 range. Written out
-/// rather than pulled from `serde_json` because this crate's dependency set is
-/// deliberately four crates, and the alternative — a `serde_json` dependency for one
-/// function — is a dependency for a quoting helper.
+/// Escapes the five things a JSON string cannot carry raw plus the C0 range. A
+/// `serde_json` edge would cover this and is fine to take; queued in the dependency
+/// sweep alongside the other binding cleanups.
 fn quote(value: &str) -> String {
     let mut quoted = String::with_capacity(value.len() + 2);
     quoted.push('"');

@@ -2,16 +2,17 @@
 //! **CLI-2's static half.** The CLI reaches AWS through `microvms-core` and through nothing else,
 //! asserted from the manifest and from the source.
 //!
-//! # Two checks, and the first is the strong one
+//! # Two checks
 //!
-//! An **exact dependency set** read out of `cargo metadata`, and a source scan. The set is what
-//! matters: a denylist of forbidden crate names is defeated by the one crate nobody thought to
-//! write down, and `test_cli.py`'s three-legged static guard grew a leg at a time as each was
-//! defeated on purpose. An equality against a written-down set has no such gap — every addition to
-//! this crate's manifest is a diff against a test that names the nine things allowed and says why.
+//! A **denylist** of crates that would mean a second path to AWS or HTTP, read out of
+//! `cargo metadata`, and a source scan. Dependencies are welcome in this crate — a good,
+//! maintained crate beats hand-rolled code, and nothing here polices the manifest's size.
+//! What the manifest must never grow is a crate that can open a socket to AWS or sign a
+//! request without going through `microvms-core`; those are named below, and
+//! `cargo metadata` sees them however they are spelled into the manifest.
 //!
 //! The scan catches what a manifest cannot: a control-plane operation invoked through a crate that
-//! *is* allowed. `microvms-core` is allowed and re-exports plenty; a handler that reached past the
+//! *is* fine to depend on. `microvms-core` re-exports plenty; a handler that reached past the
 //! seam into `ControlPlane::new` would add no dependency at all.
 //!
 //! # The scan matches code, not prose, and that took three attempts
@@ -38,87 +39,13 @@
 
 use std::path::{Path, PathBuf};
 
-/// One name this crate deliberately does **not** depend on, and the API that replaced it.
-///
-/// Not on the forbidden list below, because it never was a capability — `futures-util` opens no
-/// socket and knows nothing about AWS, so it could not have been the second path to the control
-/// plane CLI-2 is about. It is here for a different reason: it was an allowed dependency, with a
-/// justification, for exactly as long as core's only stream API was one returning a trait `std`
-/// does not define. `ExecHandle::for_each_event` takes a `FnMut(ExecEvent) -> ControlFlow<()>`
-/// instead, so this crate consumes a stream with nothing but `microvms-core`.
-///
-/// Recorded as a named absence rather than left to the equality alone so a future contributor who
-/// reaches for `StreamExt` finds the alternative in the failure message instead of a bare "the
-/// dependency set changed".
-const RETIRED: [(&str, &str); 1] = [(
-    "futures-util",
-    "the `Stream` trait `ExecHandle::stream_with` returns. Retired: core's \
-     `ExecHandle::for_each_event(options, |event| ControlFlow::Continue(()))` drives the same \
-     state machine through a std callback, so there is no trait to name. See \
-     `commands/attached.rs`'s `stream_exec`",
-)];
-
-/// The exact set of direct dependencies this crate is allowed, and the reason for each.
-///
-/// An allowlist. See the module docs on why a denylist is not good enough. The reason strings are
-/// not decorative: this test asserts each is a real sentence, so a new entry cannot be added
-/// without someone writing down what it is for.
-const ALLOWED: [(&str, &str); 9] = [
-    (
-        "microvms-core",
-        "the product surface: every AWS call, every trap closure, the cost engine, the taxonomy — \
-         and the wire types, via its `pub use protocol` re-export, so one door covers everything",
-    ),
-    (
-        "clap",
-        "the command tree, which is the manifest's only source and the CLI-5 closed sets",
-    ),
-    (
-        "ratatui",
-        "the interactive surface CLI-1 requires, drawn only when stdout is a terminal",
-    ),
-    (
-        "serde",
-        "the envelope's derives, and the ledger's camelCase wire shape that `microvm ls` reads",
-    ),
-    (
-        "serde_json",
-        "the envelope itself, and the constants object the drift gate reads (TRAP-12)",
-    ),
-    (
-        "tokio",
-        "the runtime this crate is entitled to choose, and ctrl_c for CLI-6",
-    ),
-    (
-        "toml",
-        "the microvm.toml project config file (issue #73): a local file parse into a serde \
-         struct with deny_unknown_fields. Opens no socket, signs nothing — the parsed values \
-         still reach AWS only through microvms-core, and the file's domains are validated \
-         against the same closed sets the parser enforces",
-    ),
-    (
-        "globset",
-        "the artifacts glob grammar in microvm.toml (issues #73/#72): doctor compiles every \
-         declared glob so a bad pattern fails before a launch is paid for, and run <DIR> \
-         selects downloaded tar members with the same compiled set. Pure pattern matching \
-         over strings; no filesystem walk, no socket",
-    ),
-    (
-        "tar",
-        "run <DIR>'s sync mode (issue #72): pack the project tree for upload, and unpack \
-         the glob-selected regular-file members of the returned archive via unpack_in's \
-         traversal refusal. The daemon stays the only tree extractor for uploads — its \
-         openat2 confinement is the trust story there — and this side never extracts a \
-         member it did not select. Same version agentd pins, so the lock gains no second \
-         copy. Opens no socket: the bytes ride microvms-core's session",
-    ),
-];
-
 /// Crate names that would mean a second path to AWS or to HTTP.
 ///
-/// Belt beside the braces: the equality below already forbids these, and naming them makes the
-/// *intent* legible in a failure message. A reviewer reading a diff that added `reqwest` sees why
-/// rather than only that a count changed.
+/// A denylist of the hazard, not a cap on the manifest: dependencies are welcome here, and
+/// nothing polices how many this crate takes. What CLI-2 forbids is a crate that lets a
+/// handler reach AWS without going through `microvms-core` — an HTTP client, a signer, a
+/// credential chain. A reviewer reading a diff that added `reqwest` sees why it is refused
+/// rather than only that a name matched.
 const FORBIDDEN: [&str; 12] = [
     "reqwest",
     "hyper",
@@ -153,21 +80,22 @@ fn manifest_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml")
 }
 
-/// **The exact dependency set.** Six normal dependencies plus the one dev-dependency, and
-/// nothing else — the ALLOWED table above is the count's source of truth, not this sentence.
+/// **No second path to AWS.** The direct dependency set carries none of the crates that
+/// could open a socket to AWS or sign a request outside `microvms-core`.
 ///
-/// The requirement under test, stated as an equality rather than as an absence. `cargo metadata`
-/// is the source rather than the TOML text, because it resolves path dependencies and workspace
-/// inheritance — an edge added through a renamed key or a `[target.'cfg(...)']` table is still an
-/// edge this sees, and a hand-parsed manifest would check the file instead of the build.
+/// A denylist, deliberately: dependencies are welcome in this crate, and this test says
+/// nothing about how many there are or what they are for. `cargo metadata` is the source
+/// rather than the TOML text, because it resolves path dependencies and workspace
+/// inheritance — an edge added through a renamed key or a `[target.'cfg(...)']` table is
+/// still an edge this sees, and a hand-parsed manifest would check the file instead of the
+/// build.
 ///
 /// **Falsification** — add `reqwest = "0.13"` to `microvms-cli/Cargo.toml` and this goes red
-/// naming it, on both the equality and the forbidden list. Verified; see the packet's guard
-/// proofs.
+/// naming it. Verified; see the packet's guard proofs.
 #[test]
-fn the_direct_dependency_set_is_exactly_the_allowed_one() {
+fn no_direct_dependency_is_a_second_path_to_aws() {
     let package = package();
-    let mut actual: Vec<String> = package
+    let actual: Vec<String> = package
         .dependencies
         .iter()
         .filter(|dependency| {
@@ -179,64 +107,14 @@ fn the_direct_dependency_set_is_exactly_the_allowed_one() {
         })
         .map(|dependency| dependency.name.clone())
         .collect();
-    actual.sort();
-    actual.dedup();
 
-    let mut allowed: Vec<String> = ALLOWED
-        .iter()
-        .map(|(name, _)| (*name).to_string())
-        // The one dev-dependency, which reads this very graph.
-        .chain(std::iter::once("cargo_metadata".to_string()))
-        .collect();
-    allowed.sort();
-
-    assert_eq!(
-        actual,
-        allowed,
-        "the CLI's dependency set changed. Added: {:?}. Removed: {:?}. CLI-2 says this crate \
-         reaches AWS through microvms-core and nothing else, so a new dependency needs a line in \
-         ALLOWED saying what it is for — a real paragraph, on the terms CLI-2 is about: can this \
-         crate open a socket or sign a request with it? If it is an HTTP or AWS crate, it needs a \
-         different design instead.",
-        actual
-            .iter()
-            .filter(|name| !allowed.contains(name))
-            .collect::<Vec<_>>(),
-        allowed
-            .iter()
-            .filter(|name| !actual.contains(name))
-            .collect::<Vec<_>>(),
-    );
-
-    // And explicitly none of the ones that would mean a second path to AWS, so a failure message
-    // says *why* rather than only that a set changed.
     for forbidden in FORBIDDEN {
         assert!(
             !actual.iter().any(|name| name == forbidden),
             "{forbidden} is a direct dependency of the CLI, which gives it a second path to AWS \
-             or to HTTP — the requirement CLI-2 is"
-        );
-    }
-
-    // And explicitly none of the ones that came out again. A separate loop from FORBIDDEN because
-    // the message is different: a retired dependency has a *replacement*, and naming it is what
-    // stops the same edge being re-added by someone who reached for `StreamExt` and found the
-    // guard rather than the API.
-    for (name, replacement) in RETIRED {
-        assert!(
-            !actual.iter().any(|entry| entry == name),
-            "{name} is a direct dependency again. It was allowed once and came out for a reason \
-             — {replacement}. If the replacement genuinely does not cover the case, move the \
-             entry into ALLOWED with a paragraph saying which case, rather than restoring the \
-             old one."
-        );
-    }
-
-    // Every allowance states its purpose, so a new one cannot be added silently.
-    for (name, reason) in ALLOWED {
-        assert!(
-            reason.len() > 25,
-            "{name}'s allowance needs a real reason, not {reason:?}"
+             or to HTTP — the requirement CLI-2 is. Every AWS call belongs in microvms-core; if \
+             this crate needs something the core does not expose, grow the core's API rather \
+             than a parallel transport."
         );
     }
 }
