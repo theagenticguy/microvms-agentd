@@ -4,7 +4,7 @@
 [![live conformance](https://github.com/theagenticguy/microvms-agentd/actions/workflows/live-conformance.yml/badge.svg)](https://github.com/theagenticguy/microvms-agentd/actions/workflows/live-conformance.yml)
 [![release](https://github.com/theagenticguy/microvms-agentd/actions/workflows/release.yml/badge.svg)](https://github.com/theagenticguy/microvms-agentd/actions/workflows/release.yml)
 [![docs](https://github.com/theagenticguy/microvms-agentd/actions/workflows/docs.yml/badge.svg)](https://theagenticguy.github.io/microvms-agentd/)
-[![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/theagenticguy/microvms-agentd/badge)](https://scorecard.dev/viewer/?uri=github.com/theagenticguy/microvms-agentd)
+[![OpenSSF Scorecard](https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fapi.scorecard.dev%2Fprojects%2Fgithub.com%2Ftheagenticguy%2Fmicrovms-agentd&query=%24.score&label=openssf%20scorecard)](https://scorecard.dev/viewer/?uri=github.com/theagenticguy/microvms-agentd)
 
 [![crates.io](https://img.shields.io/crates/v/microvms-cli.svg?label=crates.io)](https://crates.io/crates/microvms-cli)
 [![docs.rs](https://img.shields.io/docsrs/microvms-core?label=docs.rs)](https://docs.rs/microvms-core)
