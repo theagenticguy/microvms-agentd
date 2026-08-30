@@ -467,7 +467,8 @@ fn check_binary(binary: Option<&std::path::Path>) -> Check {
         return Check::fail(
             "daemon-binary",
             "no --binary given, so the architecture could not be checked",
-            "pass --binary target/aarch64-unknown-linux-musl/release/agentd",
+            "not required: `run`/`build` with no binary provision this CLI's own release \
+             asset. Pass --binary only for a daemon you built or manage yourself.",
         )
         .advisory();
     };
@@ -687,6 +688,7 @@ mod tests {
             out: &mut out,
             infra: crate::seam::Infra::default(),
             env: &env,
+            fetch: &crate::provision::PanickingFetch,
         };
         let checks = check_infra(&ctx);
         assert_eq!(checks.len(), 3);

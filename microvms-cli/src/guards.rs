@@ -174,10 +174,25 @@ impl Drop for FakeBinary {
 }
 
 /// Runs `command` against `seam` and returns whatever the handler produced.
+///
+/// The fetch seam is [`crate::provision::PanickingFetch`], so every guard routed through
+/// here is *also* asserting its command never provisions — a run or build handed a binary
+/// that reached for GitHub anyway would panic the test rather than pass it quietly.
 async fn dispatch_with(
     seam: &dyn CoreSeam,
     command: &Command,
     infra: Infra,
+) -> (Result<Rendered, CliError>, String) {
+    dispatch_with_fetch(seam, command, infra, &crate::provision::PanickingFetch).await
+}
+
+/// [`dispatch_with`], with the provisioning seam scripted — for the guards whose subject
+/// *is* the provisioning chain.
+async fn dispatch_with_fetch(
+    seam: &dyn CoreSeam,
+    command: &Command,
+    infra: Infra,
+    fetch: &dyn crate::provision::Fetch,
 ) -> (Result<Rendered, CliError>, String) {
     let mut out = Output::new(Format::Json, false, Vec::new(), Vec::new());
     let env = |_: &str| None;
@@ -187,6 +202,7 @@ async fn dispatch_with(
             out: &mut out,
             infra,
             env: &env,
+            fetch,
         };
         // The *shipped* dispatcher, with the one substitution the guard needs: the interrupt for
         // `run` is [`crate::commands::lifecycle::never`], so this measures the seam rather than
@@ -242,7 +258,8 @@ fn aws_commands(binary: &std::path::Path) -> Vec<(&'static str, Command, Door)> 
         (
             "build",
             Command::Build(BuildArgs {
-                binary: binary.to_path_buf(),
+                binary: Some(binary.to_path_buf()),
+                state_dir: None,
                 base_image_version: None,
                 artifact_uri: Some("s3://bucket/img.zip".into()),
                 name: Some("img".into()),
@@ -927,6 +944,7 @@ async fn an_interrupt_after_launch_tears_down_and_names_every_leaked_identifier(
             out: &mut out,
             infra: full_infra(),
             env: &env,
+            fetch: &crate::provision::PanickingFetch,
         };
         crate::commands::lifecycle::run(&mut ctx, &args, interrupt).await
     };
@@ -1008,6 +1026,7 @@ async fn an_interrupt_whose_teardown_succeeds_reports_no_leak_and_still_exits_in
             out: &mut out,
             infra: full_infra(),
             env: &env,
+            fetch: &crate::provision::PanickingFetch,
         };
         crate::commands::lifecycle::run(&mut ctx, &args, interrupt).await
     };
@@ -1701,7 +1720,8 @@ async fn a_reuse_build_whose_hash_name_exists_skips_the_build_entirely() {
         clock: Arc::new(YieldingClock::default()),
     };
     let command = Command::Build(BuildArgs {
-        binary: binary.0.clone(),
+        binary: Some(binary.0.clone()),
+        state_dir: None,
         base_image_version: None,
         artifact_uri: None,
         name: Some("coding-agents".into()),
@@ -1786,7 +1806,8 @@ async fn a_reuse_build_whose_hash_name_is_absent_builds_under_the_derived_name()
         clock: Arc::new(YieldingClock::default()),
     };
     let command = Command::Build(BuildArgs {
-        binary: binary.0.clone(),
+        binary: Some(binary.0.clone()),
+        state_dir: None,
         base_image_version: None,
         artifact_uri: None,
         name: Some("coding-agents".into()),
@@ -1820,6 +1841,156 @@ async fn a_reuse_build_whose_hash_name_is_absent_builds_under_the_derived_name()
     assert_eq!(rendered.data["imageName"], expected.as_str());
 }
 
+/// A [`crate::provision::Fetch`] that writes an aarch64 ELF header and counts calls, for
+/// the provisioning guards.
+struct CountingFetch(std::sync::atomic::AtomicUsize);
+
+impl crate::provision::Fetch for CountingFetch {
+    fn fetch(
+        &self,
+        _: &str,
+        dest: &std::path::Path,
+        _: &mut dyn FnMut(&str),
+    ) -> Result<crate::provision::Verification, String> {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let mut header = vec![0u8; 20];
+        header[..4].copy_from_slice(b"\x7fELF");
+        header[5] = 1;
+        header[18..20].copy_from_slice(&0xB7u16.to_le_bytes());
+        std::fs::write(dest, header).map_err(|error| error.to_string())?;
+        Ok(crate::provision::Verification::Attestation)
+    }
+}
+
+/// `build` arguments with **no binary at all** — the headline case provisioning exists for.
+fn build_args_without_binary(state_dir: std::path::PathBuf) -> BuildArgs {
+    BuildArgs {
+        binary: None,
+        state_dir: Some(state_dir),
+        base_image_version: None,
+        artifact_uri: None,
+        name: Some("prov".into()),
+        memory: MemoryMib::Mib2048,
+        dockerfile: None,
+        repair_identity: false,
+        log_group: None,
+        log_stream: None,
+        reuse: false,
+        port: None,
+        region: region_flags(),
+        infra: InfraFlags::default(),
+    }
+}
+
+/// The scripted control-plane answers a provisioning build needs: one create, one poll.
+fn script_prov_build(transport: &ScriptedTransport) {
+    transport
+        .answer(
+            "CreateMicrovmImage",
+            201,
+            r#"{"imageArn": "arn:aws:lambda:us-east-1:123456789012:microvm-image:prov",
+                 "name": "prov", "state": "CREATING", "createdAt": 1754524800,
+                 "baseImageArn": "arn:aws:lambda:us-east-1:aws:microvm-image:al2023-1",
+                 "buildRoleArn": "arn:aws:iam::123456789012:role/build",
+                 "codeArtifact": {"uri": "s3://a-bucket/prov.zip"},
+                 "imageVersion": "1"}"#,
+        )
+        .answer(
+            "GetMicrovmImage",
+            200,
+            r#"{"imageArn": "arn:aws:lambda:us-east-1:123456789012:microvm-image:prov",
+                 "name": "prov", "state": "CREATED", "createdAt": 1754524800}"#,
+        );
+}
+
+/// **A `build` with no binary provisions one, builds from it, and says so on the
+/// envelope; the next invocation reads the cache instead of fetching again.** The whole
+/// self-provisioning promise in one guard: `microvm build`/`run` on a fresh machine needs
+/// no path to this product's own component, and one download serves every later call.
+///
+/// **Guard proof.** Reorder the resolution chain so the fetch outranks the cache
+/// (`provision.rs`) and the second dispatch fetches again — the count assertion below
+/// reads 2 and goes red. Watched fail exactly that way before this landed.
+#[tokio::test]
+async fn a_build_with_no_binary_provisions_once_and_the_next_build_reads_the_cache() {
+    let dir = TempDir::new("prov-cache");
+    let fetch = CountingFetch(std::sync::atomic::AtomicUsize::new(0));
+
+    let transport = Arc::new(ScriptedTransport::new());
+    script_prov_build(&transport);
+    let seam = ScriptedSeam {
+        transport: Arc::clone(&transport),
+        clock: Arc::new(YieldingClock::default()),
+    };
+    let command = Command::Build(build_args_without_binary(dir.0.clone()));
+    let (result, stderr) = dispatch_with_fetch(&seam, &command, full_infra(), &fetch).await;
+    let rendered = result.expect("a provisioned build succeeds");
+
+    assert_eq!(
+        transport.called("CreateMicrovmImage"),
+        1,
+        "the build went out"
+    );
+    assert_eq!(fetch.0.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(
+        rendered.data["agentd"]["source"], "fetched",
+        "{:?}",
+        rendered.data
+    );
+    assert_eq!(rendered.data["agentd"]["verified"], "attestation");
+    assert!(
+        stderr.contains("fetching the release asset"),
+        "the fetch must be visible on stderr, not silent: {stderr}"
+    );
+
+    // The second invocation: same state dir, fresh transport script, and the count must
+    // not move — a chain that re-fetched would make every build cost a download.
+    let transport = Arc::new(ScriptedTransport::new());
+    script_prov_build(&transport);
+    let seam = ScriptedSeam {
+        transport: Arc::clone(&transport),
+        clock: Arc::new(YieldingClock::default()),
+    };
+    let command = Command::Build(build_args_without_binary(dir.0.clone()));
+    let (result, _) = dispatch_with_fetch(&seam, &command, full_infra(), &fetch).await;
+    let rendered = result.expect("a cached build succeeds");
+    assert_eq!(
+        fetch.0.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "no second fetch"
+    );
+    assert_eq!(
+        rendered.data["agentd"]["source"], "cache",
+        "{:?}",
+        rendered.data
+    );
+    assert_eq!(rendered.data["agentd"]["verified"], serde_json::Value::Null);
+}
+
+/// **A caller-supplied binary suppresses provisioning entirely** — the envelope's
+/// `agentd` is null and the fetch seam is never consulted. Proven by routing through
+/// [`dispatch_with`], whose fetcher panics on contact.
+#[tokio::test]
+async fn a_supplied_binary_never_consults_the_provisioning_chain() {
+    let binary = FakeBinary::new("no-prov");
+    let transport = Arc::new(ScriptedTransport::new());
+    script_prov_build(&transport);
+    let seam = ScriptedSeam {
+        transport: Arc::clone(&transport),
+        clock: Arc::new(YieldingClock::default()),
+    };
+    let mut args = build_args_without_binary(std::env::temp_dir());
+    args.binary = Some(binary.0.clone());
+    let (result, _) = dispatch_with(&seam, &Command::Build(args), full_infra()).await;
+    let rendered = result.expect("a supplied binary builds");
+    assert_eq!(
+        rendered.data["agentd"],
+        serde_json::Value::Null,
+        "{:?}",
+        rendered.data
+    );
+}
+
 /// A plain `build` (no `--reuse`) never touches the listing, and its envelope still
 /// carries `reused: false` — the key is always present, so no consumer guards for it.
 #[tokio::test]
@@ -1849,7 +2020,8 @@ async fn a_plain_build_never_lists_and_reports_reused_false() {
         clock: Arc::new(YieldingClock::default()),
     };
     let command = Command::Build(BuildArgs {
-        binary: binary.0.clone(),
+        binary: Some(binary.0.clone()),
+        state_dir: None,
         base_image_version: None,
         artifact_uri: None,
         name: Some("img".into()),
@@ -1907,7 +2079,8 @@ async fn a_locally_refused_dockerfile_costs_no_upload_and_no_call() {
         clock: Arc::new(YieldingClock::default()),
     };
     let command = Command::Build(BuildArgs {
-        binary: binary.0.clone(),
+        binary: Some(binary.0.clone()),
+        state_dir: None,
         base_image_version: None,
         artifact_uri: None,
         name: Some("refused".into()),
@@ -1996,7 +2169,8 @@ async fn a_pinned_base_image_version_reaches_the_create_body_from_the_build_flag
         clock: Arc::new(YieldingClock::default()),
     };
     let command = Command::Build(BuildArgs {
-        binary: binary.0.clone(),
+        binary: Some(binary.0.clone()),
+        state_dir: None,
         // The managed base's versions are bare integers, measured 2026-08-16.
         base_image_version: Some("1".into()),
         artifact_uri: None,
@@ -2068,7 +2242,8 @@ async fn a_build_log_stream_reaches_the_wire_suffixed_and_the_envelope_reports_i
         clock: Arc::new(YieldingClock::default()),
     };
     let command = Command::Build(BuildArgs {
-        binary: binary.0.clone(),
+        binary: Some(binary.0.clone()),
+        state_dir: None,
         base_image_version: None,
         artifact_uri: None,
         name: Some("img".into()),
@@ -2145,7 +2320,8 @@ async fn a_build_without_logging_flags_emits_no_logging_member_and_a_null_stream
         clock: Arc::new(YieldingClock::default()),
     };
     let command = Command::Build(BuildArgs {
-        binary: binary.0.clone(),
+        binary: Some(binary.0.clone()),
+        state_dir: None,
         base_image_version: None,
         artifact_uri: None,
         name: Some("img".into()),
@@ -2481,6 +2657,7 @@ async fn against_daemon(
             out: &mut out,
             infra: full_infra(),
             env: &env,
+            fetch: &crate::provision::PanickingFetch,
         };
         crate::handle(&mut ctx, command, crate::commands::lifecycle::never()).await
     };

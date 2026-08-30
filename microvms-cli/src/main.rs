@@ -39,6 +39,7 @@ mod guards;
 mod history;
 mod ledger;
 mod manifest;
+mod provision;
 mod render;
 mod seam;
 mod sync;
@@ -167,6 +168,7 @@ async fn run<O: std::io::Write, E: std::io::Write>(
             out,
             infra,
             env: &process_env,
+            fetch: &provision::SubprocessFetch,
         };
         handle(&mut ctx, &parsed.command, commands::lifecycle::on_ctrl_c()).await
     };

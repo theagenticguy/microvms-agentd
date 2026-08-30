@@ -86,6 +86,14 @@ tar = "0.4.46"
 # rather than chars — a CJK glyph is two cells, and chars().count() under-sizes
 # the column it sits in.
 unicode-width = "0.2"
+# Verifying a provisioned agentd against the release's SHA256SUMS (`provision.rs`).
+# In-process rather than shelled to `sha256sum`, which does not exist on Windows; the
+# same version core's artifact hash uses, so the lock gains no second copy. NOT a
+# second path to AWS: hashing is arithmetic, and the download itself goes through the
+# same subprocess pattern as the `aws s3 cp` upload. `const-hex` renders the digest the
+# way core's artifact hash does — sha2 0.11's output type carries no LowerHex impl.
+sha2 = "0.11"
+const-hex = "1.19"
 
 [dev-dependencies]
 # Temp files/dirs for the test suites: random names with O_EXCL creation and
