@@ -6,7 +6,53 @@ Versions are [semantic](https://semver.org/spec/v2.0.0.html); the wire contract 
 
 ## Unreleased
 
+### Added
+
+- **Configurable build-log destination with a per-build stream discriminator (#98).**
+  `microvm build`/`run` accept `--log-group`/`--log-stream` (and `log-group`/`log-stream`
+  in `microvm.toml`), sent as the image-build `logging` config. The platform treats
+  `logStream` as an **exact** stream name — no prefix support — so a fixed name would
+  collapse every build's three streams (docker build, snapshot per chipset generation)
+  into one; this client therefore never sends the configured name verbatim and appends
+  `/<16 hex>` fresh per create attempt. The build envelope reports the resolved stream,
+  `microvm logs` now labels the three-VM build topology in `data.streams`, and
+  `docs/PLATFORM.md` records the measured finding. Verified live (us-east-1,
+  2026-08-30): a configured build produced exactly `suite-build/<16 hex>` in the
+  configured group, non-empty, with no verbatim-named stream; four permanent
+  conformance checks cover the surface and the suite deletes the group it creates.
+
+- **Lifecycle-hook observations in health and history (#80).** agentd records every
+  platform hook invocation (ready/validate/run/suspend/resume/terminate) in memory —
+  capped at 64, first-N-wins, drops counted — and reports them on `GET /v1/health`
+  (`hooks`/`hooks_dropped`, `#[serde(default)]` for old daemons). The CLI appends
+  unseen observations to the per-VM history JSONL as `hookObserved` events at three
+  moments (`run` teardown, `resume`, `microvm health`), deduplicated on
+  (hook, firedAt). No guest-printed byte reaches a history line, preserving the
+  forgery property; the additive caveat — the unauthenticated loopback hook routes let
+  a workload *add* observations, never remove real ones — is documented in
+  PROTOCOL.md and the history docs. Verified live (us-east-1, 2026-08-30): the run
+  hook appeared on health with a wall-clock-bracketed timestamp, suspend/resume
+  observations surfaced after the thaw, history carried the cycle exactly once each,
+  and a build-time `ready` observation survived from the snapshot VM's memory into
+  the launched VM — the snapshot-survival design expectation, now measured.
+
 ### Changed
+
+- **Sizing vocabulary matches the confirmed platform model (#99).** The service team
+  confirmed (2026-08) there is no vertical scaling: a VM is provisioned at 4x the
+  requested minimum from the start, the minimum is the bill floor (25%), above-minimum
+  usage bills by consumption, and nothing resizes. The repo's "burst" vocabulary —
+  which implies a scaling event that does not exist — is replaced throughout
+  (`sizing.rs`, CLI help, both bindings, `docs/PLATFORM.md`, README) with
+  always-provisioned language, and README's "What it costs" gains the one-paragraph
+  rule: min = floor, 4x min = fixed ceiling, so peaky agent workloads should pick a
+  low minimum and let peaks ride the always-present headroom. The size JSON gains a
+  static `headroomMib` (peak − baseline, read from the table per TRAP-13, never
+  computed). `SizeClass::DEFAULT` stays 2048, re-argued around the ceiling. The cost
+  engine's formula is unchanged — baseline per second, a labelled lower bound, since
+  above-minimum consumption is real but unobservable to this client. A new example
+  `examples/coding-agents-on-bedrock/microvm.toml` ships the low-minimum sizing rule
+  (`memory = 1024`), loader-tested.
 
 - **Dependency rollup (2026-08-29).** 62 lockfile entries moved; two manifest bumps and one
   deliberate hold, plus the toolchain:
