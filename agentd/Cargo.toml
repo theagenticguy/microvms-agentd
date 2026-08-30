@@ -112,7 +112,7 @@ snow = { version = "0.10", default-features = false, features = [
 # Held at 2.x on purpose while snow 0.10 pins curve25519-dalek 4: the 3.0 line moves to
 # curve25519-dalek 5, and taking it puts two copies of the same curve arithmetic in the
 # tree — the exact duplication this crate was chosen to avoid. Revisit when snow bumps.
-x25519-dalek = { version = "2", default-features = false, features = ["static_secrets"] }
+x25519-dalek = { version = "3", default-features = false, features = ["static_secrets"] }
 
 [features]
 # Compiles the fuzz doorway in `fs.rs` (`fuzz_extract`), and nothing else. The
