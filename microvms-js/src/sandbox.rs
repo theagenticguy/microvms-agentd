@@ -78,6 +78,13 @@ pub struct Image {
     /// leaves it behind — "the stack destroyed cleanly" is not "the account is clean". Six
     /// accumulated before anyone noticed.
     pub build_log_group: String,
+    /// The resolved exact log stream this build's logs went to, when `logStream` was
+    /// configured — the configured prefix plus the per-build `/<16 hex>` discriminator the
+    /// client appends. `null` for an unconfigured build (the service names the streams).
+    ///
+    /// The only copy of the resolved name: the discriminator is minted fresh inside the
+    /// create call, so a caller reads it here or never.
+    pub log_stream: Option<String>,
 }
 
 impl Image {
@@ -89,6 +96,7 @@ impl Image {
             state: image.state.clone(),
             baseline_mib: image.size.baseline_mib(),
             build_log_group: image.build_log_group(),
+            log_stream: image.log_stream.clone(),
         }
     }
 }
@@ -210,6 +218,15 @@ pub struct BuildImageOptions {
     /// one, because the inheritance would silently resolve to `/`.
     pub inherit_workdir: Option<bool>,
     pub tags: Option<std::collections::HashMap<String, String>>,
+    /// `logging.cloudWatch.logGroup`, or absent for the service default (a service-created
+    /// group under `/aws/lambda-microvms/<image-name>` with random stream names). The
+    /// build role must grant logs on whatever this names.
+    pub log_group: Option<String>,
+    /// A log-stream name **prefix** inside `logGroup`, never the exact name: the platform
+    /// member is an exact stream name (prefixes unsupported) and one build is three VMs
+    /// writing three streams, so the client appends `/<16 hex>` per build attempt and the
+    /// resolved name comes back on `Image.logStream`. Requires `logGroup`.
+    pub log_stream: Option<String>,
     /// A CloudTrail-readability **label**, defaulting to the image name. Not the token.
     pub token_scope: Option<String>,
 }
@@ -269,6 +286,8 @@ impl BuildImageOptions {
         if let Some(tags) = self.tags {
             request.tags = tags.into_iter().collect::<BTreeMap<_, _>>();
         }
+        request.log_group = self.log_group;
+        request.log_stream = self.log_stream;
         request.token_scope = self.token_scope;
         request
     }

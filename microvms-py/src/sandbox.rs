@@ -60,6 +60,7 @@ pub struct PyImage {
     state: String,
     size: SizeClass,
     build_log_group: String,
+    log_stream: Option<String>,
 }
 
 #[pymethods]
@@ -102,6 +103,19 @@ impl PyImage {
     #[getter]
     fn build_log_group(&self) -> &str {
         &self.build_log_group
+    }
+
+    /// The resolved exact log stream this build's logs went to, when `log_stream` was
+    /// configured on the build — the configured prefix plus the per-build `/<16 hex>`
+    /// discriminator the client appends. `None` for an unconfigured build (the service
+    /// names the streams randomly).
+    ///
+    /// This is the only copy of the resolved name: the discriminator is minted fresh
+    /// inside the create call, so a caller who wants to read their build's logs reads it
+    /// here or never.
+    #[getter]
+    fn log_stream(&self) -> Option<&str> {
+        self.log_stream.as_deref()
     }
 
     fn __repr__(&self) -> String {
@@ -384,6 +398,7 @@ impl PySandbox {
                 state: image.state.clone(),
                 size: image.size,
                 build_log_group: image.build_log_group(),
+                log_stream: image.log_stream.clone(),
             })
         })
     }
@@ -432,6 +447,14 @@ impl PySandbox {
     ///
     /// An `architecture`. The model's enum has exactly one value, so the only thing a field
     /// could express is a rejected request.
+    ///
+    /// # `log_stream` is a prefix, never the exact stream name
+    ///
+    /// The platform's `logging.logStream` member is an EXACT stream name (prefixes
+    /// unsupported), and one build is three VMs writing three streams — so a fixed name
+    /// would collapse every build's logs into one stream. The client appends `/<16 hex>`
+    /// of fresh randomness per build attempt, and the resolved exact name comes back on
+    /// `Image.log_stream`. `log_stream` requires `log_group`.
     #[pyo3(signature = (
         *,
         name,
@@ -446,6 +469,8 @@ impl PySandbox {
         run_hook_timeout=None,
         build_hook_timeout=None,
         tags=None,
+        log_group=None,
+        log_stream=None,
         token_scope=None,
     ))]
     #[allow(
@@ -469,6 +494,8 @@ impl PySandbox {
         run_hook_timeout: Option<PyRunHookTimeout>,
         build_hook_timeout: Option<PyBuildHookTimeout>,
         tags: Option<std::collections::BTreeMap<String, String>>,
+        log_group: Option<String>,
+        log_stream: Option<String>,
         token_scope: Option<String>,
     ) -> PyCoreResult<PyImage> {
         let mut request = CreateImageRequest::new(name, binary, code_artifact_uri, build_role_arn);
@@ -490,6 +517,11 @@ impl PySandbox {
         if let Some(tags) = tags {
             request.tags = tags;
         }
+        // The stream is a *prefix* by core's contract: the create call appends `/<16
+        // hex>` per attempt (one build is three VMs writing three streams under an
+        // exact-name member), and the resolved name comes back on `Image.log_stream`.
+        request.log_group = log_group;
+        request.log_stream = log_stream;
         request.token_scope = token_scope;
 
         let built = self.detached(py, move |sandbox| {
@@ -500,6 +532,7 @@ impl PySandbox {
                 state: image.state.clone(),
                 size: image.size,
                 build_log_group: image.build_log_group(),
+                log_stream: image.log_stream.clone(),
             })
         })?;
         Ok(built)

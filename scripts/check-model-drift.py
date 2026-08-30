@@ -169,6 +169,11 @@ CONSTANT_NAMES = (
     "MAX_TAG_KEY_LEN",
     "MAX_TAG_VALUE_LEN",
     "TAG_COMPONENT_PATTERN",
+    "MAX_LOG_GROUP_LEN",
+    "LOG_GROUP_PATTERN",
+    "MAX_LOG_STREAM_LEN",
+    "LOG_STREAM_PATTERN",
+    "MAX_USER_LOG_STREAM_LEN",
     "MIN_ROLE_ARN_LEN",
     "MAX_ROLE_ARN_LEN",
     "ROLE_ARN_PATTERN",
@@ -708,6 +713,51 @@ def check(src: Source, model: dict[str, Any]) -> Checker:
     # matcher covers both only for as long as they agree.
     for shape in ("TagKey", "TagValue"):
         c.pattern(f"{shape} pattern", shape, src.get("TAG_COMPONENT_PATTERN"))
+
+    # The build-logging pair (issue #98), bound the way the
+    # `RunMicrovmRequestClientTokenString` precedent was: the coverage report named these
+    # shapes unbound, and binding the stream one is what carries the discriminator
+    # arithmetic — the client caps a caller's stream at 495 because it always appends
+    # `/<16 hex>`, and 495 + 17 must equal the shape's max or a legal-looking config is a
+    # ValidationException after the artifact upload.
+    c.bound(
+        "logging.cloudWatch.logGroup max",
+        "CloudWatchLoggingLogGroupString",
+        "max",
+        src.get("MAX_LOG_GROUP_LEN"),
+    )
+    c.bound(
+        "logging.cloudWatch.logGroup min", "CloudWatchLoggingLogGroupString", "min", 1
+    )
+    c.pattern(
+        "logging.cloudWatch.logGroup pattern",
+        "CloudWatchLoggingLogGroupString",
+        src.get("LOG_GROUP_PATTERN"),
+    )
+    c.bound(
+        "logging.cloudWatch.logStream max",
+        "CloudWatchLoggingLogStreamString",
+        "max",
+        src.get("MAX_LOG_STREAM_LEN"),
+    )
+    c.bound(
+        "logging.cloudWatch.logStream min", "CloudWatchLoggingLogStreamString", "min", 1
+    )
+    c.pattern(
+        "logging.cloudWatch.logStream pattern",
+        "CloudWatchLoggingLogStreamString",
+        src.get("LOG_STREAM_PATTERN"),
+    )
+    # The discriminator arithmetic itself, held against the shape's max rather than a
+    # literal: user ceiling + '/' + 16 hex == wire ceiling. If AWS moves the shape, this
+    # names the constant that has to move with it.
+    c.record(
+        "user log-stream ceiling + 17-char discriminator == the shape's max",
+        src.get("MAX_USER_LOG_STREAM_LEN") + 17,
+        model["shapes"]["CloudWatchLoggingLogStreamString"].get("max"),
+        note="the client always appends `/<16 hex>` per create attempt",
+        sides=(src.label, "model"),
+    )
 
     # `RoleArn`. The pattern was already pinned here, against a literal in this file — moved to
     # the client because there is a matcher for it now (`is_valid_role_arn`), so the value has a

@@ -525,6 +525,18 @@ class Image:
         The image ARN, which is what `imageIdentifier` takes.
         """
     @property
+    def log_stream(self, /) -> str |None:
+        """
+        The resolved exact log stream this build's logs went to, when `log_stream` was
+        configured on the build — the configured prefix plus the per-build `/<16 hex>`
+        discriminator the client appends. `None` for an unconfigured build (the service
+        names the streams randomly).
+        
+        This is the only copy of the resolved name: the discriminator is minted fresh
+        inside the create call, so a caller who wants to read their build's logs reads it
+        here or never.
+        """
+    @property
     def name(self, /) -> str: ...
     @property
     def size(self, /) -> SizeClass:
@@ -874,7 +886,7 @@ class Sandbox:
         as [`Self::build_image`] so the bytes a caller puts in the bucket are the bytes the
         build will receive.
         """
-    def build_image(self, /, *, name: str, binary: Sequence[int], code_artifact_uri: str, build_role_arn: str, size: SizeClass |None = None, base_image: BaseImage |None = None, dockerfile: str |None = None, repair_guest_identity: bool = False, inherit_workdir: bool = False, run_hook_timeout: RunHookTimeout |None = None, build_hook_timeout: BuildHookTimeout |None = None, tags: dict[str, str] |None = None, token_scope: str |None = None) -> Image:
+    def build_image(self, /, *, name: str, binary: Sequence[int], code_artifact_uri: str, build_role_arn: str, size: SizeClass |None = None, base_image: BaseImage |None = None, dockerfile: str |None = None, repair_guest_identity: bool = False, inherit_workdir: bool = False, run_hook_timeout: RunHookTimeout |None = None, build_hook_timeout: BuildHookTimeout |None = None, tags: dict[str, str] |None = None, log_group: str |None = None, log_stream: str |None = None, token_scope: str |None = None) -> Image:
         """
         Builds an image and waits for it to become usable.
         
@@ -894,6 +906,14 @@ class Sandbox:
         
         An `architecture`. The model's enum has exactly one value, so the only thing a field
         could express is a rejected request.
+        
+        # `log_stream` is a prefix, never the exact stream name
+        
+        The platform's `logging.logStream` member is an EXACT stream name (prefixes
+        unsupported), and one build is three VMs writing three streams — so a fixed name
+        would collapse every build's logs into one stream. The client appends `/<16 hex>`
+        of fresh randomness per build attempt, and the resolved exact name comes back on
+        `Image.log_stream`. `log_stream` requires `log_group`.
         """
     @property
     def endpoint(self, /) -> str |None:

@@ -242,7 +242,11 @@ pub fn logs<O: std::io::Write, E: std::io::Write>(
              would give it a second path to AWS (CLI-2). The group name is the part that is easy \
              to get wrong — a build role granted /aws/lambda/microvms/* instead of \
              /aws/lambda-microvms/* produces builds that write no logs at all, and every failure \
-             then reads reason=unknown.",
+             then reads reason=unknown. Inside the group, one build is THREE streams — \
+             data.streams labels them by role — with random service-chosen names by default; a \
+             configured logStream collapses all three into one exact stream (the member is not a \
+             prefix), distinguished across builds only by the per-build /<16 hex> suffix this \
+             client appends, and the resolved name is on the build envelope's logStream.",
             args.image_name,
         ),
     )
@@ -253,7 +257,32 @@ pub fn logs<O: std::io::Write, E: std::io::Write>(
     ))
     .with_data("logGroup", json!(group))
     // Explicitly null rather than an empty array, so a consumer cannot read "no events".
-    .with_data("lines", Value::Null))
+    .with_data("lines", Value::Null)
+    // The build topology, labelled by role, so an agent handed this envelope knows what
+    // it is looking for inside the group (issue #98). Measured 2026-08: one image build
+    // runs three VMs and emits three log streams, and `logging.logStream` is an EXACT
+    // stream name — so a configured stream collapses all three into one, distinguishable
+    // across builds only by the per-build `/<16 hex>` suffix this client appends.
+    .with_data(
+        "streams",
+        json!([
+            {
+                "role": "docker-build",
+                "description": "zip pull and docker image build — the VM that assembles \
+                                the image from the code artifact",
+            },
+            {
+                "role": "snapshot-graviton3",
+                "description": "snapshot build for Graviton 3 — the snapshot VM is the \
+                                one that starts the app, so app startup logs are here",
+            },
+            {
+                "role": "snapshot-graviton4",
+                "description": "snapshot build for Graviton 4 — the same snapshot pass \
+                                for the other chipset generation; also starts the app",
+            },
+        ]),
+    ))
 }
 
 /// The whole command surface, derived from the clap tree.
@@ -556,6 +585,45 @@ mod tests {
                 .any(|hint| hint.contains("aws logs tail")),
             "{failure:?}"
         );
+
+        // The build topology, labelled by role (issue #98): one build is three VMs and
+        // three streams, and the envelope is where an agent learns what to look for
+        // inside the group. Exactly three, each with a role and a description, and the
+        // three roles are the measured ones — the snapshot VMs are the ones that start
+        // the app, so the descriptions have to say where app logs land.
+        let streams = failure.data["streams"].as_array().expect("a streams array");
+        assert_eq!(streams.len(), 3, "one build is exactly three streams");
+        let roles: Vec<&str> = streams
+            .iter()
+            .map(|stream| stream["role"].as_str().expect("a role"))
+            .collect();
+        assert_eq!(
+            roles,
+            ["docker-build", "snapshot-graviton3", "snapshot-graviton4"]
+        );
+        for stream in streams {
+            assert!(
+                stream["description"]
+                    .as_str()
+                    .is_some_and(|text| !text.is_empty()),
+                "every role carries a description: {stream}"
+            );
+        }
+        assert!(
+            streams[1]["description"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("starts the app"),
+            "the snapshot VM is the one that starts the app, and the topology has to \
+             say so: {streams:?}"
+        );
+        // The collapse hazard is in the message: a configured logStream is an exact
+        // name, not a prefix, and only the per-build suffix keeps builds apart.
+        assert!(
+            failure.message.contains("collapses all three"),
+            "{failure:?}"
+        );
+        assert!(failure.message.contains("/<16 hex>"), "{failure:?}");
     }
 
     /// `constants` emits the bare object as its text rendering, keyed for the drift gate.

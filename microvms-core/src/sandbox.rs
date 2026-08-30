@@ -610,10 +610,17 @@ impl Sandbox {
     pub async fn build_image(&mut self, request: CreateImageRequest) -> Result<&Image, Error> {
         let size = request.size;
         let created = self.control.create_image(request).await?;
-        let built = self
+        let mut built = self
             .control
             .wait_for_image(&created.identifier, size, WaitOpts::default())
             .await?;
+        // The logging config survives the wait from the create's own record, because the
+        // readback cannot carry it: `GetMicrovmImage` reports no logging member, and the
+        // resolved log stream's discriminator was minted inside `create_image` — this is
+        // the only copy, and dropping it here would leave the caller unable to name the
+        // stream their build wrote to.
+        built.log_group = created.log_group;
+        built.log_stream = created.log_stream;
         // Recorded before any launch, because a built image exists whether or not anything
         // is ever run from it — and the teardown has to be able to name it either way.
         self.image_exists = true;

@@ -110,6 +110,37 @@ pub fn run_token(scope: &str) -> String {
     mint(Verb::Run, scope, &nonce_bytes())
 }
 
+/// A caller's log-stream prefix with a fresh per-build discriminator: `<prefix>/<16 hex>`.
+///
+/// # The same mechanism as the token nonce, for the same class of reason
+///
+/// `logging.cloudWatch.logStream` is an **exact** stream name on the wire — prefixes are
+/// unsupported (docs/PLATFORM.md, 'An image build is three VMs and three log streams') —
+/// and one image build emits three log streams. A caller's fixed name sent verbatim
+/// collapses all three of every build, concurrent builds of different images included,
+/// into one stream nothing can tell apart. So the caller's value is a prefix by contract
+/// ([`crate::control::CreateImageRequest::log_stream`]), and this appends eight bytes of
+/// fresh CSPRNG rendered as sixteen hex characters per create attempt — the exact nonce
+/// [`create_token`] folds into an idempotency token, reused rather than reinvented.
+///
+/// The arithmetic that keeps the result legal is `MAX_USER_LOG_STREAM_LEN`'s: the caller's
+/// prefix is capped at 495 before this runs, so `495 + 1 + 16` is exactly the shape's 512
+/// ceiling. The debug assertion holds that rather than trusting it.
+pub(crate) fn resolve_log_stream(prefix: &str) -> String {
+    let nonce = nonce_bytes();
+    let mut resolved = String::with_capacity(prefix.len() + 1 + nonce.len() * 2);
+    resolved.push_str(prefix);
+    resolved.push('/');
+    resolved.push_str(&const_hex::encode(nonce));
+    debug_assert!(
+        resolved.len() <= crate::constants::MAX_LOG_STREAM_LEN,
+        "resolved a {}-character stream name, over the {} ceiling: {resolved}",
+        resolved.len(),
+        crate::constants::MAX_LOG_STREAM_LEN,
+    );
+    resolved
+}
+
 /// The one place a token is assembled, with the randomness passed in.
 ///
 /// Split from the two public functions so a test can drive the *format* with a fixed
@@ -371,6 +402,46 @@ mod tests {
             prop_assert_ne!(create_token(&scope), create_token(&scope));
             prop_assert_ne!(run_token(&scope), run_token(&scope));
         }
+    }
+
+    /// A resolved log stream is the caller's prefix, a `/`, and sixteen hex characters —
+    /// never the prefix verbatim — and two resolutions of one prefix differ.
+    ///
+    /// The distinctness is the whole point: one image build is three VMs writing three
+    /// streams under an exact-name member, so a resolution that could repeat would
+    /// collapse two builds' streams the way a verbatim name collapses every build's.
+    ///
+    /// **Falsification** — return `prefix.to_string()` from `resolve_log_stream` and the
+    /// format assertions and the distinctness assertion all go red.
+    #[test]
+    fn a_resolved_log_stream_carries_the_prefix_a_slash_and_sixteen_fresh_hex() {
+        let first = resolve_log_stream("ci-image");
+        let second = resolve_log_stream("ci-image");
+
+        for resolved in [&first, &second] {
+            assert!(resolved.starts_with("ci-image/"), "{resolved}");
+            let suffix = &resolved["ci-image/".len()..];
+            assert_eq!(suffix.len(), TOKEN_NONCE_HEX_LEN, "{resolved}");
+            assert!(
+                suffix.bytes().all(|b| b.is_ascii_hexdigit()),
+                "the discriminator is hex: {resolved}"
+            );
+            assert_ne!(resolved.as_str(), "ci-image", "never the prefix verbatim");
+        }
+        assert_ne!(
+            first, second,
+            "two creates from one request must resolve to two streams, or concurrent \
+             builds collapse into one"
+        );
+    }
+
+    /// The worst legal prefix — `MAX_USER_LOG_STREAM_LEN` characters — resolves to exactly
+    /// the shape's 512 ceiling, which is the arithmetic the 495 cap exists to hold.
+    #[test]
+    fn the_longest_legal_prefix_resolves_to_exactly_the_shapes_ceiling() {
+        let prefix = "s".repeat(crate::constants::MAX_USER_LOG_STREAM_LEN);
+        let resolved = resolve_log_stream(&prefix);
+        assert_eq!(resolved.len(), crate::constants::MAX_LOG_STREAM_LEN);
     }
 
     /// The randomness source produces distinct draws. A `nonce_bytes` that returned a

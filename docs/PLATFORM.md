@@ -587,6 +587,44 @@ then reports `reason=unknown` — which reads as the service failing to populate
 Build roles also need ECR permissions if any task points `docker_image` at a
 same-account ECR repository; without them the build fails outright.
 
+## An image build is three VMs and three log streams, and `logStream` is an exact name
+
+Measured 2026-08, us-east-1, API version 2025-09-09.
+
+One `CreateMicrovmImage` runs **three VMs**, each emitting its own log stream:
+
+1. **docker-build** — zip pull and docker image build, the VM that assembles the image
+   from the code artifact.
+2. **snapshot build for Graviton 3** — boots the image and snapshots it. The snapshot VM
+   is the one that **starts the app**, so application startup logs land here.
+3. **snapshot build for Graviton 4** — the same snapshot pass for the other chipset
+   generation; also starts the app.
+
+With no logging configuration (the default), the service creates a new log group per
+image and each stream gets a random name.
+
+The request's `logging` member (`{"disabled": {}} | {"cloudWatch": {logGroup, logStream}}`
+in the model) changes that — and its `logStream` is an **exact stream name, never a
+prefix**. Prefixes are unsupported (a feature request is filed). Setting both `logGroup`
+and `logStream` therefore collapses all three of a build's streams into **one** stream —
+and successive or concurrent builds of different images become indistinguishable inside
+it, because every build writes to the same exact name.
+
+This client's response is a per-build discriminator: it **never sends a configured
+`logStream` verbatim**. The configured value is treated as a family prefix and the wire
+carries `<configured>/<16 hex>` with fresh CSPRNG per create attempt (the same nonce
+mechanism as the `clientToken`, which is the other permanent-name trap on this call). The
+resolved exact name is returned on the create result and on `microvm build`'s envelope as
+`logStream`, because the discriminator exists nowhere else. A configured value is
+therefore capped at 495 characters — the shape's 512 minus the suffix's 17 — and refused
+when it carries `:` or `*` (the shape's pattern is `[^:*]*`).
+
+A configured `logGroup` must still be somewhere the build role can write:
+`logs:CreateLogGroup`/`CreateLogStream`/`PutLogEvents` on the group, or the build writes
+no logs at all — the same silent outcome as the wrong-prefix policy above. The
+conformance account grants `/aws/lambda-microvms/*` only, so configured groups there stay
+under that prefix.
+
 ## A failed build's `stateReason` lives on the **build**, not on the version or the image
 
 Measured 2026-08-15, us-east-1, against a deliberately failing Dockerfile (`RUN … && exit

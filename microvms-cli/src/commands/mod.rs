@@ -139,6 +139,10 @@ pub const RESPONSE_TYPES: [(&str, &str, &[&str]); 20] = [
             "imageIdentifier",
             "imageName",
             "buildLogGroup",
+            // The RESOLVED exact log stream — the configured prefix plus the per-build
+            // `/<16 hex>` discriminator — or null when no `--log-stream` was configured.
+            // This envelope is the only place the resolved name exists (issue #98).
+            "logStream",
             "size",
             // Always present, `false` for a plain build: `true` means `--reuse` matched
             // an existing image by content-hash name and nothing was built.
@@ -242,7 +246,7 @@ pub const RESPONSE_TYPES: [(&str, &str, &[&str]); 20] = [
     ),
     ("ls", "microvm.runs", &["runs"]),
     ("history", "microvm.history", &["microvmId", "events"]),
-    ("logs", "microvm.logs", &["logGroup", "lines"]),
+    ("logs", "microvm.logs", &["logGroup", "lines", "streams"]),
     ("cost", "microvm.cost", &["report", "comparison"]),
     ("doctor", "microvm.doctor", &["checks", "ok"]),
     (

@@ -70,16 +70,37 @@ pub struct Image {
     /// Carried on the image because billing follows the baseline requested at *create*
     /// time, and by the time anyone asks what a run cost the request is gone.
     pub size: SizeClass,
+    /// The build log group the create call configured, or `None` for the service default
+    /// ([`Image::build_log_group`]'s derivation).
+    ///
+    /// Carried for the same reason `size` is: by the time anyone asks where the build's
+    /// logs went, the request is gone.
+    pub log_group: Option<String>,
+    /// The **resolved** exact log stream the create call configured — the caller's prefix
+    /// plus `/` plus the sixteen-hex per-build discriminator — or `None` when no stream
+    /// was configured.
+    ///
+    /// This is the only place the resolved name exists: the discriminator is minted fresh
+    /// inside [`ControlPlane::create_image`], so a caller who wants to read their build's
+    /// logs has to read the name off this field rather than re-deriving it. The CLI's
+    /// build envelope reports it as `logStream` for exactly that reason.
+    pub log_stream: Option<String>,
 }
 
 impl Image {
+    /// The configured build log group, or the derived default
     /// `/aws/lambda-microvms/<image-name>`.
     ///
-    /// The service creates this itself, so a Terraform stack never owns it and `terraform
-    /// destroy` leaves it behind — "the stack destroyed cleanly" is not "the account is
-    /// clean". Six of these accumulated before anyone noticed.
+    /// The default is the group the service creates itself, so a Terraform stack never
+    /// owns it and `terraform destroy` leaves it behind — "the stack destroyed cleanly"
+    /// is not "the account is clean". Six of these accumulated before anyone noticed. A
+    /// configured group ([`crate::control::CreateImageRequest::log_group`]) replaces the
+    /// derivation, because the derived name is then a group no build ever writes to.
     pub fn build_log_group(&self) -> String {
-        format!("{BUILD_LOG_GROUP_PREFIX}/{}", self.name)
+        match &self.log_group {
+            Some(group) => group.clone(),
+            None => format!("{BUILD_LOG_GROUP_PREFIX}/{}", self.name),
+        }
     }
 
     /// Whether the state the service reported means "built and usable".
@@ -157,6 +178,19 @@ impl ControlPlane {
     pub async fn create_image(&self, request: CreateImageRequest) -> Result<Image, Error> {
         self.preflight(&request)?;
 
+        // The discriminator rule: a configured logStream never reaches the wire verbatim.
+        // The member is an EXACT stream name (prefixes unsupported) and one build is three
+        // VMs writing three streams, so a verbatim name collapses every build's streams
+        // into one — this suffixes `/<16 hex>` of fresh CSPRNG per create attempt, the
+        // same mechanism as the clientToken nonce below (docs/PLATFORM.md, 'An image
+        // build is three VMs and three log streams'). Resolved here, once, so the value
+        // on the wire and the value returned to the caller are the same string.
+        let resolved_stream = request.log_stream.as_deref().map(token::resolve_log_stream);
+        let logging = request
+            .log_group
+            .as_deref()
+            .map(|group| ops::Logging::cloud_watch(group, resolved_stream.clone()));
+
         let wire = ops::CreateMicrovmImageWire {
             name: request.name.clone(),
             base_image_arn: request.base_image.arn(&self.region),
@@ -183,6 +217,7 @@ impl ControlPlane {
             additional_os_capabilities: request
                 .repair_guest_identity
                 .then(|| vec![crate::constants::CAPABILITIES[0].to_string()]),
+            logging,
             tags: (!request.tags.is_empty()).then(|| request.tags.clone()),
             // TRAP-1: minted here, from a label. Never from the caller.
             client_token: token::create_token(
@@ -200,6 +235,10 @@ impl ControlPlane {
             version: created.image_version,
             state: created.state,
             size: request.size,
+            log_group: request.log_group.clone(),
+            // The resolved name, discriminator included, so the caller can find their
+            // logs — the wire value is the only copy and it was minted here.
+            log_stream: resolved_stream,
         })
     }
 
@@ -241,6 +280,28 @@ impl ControlPlane {
         // against.
         if let Some(version) = request.base_image_version.as_deref() {
             super::require_valid_version("baseImageVersion", version)?;
+        }
+
+        // The logging pair, when configured. The stream requires the group because a
+        // stream inside a group the service names randomly is a stream whose location
+        // nobody can predict — the configured pair is the whole point of configuring.
+        // Both checked here for the create-after-upload ordering everything else in this
+        // list is about.
+        if let Some(group) = request.log_group.as_deref() {
+            super::require_valid_log_group(group)?;
+        }
+        if let Some(stream) = request.log_stream.as_deref() {
+            if request.log_group.is_none() {
+                return Err(Error::invalid_arg(
+                    "logging.cloudWatch.logStream was configured with no logGroup. The \
+                     stream lives inside the group, and with no group configured the \
+                     service creates one with random stream names — so a configured \
+                     stream alone names a location that does not exist. Configure the \
+                     group too, or drop the stream."
+                        .to_string(),
+                ));
+            }
+            super::require_valid_log_stream(stream)?;
         }
 
         // Every remaining member the model constrains, in the order the request lists them.
@@ -309,6 +370,12 @@ impl ControlPlane {
                     version: got.latest_active_image_version.unwrap_or_default(),
                     state: got.state,
                     size,
+                    // `None`, not "unknown": `GetMicrovmImage` reports no logging config,
+                    // so the wait cannot know one. The create call is the only place the
+                    // resolved stream exists, and `Sandbox::build_image` carries the
+                    // create's values across this readback for that reason.
+                    log_group: None,
+                    log_stream: None,
                 });
             }
             if Image::is_failed(&got.state) {
@@ -1311,6 +1378,249 @@ mod tests {
         assert_ne!(tokens[0], tokens[1], "the label is not the token");
     }
 
+    /// **The discriminator rule, observed on the wire.** A configured log stream reaches
+    /// `CreateMicrovmImage` as `<user value>/<16 hex>` — never verbatim — and the resolved
+    /// name on the returned [`Image`] is byte-identical to what went out.
+    ///
+    /// Asserted on the serialized body through the recorder's generic JSON view, because
+    /// the claim is about what the service sees: the member is an exact stream name, one
+    /// build is three VMs writing three streams, and a verbatim configured name collapses
+    /// them all (docs/PLATFORM.md, 'An image build is three VMs and three log streams').
+    ///
+    /// **Falsification** — pass `request.log_stream` straight into `Logging::cloud_watch`
+    /// instead of through `token::resolve_log_stream` and the suffix assertions go red
+    /// with the verbatim name on the wire. Done 2026-08-30; failed as stated; restored.
+    #[tokio::test]
+    async fn a_configured_log_stream_reaches_the_wire_with_a_fresh_discriminator() {
+        let (plane, fake, _) = planted();
+        fake.answer(
+            "CreateMicrovmImage",
+            Answer::created(fake::create_image_response("img")),
+        );
+        let mut request = a_request();
+        request.log_group = Some("/aws/lambda-microvms/conformance-builds".to_string());
+        request.log_stream = Some("ci-image".to_string());
+
+        let image = plane.create_image(request).await.expect("creates");
+
+        let body = fake.first_body("CreateMicrovmImage");
+        assert_eq!(
+            body["logging"]["cloudWatch"]["logGroup"],
+            "/aws/lambda-microvms/conformance-builds"
+        );
+        let wire_stream = body["logging"]["cloudWatch"]["logStream"]
+            .as_str()
+            .expect("a stream was sent");
+        assert_ne!(
+            wire_stream, "ci-image",
+            "the caller's value must never reach the wire verbatim"
+        );
+        assert!(
+            wire_stream.starts_with("ci-image/"),
+            "the caller's value survives as the prefix: {wire_stream}"
+        );
+        let suffix = &wire_stream["ci-image/".len()..];
+        assert_eq!(suffix.len(), 16, "{wire_stream}");
+        assert!(
+            suffix.bytes().all(|b| b.is_ascii_hexdigit()),
+            "the discriminator is sixteen hex characters: {wire_stream}"
+        );
+
+        // The resolved name is threaded back, byte-identical to the wire's — this is the
+        // only copy of the discriminator, so the caller reads it here or never.
+        assert_eq!(image.log_stream.as_deref(), Some(wire_stream));
+        assert_eq!(
+            image.log_group.as_deref(),
+            Some("/aws/lambda-microvms/conformance-builds")
+        );
+        assert_eq!(
+            image.build_log_group(),
+            "/aws/lambda-microvms/conformance-builds",
+            "a configured group replaces the derived default"
+        );
+    }
+
+    /// Two creates from the **same** request resolve two different streams — the
+    /// per-attempt property, which is what keeps successive builds of one image apart.
+    ///
+    /// The same claim `recreating_the_same_image_name_emits_two_distinct_client_tokens`
+    /// makes for the token, on the surface that reuses its nonce.
+    #[tokio::test]
+    async fn two_creates_from_one_request_resolve_two_different_streams() {
+        let (plane, fake, _) = planted();
+        fake.answer(
+            "CreateMicrovmImage",
+            Answer::created(fake::create_image_response("img")),
+        );
+        let mut request = a_request();
+        request.log_group = Some("/aws/lambda-microvms/builds".to_string());
+        request.log_stream = Some("ci".to_string());
+
+        let first = plane
+            .create_image(request.clone())
+            .await
+            .expect("first create");
+        let second = plane.create_image(request).await.expect("second create");
+
+        assert_ne!(
+            first.log_stream, second.log_stream,
+            "a repeated stream name collapses two builds' logs into one"
+        );
+
+        let streams: Vec<String> = fake
+            .bodies_as_text()
+            .iter()
+            .filter_map(|body| {
+                serde_json::from_str::<serde_json::Value>(body)
+                    .ok()
+                    .map(|v| {
+                        v["logging"]["cloudWatch"]["logStream"]
+                            .as_str()
+                            .unwrap_or_default()
+                            .to_string()
+                    })
+            })
+            .filter(|stream| !stream.is_empty())
+            .collect();
+        assert_eq!(streams.len(), 2, "both creates carried a stream");
+        assert_ne!(streams[0], streams[1], "distinct on the wire too");
+    }
+
+    /// A create with no logging config serialises **no** `logging` member at all —
+    /// absent, not null — so an unconfigured build emits byte-for-byte the request this
+    /// client always sent.
+    #[tokio::test]
+    async fn an_unconfigured_build_serialises_no_logging_member() {
+        let (plane, fake, _) = planted();
+        fake.answer(
+            "CreateMicrovmImage",
+            Answer::created(fake::create_image_response("img")),
+        );
+        let image = plane.create_image(a_request()).await.expect("creates");
+
+        let body = fake.first_body("CreateMicrovmImage");
+        assert!(
+            body.get("logging").is_none(),
+            "absent, not null: an absent member takes the service default: {body}"
+        );
+        assert_eq!(image.log_group, None);
+        assert_eq!(image.log_stream, None);
+        assert_eq!(
+            image.build_log_group(),
+            "/aws/lambda-microvms/img",
+            "no configured group means the derived default"
+        );
+    }
+
+    /// A group with no stream sends the group alone, and the service names the streams:
+    /// the `logStream` member is omitted rather than sent empty or invented.
+    #[tokio::test]
+    async fn a_group_without_a_stream_sends_the_group_alone() {
+        let (plane, fake, _) = planted();
+        fake.answer(
+            "CreateMicrovmImage",
+            Answer::created(fake::create_image_response("img")),
+        );
+        let mut request = a_request();
+        request.log_group = Some("/aws/lambda-microvms/builds".to_string());
+
+        let image = plane.create_image(request).await.expect("creates");
+        let body = fake.first_body("CreateMicrovmImage");
+        assert_eq!(
+            body["logging"]["cloudWatch"]["logGroup"],
+            "/aws/lambda-microvms/builds"
+        );
+        assert!(
+            body["logging"]["cloudWatch"].get("logStream").is_none(),
+            "no configured stream, no invented one: {body}"
+        );
+        assert_eq!(image.log_stream, None);
+    }
+
+    /// The log-stream pattern's two forbidden characters are refused locally, with zero
+    /// calls, naming the platform pattern — and the length checks bracket the caller's
+    /// 495 ceiling.
+    ///
+    /// 495 rather than the shape's 512, because the discriminator needs its 17 characters:
+    /// the boundary cases assert that 495 passes and 496 is refused with the arithmetic in
+    /// the message.
+    #[tokio::test]
+    async fn an_illegal_log_stream_is_refused_before_any_call() {
+        for (label, stream, named) in [
+            ("a colon", "ci:image".to_string(), "[^:*]*"),
+            ("a star", "ci-*".to_string(), "[^:*]*"),
+            ("over the caller ceiling", "s".repeat(496), "495"),
+        ] {
+            let (plane, fake, _) = planted();
+            let mut request = a_request();
+            request.log_group = Some("/aws/lambda-microvms/builds".to_string());
+            request.log_stream = Some(stream);
+
+            let error = plane.create_image(request).await.expect_err(label);
+            assert_eq!(error.kind(), ErrorKind::InvalidArg, "{label}");
+            assert_eq!(error.code(), "ERR_INVALID_ARG", "{label}");
+            assert!(
+                error.to_string().contains(named),
+                "{label}: the refusal must name the constraint: {error}"
+            );
+            assert_eq!(fake.calls().len(), 0, "{label}: nothing reached the wire");
+        }
+
+        // The boundary passes: 495 characters resolve to exactly the shape's 512.
+        let (plane, fake, _) = planted();
+        fake.answer(
+            "CreateMicrovmImage",
+            Answer::created(fake::create_image_response("img")),
+        );
+        let mut request = a_request();
+        request.log_group = Some("g".to_string());
+        request.log_stream = Some("s".repeat(495));
+        let image = plane.create_image(request).await.expect("495 is legal");
+        assert_eq!(
+            image.log_stream.expect("resolved").len(),
+            512,
+            "the longest legal prefix resolves to exactly the shape's ceiling"
+        );
+    }
+
+    /// An illegal log group is refused locally too, with the pattern named — the colon
+    /// case is a pasted ARN, which is the mistake the message calls out.
+    #[tokio::test]
+    async fn an_illegal_log_group_is_refused_before_any_call() {
+        for (label, group) in [
+            (
+                "a pasted ARN",
+                "arn:aws:logs:us-east-1:1:log-group:g".to_string(),
+            ),
+            ("a space", "my builds".to_string()),
+            ("over the ceiling", "g".repeat(513)),
+            ("empty", String::new()),
+        ] {
+            let (plane, fake, _) = planted();
+            let mut request = a_request();
+            request.log_group = Some(group);
+
+            let error = plane.create_image(request).await.expect_err(label);
+            assert_eq!(error.kind(), ErrorKind::InvalidArg, "{label}");
+            assert_eq!(fake.calls().len(), 0, "{label}: nothing reached the wire");
+        }
+    }
+
+    /// A stream with no group is refused: the stream lives inside the group, and with no
+    /// group configured the service creates one with random stream names, so the
+    /// configured stream would name a location that does not exist.
+    #[tokio::test]
+    async fn a_stream_without_a_group_is_refused_before_any_call() {
+        let (plane, fake, _) = planted();
+        let mut request = a_request();
+        request.log_stream = Some("ci".to_string());
+
+        let error = plane.create_image(request).await.expect_err("refused");
+        assert_eq!(error.kind(), ErrorKind::InvalidArg);
+        assert!(error.to_string().contains("logGroup"), "{error}");
+        assert_eq!(fake.calls().len(), 0);
+    }
+
     /// A name the service would reject never reaches the wire, so the caller does not pay
     /// for the artifact upload first.
     #[tokio::test]
@@ -1380,8 +1690,16 @@ mod tests {
     #[tokio::test]
     async fn preflight_and_create_image_refuse_identically_with_zero_calls() {
         type Breakage = Box<dyn Fn(&mut CreateImageRequest)>;
-        let broken: [(&str, Breakage); 5] = [
+        let broken: [(&str, Breakage); 7] = [
             ("an invalid name", Box::new(|r| r.name = "my.image".into())),
+            (
+                "a log group with a colon",
+                Box::new(|r| r.log_group = Some("arn:aws:logs:g".into())),
+            ),
+            (
+                "a log stream with no group",
+                Box::new(|r| r.log_stream = Some("ci".into())),
+            ),
             (
                 "a mismatched FROM",
                 Box::new(|r| r.dockerfile = Some("FROM ubuntu:24.04\nCMD [\"/agentd\"]\n".into())),
@@ -2035,6 +2353,8 @@ mod tests {
             version: "1".to_string(),
             state: "CREATED".to_string(),
             size: SizeClass::DEFAULT,
+            log_group: None,
+            log_stream: None,
         };
         assert_eq!(
             image.build_log_group(),
