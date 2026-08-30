@@ -174,6 +174,7 @@ mod tests {
                 out: &mut out,
                 infra: Infra::default(),
                 env: &env,
+                fetch: &crate::provision::PanickingFetch,
             };
             cost(&mut ctx, &args)
         };

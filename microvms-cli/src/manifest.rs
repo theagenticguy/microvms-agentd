@@ -277,8 +277,8 @@ mod tests {
         assert_eq!(listed, registered);
         assert_eq!(
             listed.len(),
-            20,
-            "the lifecycle six, the attached seven, and the local seven"
+            21,
+            "the lifecycle seven (quickstart included), the attached seven, and the local seven"
         );
     }
 
@@ -534,6 +534,7 @@ mod tests {
         let rendered = render(&manifest, false);
         for name in [
             "run",
+            "quickstart",
             "build",
             "exec",
             "health",
@@ -550,11 +551,11 @@ mod tests {
         for code in ["ERR_INVALID_ARG", "ERR_EXEC_FAILED", "ERR_INTERRUPTED"] {
             assert!(rendered.contains(code), "{code} missing");
         }
-        assert!(rendered.contains("20 commands"), "{rendered}");
+        assert!(rendered.contains("21 commands"), "{rendered}");
 
         // The dense rendering is one line per command with its parameters.
         let dense = render(&manifest, true);
-        assert_eq!(dense.lines().count(), 20);
+        assert_eq!(dense.lines().count(), 21);
         assert!(
             dense
                 .lines()

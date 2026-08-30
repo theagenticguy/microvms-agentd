@@ -100,6 +100,15 @@ pub enum Command {
     /// opts out and prints the identifiers you have just taken responsibility for.
     Run(RunArgs),
 
+    /// Zero to a live exec: provision the daemon, build, launch, run, report, tear down.
+    ///
+    /// `run` with every decision already made (issue #75): the daemon binary is
+    /// provisioned from this CLI's own release, the exec defaults to a hello-world, and
+    /// nothing survives the invocation. Needs AWS credentials and the three MICROVM_*
+    /// values from the Quick start; everything else is a default a first run should not
+    /// have to choose. Once this works, `run` is the same thing with the knobs exposed.
+    Quickstart(QuickstartArgs),
+
     /// Build a MicroVM image and wait for it to be usable.
     ///
     /// Separate from `run` for the case where one image serves many launches, which is the
@@ -521,16 +530,23 @@ pub struct InfraFlags {
 
 #[derive(Args, Clone, Debug)]
 pub struct RunArgs {
-    /// The aarch64 agentd binary to bake in — or a directory to sync (issue #72).
+    /// A directory to sync (issue #72), or an agentd binary to bake in.
+    ///
+    /// **Omitted while building** (no --image), the CLI provisions the daemon itself: its
+    /// own version's release asset, provenance-verified through `gh attestation verify`
+    /// when `gh` is on PATH (the release's SHA256SUMS otherwise), cached under the state
+    /// directory. `microvm run --exec "…"` on a fresh machine is the headline spelling,
+    /// and no caller should need to hold a path to this product's own component.
     ///
     /// A positional that names a *directory* switches run into sync mode: the tree is
     /// packed (skipping `.git`, symlinks preserved), uploaded to /workspace in the VM,
     /// the exec runs with /workspace as its working directory, and the members matching
     /// the config's `artifacts` globs are brought back into the directory afterwards —
-    /// `microvm run .` is the headline spelling. A positional that names a file is the
-    /// daemon binary to bake in as the image CMD, ignored when --image names an image
-    /// to launch instead of building one. The two readings cannot collide: a path is a
-    /// directory or it is not.
+    /// `microvm run . --image <name>` is that spelling. A positional that names a file
+    /// is a daemon binary you built or manage yourself, ignored when --image names an
+    /// image to launch instead of building one. The readings cannot collide: a path is
+    /// a directory or it is not, and $MICROVM_AGENTD covers the file case with no
+    /// positional at all.
     #[arg(value_name = "BINARY_OR_DIR")]
     pub binary: Option<PathBuf>,
 
@@ -747,11 +763,50 @@ pub struct RunArgs {
     pub infra: InfraFlags,
 }
 
+/// `quickstart`'s three knobs — everything else is deliberately a `run` default.
+///
+/// The struct stays this small on purpose: every flag added here is a decision the first
+/// run was supposed to not need, and the command's doc sends anyone who wants a knob to
+/// `run`, where all of them live.
+#[derive(Args, Debug)]
+pub struct QuickstartArgs {
+    /// The command to run inside the first VM.
+    #[arg(
+        long,
+        value_name = "COMMAND",
+        default_value = "echo hello from a microvm"
+    )]
+    pub exec: String,
+
+    /// Where the run ledger and the provisioned-daemon cache live. Defaults to
+    /// $MICROVM_STATE_DIR or ~/.microvm/runs.
+    #[arg(long)]
+    pub state_dir: Option<PathBuf>,
+
+    #[command(flatten)]
+    pub region: RegionFlags,
+
+    #[command(flatten)]
+    pub infra: InfraFlags,
+}
+
 #[derive(Args, Debug)]
 pub struct BuildArgs {
     /// The aarch64 agentd binary to bake in as the image CMD.
+    ///
+    /// Omitted, the CLI provisions its own version's release asset — verified provenance
+    /// through `gh attestation verify` when `gh` is on PATH, the release's SHA256SUMS
+    /// otherwise — and caches it under the state directory. Pass a path for a daemon you
+    /// built or manage yourself; $MICROVM_AGENTD does the same without touching the
+    /// command line.
     #[arg(value_name = "BINARY")]
-    pub binary: PathBuf,
+    pub binary: Option<PathBuf>,
+
+    /// Where the provisioned-daemon cache lives. Defaults to $MICROVM_STATE_DIR or
+    /// ~/.microvm/runs — the same directory `run`'s ledger uses, so the two commands
+    /// share one cache.
+    #[arg(long)]
+    pub state_dir: Option<PathBuf>,
 
     /// Where the build artifact already is, as an s3:// URI. See `run --artifact-uri`.
     #[arg(long, value_name = "S3_URI")]
@@ -1621,6 +1676,7 @@ mod tests {
             registered,
             [
                 "run",
+                "quickstart",
                 "build",
                 "exec",
                 "health",

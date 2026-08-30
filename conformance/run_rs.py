@@ -6,7 +6,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Live conformance run driving the **Rust** client stack through the `microvm` CLI.
 
-This is the only live suite, and it now expresses **every named check** — 113 of them, with
+This is the only live suite, and it now expresses **every named check** — 118 of them, with
 none recorded SKIP. `conformance/run.py` was the oracle — 56 checks through the Python
 client — and it went away with that client once both suites ran green against real AWS on
 the same commit (Python 56/56, this one 38/38 with 34 recorded SKIP). Those 34 were the
@@ -97,6 +97,15 @@ Live because the claim is about what the service recorded: the discriminator's w
 point is what CloudWatch ends up holding, and no fake can say the platform accepted the
 suffixed name. The configured group rides `drive_teardown`'s `extra_log_groups`, since
 the CLI's terminate derives only the default group name and cannot know to name this one.
+
+118 rather than 113: `drive_provisioned_quickstart` adds five for the self-provisioning
+chain and issue #75 — one `microvm quickstart` on a fresh state directory, which is the
+one section with its own build because provisioning fires only when building. Live
+because the local guards script the fetch: nothing local proves the real release carries
+the asset, that `gh attestation verify` accepts it, or that the fetched bytes boot a real
+VM. Version-coupled on purpose (the fetch targets `v{CLI version}`), so between a version
+bump on main and that version's release publishing, this section fails naming the missing
+tag — the calendar, not the code.
 
 A hybrid driver, and both lanes are deliberate
 ----------------------------------------------
@@ -2264,6 +2273,93 @@ def drive_config_and_sync(
     # itself part of what this section exercises — the teardown path after a download.
 
 
+def drive_provisioned_quickstart(
+    cli: Cli, state: Path, logs: Any, results: Results
+) -> None:
+    """`microvm quickstart` on a fresh state directory: the self-provisioning surface.
+
+    One invocation covers both new surfaces at once — the provisioning chain (a run
+    with no binary fetches this CLI's own version's release asset, verifies it, caches
+    it under the state directory) and `quickstart` itself (issue #75). Live rather
+    than only scripted for the id-prefix lesson's reason: the local guards script the
+    fetch, so nothing local ever proves the real release carries the asset, that `gh`
+    or the SHA256SUMS path verifies it, or that the fetched bytes boot a real VM. This
+    is the one place the whole chain runs against the things it actually talks to.
+
+    The fetch targets `v{CLI version}`, so between a version bump landing on main and
+    that version's release publishing, this section fails with the fetch error naming
+    the missing tag. That failure is the calendar, not the code — run the suite again
+    once the release exists.
+
+    Its own build (~3 minutes): provisioning fires only when building, so no launch
+    from the suite's image can carry it. Teardown is quickstart's default, and the
+    teardown-left-nothing check is asserted off the same envelope.
+    """
+    print("\n== quickstart (self-provisioned daemon, own build) ==")
+    envelope = cli.call(
+        "quickstart",
+        "--state-dir",
+        str(state),
+        "--region",
+        cli.region,
+        timeout=50 * 60,
+    )
+    results.eq(
+        "quickstart emitted the run envelope shape", envelope.type, "microvm.run"
+    )
+
+    agentd = envelope.data.get("agentd") or {}
+    results.check(
+        "a run with no binary provisioned the daemon from the release",
+        agentd.get("source") == "fetched"
+        and agentd.get("verified") in ("attestation", "checksum"),
+        f"source={agentd.get('source')!r} verified={agentd.get('verified')!r}",
+    )
+
+    # The cached install, read off this machine rather than trusted from the envelope:
+    # twenty bytes of header is the same gate the CLI ran, asserted independently.
+    cached = Path(str(agentd.get("path") or state / "missing"))
+    machine = None
+    if cached.exists():
+        header = cached.read_bytes()[:20]
+        if header[:4] == b"\x7fELF" and len(header) >= 20:
+            order = "little" if header[5] == 1 else "big"
+            machine = int.from_bytes(header[18:20], order)
+    results.check(
+        "the provisioned daemon is cached as an aarch64 ELF",
+        machine == 0xB7,
+        f"{cached} e_machine={machine!r}",
+    )
+
+    stdout = envelope.data.get("stdout") or ""
+    results.check(
+        "the hello-world executed inside the provisioned VM",
+        envelope.data.get("execExitCode") == 0 and "hello from a microvm" in stdout,
+        f"exit={envelope.data.get('execExitCode')!r} stdout={stdout[:80]!r}",
+    )
+    # The teardown claim, with the one documented exception stated rather than absorbed:
+    # the service creates the build log group and teardown cannot delete it on this path
+    # (docs/PLATFORM.md, "The build log group survives Terraform"), so a real run's
+    # `leaked` carries exactly that group — measured on the first live run of this
+    # surface (2026-08-30, us-east-1), which is why this is not `leaked == []`.
+    leaked = envelope.data.get("leaked") or []
+    log_groups = [
+        entry for entry in leaked if str(entry).startswith("/aws/lambda-microvms/")
+    ]
+    results.check(
+        "quickstart tore down everything but the service-created log group",
+        envelope.data.get("kept") is False and leaked == log_groups,
+        f"kept={envelope.data.get('kept')!r} leaked={leaked!r}",
+    )
+    # Deleted here so the suite leaves the account as clean as it found it — the same
+    # discipline drive_teardown applies to the suite's own groups.
+    for group in log_groups:
+        try:
+            logs.delete_log_group(logGroupName=str(group))
+        except Exception as exc:  # noqa: BLE001 - a cleanup failure is a report, not a crash
+            print(f"  (could not delete {group}: {exc})")
+
+
 def drive_idle_keepalive(
     cli: Cli, launched: Envelope, aws: Any, results: Results
 ) -> None:
@@ -3185,6 +3281,12 @@ def main() -> int:
             # file*, from the suite's image): the config merge and the sync round trip
             # both happen at launch, so the suite's VM cannot carry them either.
             drive_config_and_sync(cli, launched, Path(tmp) / "sync-project", results)
+            # The self-provisioned quickstart is the one section with its own build:
+            # provisioning fires only when building, so no launch from the suite's
+            # image can exercise it. See its docstring for the version-coupled caveat.
+            drive_provisioned_quickstart(
+                cli, Path(tmp) / "quickstart-state", aws.client("logs"), results
+            )
             # The idle-keepalive section runs on its own VM (launched from the image this
             # suite already built, so no second build) and is the slowest section here —
             # its own output says how long. Last, so its four minutes of deliberate

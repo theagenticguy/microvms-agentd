@@ -92,6 +92,10 @@ pub struct Ctx<'a, O: Write, E: Write> {
     /// `std::env::set_var` is `unsafe` in edition 2024 and is shared mutable state besides,
     /// which under a parallel test runner means one test's region leaking into another's.
     pub env: &'a dyn Fn(&str) -> Option<String>,
+    /// The agentd-provisioning seam, injected for the reason `seam` is: the shipped binary
+    /// carries [`crate::provision::SubprocessFetch`], and the guards script it, so no test
+    /// can open a socket to GitHub the way none can open one to AWS.
+    pub fetch: &'a dyn crate::provision::Fetch,
 }
 
 /// The `type` discriminant and `data` keys each command's success envelope carries.
@@ -101,7 +105,7 @@ pub struct Ctx<'a, O: Write, E: Write> {
 /// command added without an entry fails rather than shipping undescribed. That check is the
 /// only thing that keeps this table from being the hand-maintained artifact the manifest is
 /// forbidden to be.
-pub const RESPONSE_TYPES: [(&str, &str, &[&str]); 20] = [
+pub const RESPONSE_TYPES: [(&str, &str, &[&str]); 21] = [
     (
         "run",
         "microvm.run",
@@ -130,6 +134,40 @@ pub const RESPONSE_TYPES: [(&str, &str, &[&str]); 20] = [
             // `run <DIR>`'s report: {workdir, uploadedBytes, uploadedMembers, artifacts:
             // [{path, bytes}]} — null for a plain run. Issue #72.
             "sync",
+            // The self-provisioned daemon: {path, source: env|cache|fetched, verified:
+            // attestation|checksum|null} — null when the caller supplied the binary
+            // themselves (positional or `binary` in microvm.toml). An agent reading the
+            // run learns provenance-versus-integrity without re-deriving which tool was
+            // on PATH.
+            "agentd",
+        ],
+    ),
+    // `quickstart` IS `run` with the decisions pre-made, and its envelope says so by
+    // carrying the same discriminant and the same keys — the `suspend`/`resume` precedent
+    // (both `microvm.state`). A consumer that learned to read one run has learned both.
+    (
+        "quickstart",
+        "microvm.run",
+        &[
+            "imageIdentifier",
+            "imageName",
+            "microvmId",
+            "endpoint",
+            "agentToken",
+            "execExitCode",
+            "stdout",
+            "stderr",
+            "truncated",
+            "buildSeconds",
+            "runningSeconds",
+            "kept",
+            "vmName",
+            "leaked",
+            "cost",
+            "resolvedConfig",
+            "configPath",
+            "sync",
+            "agentd",
         ],
     ),
     (
@@ -147,6 +185,9 @@ pub const RESPONSE_TYPES: [(&str, &str, &[&str]); 20] = [
             // Always present, `false` for a plain build: `true` means `--reuse` matched
             // an existing image by content-hash name and nothing was built.
             "reused",
+            // The same self-provisioning report `run` carries; null when the caller
+            // supplied the binary.
+            "agentd",
         ],
     ),
     (

@@ -95,6 +95,16 @@ ADDON_WORKFLOWS = (
 #: `napi.targets`. Two or more hyphens is what separates them.
 WORKFLOW_TARGET = re.compile(r"target:\s*([A-Za-z0-9_.-]+)")
 
+#: A matrix row that belongs to the host-CLI asset job (issue #76), not the addon matrix.
+#:
+#: `release.yml`'s `cli` job builds `microvm` for host platforms, and its triples are a
+#: different set from the addon's on purpose — x86_64 macOS ships a CLI archive while no
+#: npm platform package exists for it. Its rows are told apart the way the wheel rows are,
+#: by line shape: every one carries the job's own `zigbuild:` key, which no addon or wheel
+#: row does. A cli row that loses the key fails this check loudly (its triple lands back in
+#: the addon comparison) rather than passing silently.
+CLI_MATRIX_ROW = re.compile(r"\bzigbuild:")
+
 #: `-p foo` and `--package foo`, the two spellings cargo accepts.
 #:
 #: Only applied to a line that invokes `cargo`, because `-p` is not cargo's alone: `mkdir -p
@@ -187,7 +197,7 @@ def addon_target_drift() -> list[str]:
         found = {
             value
             for line in path.read_text().splitlines()
-            if not line.lstrip().startswith("#")
+            if not line.lstrip().startswith("#") and not CLI_MATRIX_ROW.search(line)
             for value in WORKFLOW_TARGET.findall(line)
             if value.count("-") >= 2
         }

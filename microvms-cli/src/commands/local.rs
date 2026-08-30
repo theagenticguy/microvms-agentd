@@ -425,6 +425,7 @@ mod tests {
             out,
             infra: Infra::default(),
             env,
+            fetch: &crate::provision::PanickingFetch,
         }
     }
 

@@ -509,29 +509,54 @@ pub async fn run<O: std::io::Write, E: std::io::Write>(
     // Every precondition before anything is created, so a missing role is not discovered
     // after a 45-minute build. `execution_role_arn` is always needed; the build inputs only
     // when this invocation is the one building.
+    //
+    // A building run with **no binary at all** provisions one (`provision.rs`): the daemon
+    // is this product's own component, and `microvm run --exec "…"` on a fresh machine is
+    // the headline the provisioning chain exists for. Provisioned *after* the role check
+    // deliberately — a missing role refuses in microseconds, and the fetch it pre-empts
+    // costs seconds of network.
     let building = args.image.is_none();
-    if building {
+    let mut agentd: Option<crate::provision::Resolved> = None;
+    let daemon_binary: Option<std::path::PathBuf> = if building {
         ctx.infra
             .require(&["execution_role_arn", "build_role_arn"])?;
-        let Some(binary) = &args.binary else {
-            return Err(crate::exit::CliError::new(
-                Exit::Precondition,
-                "no BINARY and no --image: `run` either builds an image from a daemon binary or \
-                 launches one you name.",
-            )
-            .suggest("`microvm run ./agentd` builds, `microvm run --image <arn>` launches"));
-        };
-        if !binary.exists() {
-            return Err(crate::exit::CliError::new(
-                Exit::Precondition,
-                format!("daemon binary not found: {}", binary.display()),
-            )
-            .suggest("cargo build --release -p agentd --target aarch64-unknown-linux-musl")
-            .suggest("`microvm doctor --binary <path>` checks the architecture too"));
+        match &args.binary {
+            Some(binary) => {
+                if !binary.exists() {
+                    return Err(crate::exit::CliError::new(
+                        Exit::Precondition,
+                        format!("daemon binary not found: {}", binary.display()),
+                    )
+                    .suggest("cargo build --release -p agentd --target aarch64-unknown-linux-musl")
+                    .suggest("`microvm doctor --binary <path>` checks the architecture too")
+                    .suggest(
+                        "or pass no binary at all: the CLI provisions its own version's \
+                         release asset",
+                    ));
+                }
+                Some(binary.clone())
+            }
+            None => {
+                let state = state_dir(args.state_dir.clone(), ctx.env);
+                let resolved = {
+                    let out = &mut *ctx.out;
+                    crate::provision::resolve(
+                        &state,
+                        env!("CARGO_PKG_VERSION"),
+                        ctx.env,
+                        ctx.fetch,
+                        &mut |line| out.progress(line),
+                    )?
+                };
+                let path = resolved.path.clone();
+                agentd = Some(resolved);
+                Some(path)
+            }
         }
     } else {
         ctx.infra.require(&["execution_role_arn"])?;
-    }
+        None
+    };
 
     let ledger_root = state_dir(args.state_dir.clone(), ctx.env);
     let mut ledger = Ledger::new(region.as_str(), &ledger_root);
@@ -562,6 +587,7 @@ pub async fn run<O: std::io::Write, E: std::io::Write>(
         let body = Box::pin(launch_and_exec(
             ctx,
             args,
+            daemon_binary.as_deref(),
             &mut sandbox,
             &mut ledger,
             &name,
@@ -788,6 +814,9 @@ pub async fn run<O: std::io::Write, E: std::io::Write>(
         "configPath".into(),
         json!(config_path.as_ref().map(|path| path.display().to_string())),
     );
+    // Null when the caller supplied the binary themselves — `resolvedConfig.binary`
+    // already tells that story, and repeating it here would be two keys for one fact.
+    data.insert("agentd".into(), agentd_report(agentd.as_ref()));
     let rendered = Rendered::ok(kind, data, text, dense);
     // A failing workload keeps its success envelope and earns a non-zero code: the sandbox did
     // its job and the output the caller asked for is in `data`. Mapped onto one stable code
@@ -797,6 +826,53 @@ pub async fn run<O: std::io::Write, E: std::io::Write>(
         return Ok(rendered.reporting(Exit::ExecFailed));
     }
     Ok(rendered)
+}
+
+/// `quickstart`: `run` with every decision pre-made (issue #75).
+///
+/// The run arguments come from **parsing `run`'s own command line** rather than from a
+/// hand-built `RunArgs`: a struct literal here would be a second copy of every default,
+/// and the copies drift — `--memory`'s default changed once already, and a quickstart
+/// still launching the old class would be exactly the stale-first-impression this
+/// command exists to prevent. Parsing keeps one source of truth at the cost of one
+/// in-process parse.
+///
+/// Everything else — provisioning the daemon, the preconditions, the teardown-by-default,
+/// the envelope — is `run`'s, byte for byte, which is why the envelope keeps the
+/// `microvm.run` discriminant: a consumer that learned to read one has learned both.
+pub async fn quickstart<O: std::io::Write, E: std::io::Write>(
+    ctx: &mut Ctx<'_, O, E>,
+    args: &crate::cli::QuickstartArgs,
+    interrupt: Interrupt<'_>,
+) -> Result<Rendered, crate::exit::CliError> {
+    use clap::Parser as _;
+    let parsed = crate::cli::Cli::try_parse_from(["microvm", "run", "--exec", &args.exec])
+        .map_err(|error| {
+            crate::exit::CliError::new(
+                Exit::InvalidArg,
+                format!("quickstart could not synthesize its run: {error}"),
+            )
+        })?;
+    let crate::cli::Command::Run(mut run_args) = parsed.command else {
+        return Err(crate::exit::CliError::new(
+            Exit::Unexpected,
+            "quickstart parsed a `run` invocation and got a different command back — a \
+             dispatch defect in this binary, not anything the caller did",
+        ));
+    };
+    run_args.region = args.region.clone();
+    run_args.infra = args.infra.clone();
+    run_args.state_dir = args.state_dir.clone();
+
+    ctx.out.progress(
+        "quickstart: provision the daemon, build an image, launch a VM, run the command, \
+         report the cost, tear everything down — nothing survives this invocation",
+    );
+    ctx.out.progress(
+        "expect a few minutes on a first run; most of it is the image build, and \
+         `microvm run --image <name>` reuses it afterwards",
+    );
+    run(ctx, &run_args, interrupt).await
 }
 
 /// What `run --exec`'s one exec reported, for the history record.
@@ -825,6 +901,7 @@ struct ExecReport {
 async fn launch_and_exec<O: std::io::Write, E: std::io::Write>(
     ctx: &mut Ctx<'_, O, E>,
     args: &RunArgs,
+    daemon_binary: Option<&std::path::Path>,
     sandbox: &mut Sandbox,
     ledger: &mut Ledger,
     name: &str,
@@ -855,7 +932,9 @@ async fn launch_and_exec<O: std::io::Write, E: std::io::Write>(
             resolved
         }
         None => {
-            let binary = args.binary.as_ref().expect("checked by the caller");
+            // Resolved by the caller: the typed positional, the config file's `binary`,
+            // or the provisioning chain — whichever won, the path is real by here.
+            let binary = daemon_binary.expect("checked by the caller");
             ctx.out.progress(&format!("building image {name} ({size})"));
             let request = build_request(ctx, args, name, size, binary)?;
             // Before the upload, so a request core itself would refuse costs zero transport
@@ -1157,13 +1236,43 @@ pub async fn build<O: std::io::Write, E: std::io::Write>(
 ) -> Result<Rendered, crate::exit::CliError> {
     let region = args.region.resolve(ctx.env)?;
     ctx.infra.require(&["build_role_arn"])?;
-    if !args.binary.exists() {
-        return Err(crate::exit::CliError::new(
-            Exit::Precondition,
-            format!("daemon binary not found: {}", args.binary.display()),
-        )
-        .suggest("cargo build --release -p agentd --target aarch64-unknown-linux-musl"));
-    }
+    // The same provisioning chain as `run` (`provision.rs`), for the same reason: the
+    // caller's intent is "an image with the daemon in it", and which bytes that means is
+    // this product's own knowledge. Role check first — it refuses in microseconds and the
+    // fetch costs seconds of network.
+    let mut agentd: Option<crate::provision::Resolved> = None;
+    let binary: std::path::PathBuf = match &args.binary {
+        Some(binary) => {
+            if !binary.exists() {
+                return Err(crate::exit::CliError::new(
+                    Exit::Precondition,
+                    format!("daemon binary not found: {}", binary.display()),
+                )
+                .suggest("cargo build --release -p agentd --target aarch64-unknown-linux-musl")
+                .suggest(
+                    "or pass no binary at all: the CLI provisions its own version's release \
+                     asset",
+                ));
+            }
+            binary.clone()
+        }
+        None => {
+            let state = state_dir(args.state_dir.clone(), ctx.env);
+            let resolved = {
+                let out = &mut *ctx.out;
+                crate::provision::resolve(
+                    &state,
+                    env!("CARGO_PKG_VERSION"),
+                    ctx.env,
+                    ctx.fetch,
+                    &mut |line| out.progress(line),
+                )?
+            };
+            let path = resolved.path.clone();
+            agentd = Some(resolved);
+            path
+        }
+    };
     let size = args.memory.size_class();
     let seed = if args.reuse {
         // A stable stem: see the function docs on why the epoch default would make
@@ -1183,7 +1292,7 @@ pub async fn build<O: std::io::Write, E: std::io::Write>(
         BuildSpec {
             name: &seed,
             size,
-            binary: &args.binary,
+            binary: &binary,
             dockerfile: args.dockerfile.as_deref(),
             repair_identity: args.repair_identity,
             artifact_uri: args.artifact_uri.as_deref(),
@@ -1230,6 +1339,7 @@ pub async fn build<O: std::io::Write, E: std::io::Write>(
                     microvms_core::control::image::BUILD_LOG_GROUP_PREFIX
                 ),
                 None,
+                agentd.as_ref(),
             ));
         }
         ctx.out
@@ -1252,7 +1362,25 @@ pub async fn build<O: std::io::Write, E: std::io::Write>(
         false,
         &image.build_log_group(),
         image.log_stream.as_deref(),
+        agentd.as_ref(),
     ))
+}
+
+/// The envelope's `agentd` value: how a provisioned daemon got here, or null when the
+/// caller supplied one (the positional or the config file's `binary` — `resolvedConfig`
+/// tells that story on `run`, and repeating it here would be two keys for one fact).
+fn agentd_report(agentd: Option<&crate::provision::Resolved>) -> serde_json::Value {
+    match agentd {
+        Some(resolved) => json!({
+            "path": resolved.path.display().to_string(),
+            "source": resolved.source.as_str(),
+            "verified": match resolved.source {
+                crate::provision::Source::Fetched(verification) => json!(verification.as_str()),
+                _ => serde_json::Value::Null,
+            },
+        }),
+        None => serde_json::Value::Null,
+    }
 }
 
 /// The `build` envelope, shared by the built and the reused outcomes so the two cannot
@@ -1269,6 +1397,7 @@ fn render_build(
     reused: bool,
     build_log_group: &str,
     log_stream: Option<&str>,
+    agentd: Option<&crate::provision::Resolved>,
 ) -> Rendered {
     let mut data = Map::new();
     data.insert("imageIdentifier".into(), json!(identifier));
@@ -1284,6 +1413,7 @@ fn render_build(
     data.insert("logStream".into(), json!(log_stream));
     data.insert("size".into(), json!(size.to_string()));
     data.insert("reused".into(), json!(reused));
+    data.insert("agentd".into(), agentd_report(agentd));
 
     let (kind, _) = response_type("build");
     let dense = format!("{identifier}\t{name}\t{build_log_group}");
