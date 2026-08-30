@@ -6,6 +6,8 @@ Versions are [semantic](https://semver.org/spec/v2.0.0.html); the wire contract 
 
 ## Unreleased
 
+## [0.5.0] — 2026-08-30
+
 ### Added
 
 - **Self-provisioning daemon: `microvm run --exec "…"` needs no binary path.** `run`
