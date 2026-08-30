@@ -1,0 +1,56 @@
+name: scorecard
+
+# OpenSSF Scorecard: an external audit of this repository's own supply-chain
+# posture (branch protection, token permissions, pinned dependencies, SAST,
+# dangerous workflow patterns). `mise run security` gates what this project
+# ships; this gates how the project itself is maintained, which is the half a
+# local task cannot see.
+#
+# Runs on a schedule because most checks read repository settings and history,
+# not the tree, so a push is neither necessary nor sufficient for the score to
+# move. The push trigger exists because the badge and the code-scanning alerts
+# should update when the workflows themselves change; `workflow_dispatch`
+# exists so the first result does not wait a week.
+on:
+  schedule:
+    - cron: '30 9 * * 1' # Mondays, after the Dependabot weekly window
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Read-all at the top, raised per-job below. Scorecard's own Token-Permissions
+# check flags anything broader.
+permissions: read-all
+
+jobs:
+  analysis:
+    name: scorecard analysis
+    runs-on: ubuntu-latest
+    permissions:
+      security-events: write # uploads the SARIF to code scanning
+      id-token: write # signs the result for the public API; publish_results needs it
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false # scorecard's docs require it; the job never pushes
+
+      # SHA-pinned like every other third-party action in these workflows
+      # (see ci.yml's cargo-deny and actionlint pins). Dependabot bumps the
+      # comment and the SHA together.
+      - name: run scorecard
+        uses: ossf/scorecard-action@2d1146689b8cda280b9bc96326124645441f03bc # v2.4.4
+        with:
+          results_file: results.sarif
+          results_format: sarif
+          # What makes the README badge exist: the signed result is published
+          # to the scorecard.dev public API, which is where
+          # api.scorecard.dev/projects/github.com/<org>/<repo>/badge reads from.
+          publish_results: true
+
+      # The same findings, as code-scanning alerts on the Security tab, so a
+      # regression shows up where reviewers already look rather than only as a
+      # number on a badge.
+      - name: upload to code scanning
+        uses: github/codeql-action/upload-sarif@cdf488f595d80d6e07e03d4674febd5ab45fa938 # v4
+        with:
+          sarif_file: results.sarif
