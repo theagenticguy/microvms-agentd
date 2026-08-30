@@ -17,17 +17,18 @@ Run commands and move files in and out of AWS Lambda MicroVMs.
 The service gives you an isolated Firecracker VM but no exec API and no
 file-transfer API. This project supplies both: `agentd` is a small daemon baked
 into your VM image, and the `microvm` CLI (plus Rust, Python, and Node
-libraries) talks to it. One command builds an image, launches a VM, runs your
-command inside it, reports the cost, and tears everything down.
+libraries) talks to it. One command provisions the daemon, builds an image,
+launches a VM, runs your command inside it, reports the cost, and tears
+everything down.
 
 ```bash
-microvm run ./agentd --exec "echo hello from a microvm"
+microvm run --exec "echo hello from a microvm"
 ```
 
 ## Contents
 
-- [Install](#install) — the CLI, the daemon binary, and the three libraries
-- [Quick start](#quick-start) — AWS prerequisites and the first run
+- [Install](#install) — the CLI (binstall or crates.io) and the three libraries
+- [Quick start](#quick-start) — AWS prerequisites and `microvm quickstart`
 - [Why this exists](#why-this-exists)
 - [How it works](#how-it-works) — control plane, session plane, and the
   [long-lived VM](#working-with-a-long-lived-vm),
@@ -43,32 +44,35 @@ microvm run ./agentd --exec "echo hello from a microvm"
 
 ## Install
 
-Everything ships from registries as of v0.4.0. Two artifacts get you running:
-the `microvm` CLI on your machine, and the `agentd` daemon binary that gets
-baked into your VM images.
+One artifact gets you running: the `microvm` CLI. The `agentd` daemon binary
+that gets baked into your VM images is the CLI's own component — `run`,
+`build`, and `quickstart` provision the release asset for their own version
+automatically, verify it, and cache it under `~/.microvm`.
 
-**The CLI**, from crates.io:
+**The CLI**, prebuilt from the release assets (seconds), or compiled from
+crates.io (minutes):
 
 ```bash
-cargo install microvms-cli --locked   # installs the `microvm` binary
+cargo binstall microvms-cli           # installs the `microvm` binary, prebuilt
+cargo install microvms-cli --locked   # the same binary, compiled locally
 ```
 
-**The daemon binary**, from the GitHub release. It is a static
-`aarch64-unknown-linux-musl` build, because Lambda MicroVMs are ARM64-only and
-a static binary bakes into any base image with no interpreter and no dynamic
-loader:
+Release assets cover Linux (x86_64, aarch64, glibc 2.17 floor), macOS (arm64,
+x86_64), and Windows (x64), each with a signed build-provenance attestation
+beside it. There is deliberately no Homebrew formula: a tap is a second
+repository with its own release cadence to maintain, and binstall plus these
+assets already cover macOS.
+
+**The daemon binary**, only if you want to manage it yourself (a custom build,
+an airgapped machine): it is a static `aarch64-unknown-linux-musl` build,
+because Lambda MicroVMs are ARM64-only and a static binary bakes into any base
+image with no interpreter and no dynamic loader. Verify it the same way the
+CLI does before passing it as the positional or `$MICROVM_AGENTD`:
 
 ```bash
 gh release download --repo theagenticguy/microvms-agentd --pattern agentd
-chmod +x agentd
-```
-
-Each release binary carries a signed build-provenance attestation, so you can
-check that the bytes came from this repository's release workflow before
-baking them into an image:
-
-```bash
 gh attestation verify agentd --repo theagenticguy/microvms-agentd
+chmod +x agentd
 ```
 
 **The libraries**, for calling the same lifecycle from code:
@@ -97,12 +101,9 @@ release is that channel.
 
 **What you need:** an AWS account with Lambda MicroVMs access in a service
 region (`us-east-1`, `us-east-2`, `us-west-2`, `eu-west-1`, `ap-northeast-1`),
-AWS credentials in your environment, and the two artifacts from
-[Install](#install): the `microvm` CLI and an `agentd` binary at a known path.
-
-```bash
-export AGENTD=./agentd    # wherever the release download landed
-```
+AWS credentials in your environment, and the `microvm` CLI from
+[Install](#install). The daemon binary is not on this list: the CLI provisions
+it.
 
 **1. Create the AWS prerequisites.**
 
@@ -126,25 +127,30 @@ convenience, and the CLI only reads the three environment values.
 **2. Check the machine.**
 
 ```bash
-microvm doctor --binary $AGENTD
+microvm doctor
 ```
 
-`doctor` checks your credentials, the region, the three environment values,
-and that the daemon binary is aarch64. When something is wrong it names the
-broken prerequisite and suggests the fix.
+`doctor` checks your credentials, the region, and the three environment
+values. When something is wrong it names the broken prerequisite and suggests
+the fix. (Managing your own daemon binary? `--binary <path>` checks its
+architecture too.)
 
 **3. Run your first command in a MicroVM.**
 
 ```bash
-microvm run $AGENTD --exec "uname -a && echo hello from inside"
+microvm quickstart
 ```
 
-This builds an image with `agentd` as its entrypoint, launches a VM from it,
-runs the command, prints its output and the run's cost, and tears the VM down.
+This provisions the daemon (this CLI's own release asset, provenance-verified
+through `gh` when it is on PATH, checksummed through the release's SHA256SUMS
+otherwise), builds an image with it as the entrypoint, launches a VM, runs a
+hello-world, prints its output and the run's cost, and tears the VM down.
 Teardown is the default so an interrupted session does not leave a billable VM
-behind. Expect the first run to take a few minutes; most of it is the image
-build, and the image snapshot has a one-week minimum retention, so keep and
-reuse it (`--image`) rather than rebuilding.
+behind. `quickstart` is exactly `microvm run --exec "echo hello from a
+microvm"` — once it works, use `run` and its knobs directly. Expect the first
+run to take a few minutes; most of it is the image build, and the image
+snapshot has a one-week minimum retention, so keep and reuse it (`--image`)
+rather than rebuilding.
 
 ## Why this exists
 
@@ -198,7 +204,7 @@ name for it, so no later command needs the endpoint, agent token, and
 MicroVM id pasted back in:
 
 ```bash
-microvm run --keep --vm-name dev $AGENTD
+microvm run --keep --vm-name dev
 
 microvm exec --name dev "python3 -V"
 microvm cp ./data.csv vm:/tmp/data.csv --name dev
@@ -329,9 +335,9 @@ that builds it, with the platform constraints annotated inline. Append your
 `RUN` layers to that output and pass the result to `--dockerfile`. Each item
 below cost a real build cycle to find, and a server-side cycle is roughly
 three minutes plus a wedged image name you cannot reuse (`clientToken` is a
-permanent idempotency key). `microvm doctor --binary $AGENTD` names every
-missing prerequisite and prints the command that fills it, which is faster
-than reading the rest of this section.
+permanent idempotency key). `microvm doctor` names every missing prerequisite
+and prints the command that fills it, which is faster than reading the rest of
+this section.
 
 **Build it locally under arm64 first.** A `dnf` typo or a missing package is
 free to find here and expensive to find server-side:

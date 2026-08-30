@@ -6,6 +6,36 @@ Versions are [semantic](https://semver.org/spec/v2.0.0.html); the wire contract 
 
 ## Unreleased
 
+### Added
+
+- **Self-provisioning daemon: `microvm run --exec "…"` needs no binary path.** `run`
+  and `build` with no positional resolve `agentd` themselves: `$MICROVM_AGENTD`, then
+  the version-matched cache under the state directory, then a fetch of the CLI's own
+  version's release asset — `gh` + `gh attestation verify` when available (provenance),
+  `curl` + the release's `SHA256SUMS` otherwise (integrity, fail-closed). Fetched bytes
+  pass the same aarch64 ELF gate `doctor` runs before they are cached; the install is
+  partial-write-then-rename so an interrupted download cannot poison the cache; and the
+  run/build envelopes report `{path, source, verified}` under a new `agentd` key. The
+  fetch is a subprocess behind a scripted-in-tests seam — the CLI still carries no HTTP
+  client, and every existing behavioral guard now also proves its command never fetches.
+
+- **`microvm quickstart` (#75).** Zero to a live exec: provision the daemon, build,
+  launch, run a hello-world (or `--exec`), report the cost, tear everything down. It is
+  `run` with every decision pre-made — the arguments come from parsing `run`'s own
+  command line, so the defaults cannot drift — and its envelope keeps the `microvm.run`
+  discriminant. Prebuilt cross-account base images (the other half of #75) are declined:
+  image ARNs are account-scoped (`docs/PLATFORM.md`) and the measured API carries no
+  image-sharing operation, so the provisioned default build is the portable equivalent.
+
+- **Host CLI release assets and `cargo binstall microvms-cli` (#76).** The release now
+  ships `microvm-<target>` archives for Linux x86_64/aarch64 (cargo-zigbuild, glibc 2.17
+  floor), macOS arm64/x86_64, and Windows x64 — each attested with the same sigstore +
+  intoto pair the daemon asset carries — plus one `SHA256SUMS` over every binary asset
+  (the file the provisioning curl fallback verifies against). `crates-io` publishing now
+  also waits on the CLI builds, keeping every buildable failure ahead of the first
+  irreversible publish. Homebrew is deliberately absent: a tap is a second repository to
+  maintain, and binstall + `cargo install` cover the same machines.
+
 ## [0.4.0] — 2026-08-30
 
 ### Added
