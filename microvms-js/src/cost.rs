@@ -416,8 +416,9 @@ impl SizeClass {
         })
     }
 
-    /// The platform's default, 2048 MiB. Not the smallest — a 0.5 GB baseline hands someone
-    /// a sandbox that OOM-kills a real test suite, and the guest has no swap.
+    /// The platform's default, 2048 MiB. Not the smallest — a 0.5 GB baseline fixes the
+    /// guest's always-present ceiling at 2 GB, which OOM-kills a real test suite, and the
+    /// guest has no swap.
     #[napi(factory)]
     pub fn default_class() -> SizeClass {
         SizeClass {

@@ -6,7 +6,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Live conformance run driving the **Rust** client stack through the `microvm` CLI.
 
-This is the only live suite, and it now expresses **every named check** — 104 of them, with
+This is the only live suite, and it now expresses **every named check** — 105 of them, with
 none recorded SKIP. `conformance/run.py` was the oracle — 56 checks through the Python
 client — and it went away with that client once both suites ran green against real AWS on
 the same commit (Python 56/56, this one 38/38 with 34 recorded SKIP). Those 34 were the
@@ -73,6 +73,11 @@ ciphertext), a tampered pin failing closed with nothing served, the restored rec
 verifying again, and the identity VM's own teardown. Live because the handshake's
 failure mode on the endpoint path is a silent 1006, which is exactly the shape that
 passes every stand-in and fails only against the real proxy.
+
+105 rather than 104: `drive_local_commands` adds one for issue #99 — the cost
+envelope's size object reporting `headroomMib` (peak minus baseline, both read from
+the sizing table) beside `baselineMib` and `peakMib`, asserted against the documented
+row for the class this suite launches with.
 
 A hybrid driver, and both lanes are deliberate
 ----------------------------------------------
@@ -845,6 +850,31 @@ def drive_local_commands(cli: Cli, results: Results) -> None:
     results.ok(
         "cost reports a labelled estimate",
         lambda: cli.call("cost", "--running-sec", "3600"),
+    )
+
+    # The size object's static headroom (issue #99). The peak and the headroom are
+    # properties of the class, read from the sizing table — the peak is provisioned
+    # from the start and headroom is peak minus baseline, so both are asserted
+    # against the documented row for the class this suite launches with, not
+    # against `baseline * 4` arithmetic (TRAP-13's discipline, at the envelope).
+    estimate = cli.call(
+        "cost",
+        "--estimate",
+        "--running-sec",
+        "3600",
+        "--memory",
+        str(BASELINE_MEMORY_MIB),
+    )
+    size = estimate.data["report"]["size"]
+    # The documented row for 1024 MiB: peak 4096. Written as a literal pair rather
+    # than derived, for the same reason the core's table is data.
+    results.check(
+        "the cost size object reports its static headroom from the table",
+        size.get("baselineMib") == BASELINE_MEMORY_MIB
+        and size.get("peakMib") == 4096
+        and size.get("headroomMib") == size["peakMib"] - size["baselineMib"],
+        f"baselineMib={size.get('baselineMib')!r} peakMib={size.get('peakMib')!r} "
+        f"headroomMib={size.get('headroomMib')!r}",
     )
 
     manifest = cli.call("manifest")

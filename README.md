@@ -124,7 +124,7 @@ directory, suspend/resume that preserves running processes, cost reporting
 from pinned rates, and a conformance suite that proves all of it against real
 VMs. The platform also has sharp edges: error responses that point away from
 their causes, a `clientToken` replay that wedges an image in `CREATING` for
-fifteen hours, a memory floor that silently doubles. Each one was measured
+fifteen hours, a memory request that silently selects a 4x-larger VM. Each one was measured
 once, recorded in [docs/PLATFORM.md](docs/PLATFORM.md) with its date and
 region, and then closed in the client: illegal states either do not construct
 (regions and sizes are closed enums) or are rejected locally with an error
@@ -250,6 +250,12 @@ API. Anything the engine cannot price is reported as unpriced with a reason
 rather than as zero, and a total containing an unpriced line renders as a
 lower bound. Note the image snapshot's one-week minimum retention: deleting an
 image early saves nothing, so reuse is the economical habit.
+
+Sizing follows one rule: the minimum you request is your bill floor (25% of
+the provisioned capacity), 4x the minimum is your hard ceiling, and both are
+fixed at provision time — there is no scaling event. For peaky workloads
+(builds, test runs, agent sessions), pick a low minimum and let peaks ride
+the always-present 4x headroom, which bills only by what is consumed.
 
 ## Writing your own guest Dockerfile
 

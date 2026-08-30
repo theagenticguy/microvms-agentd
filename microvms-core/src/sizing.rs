@@ -10,14 +10,19 @@
 //! enough to predict the bill (`docs/PLATFORM.md`, "`minimumMemoryInMiB` selects a
 //! *baseline*, and the guest reports the *peak*").
 //!
+//! The peak is provisioned from the start (service team, confirmed 2026-08): there
+//! is no scaling event, nothing resizes during a run, and app code never observes a
+//! resource change. The baseline is the bill's floor — always paid while the VM
+//! runs — and usage above it is billed by consumption.
+//!
 //! # Why the table is data (TRAP-13)
 //!
 //! Every documented peak is exactly four times its baseline, which makes
 //! `baseline * 4` look like the obvious simplification. It is the one thing this
 //! module must not do. That regularity is AWS's and not ours: a sixth row, or a
 //! revision to an existing one, that breaks the pattern would silently get the
-//! pattern applied to it, and the report would name a burst ceiling the service does
-//! not offer. So [`SIZE_CLASSES`] is the only place any of these numbers appears, and
+//! pattern applied to it, and the report would name a provisioned ceiling the service
+//! does not offer. So [`SIZE_CLASSES`] is the only place any of these numbers appears, and
 //! every accessor reads a row out of it through one lookup — which is also what makes
 //! the guard testable: the test below drives the accessors over a table whose peak is
 //! *not* 4x, and a computed implementation cannot answer it.
@@ -42,7 +47,7 @@ use crate::error::Error;
 /// nature.
 pub const MIB_PER_GB: u32 = 1024;
 
-/// One row of the documented sizing table: a baseline and its burst ceiling.
+/// One row of the documented sizing table: a baseline and its provisioned ceiling.
 ///
 /// Plain data with public fields, because that is what it is — a transcription of
 /// someone else's published table, not settings. The accessors on [`SizeClass`] are
@@ -55,8 +60,9 @@ pub struct SizeRow {
     /// Billed per running second, alongside `baseline_vcpu`. Not what the guest
     /// reports.
     pub baseline_vcpu: f64,
-    /// What the guest reports as `MemTotal`, and the ceiling a burst can reach.
-    /// Charged only for the seconds above baseline that are actually consumed.
+    /// What the guest reports as `MemTotal`: a fixed ceiling, provisioned from the
+    /// start and present the whole run. Usage above the baseline is billed by
+    /// consumption, per second.
     pub peak_mib: u32,
     pub peak_vcpu: f64,
 }
@@ -121,11 +127,12 @@ pub enum SizeClass {
 impl SizeClass {
     /// The platform's own default, and ours.
     ///
-    /// Deliberately not the smallest class: the baseline is also the floor of the
-    /// burst range, and a 0.5 GB default hands someone a sandbox that OOM-kills a
-    /// real test suite to save about three cents an hour. Guest swap is absent
-    /// (`SwapTotal: 0 kB`), so there is no paging phase to absorb the mistake —
-    /// pressure goes straight to the OOM killer.
+    /// Deliberately not the smallest class, and the reason is the CEILING: picking
+    /// 512 gives the guest a hard 2 GiB total — provisioned from the start, fixed
+    /// for the whole run, nothing resizes past it — and a real test suite breaches
+    /// it. Guest swap is absent (`SwapTotal: 0 kB`), so there is no paging phase to
+    /// absorb the mistake — pressure goes straight to the OOM killer. The default's
+    /// job is a ceiling that survives a real test suite, and 8 GiB does.
     pub const DEFAULT: SizeClass = SizeClass::Mib2048;
 
     /// Every class, smallest first, in [`SIZE_CLASSES`] order.
@@ -173,11 +180,24 @@ impl SizeClass {
         self.row().baseline_mib
     }
 
-    /// What the guest reports as `MemTotal`, and the burst ceiling.
+    /// What the guest reports as `MemTotal`: the provisioned ceiling, present from
+    /// the start of the run.
     ///
     /// Read from the table. Never `baseline_mib() * 4` — see the module docs.
     pub fn peak_mib(self) -> u32 {
         self.row().peak_mib
+    }
+
+    /// The static headroom above the baseline: peak minus baseline, both read from
+    /// this class's table row.
+    ///
+    /// Fixed at provision time — the headroom is always present, never granted by a
+    /// scaling event — and usage inside it is billed by consumption. Computed as a
+    /// difference of two *table* values, never as `baseline * 3`: the 4x regularity
+    /// is AWS's, not ours, and a row that breaks it must be reported as written
+    /// (TRAP-13, same discipline as [`SizeClass::peak_mib`]).
+    pub fn headroom_mib(self) -> u32 {
+        headroom_in(&SIZE_CLASSES, self)
     }
 
     /// Billed per running second, alongside [`SizeClass::baseline_mib`].
@@ -185,7 +205,7 @@ impl SizeClass {
         self.row().baseline_vcpu
     }
 
-    /// The vCPU ceiling a burst can reach. Read from the table.
+    /// The provisioned vCPU ceiling, present from the start. Read from the table.
     pub fn peak_vcpu(self) -> f64 {
         self.row().peak_vcpu
     }
@@ -228,8 +248,8 @@ impl fmt::Display for SizeClass {
         let row = self.row();
         write!(
             f,
-            "{} GB / {} vCPU baseline (billed while running), bursting to {} GB / {} vCPU \
-             (what the guest reports)",
+            "{} GB / {} vCPU baseline (billed while running), with a fixed ceiling of {} GB / \
+             {} vCPU provisioned from the start (what the guest reports)",
             self.baseline_gb(),
             row.baseline_vcpu,
             self.peak_gb(),
@@ -246,6 +266,18 @@ impl fmt::Display for SizeClass {
 /// answer follows the data or the pattern.
 fn row_in(table: &[SizeRow], class: SizeClass) -> &SizeRow {
     &table[class.index()]
+}
+
+/// The headroom `table`'s row carries for `class`: its peak minus its baseline.
+///
+/// Table-parameterized for the same reason as [`row_in`]: a test can hand this a
+/// table whose peak is not four times its baseline and see whether the headroom
+/// follows the data or the pattern. Saturating rather than plain subtraction so a
+/// hostile test table whose peak is below its baseline reads as zero headroom
+/// rather than a panic.
+fn headroom_in(table: &[SizeRow], class: SizeClass) -> u32 {
+    let row = row_in(table, class);
+    row.peak_mib.saturating_sub(row.baseline_mib)
 }
 
 /// The class whose row in `table` carries `baseline_mib`, if any.
@@ -394,8 +426,11 @@ mod tests {
         }
     }
 
-    /// The default is the platform's, not the cheapest. A default of `Mib512` would
-    /// hand someone a 2 GB ceiling and no swap.
+    /// The default is the platform's, not the cheapest, and the reason is the
+    /// ceiling: a default of `Mib512` gives the guest a hard 2 GB total —
+    /// provisioned from the start, fixed for the whole run — which a real test
+    /// suite breaches, and there is no swap to absorb the breach. The default's
+    /// job is a ceiling that survives real work.
     #[test]
     fn the_default_class_is_two_gigabytes_of_baseline() {
         assert_eq!(SizeClass::DEFAULT, SizeClass::Mib2048);
@@ -413,6 +448,39 @@ mod tests {
         assert!(described.contains("8 GB / 4 vCPU"), "{described}");
         assert!(described.contains("billed while running"), "{described}");
         assert!(described.contains("what the guest reports"), "{described}");
+        // The mechanism, stated as it is: a fixed ceiling present from the start,
+        // not a "burst" the service would have to grant.
+        assert!(
+            described.contains("provisioned from the start"),
+            "{described}"
+        );
+        assert!(!described.contains("burst"), "{described}");
+    }
+
+    /// TRAP-13 for the headroom: peak minus baseline, both read from the table.
+    ///
+    /// The falsification: replace [`SizeClass::headroom_mib`]'s body with
+    /// `self.baseline_mib() * 3` — arithmetically identical over the shipped table,
+    /// where every peak is 4x — and this row's headroom comes back 6144 instead of
+    /// 6952. A test over the shipped table alone could not tell the two apart.
+    #[test]
+    fn headroom_follows_a_table_whose_peak_is_not_four_times_its_baseline() {
+        let mut table = SIZE_CLASSES;
+        table[SizeClass::Mib2048.index()].peak_mib = 9000;
+        assert_eq!(
+            headroom_in(&table, SizeClass::Mib2048),
+            9000 - 2048,
+            "headroom must be a difference of table values, not baseline * 3"
+        );
+        // The shipped table's headroom for every class, through the public accessor.
+        for class in SizeClass::ALL {
+            let row = &SIZE_CLASSES[class.index()];
+            assert_eq!(
+                class.headroom_mib(),
+                row.peak_mib - row.baseline_mib,
+                "{class:?}"
+            );
+        }
     }
 
     /// The band where an off-table figure is *plausible*, sampled deliberately.

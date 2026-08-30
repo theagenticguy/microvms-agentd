@@ -36,11 +36,22 @@ authenticated channel.
 ## Launch
 
 ```bash
-microvm run --keep --egress --image "$IMAGE_ARN"
+microvm run --keep --egress --image "$IMAGE_ARN" --config microvm.toml
 ```
 
 `--egress` matters: it requests the outbound-network connector, and without
-it the guest cannot reach Bedrock. Both agents would install fine and then
+it the guest cannot reach Bedrock.
+
+`microvm.toml` pins the size class, and the choice encodes the sizing rule
+for agent workloads. The minimum you request is your bill floor (25% of the
+provisioned capacity), and 4x the minimum is the guest's hard ceiling — both
+fixed at provision time, with no scaling event and nothing app code can
+observe changing. Agent sessions are peaky: long stretches of a small steady
+state punctuated by bursts of build and test work. So the example picks
+`memory = 1024` — a 4 GiB always-present ceiling at half the floor cost of
+the 2048 default — and lets the peaks ride the headroom, which bills only by
+what is consumed. A steadier or heavier workload should keep the 2048
+default, whose 8 GiB ceiling survives a real test suite. Both agents would install fine and then
 fail on their first model call. `--keep` leaves the VM running and reports
 the three values every attached command needs (endpoint, agent token,
 MicroVM id). The image goes by ARN: `RunMicrovm` answers 400 "Malformed ARN"

@@ -412,6 +412,23 @@ CI = "1"
         assert_eq!(env.get("CI").map(String::as_str), Some("1"));
     }
 
+    /// The shipped example config parses through the real loader (issue #99).
+    ///
+    /// `examples/coding-agents-on-bedrock/microvm.toml` is documentation a user will
+    /// copy, so it must survive `deny_unknown_fields` and the domain checks exactly
+    /// as a project's own file does — a schema change that orphans it fails here
+    /// rather than on a reader's first launch. It pins the low-minimum sizing choice
+    /// the example documents, so the value is asserted too.
+    #[test]
+    fn the_shipped_example_config_parses_and_pins_a_low_minimum() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../examples/coding-agents-on-bedrock/microvm.toml");
+        let (_, config) = load(Some(&path), false, Path::new("."))
+            .expect("the example must parse through the loader `run` uses")
+            .expect("present");
+        assert_eq!(config.memory, Some(1024));
+    }
+
     /// An unknown key is a refusal naming it, not a setting silently ignored.
     ///
     /// The failure this closes: `memroy = 4096` launching a 2 GB VM while the caller
