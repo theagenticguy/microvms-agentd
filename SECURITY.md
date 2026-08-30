@@ -3,8 +3,10 @@
 ## Reporting a vulnerability
 
 Report privately through **GitHub Security Advisories** on this repository
-("Security" → "Report a vulnerability"). There is no security email address for
-this project. The advisory form is the only private reporting channel.
+("Security" → "Report a vulnerability", or directly at
+<https://github.com/theagenticguy/microvms-agentd/security/advisories/new>).
+There is no security email address for this project. The advisory form is the
+only private reporting channel.
 
 Include the daemon version or commit, the region and API version if AWS behavior
 is involved, and a reproduction. There is no funded response SLA. This is an
@@ -15,7 +17,8 @@ anything in "Not vulnerabilities" below.
 
 ## Threat model
 
-`docs/TRUST.md` is the threat model. It describes what the daemon guarantees
+[`docs/TRUST.md`](https://github.com/theagenticguy/microvms-agentd/blob/main/docs/TRUST.md)
+is the threat model. It describes what the daemon guarantees
 when the workload is assumed hostile, and what it does not guarantee. Read it
 before filing. `docs/PROTOCOL.md` states the enforced rules, and `model/` checks
 the safety properties over every reachable state.
@@ -81,9 +84,9 @@ dependency-license policy in `deny.toml` (measured allowlist, yanked crates
 denied, unknown registries denied), and actionlint over the workflows. CI runs
 the same set, plus SBOM generation and three vulnerability scanners
 (grype, trivy, osv-scanner); every accepted finding is recorded with its
-reason in `.trivyignore.yaml` or `osv-scanner.toml`. The cargo-deny and
-actionlint actions are SHA-pinned, the downloaded scanner binaries are
-version-pinned and checksummed, and `.github/dependabot.yml` watches cargo,
+reason in `.trivyignore.yaml` or `osv-scanner.toml`. Every workflow action is
+SHA-pinned with its tag as a trailing comment, the downloaded scanner binaries
+are version-pinned and checksummed, and `.github/dependabot.yml` watches cargo,
 github-actions, and npm weekly.
 
 ## An open question
