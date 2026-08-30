@@ -1,6 +1,6 @@
 {
   "name": "@theagenticguy/microvms",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Node bindings over microvms-core: the MicroVMs client with every trap closure",
   "license": "Apache-2.0",
   "author": "Laith Al-Saadoon",
