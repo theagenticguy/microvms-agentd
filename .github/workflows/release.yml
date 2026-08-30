@@ -101,7 +101,7 @@ jobs:
     # Nothing here makes a release atomic — crates.io, PyPI and npm are three separate
     # irreversible acts. What this does is move every *buildable* failure ahead of the first
     # one, so a broken artifact costs a re-tag rather than a burnt version number.
-    needs: [guard, wheels, sdist, addons]
+    needs: [guard, wheels, sdist, addons, cli]
     runs-on: ubuntu-latest
     environment: release
     permissions:
@@ -403,6 +403,94 @@ jobs:
         working-directory: microvms-js
         run: npm publish --access public
 
+  # ── the host CLI binaries (issue #76) ─────────────────────────────────────
+  #
+  # `cargo install microvms-cli` compiles for minutes on a first-time machine;
+  # `cargo binstall microvms-cli` resolves these assets and installs in seconds. The
+  # asset name is `microvm-<target>` — the *binary's* name, matching the
+  # `[package.metadata.binstall]` template in microvms-cli/Cargo.toml, and the two must
+  # move together.
+  #
+  # The linux legs cross-compile through cargo-zigbuild against glibc 2.17 — the same
+  # zig arrangement (and the same pinned tarball) the wheels and addons jobs use, for the
+  # same measured reason: a native build inherits the runner image's glibc as a floor on
+  # every consumer, and aws-lc-sys does not compile under the manylinux2014 container's
+  # GCC. The macOS x86_64 leg cross-compiles from the arm64 runner exactly as the wheel
+  # does: Rust demoted the target to Tier 2 in 1.90 and GitHub is discontinuing free
+  # x86_64 macOS runners for public repositories.
+  cli:
+    name: build the microvm CLI (${{ matrix.target }})
+    needs: guard
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: ubuntu-latest, target: x86_64-unknown-linux-gnu, zigbuild: true }
+          - { runner: ubuntu-latest, target: aarch64-unknown-linux-gnu, zigbuild: true }
+          - { runner: macos-latest, target: aarch64-apple-darwin, zigbuild: false }
+          - { runner: macos-latest, target: x86_64-apple-darwin, zigbuild: false }
+          - { runner: windows-latest, target: x86_64-pc-windows-msvc, zigbuild: false }
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      id-token: write # signs each archive's provenance attestation
+      attestations: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - name: install zig (pinned, checksummed)
+        if: matrix.zigbuild
+        run: |
+          set -euo pipefail
+          curl -sSfL -o zig.tar.xz https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz
+          echo "70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00  zig.tar.xz" | sha256sum -c -
+          tar -xJf zig.tar.xz
+          echo "$PWD/zig-x86_64-linux-0.16.0" >> "$GITHUB_PATH"
+      - name: install cargo-zigbuild
+        if: matrix.zigbuild
+        run: cargo install cargo-zigbuild --locked
+      # `.2.17` pins the glibc floor the wheels verified: the tag was checked against the
+      # shipped artifact's symbols there, and this reuses the same toolchain arrangement.
+      - name: build (zigbuild, glibc 2.17 floor)
+        if: matrix.zigbuild
+        run: cargo zigbuild --release -p microvms-cli --target ${{ matrix.target }}.2.17 --locked
+      - name: build (native toolchain)
+        if: ${{ !matrix.zigbuild }}
+        run: cargo build --release -p microvms-cli --target ${{ matrix.target }} --locked
+      # One archive per triple, named for binstall's template. tar on the unixes; zip on
+      # Windows because there is no tar-consuming convention there and binstall's per-target
+      # override expects it.
+      - name: archive (tar.gz)
+        if: runner.os != 'Windows'
+        run: tar -C "target/${{ matrix.target }}/release" -czf "microvm-${{ matrix.target }}.tar.gz" microvm
+      - name: archive (zip)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: Compress-Archive -Path "target/${{ matrix.target }}/release/microvm.exe" -DestinationPath "microvm-${{ matrix.target }}.zip"
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        id: attest
+        with:
+          subject-path: microvm-${{ matrix.target }}.*
+      # The same two spellings the agentd asset ships: the Sigstore bundle whole, and the
+      # DSSE envelope in the `.intoto.jsonl` form Scorecard's Signed-Releases check reads.
+      - name: put the signature and provenance beside the archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive=$(ls microvm-${{ matrix.target }}.*)
+          cp "${{ steps.attest.outputs.bundle-path }}" "${archive}.sigstore.json"
+          jq -c .dsseEnvelope "${archive}.sigstore.json" > "${archive}.intoto.jsonl"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: cli-${{ matrix.target }}
+          path: |
+            microvm-${{ matrix.target }}.*
+          if-no-files-found: error
+
   # ── the daemon, and the attestation crates.io cannot give ────────────────
   #
   # `agentd` is `publish = false` and reaches a consumer as this binary, so the GitHub
@@ -410,8 +498,8 @@ jobs:
   # this workflow gets provenance at all: PyPI produces PEP 740 attestations and npm produces
   # SLSA provenance, both automatically, and crates.io supports neither.
   github-release:
-    name: attest and publish the daemon binary
-    needs: guard
+    name: attest and publish the release assets
+    needs: [guard, cli]
     runs-on: ubuntu-latest
     permissions:
       contents: write # creates the release and uploads the asset
@@ -456,6 +544,23 @@ jobs:
           set -euo pipefail
           cp "${{ steps.attest.outputs.bundle-path }}" agentd.sigstore.json
           jq -c .dsseEnvelope agentd.sigstore.json > agentd.intoto.jsonl
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          pattern: cli-*
+          merge-multiple: true
+          path: cli-dist
+      # One SHA256SUMS over every binary asset, bare basenames, sha256sum's own format.
+      # This file is what `microvm`'s curl fallback verifies a provisioned agentd against
+      # (`provision.rs::verify_sha256` looks up the literal `agentd` entry), so its absence
+      # on a release makes that path fail closed — it exists from v0.5.0 on.
+      - name: write SHA256SUMS over every asset
+        run: |
+          set -euo pipefail
+          mkdir staging
+          cp target/aarch64-unknown-linux-musl/release/agentd staging/
+          cp cli-dist/microvm-*.tar.gz cli-dist/microvm-*.zip staging/
+          (cd staging && sha256sum ./* | sed 's|\./||') > SHA256SUMS
+          cat SHA256SUMS
       - name: publish the release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -467,3 +572,5 @@ jobs:
           target/aarch64-unknown-linux-musl/release/agentd#agentd-aarch64-unknown-linux-musl
           agentd.sigstore.json
           agentd.intoto.jsonl
+          SHA256SUMS
+          cli-dist/*

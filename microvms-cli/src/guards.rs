@@ -220,6 +220,24 @@ async fn dispatch_with_fetch(
 fn aws_commands(binary: &std::path::Path) -> Vec<(&'static str, Command, Door)> {
     vec![
         (
+            // `quickstart` builds, so its door is `run`'s. Its state dir is a fresh temp
+            // path because it carries no binary: the door test's scripted fetch provisions
+            // one there, which is itself part of what the row proves — quickstart reaches
+            // the sandbox door only through the provisioning chain.
+            "quickstart",
+            Command::Quickstart(crate::cli::QuickstartArgs {
+                exec: "true".into(),
+                state_dir: Some(std::env::temp_dir().join(format!(
+                    "microvm-guard-quickstart-{}-{:?}",
+                    std::process::id(),
+                    std::thread::current().id()
+                ))),
+                region: region_flags(),
+                infra: InfraFlags::default(),
+            }),
+            Door::OpenSandbox,
+        ),
+        (
             "run",
             Command::Run(RunArgs {
                 binary: Some(binary.to_path_buf()),
@@ -477,7 +495,16 @@ async fn every_aws_command_fails_through_the_seam_and_names_the_door_it_entered(
     let binary = FakeBinary::new("behavioral");
     for (name, command, expected) in aws_commands(&binary.0) {
         let seam = RefusingSeam::new();
-        let (result, _) = dispatch_with(&seam, &command, full_infra()).await;
+        // A scripted fetch rather than the panicking one, because `quickstart` carries no
+        // binary and must provision before it can reach its door. The count assertion
+        // below keeps the old property for every other row: only quickstart fetches.
+        let fetch = CountingFetch(std::sync::atomic::AtomicUsize::new(0));
+        let (result, _) = dispatch_with_fetch(&seam, &command, full_infra(), &fetch).await;
+        assert_eq!(
+            fetch.0.load(std::sync::atomic::Ordering::SeqCst),
+            usize::from(name == "quickstart"),
+            "{name} consulted the provisioning chain when it carries its own binary"
+        );
 
         match result {
             Ok(rendered) => {
@@ -1988,6 +2015,29 @@ async fn a_supplied_binary_never_consults_the_provisioning_chain() {
         serde_json::Value::Null,
         "{:?}",
         rendered.data
+    );
+}
+
+/// **`quickstart` is `run` — same preconditions, same refusals, same order.** With no
+/// infrastructure configured it fails `run`'s own role check, locally, before the fetch
+/// (the panicking fetcher proves the ordering) and before any AWS call (the refusing seam
+/// proves that). A quickstart that fetched or called AWS before the cheap refusal would
+/// spend a first-time user's seconds discovering what one env read already knew.
+#[tokio::test]
+async fn quickstart_refuses_missing_infrastructure_before_fetching_or_calling_aws() {
+    let command = Command::Quickstart(crate::cli::QuickstartArgs {
+        exec: "echo hello".into(),
+        state_dir: None,
+        region: region_flags(),
+        infra: InfraFlags::default(),
+    });
+    let (result, _) = dispatch_with(&RefusingSeam::new(), &command, Infra::default()).await;
+    let failure = result.expect_err("no roles configured");
+    assert_eq!(failure.exit, Exit::Precondition);
+    assert!(
+        failure.message.contains("build_role_arn") || failure.message.contains("BUILD_ROLE"),
+        "the refusal names the missing value: {}",
+        failure.message
     );
 }
 

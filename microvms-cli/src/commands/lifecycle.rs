@@ -828,6 +828,53 @@ pub async fn run<O: std::io::Write, E: std::io::Write>(
     Ok(rendered)
 }
 
+/// `quickstart`: `run` with every decision pre-made (issue #75).
+///
+/// The run arguments come from **parsing `run`'s own command line** rather than from a
+/// hand-built `RunArgs`: a struct literal here would be a second copy of every default,
+/// and the copies drift — `--memory`'s default changed once already, and a quickstart
+/// still launching the old class would be exactly the stale-first-impression this
+/// command exists to prevent. Parsing keeps one source of truth at the cost of one
+/// in-process parse.
+///
+/// Everything else — provisioning the daemon, the preconditions, the teardown-by-default,
+/// the envelope — is `run`'s, byte for byte, which is why the envelope keeps the
+/// `microvm.run` discriminant: a consumer that learned to read one has learned both.
+pub async fn quickstart<O: std::io::Write, E: std::io::Write>(
+    ctx: &mut Ctx<'_, O, E>,
+    args: &crate::cli::QuickstartArgs,
+    interrupt: Interrupt<'_>,
+) -> Result<Rendered, crate::exit::CliError> {
+    use clap::Parser as _;
+    let parsed = crate::cli::Cli::try_parse_from(["microvm", "run", "--exec", &args.exec])
+        .map_err(|error| {
+            crate::exit::CliError::new(
+                Exit::InvalidArg,
+                format!("quickstart could not synthesize its run: {error}"),
+            )
+        })?;
+    let crate::cli::Command::Run(mut run_args) = parsed.command else {
+        return Err(crate::exit::CliError::new(
+            Exit::Unexpected,
+            "quickstart parsed a `run` invocation and got a different command back — a \
+             dispatch defect in this binary, not anything the caller did",
+        ));
+    };
+    run_args.region = args.region.clone();
+    run_args.infra = args.infra.clone();
+    run_args.state_dir = args.state_dir.clone();
+
+    ctx.out.progress(
+        "quickstart: provision the daemon, build an image, launch a VM, run the command, \
+         report the cost, tear everything down — nothing survives this invocation",
+    );
+    ctx.out.progress(
+        "expect a few minutes on a first run; most of it is the image build, and \
+         `microvm run --image <name>` reuses it afterwards",
+    );
+    run(ctx, &run_args, interrupt).await
+}
+
 /// What `run --exec`'s one exec reported, for the history record.
 ///
 /// A separate struct from [`RunOutcome`] because the two answer different callers: the

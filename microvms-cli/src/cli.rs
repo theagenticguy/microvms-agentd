@@ -100,6 +100,15 @@ pub enum Command {
     /// opts out and prints the identifiers you have just taken responsibility for.
     Run(RunArgs),
 
+    /// Zero to a live exec: provision the daemon, build, launch, run, report, tear down.
+    ///
+    /// `run` with every decision already made (issue #75): the daemon binary is
+    /// provisioned from this CLI's own release, the exec defaults to a hello-world, and
+    /// nothing survives the invocation. Needs AWS credentials and the three MICROVM_*
+    /// values from the Quick start; everything else is a default a first run should not
+    /// have to choose. Once this works, `run` is the same thing with the knobs exposed.
+    Quickstart(QuickstartArgs),
+
     /// Build a MicroVM image and wait for it to be usable.
     ///
     /// Separate from `run` for the case where one image serves many launches, which is the
@@ -746,6 +755,33 @@ pub struct RunArgs {
     /// handler's merge can tell `--memory 2048` from the default. See [`Explicit`].
     #[arg(skip)]
     pub explicit: Explicit,
+
+    #[command(flatten)]
+    pub region: RegionFlags,
+
+    #[command(flatten)]
+    pub infra: InfraFlags,
+}
+
+/// `quickstart`'s three knobs — everything else is deliberately a `run` default.
+///
+/// The struct stays this small on purpose: every flag added here is a decision the first
+/// run was supposed to not need, and the command's doc sends anyone who wants a knob to
+/// `run`, where all of them live.
+#[derive(Args, Debug)]
+pub struct QuickstartArgs {
+    /// The command to run inside the first VM.
+    #[arg(
+        long,
+        value_name = "COMMAND",
+        default_value = "echo hello from a microvm"
+    )]
+    pub exec: String,
+
+    /// Where the run ledger and the provisioned-daemon cache live. Defaults to
+    /// $MICROVM_STATE_DIR or ~/.microvm/runs.
+    #[arg(long)]
+    pub state_dir: Option<PathBuf>,
 
     #[command(flatten)]
     pub region: RegionFlags,
@@ -1640,6 +1676,7 @@ mod tests {
             registered,
             [
                 "run",
+                "quickstart",
                 "build",
                 "exec",
                 "health",

@@ -105,7 +105,7 @@ pub struct Ctx<'a, O: Write, E: Write> {
 /// command added without an entry fails rather than shipping undescribed. That check is the
 /// only thing that keeps this table from being the hand-maintained artifact the manifest is
 /// forbidden to be.
-pub const RESPONSE_TYPES: [(&str, &str, &[&str]); 20] = [
+pub const RESPONSE_TYPES: [(&str, &str, &[&str]); 21] = [
     (
         "run",
         "microvm.run",
@@ -139,6 +139,34 @@ pub const RESPONSE_TYPES: [(&str, &str, &[&str]); 20] = [
             // themselves (positional or `binary` in microvm.toml). An agent reading the
             // run learns provenance-versus-integrity without re-deriving which tool was
             // on PATH.
+            "agentd",
+        ],
+    ),
+    // `quickstart` IS `run` with the decisions pre-made, and its envelope says so by
+    // carrying the same discriminant and the same keys — the `suspend`/`resume` precedent
+    // (both `microvm.state`). A consumer that learned to read one run has learned both.
+    (
+        "quickstart",
+        "microvm.run",
+        &[
+            "imageIdentifier",
+            "imageName",
+            "microvmId",
+            "endpoint",
+            "agentToken",
+            "execExitCode",
+            "stdout",
+            "stderr",
+            "truncated",
+            "buildSeconds",
+            "runningSeconds",
+            "kept",
+            "vmName",
+            "leaked",
+            "cost",
+            "resolvedConfig",
+            "configPath",
+            "sync",
             "agentd",
         ],
     ),

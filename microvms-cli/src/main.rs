@@ -369,6 +369,11 @@ fn infra_for(command: &Command) -> Infra {
             args.infra.build_role_arn.clone(),
             args.infra.execution_role_arn.clone(),
         ),
+        Command::Quickstart(args) => (
+            args.infra.bucket.clone(),
+            args.infra.build_role_arn.clone(),
+            args.infra.execution_role_arn.clone(),
+        ),
         Command::Build(args) => (
             args.infra.bucket.clone(),
             args.infra.build_role_arn.clone(),
@@ -403,6 +408,7 @@ async fn handle<O: std::io::Write, E: std::io::Write>(
         // The only command that races the interrupt, because it is the only one that launches
         // (CLI-6). Injected rather than a global handler, so the guard can pass its own.
         Command::Run(args) => commands::lifecycle::run(ctx, args, interrupt).await,
+        Command::Quickstart(args) => commands::lifecycle::quickstart(ctx, args, interrupt).await,
         Command::Build(args) => commands::lifecycle::build(ctx, args).await,
         // The attached block: five commands, one door. See `commands/attached.rs`.
         Command::Exec(args) => commands::attached::exec(ctx, args).await,

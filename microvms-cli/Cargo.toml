@@ -95,6 +95,25 @@ unicode-width = "0.2"
 sha2 = "0.11"
 const-hex = "1.19"
 
+# ── the fast install path (issue #76) ───────────────────────────────────────
+#
+# `cargo binstall microvms-cli` resolves these templates against the GitHub release's
+# `microvm-<target>` archives instead of compiling for minutes. The asset name is the
+# *binary's* name, spelled here and in release.yml's `cli` job, and the two must move
+# together — binstall fails with a 404 naming the URL when they drift. Windows ships a
+# zip because nothing there consumes tar; every other target is a tar.gz.
+#
+# Homebrew was considered for the same job and declined: a formula or tap is a second
+# repository with its own release cadence to maintain, and binstall + these assets +
+# `cargo install` already cover macOS. Recorded here and on issue #76 so the next person
+# does not re-litigate it from scratch.
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/microvm-{ target }{ archive-suffix }"
+pkg-fmt = "tgz"
+
+[package.metadata.binstall.overrides.x86_64-pc-windows-msvc]
+pkg-fmt = "zip"
+
 [dev-dependencies]
 # Temp files/dirs for the test suites: random names with O_EXCL creation and
 # guaranteed cleanup on drop. Replaces eight hand-rolled pid+thread-id helpers
