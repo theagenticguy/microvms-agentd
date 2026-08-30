@@ -478,14 +478,13 @@ def test_the_minimum_retention_is_a_week_and_the_constants_agree_with_the_table(
 # -- size classes: the closed set --------------------------------------------
 
 
-def test_the_five_size_classes_are_the_documented_baselines_and_burst_four_times() -> (
-    None
-):
+def test_the_five_size_classes_pair_each_baseline_with_a_peak_four_times_it() -> None:
     """The table, asserted as the *relationship* rather than as ten numbers.
 
-    Every class bursts to 4x its baseline in both memory and vCPU. Stating that as a ratio is
-    what would catch a class whose peak was transcribed from the row above it — which two
-    columns of literals would not, because both columns would look internally consistent.
+    Every class's provisioned peak — present from the start, never a scaling event — is 4x
+    its baseline in both memory and vCPU. Stating that as a ratio is what would catch a class
+    whose peak was transcribed from the row above it — which two columns of literals would
+    not, because both columns would look internally consistent.
     """
     classes = microvms.SizeClass.all()
     assert [size.baseline_mib for size in classes] == [512, 1024, 2048, 4096, 8192]

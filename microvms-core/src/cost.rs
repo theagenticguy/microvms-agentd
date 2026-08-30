@@ -1543,11 +1543,14 @@ impl CostReport {
 
 /// Compute for one phase, as two line items (COST-5).
 ///
-/// Both figures read `baseline_*`. The guest reports the peak and bursts to it, but
-/// the peak is charged only for the seconds above baseline that are actually consumed
-/// — which this client cannot observe, so it is left out rather than guessed at. See
-/// [`crate::sizing`], whose 2 GB class reports 8 GB in the guest: reading the peak
-/// would overstate the memory line exactly 4x.
+/// Both figures read `baseline_*`. Our line bills the minimum floor: the baseline is
+/// always paid while the VM runs. The peak is provisioned from the start — the guest
+/// reports it and can use all of it at any moment — and usage above the baseline is
+/// real and billed by AWS by consumption, per second. This client cannot observe that
+/// consumption, so it is left out rather than guessed at — our figure is the floor of
+/// the real bill, which is what the report's own header ("only Cost Explorer knows
+/// the bill") warns about. See [`crate::sizing`], whose 2 GB class reports 8 GB in
+/// the guest: reading the peak would overstate the memory line exactly 4x.
 fn compute_lines(
     size: SizeClass,
     duration: DurationP,

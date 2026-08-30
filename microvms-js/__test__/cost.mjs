@@ -515,11 +515,12 @@ test('the minimum retention is a week and the constants agree with the table', (
 
 // -- size classes: the closed set ---------------------------------------------
 
-test('the five size classes are the documented baselines and burst four times', () => {
-  // The table, asserted as the *relationship* rather than as ten numbers. Every class bursts to 4x
-  // its baseline in both memory and vCPU — stating that as a ratio is what would catch a class whose
-  // peak was transcribed from the row above it, which two columns of literals would not because both
-  // columns would look internally consistent.
+test('the five size classes pair each baseline with a peak four times it', () => {
+  // The table, asserted as the *relationship* rather than as ten numbers. Every class's provisioned
+  // peak — present from the start, never a scaling event — is 4x its baseline in both memory and
+  // vCPU. Stating that as a ratio is what would catch a class whose peak was transcribed from the
+  // row above it, which two columns of literals would not because both columns would look
+  // internally consistent.
   const classes = SizeClass.all();
   assert.deepEqual(
     classes.map((size) => size.baselineMib),

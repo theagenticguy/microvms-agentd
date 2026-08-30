@@ -51,8 +51,13 @@ IMAGE_ARN=$(echo "$BUILT" | jqr "['imageIdentifier']")
 # ── 2. launch, keep, with egress ────────────────────────────────────────────
 # --egress is what lets the guest reach bedrock-runtime; without it the VM has
 # no outbound network and both agents fail on their first model call.
+# --config carries the size class from microvm.toml: agent sessions are peaky,
+# so the file pins a 1024 MiB minimum (the bill floor) under the always-present
+# 4 GiB ceiling — half the floor cost of the 2048 default. The file explains
+# the rule; the envelope's resolvedConfig reports that it won.
 echo "launching..." >&2
-LAUNCH=$(microvm run --json --keep --egress --image "$IMAGE_ARN" --region "$REGION")
+LAUNCH=$(microvm run --json --keep --egress --image "$IMAGE_ARN" \
+  --config "$HERE/microvm.toml" --region "$REGION")
 EP=$(echo "$LAUNCH"    | jqr "['endpoint']")
 TOK=$(echo "$LAUNCH"   | jqr "['agentToken']")
 ID=$(echo "$LAUNCH"    | jqr "['microvmId']")

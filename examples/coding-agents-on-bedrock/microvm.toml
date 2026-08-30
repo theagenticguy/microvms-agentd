@@ -1,0 +1,13 @@
+# SPDX-License-Identifier: Apache-2.0
+# Project config for the coding-agents example. `run.sh` passes it with
+# `--config`, and `microvm doctor --config` validates the same file through
+# the same loader.
+#
+# The sizing rule for agent workloads: the minimum you request is your bill
+# floor (25% of the provisioned capacity), and 4x the minimum is the guest's
+# hard ceiling — both fixed at provision time, with no scaling event. Agent
+# sessions are peaky (bursts of build/test work over a small steady state),
+# so pick a low minimum and let peaks ride the always-present 4x headroom,
+# which bills only by what is consumed. 1024 here means a 4 GiB
+# always-present ceiling at half the floor cost of the 2048 default.
+memory = 1024

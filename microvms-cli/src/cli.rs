@@ -587,9 +587,9 @@ pub struct RunArgs {
 
     /// Baseline MiB, which selects a documented size class.
     ///
-    /// Defaults to the platform's own 2 GB rather than the cheapest class: baseline is also
-    /// the floor of the burst range, and 0.5 GB OOM-kills a real test suite to save about
-    /// three cents an hour.
+    /// Defaults to the platform's own 2 GB rather than the cheapest class: the baseline fixes
+    /// the guest's hard ceiling at 4x, provisioned from the start, and a 0.5 GB baseline's
+    /// 2 GB ceiling OOM-kills a real test suite to save about three cents an hour.
     #[arg(long, value_enum, default_value = "2048")]
     pub memory: MemoryMib,
 

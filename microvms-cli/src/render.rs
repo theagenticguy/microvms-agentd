@@ -58,7 +58,9 @@ use serde_json::{Map, Value, json};
 /// A cost report as JSON, keeping every label the report carries.
 ///
 /// Keys are `cli.py:688`'s `report_to_dict` verbatim, because the conformance oracle compares
-/// them and the two clients' `--json` output has to be substitutable.
+/// them and the two clients' `--json` output has to be substitutable. `headroomMib` is the
+/// one addition since that client retired (issue #99): a new key is safe where a rename is
+/// not, because the suite asserts presence, never absence.
 pub fn report_to_json(report: &CostReport) -> Value {
     let size = report.size();
     let total = report.total();
@@ -69,6 +71,11 @@ pub fn report_to_json(report: &CostReport) -> Value {
             "baselineVcpu": size.baseline_vcpu(),
             "peakMib": size.peak_mib(),
             "peakVcpu": size.peak_vcpu(),
+            // Static, from the table row (peak − baseline): the headroom is provisioned
+            // from the start and always present, so it is a property of the class, not
+            // of anything measured. Read through the core accessor rather than derived
+            // here, for TRAP-13's reason — the 4x regularity is AWS's, not ours.
+            "headroomMib": size.headroom_mib(),
             // The Python's `describe()`; core's is `Display`, which names both numbers or
             // neither for the reason its docs give — naming only the peak invites budgeting
             // for memory nobody is billed for.
@@ -655,7 +662,8 @@ mod tests {
         assert_eq!(json["estimated"], true);
     }
 
-    /// The report's key set is `cli.py`'s `report_to_dict` key for key.
+    /// The report's key set is `cli.py`'s `report_to_dict` key for key, plus the one
+    /// addition since that client retired: `headroomMib` (issue #99).
     ///
     /// Pinned because the conformance oracle reads these names: a rename here is a driver
     /// that reports every cost check as missing rather than as wrong.
@@ -687,6 +695,7 @@ mod tests {
                 "baselineMib",
                 "baselineVcpu",
                 "describe",
+                "headroomMib",
                 "peakMib",
                 "peakVcpu"
             ]
