@@ -576,6 +576,23 @@ pub async fn run<O: std::io::Write, E: std::io::Write>(
         ledger.record_image(&image.identifier, &image.name);
     }
 
+    // The daemon's hook log, read *before* the teardown because a terminated VM cannot
+    // answer, and best-effort throughout: this is the teardown path, and a health fetch
+    // that failed must not displace the run's real outcome. Short deadline for the same
+    // reason — a wedged endpoint must not hold the teardown hostage for the transport's
+    // full 60s. Only attempted when a session is in hand; a launch that never built one
+    // has no endpoint to ask.
+    let observed_hooks: Vec<microvms_core::protocol::health::HookObservation> =
+        match sandbox.session() {
+            Some(session) => {
+                match tokio::time::timeout(Duration::from_secs(5), session.health()).await {
+                    Ok(Ok(health)) => health.hooks,
+                    _ => Vec::new(),
+                }
+            }
+            None => Vec::new(),
+        };
+
     // Runs however the block above ended, which is CLI-6. Recorded as leaked *before* the
     // delete is attempted — the other order loses the identifier when the process dies inside
     // the call, which is exactly the interrupt case.
@@ -610,6 +627,12 @@ pub async fn run<O: std::io::Write, E: std::io::Write>(
                 writers_may_be_alive: exec.writers_may_be_alive,
             });
         }
+        // The daemon's own hook observations, fetched above while the VM could still
+        // answer. Deduplicated on (hook, firedAt) so a `run` against a VM some other
+        // command already polled appends only what is new. The run hook is the one a
+        // plain launch always produces; validate/ready appear when the snapshot VM's
+        // memory carried them into this one.
+        crate::history::append_unseen_hooks(&ledger_root, &vm.id, &observed_hooks);
         if !args.keep {
             history.append(Event::Terminated {
                 terminate_accepted: teardown.terminate_accepted,
@@ -1576,7 +1599,7 @@ pub async fn resume<O: std::io::Write, E: std::io::Write>(
     let region = args.region.resolve(ctx.env)?;
     let microvm_id =
         crate::commands::resolve_vm_identifier(ctx, &args.microvm_id, args.state_dir.clone())?;
-    let plane = ctx.seam.control_plane(region).await?;
+    let plane = ctx.seam.control_plane(region.clone()).await?;
     ctx.out.progress(&format!("resuming {}", microvm_id));
     plane.resume(&microvm_id).await?;
     let running = plane
@@ -1589,8 +1612,32 @@ pub async fn resume<O: std::io::Write, E: std::io::Write>(
         .await?;
 
     // The wait returned, so the service reported RUNNING — which is what `resumed` means.
-    History::for_vm(&state_dir(args.state_dir.clone(), ctx.env), &microvm_id)
-        .append(Event::Resumed);
+    let root = state_dir(args.state_dir.clone(), ctx.env);
+    History::for_vm(&root, &microvm_id).append(Event::Resumed);
+
+    // The daemon's hook log, best-effort, and this is the moment that makes suspend-hook
+    // firings visible at all: a frozen VM cannot answer a poll, so the record of the
+    // suspend hook is readable only after the thaw. `/v1/health` is unauthenticated at
+    // the daemon — no bearer is sent — so the attach carries an empty agent token; the
+    // proxy credential it does need is minted through the same seam every attached
+    // command uses. Every failure is swallowed: a resume whose VM is RUNNING must not
+    // fail over a history nicety, so the short deadline bounds what a wedged endpoint
+    // can cost.
+    let attach = crate::seam::Attach {
+        endpoint: running.endpoint.clone(),
+        agent_token: String::new(),
+        microvm_id: microvm_id.clone(),
+        port: None,
+    };
+    if let Ok(Ok(session)) = tokio::time::timeout(
+        Duration::from_secs(10),
+        ctx.seam.attach_session(region, attach),
+    )
+    .await
+        && let Ok(Ok(health)) = tokio::time::timeout(Duration::from_secs(5), session.health()).await
+    {
+        crate::history::append_unseen_hooks(&root, &microvm_id, &health.hooks);
+    }
 
     let mut data = Map::new();
     data.insert("microvmId".into(), json!(microvm_id));

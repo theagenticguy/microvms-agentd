@@ -382,7 +382,7 @@ run = "terraform -chdir=conformance/infra init -input=false && terraform -chdir=
 # discovered them.
 
 [tasks."live:conformance-rs"]
-description = "The live suite through the Rust client: all 105 checks, no SKIP"
+description = "The live suite through the Rust client: all 109 checks, no SKIP"
 depends = ["build", "build:cli", "live:infra"]
 # Both binaries: `--binary` is the aarch64 daemon that gets baked into the image, and
 # `--microvm-binary` is the host-architecture CLI under test. Naming both is what makes the

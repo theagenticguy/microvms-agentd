@@ -3674,6 +3674,195 @@ async fn an_exec_appends_the_daemons_report_and_a_detached_one_appends_a_null_co
     );
 }
 
+/// **`resume` polls the thawed daemon and lands its hook observations in history.**
+/// (issue #80)
+///
+/// This is the moment suspend-hook firings become visible at all — a frozen VM cannot
+/// answer a poll — so the wiring deserves its own guard: delete the post-RUNNING
+/// health poll from `lifecycle::resume` and the hook read below is empty while the
+/// resume's envelope and exit are byte-identical, which is why nothing else catches it.
+#[tokio::test]
+async fn a_resume_polls_the_thawed_daemon_and_lands_its_hook_observations() {
+    /// `ScriptedSeam` for the control plane, `DaemonScript` for the attach the
+    /// post-RUNNING poll makes — `resume` is the one lifecycle command that uses both.
+    struct ResumeSeam {
+        transport: Arc<ScriptedTransport>,
+        clock: Arc<YieldingClock>,
+        daemon: Arc<DaemonScript>,
+    }
+    impl CoreSeam for ResumeSeam {
+        fn control_plane(&self, region: Region) -> BoxFuture<'_, Result<ControlPlane, Error>> {
+            let plane = ControlPlane::with_transport(
+                Arc::clone(&self.transport) as Arc<dyn Transport>,
+                region,
+                Arc::clone(&self.clock) as Arc<dyn Clock>,
+            );
+            Box::pin(async move { Ok(plane) })
+        }
+        fn open_sandbox(
+            &self,
+            _region: Region,
+            _port: Option<u16>,
+        ) -> BoxFuture<'_, Result<Sandbox, Error>> {
+            Box::pin(async move { Err(Error::new(ErrorKind::Platform, "resume never launches")) })
+        }
+        fn attach_session(
+            &self,
+            _region: Region,
+            _attach: Attach,
+        ) -> BoxFuture<'_, Result<Session, Error>> {
+            let backend = Arc::clone(&self.daemon) as Arc<dyn microvms_core::session::HttpBackend>;
+            let built = Session::builder("https://mvm-1.example", "")
+                .with_backend(backend)
+                .build();
+            Box::pin(async move { built })
+        }
+        fn put_artifact(&self, _uri: &str, _bytes: Vec<u8>) -> BoxFuture<'_, Result<(), Error>> {
+            Box::pin(async move { Ok(()) })
+        }
+    }
+
+    let dir = TempDir::new("history-resume-hooks");
+    let transport = Arc::new(ScriptedTransport::new());
+    transport.answer("ResumeMicrovm", 200, "{}").answer(
+        "GetMicrovm",
+        200,
+        &microvm_body("RUNNING"),
+    );
+    let daemon = DaemonScript::new();
+    daemon.reply(
+        200,
+        r#"{"version": "0.1.0", "bootstrapped": true, "disk": null,
+             "identity_degraded": false, "identity_repaired": true,
+             "hooks": [{"hook": "suspend", "fired_at": 1756500500},
+                       {"hook": "resume", "fired_at": 1756500600}],
+             "hooks_dropped": 0}"#,
+    );
+    let seam = ResumeSeam {
+        transport,
+        clock: Arc::new(YieldingClock::default()),
+        daemon: Arc::clone(&daemon),
+    };
+    let command = Command::Resume(ResumeArgs {
+        microvm_id: "mvm-abc123".into(),
+        timeout: 30.0,
+        state_dir: Some(dir.0.clone()),
+        region: region_flags(),
+    });
+    let (result, _) = dispatch_with(&seam, &command, full_infra()).await;
+    result.expect("the resume succeeds");
+
+    assert_eq!(
+        daemon.paths(),
+        ["GET /v1/health"],
+        "one poll, after RUNNING"
+    );
+    let read = crate::history::read_events(&dir.0, "mvm-abc123");
+    let hooks: Vec<(&str, u64)> = read
+        .iter()
+        .filter(|event| event["event"] == "hookObserved")
+        .map(|event| {
+            (
+                event["hook"].as_str().expect("a hook"),
+                event["firedAt"].as_u64().expect("an epoch"),
+            )
+        })
+        .collect();
+    assert_eq!(
+        hooks,
+        [("suspend", 1_756_500_500), ("resume", 1_756_500_600)],
+        "the thawed daemon's observations, verbatim: {read:?}"
+    );
+    // And the `resumed` event still precedes them — the poll is after RUNNING.
+    assert_eq!(read[0]["event"], "resumed");
+}
+
+/// **`microvm health` lands the daemon's hook observations in the VM's history,
+/// deduplicated on the (hook, firedAt) pair.** (issue #80)
+///
+/// Three polls prove three claims. The first appends the body's two observations with
+/// the daemon's own values — never anything the guest printed, which is the forgery
+/// property's letter; the daemon-reported caveat (an in-guest caller can forge
+/// *additional* firings by posting the unauthenticated hook paths) is documented in
+/// `history.rs` and does not change what this asserts, because the values on file are
+/// still exactly what the daemon reported. The second poll repeats the identical body
+/// and appends nothing. The third carries one new firing and appends exactly it, with
+/// `seq` continuing the one sequence.
+///
+/// **Guard proof.** Delete the `append_unseen_hooks` call from `attached::health` and
+/// the first read below is empty while the envelope still carries `hooks`; drop the
+/// dedup and the second read counts four. The dedup half was broken exactly so on
+/// 2026-08-30 (in `history.rs`'s own falsification), failed as stated, restored.
+#[tokio::test]
+async fn a_health_poll_lands_hook_observations_in_history_and_a_repeat_appends_nothing() {
+    let dir = TempDir::new("history-hooks");
+    let health_command = || {
+        Command::Health(HealthArgs {
+            attach: AttachFlags {
+                state_dir: Some(dir.0.clone()),
+                ..attach_flags()
+            },
+            region: region_flags(),
+        })
+    };
+    let body_two_hooks = r#"{"version": "0.1.0", "bootstrapped": true, "disk": null,
+             "identity_degraded": false, "identity_repaired": true,
+             "hooks": [{"hook": "validate", "fired_at": 1756500000},
+                       {"hook": "run", "fired_at": 1756500100}],
+             "hooks_dropped": 0}"#;
+
+    // First poll: both observations land, with the daemon's values.
+    let script = DaemonScript::new();
+    script.reply(200, body_two_hooks);
+    let (result, _, _) = against_daemon(&script, &health_command()).await;
+    let rendered = result.expect("health answers");
+    assert_eq!(
+        rendered.data["hooks"],
+        serde_json::json!([
+            {"hook": "validate", "firedAt": 1756500000_u64},
+            {"hook": "run", "firedAt": 1756500100_u64},
+        ]),
+        "the envelope carries the observations, camelCase like its neighbours"
+    );
+    assert_eq!(rendered.data["hooksDropped"], 0);
+    let read = crate::history::read_events(&dir.0, "mvm-1");
+    assert_eq!(read.len(), 2, "{read:?}");
+    assert_eq!(read[0]["event"], "hookObserved");
+    assert_eq!(read[0]["hook"], "validate");
+    assert_eq!(read[0]["firedAt"], 1_756_500_000_u64);
+    assert_eq!(read[1]["hook"], "run");
+
+    // Second poll, identical body: dedup proven — nothing appends.
+    let script = DaemonScript::new();
+    script.reply(200, body_two_hooks);
+    let (result, _, _) = against_daemon(&script, &health_command()).await;
+    result.expect("health answers again");
+    assert_eq!(
+        crate::history::read_events(&dir.0, "mvm-1").len(),
+        2,
+        "a repeat poll must append nothing"
+    );
+
+    // Third poll, one new firing: exactly it appends, and seq continues.
+    let script = DaemonScript::new();
+    script.reply(
+        200,
+        r#"{"version": "0.1.0", "bootstrapped": true, "disk": null,
+             "identity_degraded": false, "identity_repaired": true,
+             "hooks": [{"hook": "validate", "fired_at": 1756500000},
+                       {"hook": "run", "fired_at": 1756500100},
+                       {"hook": "suspend", "fired_at": 1756500900}],
+             "hooks_dropped": 0}"#,
+    );
+    let (result, _, _) = against_daemon(&script, &health_command()).await;
+    result.expect("health answers a third time");
+    let read = crate::history::read_events(&dir.0, "mvm-1");
+    assert_eq!(read.len(), 3, "{read:?}");
+    assert_eq!(read[2]["hook"], "suspend");
+    assert_eq!(read[2]["firedAt"], 1_756_500_900_u64);
+    assert_eq!(read[2]["seq"], 2, "one monotonic sequence across the polls");
+}
+
 // ── CLI-3's classification half ──────────────────────────────────────────────
 
 /// **CLI-3, table-driven over every non-zero row that a core failure can produce.**
@@ -4039,6 +4228,17 @@ async fn run_dir_uploads_the_tree_execs_in_it_and_brings_back_matched_artifacts(
             ("secrets.env", b"never asked for"),
         ]),
     ));
+    // The teardown's own health poll (issue #80), carrying the daemon's hook log. The
+    // hooks below are what a real launch reports: validate and ready fired in the
+    // snapshot VM, run fired in this one.
+    daemon.reply(
+        200,
+        r#"{"version": "0.1.0", "bootstrapped": true, "disk": null,
+                    "identity_degraded": false, "identity_repaired": true,
+                    "hooks": [{"hook": "validate", "fired_at": 1756500000},
+                              {"hook": "run", "fired_at": 1756500100}],
+                    "hooks_dropped": 0}"#,
+    );
 
     let seam = SyncSeam {
         transport: sync_launch_script(),
@@ -4116,6 +4316,27 @@ async fn run_dir_uploads_the_tree_execs_in_it_and_brings_back_matched_artifacts(
     );
     // One member: `main.py`. The `.git` tree was skipped whole.
     assert_eq!(rendered.data["sync"]["uploadedMembers"], 1);
+
+    // The teardown's health poll landed the daemon's hook observations in the VM's
+    // history, with the daemon's own values (issue #80). The daemon lane is where the
+    // values are proven; this is the wiring — a `run` that never polled would leave no
+    // hookObserved lines while every other assertion above stayed green.
+    let events = crate::history::read_events(&state.0, "mvm-abc123");
+    let hooks: Vec<(&str, u64)> = events
+        .iter()
+        .filter(|event| event["event"] == "hookObserved")
+        .map(|event| {
+            (
+                event["hook"].as_str().expect("a hook name"),
+                event["firedAt"].as_u64().expect("an epoch"),
+            )
+        })
+        .collect();
+    assert_eq!(
+        hooks,
+        [("validate", 1_756_500_000), ("run", 1_756_500_100)],
+        "the daemon's observations, verbatim: {events:?}"
+    );
 }
 
 /// **An exec that fails still gets its artifacts downloaded — CI wants the logs.**
@@ -4151,6 +4372,12 @@ async fn a_failing_exec_still_brings_the_artifacts_back() {
         .lock()
         .expect("not poisoned")
         .push_back((200, daemon_archive(&[("report/junit.xml", b"<failure/>")])));
+    // The teardown's health poll (issue #80); no hooks in this body, so nothing lands.
+    daemon.reply(
+        200,
+        r#"{"version": "0.1.0", "bootstrapped": true, "disk": null,
+                    "identity_degraded": false, "identity_repaired": true}"#,
+    );
 
     let seam = SyncSeam {
         transport: sync_launch_script(),

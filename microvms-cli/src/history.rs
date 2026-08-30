@@ -33,6 +33,17 @@
 //! exit codes, teardown verdicts — and never anything the guest printed. A record built
 //! from guest output would be a record the workload can forge.
 //!
+//! [`Event::HookObserved`] carries one caveat that must be stated rather than implied.
+//! The observation is the daemon's — a hook path posted, and the daemon's clock when it
+//! arrived — so no guest-printed byte ever enters the line, and the letter of the rule
+//! above holds. But the daemon's hook routes are unauthenticated and reachable over
+//! loopback from inside the guest (`docs/PROTOCOL.md`, "Trust boundary"), so a hostile
+//! workload can make the daemon observe *additional* firings by posting the hook paths
+//! itself. It cannot remove or alter real ones: the daemon records before responding,
+//! and its log keeps the earliest entries when capped — the platform's real lifecycle
+//! firings — while later spam is dropped and counted. Read a hook line as "the daemon
+//! saw this hook fire", never as "only the platform could have fired it".
+//!
 //! # Failures are swallowed, like the ledger's
 //!
 //! [`History::append`] runs on teardown paths, and a history write that raised would
@@ -83,6 +94,16 @@ pub enum Event {
         truncated: bool,
         writers_may_be_alive: Option<bool>,
     },
+    /// The daemon observed one lifecycle-hook invocation.
+    ///
+    /// Read off a health poll rather than pushed: the CLI appends the observations a
+    /// `GET /v1/health` reported wherever it already holds both a health envelope and a
+    /// VM id, deduplicated on the (hook, firedAt) pair so re-polling appends nothing.
+    /// `hook` is the route's own spelling (`ready`, `validate`, `run`, `suspend`,
+    /// `resume`, `terminate`) and `fired_at` is epoch seconds on the *daemon's* clock —
+    /// distinct from the record's own `at`, which is when this CLI learned of it.
+    /// See the module docs for the additive-forgery caveat this event carries.
+    HookObserved { hook: String, fired_at: u64 },
     /// The service reported SUSPENDED.
     Suspended,
     /// The service reported RUNNING again.
@@ -158,6 +179,48 @@ impl History {
             .open(&self.path)
         {
             let _ = writeln!(file, "{line}");
+        }
+    }
+}
+
+/// Appends every hook observation from a health envelope that this VM's history has
+/// not seen, deduplicated on the (hook, firedAt) pair.
+///
+/// The dedup is what makes hook recording safe to run opportunistically — `run`'s
+/// teardown, `resume`, and `microvm health` all call this with whatever the daemon
+/// reported, and a pair already on file is not re-appended, so polling twice appends
+/// nothing. The comparison reads the file through [`read_events`] first, which keeps
+/// the writes inside the single command that owns the moment (the module's
+/// single-writer assumption) rather than adding a lock.
+///
+/// Failures are swallowed like every other append here: this runs on teardown paths.
+pub fn append_unseen_hooks(
+    root: &Path,
+    vm_id: &str,
+    observed: &[microvms_core::protocol::health::HookObservation],
+) {
+    if observed.is_empty() {
+        return;
+    }
+    let mut seen: std::collections::HashSet<(String, u64)> = read_events(root, vm_id)
+        .iter()
+        .filter(|event| event["event"] == "hookObserved")
+        .filter_map(|event| {
+            Some((
+                event["hook"].as_str()?.to_string(),
+                event["firedAt"].as_u64()?,
+            ))
+        })
+        .collect();
+    let history = History::for_vm(root, vm_id);
+    for observation in observed {
+        // Inserted as it is appended, so a health body that repeats a pair — which a
+        // hostile guest posting the hook routes can produce — lands once.
+        if seen.insert((observation.hook.clone(), observation.fired_at)) {
+            history.append(Event::HookObserved {
+                hook: observation.hook.clone(),
+                fired_at: observation.fired_at,
+            });
         }
     }
 }
@@ -365,6 +428,10 @@ mod tests {
             truncated: false,
             writers_may_be_alive: Some(false),
         });
+        history.append(Event::HookObserved {
+            hook: "validate".to_string(),
+            fired_at: 1_756_500_000,
+        });
         history.append(Event::Terminated {
             terminate_accepted: false,
             undeleted: vec!["mvm-1".to_string()],
@@ -410,6 +477,14 @@ mod tests {
         );
         assert_eq!(
             keys_of(&read[3]),
+            ["at", "event", "firedAt", "hook", "seq"],
+            "the hook line's keys are camelCase like every other event's"
+        );
+        assert_eq!(read[3]["event"], "hookObserved");
+        assert_eq!(read[3]["hook"], "validate");
+        assert_eq!(read[3]["firedAt"], 1_756_500_000_u64);
+        assert_eq!(
+            keys_of(&read[4]),
             ["at", "event", "seq", "terminateAccepted", "undeleted"]
         );
 
@@ -423,6 +498,97 @@ mod tests {
         let back: Record = serde_json::from_str(&line).expect("round trips");
         assert_eq!(back.event, Event::Suspended);
         assert_eq!(back.seq, 9);
+    }
+
+    /// The hook variant round-trips through the file, and its wire keys are the
+    /// camelCase spellings the renderer and the dedup both read.
+    #[test]
+    fn a_hook_observation_round_trips_through_the_real_file() {
+        let dir = TempDir::new("hook-roundtrip");
+        History::for_vm(&dir.0, "mvm-1").append(Event::HookObserved {
+            hook: "run".to_string(),
+            fired_at: 1_756_500_100,
+        });
+
+        let read = read_events(&dir.0, "mvm-1");
+        assert_eq!(read.len(), 1, "{read:?}");
+        assert_eq!(read[0]["event"], "hookObserved");
+        assert_eq!(read[0]["hook"], "run");
+        assert_eq!(read[0]["firedAt"], 1_756_500_100_u64);
+
+        // And through the enum, so the reader above is the writer's own shape.
+        let line = serde_json::to_string(&Record {
+            seq: 0,
+            at: 1,
+            event: Event::HookObserved {
+                hook: "run".to_string(),
+                fired_at: 1_756_500_100,
+            },
+        })
+        .expect("serializes");
+        let back: Record = serde_json::from_str(&line).expect("round trips");
+        assert_eq!(
+            back.event,
+            Event::HookObserved {
+                hook: "run".to_string(),
+                fired_at: 1_756_500_100,
+            }
+        );
+    }
+
+    /// `append_unseen_hooks` appends only the pairs the file has not seen: a repeat
+    /// poll appends nothing, a poll with one new firing appends exactly it, and `seq`
+    /// stays one monotonic sequence through it all.
+    ///
+    /// **Falsification** — drop the `seen.insert(..)` check (append unconditionally)
+    /// and the second read below counts four rather than two. Broken exactly so on
+    /// 2026-08-30, failed as stated, restored.
+    #[test]
+    fn unseen_hook_observations_append_once_and_a_repeat_poll_appends_nothing() {
+        use microvms_core::protocol::health::HookObservation;
+
+        let dir = TempDir::new("hook-dedup");
+        let first_poll = vec![
+            HookObservation {
+                hook: "validate".to_string(),
+                fired_at: 100,
+            },
+            HookObservation {
+                hook: "run".to_string(),
+                fired_at: 200,
+            },
+        ];
+        append_unseen_hooks(&dir.0, "mvm-1", &first_poll);
+        assert_eq!(read_events(&dir.0, "mvm-1").len(), 2);
+
+        // The same body again: the daemon's log is append-only, so a re-poll repeats
+        // every pair, and none of them may re-append.
+        append_unseen_hooks(&dir.0, "mvm-1", &first_poll);
+        let read = read_events(&dir.0, "mvm-1");
+        assert_eq!(read.len(), 2, "a repeat poll appends nothing: {read:?}");
+
+        // One new firing beside the old two appends exactly it. A second `run` at a
+        // different firedAt is a different fact — a platform retry — and is kept.
+        let second_poll = vec![
+            HookObservation {
+                hook: "validate".to_string(),
+                fired_at: 100,
+            },
+            HookObservation {
+                hook: "run".to_string(),
+                fired_at: 200,
+            },
+            HookObservation {
+                hook: "run".to_string(),
+                fired_at: 250,
+            },
+        ];
+        append_unseen_hooks(&dir.0, "mvm-1", &second_poll);
+        let read = read_events(&dir.0, "mvm-1");
+        assert_eq!(read.len(), 3, "{read:?}");
+        assert_eq!(read[2]["hook"], "run");
+        assert_eq!(read[2]["firedAt"], 250);
+        assert_eq!(read[2]["seq"], 2, "seq is one sequence across the polls");
     }
 
     /// A VM this state dir never saw reads back empty, not as an error.

@@ -169,6 +169,11 @@ pub const RESPONSE_TYPES: [(&str, &str, &[&str]); 20] = [
             "diskUnderPressure",
             "busy",
             "execs",
+            // The daemon's lifecycle-hook observations, [{hook, firedAt}] oldest
+            // first, and how many the daemon's cap dropped. Empty/zero against an
+            // old daemon. Issue #80: the validate hook's only trace anywhere.
+            "hooks",
+            "hooksDropped",
         ],
     ),
     (

@@ -6,7 +6,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Live conformance run driving the **Rust** client stack through the `microvm` CLI.
 
-This is the only live suite, and it now expresses **every named check** — 105 of them, with
+This is the only live suite, and it now expresses **every named check** — 109 of them, with
 none recorded SKIP. `conformance/run.py` was the oracle — 56 checks through the Python
 client — and it went away with that client once both suites ran green against real AWS on
 the same commit (Python 56/56, this one 38/38 with 34 recorded SKIP). Those 34 were the
@@ -78,6 +78,16 @@ passes every stand-in and fails only against the real proxy.
 envelope's size object reporting `headroomMib` (peak minus baseline, both read from
 the sizing table) beside `baselineMib` and `peakMib`, asserted against the documented
 row for the class this suite launches with.
+
+109 rather than 105: hook observations, issue #80. `drive_health` adds two — the run
+hook the platform fired appearing on the health envelope with a wall-clock-bracketed
+timestamp, and an *informational* check for validate/ready surviving from the snapshot
+VM's memory (PASS either way; absence prints as a finding, because the survival is a
+design expectation no live run has yet confirmed). `drive_suspend_resume` adds two —
+the suspend and resume hooks on health after the thaw (the only moment a suspend
+observation is readable at all), and the local history JSONL carrying the cycle's
+hookObserved events exactly once each, read the way a user would, through
+`microvm history --json`.
 
 A hybrid driver, and both lanes are deliberate
 ----------------------------------------------
@@ -1055,7 +1065,7 @@ def drive_exec(cli: Cli, launched: Envelope, results: Results) -> None:
 
 
 def drive_health(cli: Cli, launched: Envelope, results: Results) -> None:
-    """`microvm health` — five checks, and the identity pair is the one with a measurement.
+    """`microvm health` — seven checks, and the identity pair is the one with a measurement.
 
     `identity_degraded` is the only guard whose unit tests inject a fake layout, so this is
     the one place the real bind mount over real procfs is exercised. Measured 2026-08-06:
@@ -1064,6 +1074,14 @@ def drive_health(cli: Cli, launched: Envelope, results: Results) -> None:
     Asserting it here is what makes the capability requirement impossible to drop by
     accident — the launch above passes `--repair-identity`, and if core stopped injecting
     `["ALL"]` this check would be the thing that noticed.
+
+    The hook checks (issue #80) split guarantee from hypothesis. A launched VM's daemon
+    served the platform's run hook by definition — no traffic is forwarded before it
+    answers 200 — so the run observation is asserted hard. Validate/ready fire in the
+    *snapshot* VM, and their surviving into a launched VM rests on launch restoring the
+    snapshot's memory: designed for, expected, and informational here rather than
+    load-bearing until a live run confirms it. Its absence is printed as a finding, never
+    a failure — a red suite over a hypothesis is a suite people stop reading.
     """
     print("\n-- health --")
     attach = attach_args(cli, launched)
@@ -1086,6 +1104,33 @@ def drive_health(cli: Cli, launched: Envelope, results: Results) -> None:
     )
     results.eq(
         "identity repair actually ran", health.data.get("identityRepaired"), True
+    )
+
+    # The daemon's own record of the run hook, with a timestamp the wall clock brackets:
+    # after this suite started (minus generous build time is unnecessary — the hook fired
+    # during this run's launch) and not in the future. `bootstrapped: true` above says the
+    # hook succeeded; this says the *observation log* recorded it, which is the surface
+    # issue #80 added and the thing that would break independently.
+    hooks = health.data.get("hooks") or []
+    now = int(time.time())
+    run_hooks = [h for h in hooks if h.get("hook") == "run"]
+    results.check(
+        "health reports the run hook the platform fired",
+        bool(run_hooks)
+        and all(0 < int(h.get("firedAt", 0)) <= now + 60 for h in run_hooks),
+        f"hooks={hooks!r}",
+    )
+    # The snapshot-survival hypothesis, reported rather than asserted: validate and ready
+    # fire in the snapshot VM, and a launched VM restores that VM's memory, so its hook
+    # log should carry them. PASS either way — presence confirms the design, absence is a
+    # finding worth reading in the report, not a defect in this client.
+    build_hooks = sorted({h.get("hook") for h in hooks} & {"ready", "validate"})
+    results.check(
+        "build-time hook observations restored from the snapshot (informational)",
+        True,
+        f"present: {build_hooks!r}"
+        if build_hooks
+        else "ABSENT — the snapshot did not carry them; a finding, not a failure",
     )
 
 
@@ -1609,6 +1654,44 @@ def drive_suspend_resume(cli: Cli, launched: Envelope, results: Results) -> None
             f"phase={survived_record.data.get('phase')!r} "
             f"stdout={(survived_record.data.get('stdout') or '')[:40]!r}",
         )
+
+    # The daemon's hook log across the cycle (issue #80). The suspend observation is
+    # only ever readable after the thaw — a frozen VM answers nothing — so this is the
+    # moment it becomes visible at all. Timestamps are bracketed by this section's own
+    # wall clock: both hooks fired between the suspend call above and now.
+    after_health = cli.call("health", *after)
+    hooks = after_health.data.get("hooks") or []
+    now = int(time.time())
+    cycle_hooks = {
+        name: [int(h.get("firedAt", 0)) for h in hooks if h.get("hook") == name]
+        for name in ("suspend", "resume")
+    }
+    results.check(
+        "health reports the suspend and resume hooks with plausible timestamps",
+        bool(cycle_hooks["suspend"])
+        and bool(cycle_hooks["resume"])
+        and all(
+            0 < stamp <= now + 60 for stamps in cycle_hooks.values() for stamp in stamps
+        ),
+        f"suspend={cycle_hooks['suspend']!r} resume={cycle_hooks['resume']!r}",
+    )
+
+    # And the local history, read the way a user would. The `resume` above polled
+    # health and the `health` call just did too, each appending unseen observations
+    # deduplicated on (hook, firedAt) — so the JSONL carries hookObserved events for
+    # the cycle, and carrying each pair exactly once is the dedup working live.
+    story = cli.call("history", microvm_id)
+    observed = [
+        (event.get("hook"), event.get("firedAt"))
+        for event in (story.data.get("events") or [])
+        if event.get("event") == "hookObserved"
+    ]
+    results.check(
+        "the local history carries the cycle's hook observations exactly once each",
+        {"suspend", "resume", "run"} <= {hook for hook, _ in observed}
+        and len(observed) == len(set(observed)),
+        f"hookObserved={observed!r}",
+    )
 
 
 def drive_token_rotation(cli: Cli, launched: Envelope, results: Results) -> None:

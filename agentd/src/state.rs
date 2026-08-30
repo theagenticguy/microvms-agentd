@@ -91,6 +91,33 @@ fn recover<'a, T>(lock: &'a Mutex<T>, name: &str) -> MutexGuard<'a, T> {
     }
 }
 
+/// How many hook invocations are kept before the log stops growing.
+///
+/// Six is what the platform ever sends a well-behaved VM (ready, validate, run,
+/// then suspend/resume cycles and a terminate), so 64 is room for many cycles
+/// while bounding what a guest spamming the unauthenticated hook routes can make
+/// this daemon hold. First-N-wins on purpose: the earliest invocations are the
+/// platform's real lifecycle firings, and spam arrives later by construction —
+/// nothing runs in the guest before the run hook.
+const HOOK_LOG_CAP: usize = 64;
+
+/// The hook-invocation log: what was kept, and how much was not.
+#[derive(Default)]
+struct HookLog {
+    observed: Vec<protocol::health::HookObservation>,
+    dropped: u64,
+}
+
+/// Seconds since the epoch on this daemon's clock, for a hook observation's
+/// `fired_at`. Zero on a clock before 1970 rather than a panic, because this runs
+/// inside the platform's own hook request and a panic here fails a launch.
+fn epoch_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.as_secs())
+        .unwrap_or_default()
+}
+
 /// What happened when a caller tried to install a token.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Bootstrap {
@@ -148,6 +175,23 @@ struct Inner {
     /// not win the identity.
     tunnel_identity: Mutex<crate::tunnel_identity::Shared>,
     execs: Mutex<HashMap<String, ExecEntry>>,
+    /// Every lifecycle-hook invocation this daemon observed, oldest first, capped.
+    ///
+    /// Plain process memory on purpose, and the placement carries a property worth
+    /// wanting: build-time hooks (validate, ready) fire in the snapshot VM before
+    /// the snapshot is taken, so their records ride the memory image into every VM
+    /// launched from it and are visible on the first health poll.
+    ///
+    /// The trust shape mirrors the routes that feed it. The hook paths are
+    /// unauthenticated and loopback-reachable from inside the guest, so a hostile
+    /// workload can *add* entries; it cannot remove or edit real ones, because the
+    /// daemon records before responding and the cap keeps the earliest entries —
+    /// the platform's real lifecycle firings — while later spam is what gets
+    /// dropped and counted. Recovery from poisoning follows `launch_env`'s
+    /// argument: every write is a bounded push or a counter bump, nothing here
+    /// authorizes anything, and a stale log is a far better outcome than a VM
+    /// nothing can reach.
+    hooks: Mutex<HookLog>,
     /// How free space is measured. Held here rather than called directly from the
     /// write paths so a test can inject a filesystem that is full, or one that
     /// fills mid-upload, without depending on the host's actual free space.
@@ -176,6 +220,7 @@ impl AppState {
                 launch_env: Mutex::new(HashMap::new()),
                 tunnel_identity: Mutex::new(None),
                 execs: Mutex::new(HashMap::new()),
+                hooks: Mutex::new(HookLog::default()),
                 space_probe,
                 identity,
             }),
@@ -295,6 +340,33 @@ impl AppState {
         Some(crate::auth::constant_time_eq(installed, presented))
     }
 
+    /// Records one lifecycle-hook invocation, on the daemon's clock.
+    ///
+    /// Called by every hook handler *before* it does any work or chooses a status:
+    /// a run hook that arrives malformed, or answers 409, was still invoked, and
+    /// the record is of the invocation rather than the verdict. Beyond the cap the
+    /// invocation is counted rather than kept — first-N-wins, because the earliest
+    /// entries are the platform's real firings and later spam is what an in-guest
+    /// caller posting these unauthenticated routes can produce.
+    pub fn record_hook(&self, hook: &str) {
+        let mut log = recover(&self.inner.hooks, "hooks");
+        if log.observed.len() >= HOOK_LOG_CAP {
+            log.dropped = log.dropped.saturating_add(1);
+            return;
+        }
+        log.observed.push(protocol::health::HookObservation {
+            hook: hook.to_string(),
+            fired_at: epoch_secs(),
+        });
+    }
+
+    /// The hook log as health reports it: every kept observation, oldest first,
+    /// and how many the cap dropped.
+    pub fn hook_report(&self) -> (Vec<protocol::health::HookObservation>, u64) {
+        let log = recover(&self.inner.hooks, "hooks");
+        (log.observed.clone(), log.dropped)
+    }
+
     /// Runs a closure against the exec registry.
     ///
     /// A panic inside `f` poisons this lock. The next call recovers the guard
@@ -405,6 +477,51 @@ mod tests {
         });
         std::panic::set_hook(previous);
         assert!(result.is_err(), "the deliberate panic must have unwound");
+    }
+
+    /// Hook invocations are recorded in arrival order, with the daemon's own clock.
+    #[test]
+    fn hook_invocations_record_in_order_with_a_plausible_clock() {
+        let state = state();
+        for hook in ["ready", "validate", "run", "suspend", "resume", "terminate"] {
+            state.record_hook(hook);
+        }
+        let (observed, dropped) = state.hook_report();
+        assert_eq!(
+            observed.iter().map(|o| o.hook.as_str()).collect::<Vec<_>>(),
+            ["ready", "validate", "run", "suspend", "resume", "terminate"],
+            "order is arrival order — a reader reconstructs the lifecycle from it"
+        );
+        assert_eq!(dropped, 0);
+        for observation in &observed {
+            assert!(
+                observation.fired_at > 1_600_000_000,
+                "the clock must be the daemon's real one: {observation:?}"
+            );
+        }
+    }
+
+    /// The cap holds: the earliest records survive and later spam is counted, not kept.
+    ///
+    /// **Falsification** — remove the `len() >= HOOK_LOG_CAP` early return from
+    /// `record_hook` (append unconditionally) and both assertions go red: the length
+    /// grows past the cap and `dropped` stays zero. Broken exactly so on 2026-08-30,
+    /// failed as stated, restored. Without the cap a guest looping POSTs against the
+    /// unauthenticated hook paths grows daemon memory without bound.
+    #[test]
+    fn the_hook_log_caps_at_first_n_and_counts_what_it_drops() {
+        let state = state();
+        state.record_hook("run");
+        for _ in 0..(HOOK_LOG_CAP + 9) {
+            state.record_hook("spam");
+        }
+        let (observed, dropped) = state.hook_report();
+        assert_eq!(observed.len(), HOOK_LOG_CAP, "the cap must hold");
+        assert_eq!(
+            observed[0].hook, "run",
+            "first-N-wins: the platform's real firing is the record the cap protects"
+        );
+        assert_eq!(dropped, 10, "every drop is counted, so the report says so");
     }
 
     #[test]

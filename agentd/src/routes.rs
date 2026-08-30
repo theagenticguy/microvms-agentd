@@ -180,6 +180,11 @@ async fn run_hook(
     State(state): State<AppState>,
     body: Result<Json<RunHookEnvelope>, JsonRejection>,
 ) -> Response {
+    // The invocation, before any parse or verdict: a run hook that arrives
+    // malformed and answers 400 was still invoked, and the record is of the
+    // invocation. This is what `microvm history` ultimately surfaces, so a launch
+    // the platform terminated at this hook still leaves the fact that it fired.
+    state.record_hook("run");
     let Ok(Json(envelope)) = body else {
         // A malformed hook body is 400. It is never 404: a client that maps 404
         // onto "missing file" would report a phantom absent artifact for what is
@@ -261,18 +266,25 @@ async fn run_hook(
 /// control API is closed: the question is whether the daemon started, not
 /// whether it is bootstrapped. Gating this on bootstrap state would fail every
 /// build.
-async fn ready_hook() -> StatusCode {
+async fn ready_hook(State(state): State<AppState>) -> StatusCode {
+    // Recorded in AppState memory, which for a build-time hook is the interesting
+    // half: the snapshot is taken after this fires, so the record rides the memory
+    // image into every VM launched from it and answers "did my ready hook run?" on
+    // the first health poll of any of them.
+    state.record_hook("ready");
     tracing::info!("image ready hook");
     StatusCode::OK
 }
 
 /// Image-build validation probe. Same reasoning as `ready`.
-async fn validate_hook() -> StatusCode {
+async fn validate_hook(State(state): State<AppState>) -> StatusCode {
+    state.record_hook("validate");
     tracing::info!("image validate hook");
     StatusCode::OK
 }
 
-async fn suspend_hook() -> StatusCode {
+async fn suspend_hook(State(state): State<AppState>) -> StatusCode {
+    state.record_hook("suspend");
     tracing::info!("suspend hook");
     StatusCode::OK
 }
@@ -294,6 +306,7 @@ async fn suspend_hook() -> StatusCode {
 /// observes the whole suspension as a single jump, so any timeout, lease, or
 /// session held by a running command expires at once on resume.
 async fn resume_hook(State(state): State<AppState>) -> StatusCode {
+    state.record_hook("resume");
     if state.is_bootstrapped() {
         tracing::info!("resumed with bootstrap state intact");
     } else {
@@ -309,7 +322,11 @@ async fn resume_hook(State(state): State<AppState>) -> StatusCode {
     StatusCode::OK
 }
 
-async fn terminate_hook() -> StatusCode {
+async fn terminate_hook(State(state): State<AppState>) -> StatusCode {
+    // Recorded even though nothing may live to report it: a suspend that follows a
+    // terminate hook does not exist, but a health poll racing the drain can still
+    // read it, and the record costs nothing.
+    state.record_hook("terminate");
     tracing::info!("terminate hook");
     StatusCode::OK
 }
@@ -334,6 +351,7 @@ async fn terminate_hook() -> StatusCode {
 async fn health(State(state): State<AppState>) -> Json<Health> {
     let identity = state.identity_report();
     let (busy, execs) = exec::activity(&state).await;
+    let (hooks, hooks_dropped) = state.hook_report();
     Json(Health {
         // `Cow` on the wire type so a client deserializes into an owned string; the
         // daemon's own version is a `&'static str` and stays borrowed.
@@ -356,6 +374,15 @@ async fn health(State(state): State<AppState>) -> Json<Health> {
         identity_repaired: identity.attempted,
         busy,
         execs,
+        // The daemon's own observations of the platform's lifecycle hooks —
+        // validate in particular has no CloudWatch trace, so this is the only
+        // place "did my validate hook even run?" is answerable. The hook routes
+        // are unauthenticated and loopback-reachable from inside the guest, so a
+        // hostile workload can forge ADDITIONAL entries; it cannot remove or
+        // alter real ones, and the cap keeps the earliest (the platform's) while
+        // `hooks_dropped` says how much later traffic was discarded.
+        hooks,
+        hooks_dropped,
     })
 }
 
@@ -423,14 +450,17 @@ pub fn surface_docs() -> Vec<schema::Endpoint> {
             hook("ready"),
             Auth::PlatformHook,
             "image-build readiness probe; answers 200 even before bootstrap, \
-             because the question is whether the daemon started",
+             because the question is whether the daemon started. Every hook \
+             invocation is recorded and reported on /v1/health as `hooks`.",
             schema::HOOK_ACK,
         ),
         row(
             "POST",
             hook("validate"),
             Auth::PlatformHook,
-            "image-build validation probe; same reasoning as ready",
+            "image-build validation probe; same reasoning as ready. Recorded on \
+             /v1/health's `hooks`, which is the only trace this hook leaves — the \
+             platform writes no CloudWatch logs for it.",
             schema::HOOK_ACK,
         ),
         schema::Endpoint {
@@ -657,7 +687,13 @@ pub fn surface_docs() -> Vec<schema::Endpoint> {
                  measures idleness by inbound traffic through the endpoint proxy, \
                  which terminates outside the guest, so a request from inside the \
                  guest cannot reset the idle timer. Polling this from outside is \
-                 both the traffic and the decision.",
+                 both the traffic and the decision. `hooks` lists every lifecycle \
+                 hook the daemon observed, oldest first, with `fired_at` epoch \
+                 seconds on the daemon's clock, and `hooks_dropped` counts \
+                 invocations past the cap. Hook routes are unauthenticated and \
+                 loopback-reachable from inside the guest, so a hostile workload \
+                 can forge ADDITIONAL entries — never remove or alter real ones; \
+                 the cap keeps the earliest, which are the platform's.",
                 schema::HEALTH,
             )
         },
@@ -852,5 +888,89 @@ mod tests {
         let Json(report) = health(State(state)).await;
         assert!(!report.busy);
         assert_eq!(report.execs, 0);
+        assert!(
+            report.hooks.is_empty(),
+            "no hook has fired on a fresh daemon"
+        );
+        assert_eq!(report.hooks_dropped, 0);
+    }
+
+    /// Every one of the six hook handlers records its invocation, and health
+    /// reports the whole sequence oldest-first.
+    ///
+    /// **Guard proof.** Delete the `state.record_hook("validate")` line from
+    /// `validate_hook` and this fails on the sequence with `validate` missing while
+    /// the handler still answers 200 — which is why the recording needs its own
+    /// test: nothing else observes it.
+    #[tokio::test]
+    async fn every_hook_handler_records_its_invocation_for_health_to_report() {
+        let state = AppState::new(Config::default());
+        assert_eq!(ready_hook(State(state.clone())).await, StatusCode::OK);
+        assert_eq!(validate_hook(State(state.clone())).await, StatusCode::OK);
+        let run = post_hook(&state, envelope(serde_json::json!({"agent_token": "tok"}))).await;
+        assert_eq!(run, StatusCode::OK);
+        assert_eq!(suspend_hook(State(state.clone())).await, StatusCode::OK);
+        assert_eq!(resume_hook(State(state.clone())).await, StatusCode::OK);
+        assert_eq!(terminate_hook(State(state.clone())).await, StatusCode::OK);
+
+        let Json(report) = health(State(state)).await;
+        assert_eq!(
+            report
+                .hooks
+                .iter()
+                .map(|observation| observation.hook.as_str())
+                .collect::<Vec<_>>(),
+            ["ready", "validate", "run", "suspend", "resume", "terminate"],
+            "the sequence is arrival order, which is the lifecycle itself"
+        );
+        assert_eq!(report.hooks_dropped, 0);
+        assert!(
+            report
+                .hooks
+                .iter()
+                .all(|observation| observation.fired_at > 1_600_000_000),
+            "{:?}",
+            report.hooks
+        );
+    }
+
+    /// The run hook records the INVOCATION, not the verdict: a malformed body
+    /// (400) and a conflicting token (409) both leave a `run` observation, because
+    /// the platform (or an attacker) really did invoke the hook either way, and a
+    /// launch that died at this hook is exactly the one whose record matters.
+    #[tokio::test]
+    async fn a_refused_run_hook_still_records_its_invocation() {
+        // The malformed-envelope path: an envelope with no runHookPayload is 400.
+        let state = AppState::new(Config::default());
+        let status = post_hook(
+            &state,
+            RunHookEnvelope {
+                run_hook_payload: None,
+            },
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (observed, _) = state.hook_report();
+        assert_eq!(observed.len(), 1, "the 400 was still an invocation");
+        assert_eq!(observed[0].hook, "run");
+
+        // The conflict path: a second bootstrap with a different token is 409, and
+        // both invocations are on the record.
+        let state = AppState::new(Config::default());
+        assert_eq!(
+            post_hook(&state, envelope(serde_json::json!({"agent_token": "a"}))).await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            post_hook(&state, envelope(serde_json::json!({"agent_token": "b"}))).await,
+            StatusCode::CONFLICT
+        );
+        let (observed, dropped) = state.hook_report();
+        assert_eq!(
+            observed.iter().map(|o| o.hook.as_str()).collect::<Vec<_>>(),
+            ["run", "run"],
+            "an invocation is recorded whatever the verdict"
+        );
+        assert_eq!(dropped, 0);
     }
 }
