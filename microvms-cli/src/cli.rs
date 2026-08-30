@@ -597,6 +597,27 @@ pub struct RunArgs {
     #[arg(long)]
     pub dockerfile: Option<PathBuf>,
 
+    /// CloudWatch log group for the build's logs, instead of the service-created
+    /// `/aws/lambda-microvms/<image-name>`.
+    ///
+    /// The build role must grant logs on whatever this names; a group outside a granted
+    /// prefix builds with no logs at all, and every failure then reads reason=unknown.
+    /// Letters, digits, and `_ - / . #` only, up to 512 characters.
+    #[arg(long, value_name = "GROUP")]
+    pub log_group: Option<String>,
+
+    /// Log stream name prefix inside --log-group. The client appends `/<16 hex>` per
+    /// build attempt, and the resolved exact name is on the envelope as `logStream`.
+    ///
+    /// A prefix rather than the exact name, because the platform member is an exact
+    /// stream name (prefixes unsupported) and one image build is three VMs writing three
+    /// log streams — a fixed name would collapse every build's logs into one stream. No
+    /// `:` or `*`; up to 495 characters (the platform's 512 minus the suffix). Needs a
+    /// log group — this flag, or `log-group` in microvm.toml — and is refused locally
+    /// without one. Not a clap `requires`, because the group may come from the file.
+    #[arg(long, value_name = "STREAM")]
+    pub log_stream: Option<String>,
+
     /// Widen the guest so `sethostname` and the boot_id bind mount work.
     ///
     /// Root in the guest is not enough for either — the MicroVM drops CAP_SYS_ADMIN.
@@ -765,6 +786,18 @@ pub struct BuildArgs {
     /// the create call happens after the upload and the service's rejection would cost you it.
     #[arg(long, value_name = "VERSION")]
     pub base_image_version: Option<String>,
+
+    /// CloudWatch log group for the build's logs, instead of the service-created
+    /// `/aws/lambda-microvms/<image-name>`. See `run --log-group`.
+    #[arg(long, value_name = "GROUP")]
+    pub log_group: Option<String>,
+
+    /// Log stream name prefix inside --log-group. The client appends `/<16 hex>` per
+    /// build attempt and the envelope reports the resolved exact name as `logStream`.
+    /// See `run --log-stream`. Requires --log-group — `build` reads no config file, so
+    /// the flag is the only place a group can come from.
+    #[arg(long, value_name = "STREAM", requires = "log_group")]
+    pub log_stream: Option<String>,
 
     /// Widen the guest so `sethostname` and the boot_id bind mount work.
     #[arg(long)]

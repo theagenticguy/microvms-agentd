@@ -215,6 +215,8 @@ fn aws_commands(binary: &std::path::Path) -> Vec<(&'static str, Command, Door)> 
                 memory: MemoryMib::Mib2048,
                 dockerfile: None,
                 repair_identity: false,
+                log_group: None,
+                log_stream: None,
                 egress: false,
                 launch_env: Vec::new(),
                 user: None,
@@ -247,6 +249,8 @@ fn aws_commands(binary: &std::path::Path) -> Vec<(&'static str, Command, Door)> 
                 memory: MemoryMib::Mib2048,
                 dockerfile: None,
                 repair_identity: false,
+                log_group: None,
+                log_stream: None,
                 reuse: false,
                 port: None,
                 region: region_flags(),
@@ -822,6 +826,8 @@ fn run_args_for_image(identifier: &str, state_dir: std::path::PathBuf) -> RunArg
         memory: MemoryMib::Mib2048,
         dockerfile: None,
         repair_identity: false,
+        log_group: None,
+        log_stream: None,
         egress: false,
         launch_env: Vec::new(),
         user: None,
@@ -1443,6 +1449,64 @@ async fn the_resolved_config_report_names_each_knobs_source() {
     assert_eq!(knob("image")["source"], "flag");
 }
 
+/// **The logging pair merges flag-over-file per knob, and a merged stream with no merged
+/// group is refused** — the combination neither layer can see alone.
+///
+/// The stream comes from the flag and the group from the file in the first case, which is
+/// the cross-layer pair the per-knob `pick` has to compose; the second case drops the
+/// file and the same flag stream becomes a refusal, because a stream inside a group the
+/// service names randomly is a location that does not exist.
+///
+/// **Falsification** — move the stream-needs-a-group check before the merge (test the
+/// flags alone) and the first case fails: the flag stream plus the file group is legal
+/// and would be refused.
+#[tokio::test]
+async fn the_log_knobs_merge_flag_over_file_and_a_cross_layer_stream_needs_its_group() {
+    let file = ConfigFile::new(
+        "log-knobs",
+        "log-group = \"/aws/lambda-microvms/from-file\"\nlog-stream = \"file-stream\"\n",
+    );
+    let mut args = run_args_for_image(
+        "arn:aws:lambda:us-east-1:123456789012:microvm-image/img",
+        std::env::temp_dir(),
+    );
+    args.config = crate::cli::ConfigFlags {
+        config: Some(file.0.clone()),
+        no_config: false,
+    };
+    args.log_stream = Some("flag-stream".into());
+
+    let merged = crate::commands::lifecycle::merge_config(&args, &|_| None).expect("merges");
+    let knob = |name: &str| merged.resolved[name].clone();
+    assert_eq!(knob("logGroup")["value"], "/aws/lambda-microvms/from-file");
+    assert_eq!(knob("logGroup")["source"], "config");
+    assert_eq!(knob("logStream")["value"], "flag-stream");
+    assert_eq!(
+        knob("logStream")["source"],
+        "flag",
+        "the typed flag beats the file's stream"
+    );
+    assert_eq!(
+        merged.args.log_group.as_deref(),
+        Some("/aws/lambda-microvms/from-file")
+    );
+    assert_eq!(merged.args.log_stream.as_deref(), Some("flag-stream"));
+
+    // The same flag stream with no file is a refusal: no layer supplied a group.
+    let mut orphan = run_args_for_image(
+        "arn:aws:lambda:us-east-1:123456789012:microvm-image/img",
+        std::env::temp_dir(),
+    );
+    orphan.log_stream = Some("flag-stream".into());
+    // A `match` rather than `expect_err`, because `MergedRunArgs` carries no `Debug` —
+    // deliberately, since `RunArgs` holds the agent-token-adjacent launch env.
+    let Err(error) = crate::commands::lifecycle::merge_config(&orphan, &|_| None) else {
+        panic!("a stream with no group from either layer must be refused");
+    };
+    assert_eq!(error.exit, Exit::InvalidArg, "{}", error.message);
+    assert!(error.message.contains("log group"), "{}", error.message);
+}
+
 /// **A typed `BINARY` positional suppresses the file's `image`, because the pair is one
 /// decision: `run` builds exactly when the merged image is absent.**
 ///
@@ -1644,6 +1708,8 @@ async fn a_reuse_build_whose_hash_name_exists_skips_the_build_entirely() {
         memory: MemoryMib::Mib2048,
         dockerfile: None,
         repair_identity: false,
+        log_group: None,
+        log_stream: None,
         reuse: true,
         port: None,
         region: region_flags(),
@@ -1727,6 +1793,8 @@ async fn a_reuse_build_whose_hash_name_is_absent_builds_under_the_derived_name()
         memory: MemoryMib::Mib2048,
         dockerfile: None,
         repair_identity: false,
+        log_group: None,
+        log_stream: None,
         reuse: true,
         port: None,
         region: region_flags(),
@@ -1788,6 +1856,8 @@ async fn a_plain_build_never_lists_and_reports_reused_false() {
         memory: MemoryMib::Mib2048,
         dockerfile: None,
         repair_identity: false,
+        log_group: None,
+        log_stream: None,
         reuse: false,
         port: None,
         region: region_flags(),
@@ -1844,6 +1914,8 @@ async fn a_locally_refused_dockerfile_costs_no_upload_and_no_call() {
         memory: MemoryMib::Mib2048,
         dockerfile: Some(dockerfile_path.clone()),
         repair_identity: false,
+        log_group: None,
+        log_stream: None,
         reuse: false,
         port: None,
         region: region_flags(),
@@ -1932,6 +2004,8 @@ async fn a_pinned_base_image_version_reaches_the_create_body_from_the_build_flag
         memory: MemoryMib::Mib2048,
         dockerfile: None,
         repair_identity: false,
+        log_group: None,
+        log_stream: None,
         reuse: false,
         port: None,
         region: region_flags(),
@@ -1949,6 +2023,158 @@ async fn a_pinned_base_image_version_reaches_the_create_body_from_the_build_flag
     assert_eq!(
         body["baseImageArn"],
         "arn:aws:lambda:us-east-1:aws:microvm-image:al2023-1"
+    );
+}
+
+/// **`build --log-group`/`--log-stream` reach the `CreateMicrovmImage` body with the
+/// per-build discriminator applied, and the envelope reports the resolved exact stream.**
+///
+/// Read off the emitted body for the base-image-version test's reason: the wiring runs
+/// through three hops — `BuildArgs`, `BuildSpec`, `CreateImageRequest` — any of which
+/// could drop it while every other test stayed green. The discriminator claim is the
+/// load-bearing one: the wire stream must be `<user value>/<16 hex>`, never verbatim,
+/// because the member is an exact stream name and one build is three VMs writing three
+/// streams (issue #98). And the envelope's `logStream` must equal the wire's byte for
+/// byte — the nonce is minted inside core's create call, so the envelope is the only
+/// place a caller can learn the name.
+///
+/// **Guard proof.** Run 2026-08-30. Set `log_stream: None` in `build`'s `BuildSpec` (the
+/// flag parsed, the spec ignores it) and the body assertion goes red with no `logging`
+/// member; every other CLI test stays green. Restored.
+#[tokio::test]
+async fn a_build_log_stream_reaches_the_wire_suffixed_and_the_envelope_reports_it() {
+    let binary = FakeBinary::new("log-stream");
+    let transport = Arc::new(ScriptedTransport::new());
+    transport
+        .answer(
+            "CreateMicrovmImage",
+            201,
+            r#"{"imageArn": "arn:aws:lambda:us-east-1:123456789012:microvm-image:img",
+                 "name": "img", "state": "CREATING", "createdAt": 1754524800,
+                 "baseImageArn": "arn:aws:lambda:us-east-1:aws:microvm-image:al2023-1",
+                 "buildRoleArn": "arn:aws:iam::123456789012:role/build",
+                 "codeArtifact": {"uri": "s3://a-bucket/img.zip"},
+                 "imageVersion": "1"}"#,
+        )
+        .answer(
+            "GetMicrovmImage",
+            200,
+            r#"{"imageArn": "arn:aws:lambda:us-east-1:123456789012:microvm-image:img",
+                 "name": "img", "state": "CREATED", "createdAt": 1754524800}"#,
+        );
+
+    let seam = ScriptedSeam {
+        transport: Arc::clone(&transport),
+        clock: Arc::new(YieldingClock::default()),
+    };
+    let command = Command::Build(BuildArgs {
+        binary: binary.0.clone(),
+        base_image_version: None,
+        artifact_uri: None,
+        name: Some("img".into()),
+        memory: MemoryMib::Mib2048,
+        dockerfile: None,
+        repair_identity: false,
+        log_group: Some("/aws/lambda-microvms/conformance-builds".into()),
+        log_stream: Some("img-ci".into()),
+        reuse: false,
+        port: None,
+        region: region_flags(),
+        infra: InfraFlags::default(),
+    });
+    let (result, _) = dispatch_with(&seam, &command, full_infra()).await;
+    let rendered = result.expect("builds");
+
+    let body = transport.first_body("CreateMicrovmImage");
+    assert_eq!(
+        body["logging"]["cloudWatch"]["logGroup"], "/aws/lambda-microvms/conformance-builds",
+        "the flag has to reach the wire: {body}"
+    );
+    let wire_stream = body["logging"]["cloudWatch"]["logStream"]
+        .as_str()
+        .expect("a stream was sent");
+    assert_ne!(
+        wire_stream, "img-ci",
+        "the flag's value must never reach the wire verbatim — an exact stream name \
+         collapses every build's three streams into one"
+    );
+    assert!(wire_stream.starts_with("img-ci/"), "{wire_stream}");
+    let suffix = &wire_stream["img-ci/".len()..];
+    assert_eq!(suffix.len(), 16, "{wire_stream}");
+    assert!(
+        suffix.bytes().all(|b| b.is_ascii_hexdigit()),
+        "{wire_stream}"
+    );
+
+    // The envelope reports the resolved name, byte-identical to the wire's, plus the
+    // configured group as buildLogGroup — not the derived default.
+    assert_eq!(rendered.data["logStream"], wire_stream);
+    assert_eq!(
+        rendered.data["buildLogGroup"],
+        "/aws/lambda-microvms/conformance-builds"
+    );
+}
+
+/// A build with no logging flags emits **no** `logging` member and a null `logStream`
+/// key: absent on the wire (byte-for-byte the request this CLI always sent), present as
+/// null in the envelope (so a consumer never guards for the key).
+#[tokio::test]
+async fn a_build_without_logging_flags_emits_no_logging_member_and_a_null_stream() {
+    let binary = FakeBinary::new("no-logging");
+    let transport = Arc::new(ScriptedTransport::new());
+    transport
+        .answer(
+            "CreateMicrovmImage",
+            201,
+            r#"{"imageArn": "arn:aws:lambda:us-east-1:123456789012:microvm-image:img",
+                 "name": "img", "state": "CREATING", "createdAt": 1754524800,
+                 "baseImageArn": "arn:aws:lambda:us-east-1:aws:microvm-image:al2023-1",
+                 "buildRoleArn": "arn:aws:iam::123456789012:role/build",
+                 "codeArtifact": {"uri": "s3://a-bucket/img.zip"},
+                 "imageVersion": "1"}"#,
+        )
+        .answer(
+            "GetMicrovmImage",
+            200,
+            r#"{"imageArn": "arn:aws:lambda:us-east-1:123456789012:microvm-image:img",
+                 "name": "img", "state": "CREATED", "createdAt": 1754524800}"#,
+        );
+
+    let seam = ScriptedSeam {
+        transport: Arc::clone(&transport),
+        clock: Arc::new(YieldingClock::default()),
+    };
+    let command = Command::Build(BuildArgs {
+        binary: binary.0.clone(),
+        base_image_version: None,
+        artifact_uri: None,
+        name: Some("img".into()),
+        memory: MemoryMib::Mib2048,
+        dockerfile: None,
+        repair_identity: false,
+        log_group: None,
+        log_stream: None,
+        reuse: false,
+        port: None,
+        region: region_flags(),
+        infra: InfraFlags::default(),
+    });
+    let (result, _) = dispatch_with(&seam, &command, full_infra()).await;
+    let rendered = result.expect("builds");
+
+    let body = transport.first_body("CreateMicrovmImage");
+    assert!(
+        body.get("logging").is_none(),
+        "an unconfigured build must emit byte-for-byte what this CLI always sent: {body}"
+    );
+    assert_eq!(
+        rendered.data["logStream"],
+        serde_json::Value::Null,
+        "the key is always present so a consumer never guards for it"
+    );
+    assert_eq!(
+        rendered.data["buildLogGroup"], "/aws/lambda-microvms/img",
+        "no configured group means the derived default"
     );
 }
 

@@ -332,6 +332,34 @@ def test_there_is_no_client_token_parameter_anywhere(
     assert not hasattr(sandbox_cls, "client_token")
 
 
+def test_the_log_stream_parameter_is_a_prefix_and_the_image_reports_the_resolved_name() -> (
+    None
+):
+    """Issue #98's contract at the binding boundary, checked without AWS.
+
+    The two halves a caller depends on: `build_image` takes the logging pair as keyword
+    parameters (so the knob exists), and `Image` exposes `log_stream` (so the resolved
+    name — the only copy of the per-build discriminator — is readable). The docstring has
+    to say the value is a prefix the client suffixes, because a caller who believes they
+    named the exact stream will grep CloudWatch for a name that does not exist.
+    """
+    signature = microvms.Sandbox.build_image.__text_signature__ or ""
+    assert "log_group" in signature, signature
+    assert "log_stream" in signature, signature
+
+    doc = microvms.Sandbox.build_image.__doc__ or ""
+    assert "prefix" in doc and "16 hex" in doc, (
+        f"the docstring must say the stream is a prefix the client suffixes: {doc[:400]}"
+    )
+
+    # The resolved name's home: a getter on Image (a PyO3 getset descriptor, not a plain
+    # attribute). Building needs AWS, so what a unit run can assert is that the surface
+    # exists and its own docs carry the discriminator contract.
+    descriptor = getattr(microvms.Image, "log_stream", None)
+    assert descriptor is not None, "Image.log_stream is where the resolved name lives"
+    assert "16 hex" in (descriptor.__doc__ or ""), descriptor.__doc__
+
+
 def test_the_two_hook_timeouts_cannot_be_transposed() -> None:
     """BIND-2's clearest case: two classes, 60x apart, not interchangeable.
 

@@ -342,6 +342,33 @@ pub struct CreateImageRequest {
     pub build_hook_timeout: BuildHookTimeout,
     /// Tags, or none.
     pub tags: std::collections::BTreeMap<String, String>,
+    /// `logging.cloudWatch.logGroup`, or `None` for the service default — a
+    /// service-created group under `/aws/lambda-microvms/<image-name>` with random stream
+    /// names.
+    ///
+    /// Checked against `CloudWatchLoggingLogGroupString` (1..=512, `[a-zA-Z0-9_\-/.#]+`)
+    /// before the artifact upload. The build role must be able to write to whatever this
+    /// names: the conformance account's role grants logs only on
+    /// `/aws/lambda-microvms/*`, so a group outside that prefix builds with no logs at
+    /// all — the same failure mode as the wrong-prefix policy (docs/PLATFORM.md).
+    pub log_group: Option<String>,
+    /// `logging.cloudWatch.logStream` — a stream-name **prefix**, never the exact name.
+    ///
+    /// # The client always appends a per-build discriminator
+    ///
+    /// The wire member is an EXACT stream name (prefixes unsupported — measured 2026-08,
+    /// docs/PLATFORM.md 'An image build is three VMs and three log streams'), and one
+    /// build emits three streams. A fixed configured name collapses all three of every
+    /// build into one stream, so [`ControlPlane::create_image`] sends
+    /// `<this>/<16 hex>` with fresh CSPRNG per create attempt — the same mechanism as
+    /// the `clientToken` nonce (TRAP-1) — and the resolved name comes back on
+    /// [`image::Image::log_stream`] so the caller can find their logs.
+    ///
+    /// Capped at [`crate::constants::MAX_USER_LOG_STREAM_LEN`] (495) so the resolved name
+    /// fits the shape's 512, and refused when it carries `:` or `*` (the pattern is
+    /// `[^:*]*`). Requires [`Self::log_group`]: a stream inside a group the service
+    /// chose randomly is a stream nobody can predict the location of.
+    pub log_stream: Option<String>,
     /// A **label** folded into the create token for CloudTrail readability, defaulting to
     /// the image name. Not the token, and cannot become it (TRAP-1).
     pub token_scope: Option<String>,
@@ -376,6 +403,8 @@ impl CreateImageRequest {
             build_hook_timeout: BuildHookTimeout::try_new(30)
                 .expect("30s is under the 3600s ceiling"),
             tags: std::collections::BTreeMap::new(),
+            log_group: None,
+            log_stream: None,
             token_scope: None,
         }
     }
@@ -702,6 +731,90 @@ pub fn require_valid_role_arn(member: &str, arn: &str) -> Result<(), Error> {
              service's answer to give.",
             crate::constants::ROLE_ARN_PATTERN,
             image::BUILD_LOG_GROUP_PREFIX,
+        )));
+    }
+    Ok(())
+}
+
+/// Rejects a `logging.cloudWatch.logGroup` the service would reject, before the artifact
+/// upload.
+///
+/// The shape is `CloudWatchLoggingLogGroupString`: 1..=512, pattern `[a-zA-Z0-9_\-/.#]+`.
+/// The character the pattern excludes that a caller writes first is the colon — a group
+/// pasted as an ARN (`arn:aws:logs:...`) fails here with the pattern named, rather than as
+/// a `ValidationException` after the upload.
+pub fn require_valid_log_group(group: &str) -> Result<(), Error> {
+    let model = crate::constants::MODEL_API_VERSION;
+    if group.is_empty() {
+        return Err(Error::invalid_arg(format!(
+            "logging.cloudWatch.logGroup is empty, but the CloudWatchLoggingLogGroupString \
+             shape requires at least 1 character (service model {model}). Omit the setting \
+             entirely to take the service default — a service-created group under \
+             {}/<image-name>.",
+            image::BUILD_LOG_GROUP_PREFIX,
+        )));
+    }
+    if group.len() > crate::constants::MAX_LOG_GROUP_LEN {
+        return Err(Error::invalid_arg(format!(
+            "logging.cloudWatch.logGroup is {} characters, over the \
+             CloudWatchLoggingLogGroupString ceiling of {} (service model {model}).",
+            group.len(),
+            crate::constants::MAX_LOG_GROUP_LEN,
+        )));
+    }
+    if !crate::constants::is_valid_log_group(group) {
+        return Err(Error::invalid_arg(format!(
+            "logging.cloudWatch.logGroup {group:?} does not match the \
+             CloudWatchLoggingLogGroupString pattern {:?} (service model {model}) — letters, \
+             digits, and `_ - / . #` only. A colon usually means an ARN was pasted where the \
+             group *name* was wanted. Rejected here rather than by AWS because the create call \
+             happens after the artifact upload, so the service's answer costs you the upload \
+             first.",
+            crate::constants::LOG_GROUP_PATTERN,
+        )));
+    }
+    Ok(())
+}
+
+/// Rejects a caller-supplied `logging.cloudWatch.logStream` prefix the resolved name could
+/// not legally carry, before the artifact upload.
+///
+/// The shape is `CloudWatchLoggingLogStreamString`: 1..=512, pattern `[^:*]*` — anything
+/// but `:` and `*`. The caller's value is capped at
+/// [`crate::constants::MAX_USER_LOG_STREAM_LEN`] (495) rather than 512, because this
+/// client always appends `/<16 hex>` of per-build discriminator before the value reaches
+/// the wire — see [`CreateImageRequest::log_stream`] for why a verbatim stream name is
+/// never sent — and 495 + 17 is exactly the shape's ceiling.
+pub fn require_valid_log_stream(stream: &str) -> Result<(), Error> {
+    let model = crate::constants::MODEL_API_VERSION;
+    if stream.is_empty() {
+        return Err(Error::invalid_arg(format!(
+            "logging.cloudWatch.logStream is empty, but the CloudWatchLoggingLogStreamString \
+             shape requires at least 1 character (service model {model}). Omit the setting to \
+             let the service name the streams inside the configured group."
+        )));
+    }
+    if stream.len() > crate::constants::MAX_USER_LOG_STREAM_LEN {
+        return Err(Error::invalid_arg(format!(
+            "logging.cloudWatch.logStream is {} characters, over this client's ceiling of {}. \
+             The shape's own ceiling is {} (service model {model}), and the client always \
+             appends a 17-character per-build discriminator (`/` + 16 hex) — one image build \
+             is three VMs writing three streams, and the member is an exact stream name, so a \
+             fixed configured name would collapse every build's streams into one. The \
+             discriminator is what keeps them tellable apart, and it needs its room.",
+            stream.len(),
+            crate::constants::MAX_USER_LOG_STREAM_LEN,
+            crate::constants::MAX_LOG_STREAM_LEN,
+        )));
+    }
+    if let Some(found) = stream.chars().find(|c| matches!(c, ':' | '*')) {
+        return Err(Error::invalid_arg(format!(
+            "logging.cloudWatch.logStream {stream:?} contains {found:?}, which the \
+             CloudWatchLoggingLogStreamString pattern {:?} forbids anywhere in the value \
+             (service model {model}). A `*` usually means a prefix or glob was intended — the \
+             member is an exact stream name, prefixes are unsupported, and this client's own \
+             per-build suffix is how a configured name behaves like one.",
+            crate::constants::LOG_STREAM_PATTERN,
         )));
     }
     Ok(())
@@ -1119,6 +1232,11 @@ mod tests {
             run_hook_timeout: _,
             build_hook_timeout: _,
             tags: _,
+            // The logging pair. The stream is a *prefix* the create call suffixes with a
+            // fresh nonce — the caller cannot name the exact wire stream, which is the
+            // same closure shape as the token's.
+            log_group: _,
+            log_stream: _,
             // A *label*, folded in beside a fresh nonce. The only token-adjacent field,
             // and it cannot become the token.
             token_scope: _,

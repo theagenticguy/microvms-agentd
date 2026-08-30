@@ -6,7 +6,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Live conformance run driving the **Rust** client stack through the `microvm` CLI.
 
-This is the only live suite, and it now expresses **every named check** — 104 of them, with
+This is the only live suite, and it now expresses **every named check** — 108 of them, with
 none recorded SKIP. `conformance/run.py` was the oracle — 56 checks through the Python
 client — and it went away with that client once both suites ran green against real AWS on
 the same commit (Python 56/56, this one 38/38 with 34 recorded SKIP). Those 34 were the
@@ -73,6 +73,15 @@ ciphertext), a tampered pin failing closed with nothing served, the restored rec
 verifying again, and the identity VM's own teardown. Live because the handshake's
 failure mode on the endpoint path is a silent 1006, which is exactly the shape that
 passes every stand-in and fails only against the real proxy.
+
+108 rather than 104: `drive_build_logging` adds four for issue #98 — the suite's own
+build configures `--log-group`/`--log-stream`, and after the build boto3 asserts the
+configured group is readable, the resolved stream exists carrying the user prefix + `/` +
+16 hex, no stream carries the configured name verbatim, and the stream is non-empty.
+Live because the claim is about what the service recorded: the discriminator's whole
+point is what CloudWatch ends up holding, and no fake can say the platform accepted the
+suffixed name. The configured group rides `drive_teardown`'s `extra_log_groups`, since
+the CLI's terminate derives only the default group name and cannot know to name this one.
 
 A hybrid driver, and both lanes are deliberate
 ----------------------------------------------
@@ -152,7 +161,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -876,13 +885,25 @@ def drive_local_commands(cli: Cli, results: Results) -> None:
 
 
 def drive_lifecycle(
-    cli: Cli, binary: Path, dockerfile: Path, results: Results
+    cli: Cli,
+    binary: Path,
+    dockerfile: Path,
+    results: Results,
+    log_group: str,
+    log_stream_prefix: str,
 ) -> Envelope:
     """`run --keep`, which is build plus launch plus exec in one invocation.
 
     `--keep` because every check after this one needs the VM, and the teardown is the
     caller's `finally` — the same shape the oracle used, for the same reason: a teardown
     that runs from inside the happy path is a teardown that does not run when it matters.
+
+    The build carries the configured logging pair (issue #98) so `drive_build_logging`
+    can assert the discriminator against real CloudWatch without a second 15-minute
+    build. The group stays under `/aws/lambda-microvms/` because that is the only prefix
+    the build role can write to (`conformance/infra/main.tf`, `WriteBuildLogs`) — a group
+    outside it builds with no logs at all, which would make the stream checks assert
+    against an IAM decision rather than against the client's suffixing.
     """
     print("\n== run (build + launch + exec) ==")
     launched = cli.call(
@@ -895,6 +916,10 @@ def drive_lifecycle(
         "--memory",
         str(BASELINE_MEMORY_MIB),
         "--repair-identity",
+        "--log-group",
+        log_group,
+        "--log-stream",
+        log_stream_prefix,
         "--keep",
         "--region",
         cli.region,
@@ -948,6 +973,86 @@ def drive_lifecycle(
         f"{type(launched.data.get('cost')).__name__}",
     )
     return launched
+
+
+def drive_build_logging(
+    logs: Any,
+    log_group: str,
+    log_stream_prefix: str,
+    results: Results,
+) -> None:
+    """The configured build-logging pair, asserted against real CloudWatch (issue #98).
+
+    The suite's own build (in `drive_lifecycle`) configured `--log-group` and
+    `--log-stream`, so by the time this runs the build has finished and its streams
+    exist. What only a live read can say:
+
+    - the client's resolved stream really exists in the configured group — the wire
+      carried `<prefix>/<16 hex>`, not the caller's verbatim value, and the service
+      accepted it;
+    - the stream is non-empty — the build's three VMs actually wrote through the
+      configured destination rather than falling back to the service default;
+    - the name carries the user prefix, a `/`, and a 16-hex suffix — the discriminator
+      contract, measured rather than assumed.
+
+    Read through boto3 rather than the CLI for `read_daemon_logs`'s reason: `microvm
+    logs` refuses CloudWatch by design (CLI-2), and this check is about what the
+    *service* recorded. The suite's own credentials do the describe; the build role only
+    ever needed to write.
+    """
+    print("\n-- build logging (the configured group and the resolved stream) --")
+    try:
+        streams = logs.describe_log_streams(
+            logGroupName=log_group,
+            logStreamNamePrefix=f"{log_stream_prefix}/",
+        ).get("logStreams", [])
+    except Exception as exc:  # noqa: BLE001 - an unreadable group is the finding
+        results.check(
+            "the configured build log group exists and is readable",
+            False,
+            f"{log_group}: {type(exc).__name__}: {exc}",
+        )
+        return
+    results.check(
+        "the configured build log group exists and is readable",
+        True,
+        log_group,
+    )
+
+    names = [str(stream["logStreamName"]) for stream in streams]
+    suffixes = [name[len(log_stream_prefix) + 1 :] for name in names]
+    results.check(
+        "the resolved stream exists and carries the prefix, a slash, and 16 hex",
+        bool(names)
+        and all(
+            len(suffix) == 16 and all(c in "0123456789abcdef" for c in suffix)
+            for suffix in suffixes
+        ),
+        f"{names!r} — the client must suffix, never send the configured name verbatim",
+    )
+    results.check(
+        "no stream carries the configured name verbatim",
+        log_stream_prefix not in names,
+        f"{names!r} — a verbatim name would collapse every build's streams into one",
+    )
+
+    # Non-empty: the three build VMs wrote through the configured destination. One
+    # configured exact name means all three collapse into this stream, which is exactly
+    # the behaviour the per-build discriminator exists to scope to a single build.
+    events = 0
+    for name in names:
+        got = logs.get_log_events(
+            logGroupName=log_group,
+            logStreamName=name,
+            limit=10,
+            startFromHead=True,
+        )
+        events += len(got.get("events", []))
+    results.check(
+        "the resolved stream is non-empty",
+        events > 0,
+        f"{events} event(s) across {len(names)} stream(s)",
+    )
 
 
 def attach_args(cli: Cli, launched: Envelope, endpoint: str | None = None) -> list[str]:
@@ -2174,7 +2279,11 @@ def drive_idle_keepalive(
 
 
 def drive_teardown(
-    cli: Cli, launched: Envelope, results: Results, logs: Any = None
+    cli: Cli,
+    launched: Envelope,
+    results: Results,
+    logs: Any = None,
+    extra_log_groups: Sequence[str] = (),
 ) -> None:
     """`microvm terminate --delete-image`, what it names as left behind, and then this
     suite deleting that.
@@ -2239,12 +2348,21 @@ def drive_teardown(
     # The suite's own residue, removed by the suite. Asserted rather than best-effort:
     # a delete that quietly failed would put the tier back where it was, red on a leak
     # nobody meant to leave.
+    #
+    # `extra_log_groups` rides along: the configured build-logging group (issue #98) is
+    # one the CLI's terminate never names — its `undeletedLogGroups` derives the default
+    # `/aws/lambda-microvms/<image-name>` — so the suite that configured it is the only
+    # party that knows to delete it. Same delete, same assertion, same tolerance for a
+    # group the service never created.
+    to_delete = [str(group) for group in undeleted] + [
+        group for group in extra_log_groups if group not in undeleted
+    ]
     deleted: list[str] = []
     failures: list[str] = []
-    for group in undeleted:
+    for group in to_delete:
         try:
-            logs.delete_log_group(logGroupName=str(group))
-            deleted.append(str(group))
+            logs.delete_log_group(logGroupName=group)
+            deleted.append(group)
         except Exception as exc:  # noqa: BLE001 - the reason is the finding
             # An already-absent group is the desired end state, not a failure: the
             # service may never have created one for a build that produced no events.
@@ -2254,20 +2372,31 @@ def drive_teardown(
                 failures.append(f"{group}: {type(exc).__name__}: {exc}")
     results.check(
         "the suite deleted the build log group the CLI could not",
-        not failures and len(deleted) == len(undeleted),
+        not failures and len(deleted) == len(to_delete),
         f"deleted={deleted!r} failures={failures!r}",
     )
 
 
-def read_daemon_logs(logs: Any, image_name: str) -> list[str]:
+def read_daemon_logs(
+    logs: Any, image_name: str, extra_groups: Sequence[str] = ()
+) -> list[str]:
     """The daemon's own log lines, through boto3.
 
     Through boto3 rather than through the CLI on purpose: `microvm logs` refuses to read
     CloudWatch by design (CLI-2), and this check is about whether the *daemon* wrote
     anything. Same shape and same reason as the oracle's own log read.
+
+    `extra_groups` is checked first: the model documents the image's `logging` member as
+    covering "build-time and runtime logs", so a suite build that configured a group
+    (issue #98) may find the daemon's runtime lines there rather than in the default
+    location — the defaults stay in the list because that half of the claim is unmeasured.
     """
     lines: list[str] = []
-    for group in (f"/aws/lambda-microvms/{image_name}", "/aws/lambda-microvms"):
+    for group in (
+        *extra_groups,
+        f"/aws/lambda-microvms/{image_name}",
+        "/aws/lambda-microvms",
+    ):
         try:
             streams = logs.describe_log_streams(
                 logGroupName=group, orderBy="LastEventTime", descending=True, limit=5
@@ -2865,6 +2994,17 @@ def main() -> int:
     # `NameError` waiting for the one run that fails early — which would replace a real
     # failure with this file's own. Creating a boto3 session costs no API call.
     aws = boto3.Session(region_name=cli.region)
+    # The configured build-logging pair (issue #98), bound before the `try` for `aws`'s
+    # reason: the teardown in the `finally` deletes this group, and a name bound inside
+    # the block is a NameError on the one run that fails early. Under
+    # /aws/lambda-microvms/ because that is the only prefix the build role can write
+    # (infra/main.tf, WriteBuildLogs) — outside it the build writes nothing and the
+    # stream checks would measure IAM rather than the client's suffixing. The random
+    # component keeps concurrent suite runs out of each other's groups.
+    build_log_group = (
+        f"/aws/lambda-microvms/conformance-configured-{secrets.token_hex(4)}"
+    )
+    build_log_stream_prefix = "suite-build"
 
     with tempfile.TemporaryDirectory() as tmp:
         dockerfile = Path(tmp) / "Dockerfile"
@@ -2878,7 +3018,17 @@ def main() -> int:
             # left to announce. The summary still prints a skip count, which should read
             # zero — see `Results.skip`.
             drive_local_commands(cli, results)
-            launched = drive_lifecycle(cli, binary, dockerfile, results)
+            launched = drive_lifecycle(
+                cli,
+                binary,
+                dockerfile,
+                results,
+                build_log_group,
+                build_log_stream_prefix,
+            )
+            drive_build_logging(
+                aws.client("logs"), build_log_group, build_log_stream_prefix, results
+            )
 
             # The daemon lane pokes the VM the CLI launched, over raw HTTP. Composed
             # rather than duplicated: the Rust client launched it and this reaches
@@ -2931,7 +3081,9 @@ def main() -> int:
 
             print("\n== daemon logs ==")
             lines = read_daemon_logs(
-                aws.client("logs"), str(launched.data["imageName"])
+                aws.client("logs"),
+                str(launched.data["imageName"]),
+                extra_groups=(build_log_group,),
             )
             results.check(
                 "daemon logs reached CloudWatch under /aws/lambda-microvms/",
@@ -2955,7 +3107,13 @@ def main() -> int:
                 # created inside the block would be a `NameError` here on the one run that
                 # failed early, which would replace a real failure with this file's own.
                 try:
-                    drive_teardown(cli, launched, results, aws.client("logs"))
+                    drive_teardown(
+                        cli,
+                        launched,
+                        results,
+                        aws.client("logs"),
+                        extra_log_groups=(build_log_group,),
+                    )
                 except Exception as exc:  # noqa: BLE001 - a teardown failure is a finding
                     results.check("teardown completed", False, repr(exc))
 

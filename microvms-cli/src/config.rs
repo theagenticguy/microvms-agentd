@@ -82,6 +82,24 @@ pub struct ProjectConfig {
     /// no flag spelling for a list this shape), validated by `doctor` and by `run` before
     /// any billable call.
     pub artifacts: Option<Vec<String>>,
+    /// `run --log-group` / `build --log-group`: the CloudWatch log group build logs go
+    /// to, instead of the service-created `/aws/lambda-microvms/<image-name>`.
+    ///
+    /// Validated against `CloudWatchLoggingLogGroupString` (1..=512,
+    /// `[a-zA-Z0-9_\-/.#]+`) at load, because the create call the value rides on happens
+    /// after the artifact upload. The build role must grant logs on whatever this names —
+    /// the conformance role grants only `/aws/lambda-microvms/*`, and a group outside a
+    /// granted prefix builds with **no logs at all** (docs/PLATFORM.md).
+    pub log_group: Option<String>,
+    /// `run --log-stream` / `build --log-stream`: a stream-name **prefix** inside
+    /// `log-group`. The client always appends `/<16 hex>` per build attempt — the wire
+    /// member is an exact stream name and one build is three VMs writing three streams,
+    /// so a fixed name would collapse every build's logs into one stream
+    /// (docs/PLATFORM.md, 'An image build is three VMs and three log streams').
+    ///
+    /// Capped at 495 characters (512 minus the discriminator's 17) and refused when it
+    /// carries `:` or `*` (the shape's pattern is `[^:*]*`). Requires `log-group`.
+    pub log_stream: Option<String>,
 }
 
 /// Why a config file could not be used. One variant per remedy.
@@ -219,6 +237,54 @@ fn validate(path: &Path, config: &ProjectConfig) -> Result<(), ConfigError> {
             if let Err(error) = globset::Glob::new(glob) {
                 problems.push(format!("artifacts glob {glob:?} does not compile: {error}"));
             }
+        }
+    }
+    // The logging pair, with the flags' own vocabulary — core's guards run again at the
+    // create call, but the create happens after the artifact upload, and doctor validates
+    // through this loader, so the refusal has to live here to be a pre-upload one.
+    if let Some(group) = config.log_group.as_deref()
+        && !microvms_core::constants::is_valid_log_group(group)
+    {
+        problems.push(format!(
+            "log-group = {group:?} does not satisfy the platform's \
+             CloudWatchLoggingLogGroupString shape (1..=512 characters of \
+             [a-zA-Z0-9_\\-/.#]+) — a colon usually means an ARN was pasted where the \
+             group name was wanted"
+        ));
+    }
+    if let Some(stream) = config.log_stream.as_deref() {
+        if config.log_group.is_none() {
+            problems.push(
+                "log-stream is set with no log-group: the stream lives inside the group, \
+                 and without one the service creates a group with random stream names, so \
+                 the configured stream would name a location that does not exist"
+                    .to_string(),
+            );
+        }
+        if stream.is_empty() {
+            problems.push(
+                "log-stream = \"\" is empty; the platform shape requires at least 1 \
+                 character — drop the key to let the service name the streams"
+                    .to_string(),
+            );
+        }
+        if stream.len() > microvms_core::constants::MAX_USER_LOG_STREAM_LEN {
+            problems.push(format!(
+                "log-stream is {} characters, over the {} this client accepts: the \
+                 platform ceiling is {} and the client always appends a 17-character \
+                 per-build discriminator (`/` + 16 hex), because the wire member is an \
+                 exact stream name and one build writes three streams",
+                stream.len(),
+                microvms_core::constants::MAX_USER_LOG_STREAM_LEN,
+                microvms_core::constants::MAX_LOG_STREAM_LEN,
+            ));
+        }
+        if let Some(found) = stream.chars().find(|c| matches!(c, ':' | '*')) {
+            problems.push(format!(
+                "log-stream = {stream:?} contains {found:?}, which the platform pattern \
+                 [^:*]* forbids — a `*` usually means a prefix was intended, and the \
+                 client's own per-build suffix is how a configured name behaves like one"
+            ));
         }
     }
     // The two Windows path shapes that mean two things at once (issue #87). Windows
@@ -385,6 +451,8 @@ max-idle-sec = 120
 suspended-sec = 300
 max-duration-sec = 7200
 artifacts = ["dist/**", "*.log"]
+log-group = "/aws/lambda-microvms/ci-builds"
+log-stream = "ci-image"
 
 [env]
 RUST_LOG = "debug"
@@ -403,6 +471,11 @@ CI = "1"
         assert_eq!(config.max_idle_sec, Some(120));
         assert_eq!(config.suspended_sec, Some(300));
         assert_eq!(config.max_duration_sec, Some(7200));
+        assert_eq!(
+            config.log_group.as_deref(),
+            Some("/aws/lambda-microvms/ci-builds")
+        );
+        assert_eq!(config.log_stream.as_deref(), Some("ci-image"));
         assert_eq!(
             config.artifacts.as_deref(),
             Some(&["dist/**".to_string(), "*.log".to_string()][..])
@@ -592,6 +665,72 @@ CI = "1"
             Some(Path::new("/opt/agentd")),
             "an absolute path passes through untouched"
         );
+    }
+
+    /// The logging pair's domain checks fire at load, with the platform pattern's
+    /// vocabulary — the same loader `doctor` validates through, so the two commands
+    /// cannot disagree about a file.
+    ///
+    /// One case per rule, because a single refusal would prove only that *some* rule
+    /// fired. The stream cases each carry a legal group, so the stream rule is the one
+    /// being exercised rather than the needs-a-group rule.
+    #[test]
+    fn an_illegal_logging_pair_is_refused_at_load_with_the_pattern_named() {
+        // A group with a colon: the pasted-ARN mistake, named.
+        let file = TempFile::new("loggrp", "log-group = \"arn:aws:logs:g\"\n");
+        let message = load(Some(&file.0), false, Path::new("."))
+            .expect_err("refused")
+            .to_string();
+        assert!(message.contains("arn:aws:logs:g"), "{message}");
+        assert!(message.contains("[a-zA-Z0-9_\\-/.#]+"), "{message}");
+
+        // A stream with a colon, and one with a star: the two characters `[^:*]*` bans.
+        for stream in ["ci:image", "ci-*"] {
+            let file = TempFile::new(
+                "logstream",
+                &format!("log-group = \"g\"\nlog-stream = \"{stream}\"\n"),
+            );
+            let message = load(Some(&file.0), false, Path::new("."))
+                .expect_err("refused")
+                .to_string();
+            assert!(message.contains(stream), "{message}");
+            assert!(message.contains("[^:*]*"), "{message}");
+        }
+
+        // Over the 495-character caller ceiling, with the discriminator arithmetic named:
+        // the platform's 512 minus the `/` + 16 hex this client always appends.
+        let long = "s".repeat(496);
+        let file = TempFile::new(
+            "logstream-long",
+            &format!("log-group = \"g\"\nlog-stream = \"{long}\"\n"),
+        );
+        let message = load(Some(&file.0), false, Path::new("."))
+            .expect_err("refused")
+            .to_string();
+        assert!(message.contains("495"), "{message}");
+        assert!(message.contains("512"), "{message}");
+
+        // And the boundary passes: 495 characters is the longest legal prefix.
+        let legal = "s".repeat(495);
+        let file = TempFile::new(
+            "logstream-max",
+            &format!("log-group = \"g\"\nlog-stream = \"{legal}\"\n"),
+        );
+        let (_, config) = load(Some(&file.0), false, Path::new("."))
+            .expect("495 is legal")
+            .expect("present");
+        assert_eq!(config.log_stream.as_deref(), Some(legal.as_str()));
+    }
+
+    /// A stream with no group is refused at load: the stream lives inside the group, and
+    /// with none configured the service names a random group the stream cannot be in.
+    #[test]
+    fn a_log_stream_without_a_group_is_refused_at_load() {
+        let file = TempFile::new("streamonly", "log-stream = \"ci\"\n");
+        let message = load(Some(&file.0), false, Path::new("."))
+            .expect_err("refused")
+            .to_string();
+        assert!(message.contains("log-group"), "{message}");
     }
 
     /// A glob that will not compile is refused at load, before any billable call.

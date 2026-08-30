@@ -72,6 +72,19 @@ pub struct CreateMicrovmImageWire {
     /// different request from an absent member.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub additional_os_capabilities: Option<Vec<String>>,
+    /// `Logging`, absent unless the caller configured build logging.
+    ///
+    /// Omitted rather than sent as `null` or `{}` when nothing was configured: an absent
+    /// member takes the service default (a service-created log group under
+    /// `/aws/lambda-microvms/<image-name>` with random stream names), and the union's own
+    /// documentation says to specify exactly one member — an empty object is a malformed
+    /// union, not a default.
+    ///
+    /// The `logStream` this carries is never a caller's value verbatim; see
+    /// [`CloudWatchLogging::log_stream`] and the discriminator rule in
+    /// [`crate::control::ControlPlane::create_image`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub logging: Option<Logging>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tags: Option<std::collections::BTreeMap<String, String>>,
     /// The minted idempotency token.
@@ -90,6 +103,88 @@ pub struct CreateMicrovmImageWire {
 #[serde(rename_all = "camelCase")]
 pub struct CodeArtifact {
     pub uri: String,
+}
+
+/// `Logging`, the model's tagged union: exactly one of `disabled` or `cloudWatch`.
+///
+/// The same wire shape as [`PortSpecification`] and modelled the same way: a Smithy union
+/// serialises as **one key** — `{"disabled": {}}` or `{"cloudWatch": {...}}` — not a
+/// discriminator field, so `#[serde(untagged)]` plus a `rename` per variant is what keeps
+/// serde's default `{"Disabled": ...}` spelling off the wire.
+///
+/// Both `CreateMicrovmImageRequest` and `RunMicrovmRequest` carry a `logging` member of
+/// this shape in the model; this client binds only the image-build side (issue #98 — build
+/// logs are where the three-VM/three-stream topology and the exact-name collision live).
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(untagged)]
+pub enum Logging {
+    /// `LoggingDisabled`: no logs at all. An empty struct rather than a unit variant for
+    /// [`AllPorts`]'s reason — the wire form is `{}` and a unit serialises to `null`,
+    /// which the service rejects as a malformed union member.
+    Disabled {
+        #[serde(rename = "disabled")]
+        disabled: LoggingDisabled,
+    },
+    /// `CloudWatchLogging`: a caller-named group and, optionally, stream.
+    CloudWatch {
+        #[serde(rename = "cloudWatch")]
+        cloud_watch: CloudWatchLogging,
+    },
+}
+
+impl Logging {
+    /// Logging off.
+    pub fn disabled() -> Self {
+        Self::Disabled {
+            disabled: LoggingDisabled {},
+        }
+    }
+
+    /// Logs to `log_group`, with the service naming the streams inside it.
+    pub fn cloud_watch(log_group: impl Into<String>, log_stream: Option<String>) -> Self {
+        Self::CloudWatch {
+            cloud_watch: CloudWatchLogging {
+                log_group: Some(log_group.into()),
+                log_stream,
+            },
+        }
+    }
+
+    /// The resolved `logStream` this configuration carries, when it carries one.
+    pub fn log_stream(&self) -> Option<&str> {
+        match self {
+            Logging::Disabled { .. } => None,
+            Logging::CloudWatch { cloud_watch } => cloud_watch.log_stream.as_deref(),
+        }
+    }
+}
+
+/// `LoggingDisabled`, which the model declares with no members. See [`AllPorts`] for why
+/// this is an empty struct rather than a unit one.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+pub struct LoggingDisabled {}
+
+/// `CloudWatchLogging`: the group and stream names, both optional in the model.
+///
+/// # `logStream` is an EXACT stream name, and the client never sends a caller's verbatim
+///
+/// Measured 2026-08 (docs/PLATFORM.md, 'An image build is three VMs and three log
+/// streams'): the member names one stream exactly — prefixes are unsupported — and one
+/// image build runs three VMs that each want their own stream, so a fixed configured name
+/// collapses all three (and every successive build's three) into one indistinguishable
+/// stream. [`crate::control::ControlPlane::create_image`] therefore appends `/<16 hex>`
+/// of fresh CSPRNG per create attempt before this struct reaches the wire, the same
+/// mechanism as the `clientToken` nonce (TRAP-1).
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CloudWatchLogging {
+    /// `CloudWatchLoggingLogGroupString`: 1..=512, pattern `[a-zA-Z0-9_\-/.#]+`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub log_group: Option<String>,
+    /// `CloudWatchLoggingLogStreamString`: 1..=512, pattern `[^:*]*`. Always carries the
+    /// per-build discriminator by the time it serialises — see the type docs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub log_stream: Option<String>,
 }
 
 /// `CpuConfiguration`. One required member, whose enum has one value (`ARM_64`).
@@ -1430,6 +1525,7 @@ mod tests {
                 },
             },
             additional_os_capabilities: Some(vec!["ALL".to_string()]),
+            logging: None,
             tags: None,
             client_token: "create-img-0011223344556677".to_string(),
         };
@@ -2265,8 +2361,102 @@ mod tests {
                 },
             },
             additional_os_capabilities: None,
+            logging: None,
             tags: None,
             client_token: "create-img-0011223344556677".to_string(),
         }
+    }
+
+    // ── the logging union ─────────────────────────────────────────────────────
+
+    /// **Each `Logging` variant serialises as the member name the model declares, with
+    /// nothing else alongside it** — the same claim
+    /// [`each_port_specification_variant_serialises_as_its_model_member`] holds for the
+    /// other union this client sends.
+    ///
+    /// **Guard proof.** Dropping `#[serde(untagged)]` makes both cases fail with the
+    /// variant name as the key (`{"Disabled": ..}`); making `LoggingDisabled` a unit
+    /// struct serialises it as `null` and the object assertion fails. Both applied and
+    /// observed.
+    #[test]
+    fn each_logging_variant_serialises_as_its_model_member() {
+        let cases = [
+            (Logging::disabled(), "disabled", serde_json::json!({})),
+            (
+                Logging::cloud_watch("/aws/lambda-microvms/builds", None),
+                "cloudWatch",
+                serde_json::json!({"logGroup": "/aws/lambda-microvms/builds"}),
+            ),
+            (
+                Logging::cloud_watch(
+                    "/aws/lambda-microvms/builds",
+                    Some("img/deadbeef00010203".to_string()),
+                ),
+                "cloudWatch",
+                serde_json::json!({
+                    "logGroup": "/aws/lambda-microvms/builds",
+                    "logStream": "img/deadbeef00010203"
+                }),
+            ),
+        ];
+        for (logging, key, expected) in cases {
+            let value = serde_json::to_value(&logging).expect("serialises");
+            let object = value.as_object().expect("a union member is an object");
+            assert_eq!(
+                object.keys().collect::<Vec<_>>(),
+                vec![key],
+                "a union serialises as exactly one member named by the model: {value}"
+            );
+            assert_eq!(object[key], expected, "{key} carries the model's shape");
+        }
+    }
+
+    /// A configured `logging` reaches the wire under the model's member name, and an
+    /// unconfigured one is **absent** — not `null`, not `{}`.
+    ///
+    /// The absence half is the compatibility claim: a create with no logging config must
+    /// emit byte-for-byte the request this client always sent, because an absent member
+    /// takes the service default and a `"logging": null` is a new member on a request
+    /// that has worked for months.
+    ///
+    /// **Guard proof.** Remove `skip_serializing_if` from `logging` and the absence
+    /// assertion fails with `"logging": null` on every unconfigured create.
+    #[test]
+    fn a_configured_logging_reaches_the_wire_and_an_unconfigured_one_is_omitted() {
+        let mut wire = minimal_create_wire();
+        wire.logging = Some(Logging::cloud_watch(
+            "/aws/lambda-microvms/builds",
+            Some("img/deadbeef00010203".to_string()),
+        ));
+        let value = serde_json::to_value(&wire).expect("serialises");
+        assert_eq!(
+            value["logging"]["cloudWatch"]["logGroup"],
+            "/aws/lambda-microvms/builds"
+        );
+        assert_eq!(
+            value["logging"]["cloudWatch"]["logStream"],
+            "img/deadbeef00010203"
+        );
+
+        let value = serde_json::to_value(minimal_create_wire()).expect("serialises");
+        assert!(
+            !value.as_object().expect("object").contains_key("logging"),
+            "omitted, not null: an absent member takes the service default: {value}"
+        );
+    }
+
+    /// A group with no stream serialises without a `logStream` key at all: the member is
+    /// optional in the model, and an absent stream means "the service names the streams"
+    /// while an empty one is a `ValidationException` on the shape's `min: 1`.
+    #[test]
+    fn a_group_only_logging_config_omits_the_stream_member() {
+        let value = serde_json::to_value(Logging::cloud_watch("/aws/lambda-microvms/b", None))
+            .expect("serialises");
+        let cloud_watch = value["cloudWatch"].as_object().expect("an object");
+        assert_eq!(
+            cloud_watch.keys().collect::<Vec<_>>(),
+            vec!["logGroup"],
+            "an absent stream is omitted, not empty: {value}"
+        );
     }
 }
