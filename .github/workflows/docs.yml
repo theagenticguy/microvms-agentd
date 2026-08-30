@@ -44,7 +44,7 @@ jobs:
       # last commit, and a shallow clone gives every file the same date — a claim that
       # every page changed together. And the citation rewriter resolves every cited
       # path with `git ls-tree` at the pinned commit, which is not reachable at depth 1.
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           fetch-depth: 0
 
@@ -54,13 +54,13 @@ jobs:
       # `package.json` at the repository root, and this project's lives one directory down — with
       # the default the action finds no file, reads no version, and fails with `No pnpm version is
       # specified` before anything else in this job runs.
-      - uses: pnpm/action-setup@v6
+      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
         with:
           package_json_file: site/package.json
 
       # `cache: pnpm` needs pnpm already on PATH to resolve the store directory, which is why this
       # step follows the one above rather than leading.
-      - uses: actions/setup-node@v5
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
         with:
           # The HIGHEST floor in play, not Astro's. `astro@7` declares node >=22.12.0 and it is
           # tempting to pin that; pnpm 11.21 declares >=22.13 and fails this job outright with
@@ -165,7 +165,7 @@ jobs:
         run: pnpm exec vitest run
 
       - name: upload the Pages artifact
-        uses: actions/upload-pages-artifact@v5
+        uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5
         with:
           path: site/dist
 
@@ -194,8 +194,8 @@ jobs:
       # `enablement: true` turns Pages on with `build_type: workflow` through the API when
       # it is off, so the first run of this workflow configures the repository instead of
       # failing on a setting a human has to find. It is a no-op once set.
-      - uses: actions/configure-pages@v6
+      - uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6
         with:
           enablement: true
       - id: deployment
-        uses: actions/deploy-pages@v5
+        uses: actions/deploy-pages@cd2ce8fcbc39b97be8ca5fce6e763baed58fa128 # v5

@@ -48,7 +48,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       # Whole history, because the ancestry check below needs it and a shallow clone has none.
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           fetch-depth: 0
       # Catches a tag created on a branch that was never merged, which is what tagging from a
@@ -75,9 +75,11 @@ jobs:
             exit 1
           fi
           echo "$TAG -> $(git rev-parse --short HEAD), on main"
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - uses: astral-sh/setup-uv@v7
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
         with:
           enable-cache: false
       - name: publish set, manifest metadata, and tag agreement
@@ -106,10 +108,12 @@ jobs:
       contents: read
       id-token: write # exchanged for a 30-minute crates.io token
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - uses: rust-lang/crates-io-auth-action@v1.0.5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
         id: auth
       # `--workspace` publishes in dependency order, which Cargo has done natively since
       # 1.90. One OIDC exchange covers all three crates because each one's trusted-publisher
@@ -161,10 +165,11 @@ jobs:
           - { runner: windows-latest, target: x64, manylinux: '', container: '', zig: '' }
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
         if: matrix.zig != ''
         with:
+          toolchain: stable
           targets: aarch64-unknown-linux-gnu
       # The same pinned tarball the addons job uses, for the same reason: one zig acquisition
       # mechanism, and the one the verification ran against.
@@ -176,7 +181,7 @@ jobs:
           echo "70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00  zig.tar.xz" | sha256sum -c -
           tar -xJf zig.tar.xz
           echo "$PWD/zig-x86_64-linux-0.16.0" >> "$GITHUB_PATH"
-      - uses: PyO3/maturin-action@v1.51.0
+      - uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
         with:
           command: build
           args: --release -m microvms-py/Cargo.toml --out dist ${{ matrix.zig }}
@@ -184,7 +189,7 @@ jobs:
           manylinux: ${{ matrix.manylinux }}
           container: ${{ matrix.container }}
           sccache: 'true'
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: dist-wheel-${{ matrix.runner }}-${{ matrix.target }}
           path: dist
@@ -195,17 +200,17 @@ jobs:
     needs: guard
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       # Verified buildable rather than assumed: maturin vendors the workspace path
       # dependencies into the archive, so `pip install` from this sdist compiles
       # `microvms-protocol` and `microvms-core` from source and the module imports. An sdist
       # that cannot build is worse than none, because pip prefers it over failing outright on
       # a platform with no wheel.
-      - uses: PyO3/maturin-action@v1.51.0
+      - uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
         with:
           command: sdist
           args: -m microvms-py/Cargo.toml --out dist
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: dist-sdist
           path: dist
@@ -219,13 +224,13 @@ jobs:
     permissions:
       id-token: write # exchanged for a short-lived PyPI token, and signs the attestations
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/download-artifact@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
         with:
           pattern: dist-*
           merge-multiple: true
           path: dist
-      - uses: astral-sh/setup-uv@v7
+      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
         with:
           enable-cache: false
       # Every wheel against its own manylinux tag, before anything immutable is uploaded. pip
@@ -236,7 +241,7 @@ jobs:
       # No `password:` and no `user:`. The action performs the OIDC exchange itself, and it
       # generates and uploads PEP 740 attestations by default — so provenance needs no
       # configuration here, only the permission above.
-      - uses: pypa/gh-action-pypi-publish@v1.14.2
+      - uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
 
   # ── npm ─────────────────────────────────────────────────────────────────
   #
@@ -268,12 +273,13 @@ jobs:
           - { runner: windows-latest, target: x86_64-pc-windows-msvc, cross: '' }
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
         with:
+          toolchain: stable
           targets: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@v2
-      - uses: actions/setup-node@v7
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
           node-version: '24'
       # zig backs `--cross-compile`; napi installs `cargo-zigbuild` but not zig. Pinned and
@@ -292,14 +298,14 @@ jobs:
           npx -y -p @napi-rs/cli@3 napi build
           --manifest-path ../Cargo.toml --package microvms-js
           --platform --release --target ${{ matrix.target }} ${{ matrix.cross }} --output-dir .
-      - uses: astral-sh/setup-uv@v7
+      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
         if: matrix.cross != ''
         with:
           enable-cache: false
       - name: the addon does not demand a newer glibc than its oldest supported host
         if: matrix.cross != ''
         run: ./scripts/check-addon-glibc.py microvms-js
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: addon-${{ matrix.target }}
           path: microvms-js/*.node
@@ -310,7 +316,7 @@ jobs:
       # `napi build`, and `files` names a file that would not exist.
       - name: upload the generated loader and types
         if: matrix.target == 'x86_64-unknown-linux-gnu'
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: binding-js
           path: |
@@ -327,17 +333,17 @@ jobs:
       contents: read
       id-token: write # the npm CLI exchanges this for a short-lived publish token
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       # For the PEP 723 loader gate below. No cache: see `ci.yml`'s `security` job — there is
       # no lockfile here to key one on, and that script's dependency set is empty.
-      - uses: astral-sh/setup-uv@v7
+      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
         with:
           enable-cache: false
       # Node 24, for npm 11.x. Trusted publishing requires npm >= 11.5.1 and Node >=
       # 22.14.0, and every Node 22 release ships npm 10.9 — so pinning the version this
       # package's `engines.node` floor allows would authenticate with a CLI that has no OIDC
       # path and fall back to looking for a token that does not exist.
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
           node-version: '24'
           registry-url: 'https://registry.npmjs.org'
@@ -368,14 +374,14 @@ jobs:
       # The generated loader already prefers a local file — `require('./microvms.<triple>.node')`
       # is tried before `require('<package>-<suffix>')` — so one package carrying all four
       # binaries works with the loader unchanged and no `optionalDependencies` at all.
-      - uses: actions/download-artifact@v7
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
         with:
           pattern: addon-*
           merge-multiple: true
           path: microvms-js
       # The loader and types, which the package cannot be published without: both are
       # gitignored and this job never runs `napi build`.
-      - uses: actions/download-artifact@v7
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
         with:
           name: binding-js
           path: microvms-js
@@ -412,11 +418,12 @@ jobs:
       id-token: write # signs the provenance attestation
       attestations: write
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
         with:
+          toolchain: stable
           targets: aarch64-unknown-linux-musl
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - name: install cross linker
         run: |
           sudo apt-get update
@@ -431,7 +438,7 @@ jobs:
         run: |
           ls -l target/aarch64-unknown-linux-musl/release/agentd
           file target/aarch64-unknown-linux-musl/release/agentd
-      - uses: actions/attest-build-provenance@v4.2.2
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: target/aarch64-unknown-linux-musl/release/agentd
       - name: publish the release

@@ -66,15 +66,16 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
         with:
+          toolchain: stable
           components: clippy, rustfmt
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       # For the PEP 723 publish gate at the end of this job, and only on the platform
       # that runs it. See the `security` job for why no cache: there is no lockfile in
       # this repo for a cache key to watch, and this script's dependency set is empty.
-      - uses: astral-sh/setup-uv@v7
+      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
         if: matrix.os == 'ubuntu-latest'
         with:
           enable-cache: false
@@ -138,11 +139,11 @@ jobs:
     name: semgrep, secret history, licenses, workflow lint
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           # betterleaks scans history, and a shallow clone has none.
           fetch-depth: 0
-      - uses: astral-sh/setup-uv@v7
+      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
         with:
           # No cache, deliberately. `enable-cache: auto` looks for a lockfile or a
           # requirements file to key the cache on, finds none in this repo, and
@@ -207,7 +208,7 @@ jobs:
     name: SBOM and vulnerability scans
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       # syft writes the SBOM, grype audits the SBOM, trivy audits the tree
       # (vulns + IaC misconfig + secrets), osv-scanner audits the lockfiles
       # against OSV directly. Three scanners because their databases disagree
@@ -234,7 +235,7 @@ jobs:
       - name: grype (audits what the SBOM publishes)
         run: grype sbom:sbom/microvms-agentd.cdx.json --fail-on high
       - name: trivy (vulns, IaC misconfig, secrets)
-        uses: aquasecurity/trivy-action@v0.36.0
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           scan-type: fs
           scan-ref: .
@@ -253,7 +254,7 @@ jobs:
       # attached per-run so any commit's inventory is downloadable, 90-day
       # default retention.
       - name: publish SBOMs
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: sbom-${{ github.sha }}
           path: sbom/
@@ -263,10 +264,12 @@ jobs:
     name: hardcoded constraints match the service model
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - uses: astral-sh/setup-uv@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
         with:
           # See the `security` job: no lockfile to key a cache on, and a cache that
           # can never be invalidated would pin the boto3 whose bundled service model
@@ -303,16 +306,18 @@ jobs:
     name: python and node bindings
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - uses: astral-sh/setup-uv@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
         with:
           # See the `security` job. Nothing here is locked either: `uvx maturin@1.14`
           # pins its own version inline and the venv holds exactly `pytest`, so there
           # is no file a cache key could watch.
           enable-cache: false
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
           node-version: '22'
       # The binding suites are where BIND-2/BIND-5 live: nine planted bypasses
@@ -375,11 +380,12 @@ jobs:
     name: static aarch64 binary
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
         with:
+          toolchain: stable
           targets: aarch64-unknown-linux-musl
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       # aarch64 musl is the shipping target: every MicroVM we have run is ARM64,
       # and a static binary is what lets the daemon bake into a task's own base
       # image without depending on an interpreter that image may not have.
