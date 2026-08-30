@@ -204,6 +204,52 @@ pub const MAX_TAG_VALUE_LEN: usize = 256;
 /// enforces. Published as a string for the drift gate.
 pub const TAG_COMPONENT_PATTERN: &str = "([\\p{L}\\p{Z}\\p{N}_.:/=+\\-@]*)";
 
+/// `CloudWatchLoggingLogGroupString.max` — the ceiling on `logging.cloudWatch.logGroup`.
+///
+/// Checked by [`crate::control::require_valid_log_group`] before the create call, which
+/// happens after the artifact upload — the same ordering argument every other create-side
+/// guard makes.
+pub const MAX_LOG_GROUP_LEN: usize = 512;
+
+/// `CloudWatchLoggingLogGroupString.pattern`, as the model spells it.
+///
+/// Letters, digits, and `_ - / . #` — no colon, no space. Published as a string for the
+/// drift gate; the matcher is [`is_valid_log_group`], a direct byte check for the reason
+/// [`IMAGE_NAME_PATTERN`] gives.
+pub const LOG_GROUP_PATTERN: &str = "[a-zA-Z0-9_\\-/.#]+";
+
+/// `CloudWatchLoggingLogStreamString.max` — the ceiling on `logging.cloudWatch.logStream`.
+///
+/// This bounds the value **on the wire**, which is never the caller's value verbatim: the
+/// client always appends `/<16 hex>` (see [`MAX_USER_LOG_STREAM_LEN`] for why, and
+/// `crate::control::image` for the mechanism), so the caller-facing ceiling is lower.
+pub const MAX_LOG_STREAM_LEN: usize = 512;
+
+/// `CloudWatchLoggingLogStreamString.pattern` — anything but `:` and `*`.
+///
+/// The two excluded characters are CloudWatch's own stream-name reserved set. Published as
+/// a string for the drift gate; [`crate::control::require_valid_log_stream`] names it in
+/// its refusal.
+pub const LOG_STREAM_PATTERN: &str = "[^:*]*";
+
+/// The ceiling on a **caller-supplied** log stream name: [`MAX_LOG_STREAM_LEN`] minus the
+/// 17 characters of per-build discriminator this client always appends (`/` + 16 hex).
+///
+/// # Why the client never sends a caller's stream name verbatim
+///
+/// The `logStream` member is an **exact** stream name, not a prefix (prefixes are
+/// unsupported — 2026-08 platform finding, docs/PLATFORM.md 'An image build is three VMs
+/// and three log streams'). One build emits three log streams, and a fixed configured name
+/// collapses all three — and every *successive* build's three — into one stream, making
+/// concurrent builds of different images indistinguishable. Appending a fresh CSPRNG
+/// discriminator per create attempt keeps a configured name useful as a *family* prefix
+/// while every attempt stays tellable apart, which is the same shape as TRAP-1's token
+/// nonce and reuses its mechanism.
+///
+/// The test beside these constants pins the arithmetic, so a change to the nonce width
+/// fails here rather than as a `ValidationException` after the artifact upload.
+pub const MAX_USER_LOG_STREAM_LEN: usize = 495;
+
 /// `RoleArn.min` — 20 characters, which is the shortest thing that can be an IAM role ARN.
 pub const MIN_ROLE_ARN_LEN: usize = 20;
 
@@ -468,6 +514,20 @@ pub fn is_valid_image_name(name: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
+/// Whether `group` satisfies [`LOG_GROUP_PATTERN`] and [`MAX_LOG_GROUP_LEN`].
+///
+/// A direct byte check over the pattern's character set — letters, digits, `_ - / . #` —
+/// for the reason [`is_valid_image_name`] gives. The length is checked here too, because a
+/// caller asking "is this group name legal" means both constraints: they arrive from the
+/// same model shape and the service rejects on either.
+pub fn is_valid_log_group(group: &str) -> bool {
+    !group.is_empty()
+        && group.len() <= MAX_LOG_GROUP_LEN
+        && group
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'/' | b'.' | b'#'))
+}
+
 /// Whether every character of `component` is in [`TAG_COMPONENT_PATTERN`]'s set.
 ///
 /// **The length is not checked here**, unlike [`is_valid_image_name`], and the asymmetry is
@@ -607,6 +667,11 @@ pub fn as_json() -> Value {
         ("MAX_TAG_KEY_LEN", json!(MAX_TAG_KEY_LEN)),
         ("MAX_TAG_VALUE_LEN", json!(MAX_TAG_VALUE_LEN)),
         ("TAG_COMPONENT_PATTERN", json!(TAG_COMPONENT_PATTERN)),
+        ("MAX_LOG_GROUP_LEN", json!(MAX_LOG_GROUP_LEN)),
+        ("LOG_GROUP_PATTERN", json!(LOG_GROUP_PATTERN)),
+        ("MAX_LOG_STREAM_LEN", json!(MAX_LOG_STREAM_LEN)),
+        ("LOG_STREAM_PATTERN", json!(LOG_STREAM_PATTERN)),
+        ("MAX_USER_LOG_STREAM_LEN", json!(MAX_USER_LOG_STREAM_LEN)),
         ("MIN_ROLE_ARN_LEN", json!(MIN_ROLE_ARN_LEN)),
         ("MAX_ROLE_ARN_LEN", json!(MAX_ROLE_ARN_LEN)),
         ("ROLE_ARN_PATTERN", json!(ROLE_ARN_PATTERN)),
@@ -708,6 +773,8 @@ mod tests {
                 "IMAGE_STATES",
                 "IMAGE_VERSION_STATES",
                 "IMAGE_VERSION_STATUSES",
+                "LOG_GROUP_PATTERN",
+                "LOG_STREAM_PATTERN",
                 "MAX_CLIENT_TOKEN_LEN",
                 "MAX_DURATION_SEC",
                 "MAX_HOOK_PORT",
@@ -716,6 +783,8 @@ mod tests {
                 "MAX_IMAGE_EGRESS_CONNECTORS",
                 "MAX_IMAGE_HOOK_TIMEOUT_SEC",
                 "MAX_IMAGE_NAME_LEN",
+                "MAX_LOG_GROUP_LEN",
+                "MAX_LOG_STREAM_LEN",
                 "MAX_MICROVM_HOOK_TIMEOUT_SEC",
                 "MAX_NETWORK_CONNECTORS",
                 "MAX_NON_BLANK_LEN",
@@ -725,6 +794,7 @@ mod tests {
                 "MAX_RUN_HOOK_PAYLOAD_BYTES",
                 "MAX_TAG_KEY_LEN",
                 "MAX_TAG_VALUE_LEN",
+                "MAX_USER_LOG_STREAM_LEN",
                 "MAX_VERSION_LEN",
                 "MICROVM_REGIONS",
                 "MICROVM_STATES",
@@ -766,6 +836,11 @@ mod tests {
             emitted["TAG_COMPONENT_PATTERN"],
             "([\\p{L}\\p{Z}\\p{N}_.:/=+\\-@]*)"
         );
+        assert_eq!(emitted["MAX_LOG_GROUP_LEN"], 512);
+        assert_eq!(emitted["LOG_GROUP_PATTERN"], "[a-zA-Z0-9_\\-/.#]+");
+        assert_eq!(emitted["MAX_LOG_STREAM_LEN"], 512);
+        assert_eq!(emitted["LOG_STREAM_PATTERN"], "[^:*]*");
+        assert_eq!(emitted["MAX_USER_LOG_STREAM_LEN"], 495);
         assert_eq!(emitted["MIN_ROLE_ARN_LEN"], 20);
         assert_eq!(emitted["MAX_ROLE_ARN_LEN"], 2048);
         assert_eq!(
@@ -978,6 +1053,39 @@ mod tests {
     fn a_multibyte_name_is_refused_by_the_character_class_not_by_luck() {
         assert!(!is_valid_image_name("é"));
         assert!(!is_valid_image_name("日本語"));
+    }
+
+    /// The log-group matcher takes exactly the model's set — letters, digits, `_ - / . #` —
+    /// and both length bounds.
+    ///
+    /// `/aws/lambda-microvms/img` is the shape the service itself creates, so it has to
+    /// pass; a colon is the character a caller pasting an ARN brings in first, so it is the
+    /// named rejection.
+    #[test]
+    fn a_log_group_takes_the_models_character_set_and_bounds() {
+        assert!(is_valid_log_group("/aws/lambda-microvms/img"));
+        assert!(is_valid_log_group("builds_2026.08#a"));
+        assert!(is_valid_log_group(&"a".repeat(MAX_LOG_GROUP_LEN)));
+
+        assert!(!is_valid_log_group(""), "min is 1");
+        assert!(
+            !is_valid_log_group(&"a".repeat(MAX_LOG_GROUP_LEN + 1)),
+            "513 characters is one past the ceiling"
+        );
+        for rejected in ["arn:aws:logs", "a group", "grp*", "grp\n", "imagé"] {
+            assert!(!is_valid_log_group(rejected), "{rejected}");
+        }
+    }
+
+    /// The user-facing stream ceiling leaves exactly the discriminator's room under the
+    /// wire ceiling: `/` plus sixteen hex characters.
+    ///
+    /// Pinned as arithmetic so a change to the nonce width (`token.rs`'s eight bytes) or to
+    /// either ceiling fails here rather than as a `ValidationException` after the artifact
+    /// upload — the same shape as `token.rs`'s own cap test.
+    #[test]
+    fn the_user_stream_ceiling_leaves_room_for_the_slash_and_sixteen_hex() {
+        assert_eq!(MAX_USER_LOG_STREAM_LEN + 1 + 16, MAX_LOG_STREAM_LEN);
     }
 
     /// **Issue #24's documentation trap, pinned as a comparison.** The model's own prose says

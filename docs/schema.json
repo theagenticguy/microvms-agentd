@@ -167,6 +167,21 @@
           "minimum": 0,
           "type": "integer"
         },
+        "hooks": {
+          "default": [],
+          "description": "Every lifecycle-hook invocation the daemon observed, oldest first.\n\nThe platform writes no CloudWatch logs for the validate hook, so \"did my\nvalidate hook even run?\" has no answer anywhere else. Each entry is the\ndaemon's own observation — the hook path that was posted and the daemon's\nclock when it arrived — never anything the guest printed.\n\nOne trust caveat travels with this field and is stated rather than implied:\nthe hook routes are unauthenticated and reachable over loopback from inside\nthe guest, so a hostile workload can *forge additional* entries by posting\nthe hook paths itself. It cannot remove or alter real ones — the daemon\nrecords before it responds and the log is append-capped, keeping the\nearliest entries — so the platform's real firings are the front of the list\nand later spam is what the cap drops.\n\nDefaulted for `busy`'s reason: an older daemon omits the field, and an empty\nlist is the honest reading of a daemon that reports no observations.",
+          "items": {
+            "$ref": "#/$defs/HookObservation"
+          },
+          "type": "array"
+        },
+        "hooks_dropped": {
+          "default": 0,
+          "description": "How many hook invocations were dropped once the log reached its cap.\n\nNon-zero means the list above is the *earliest* invocations only — the cap\nkeeps first-N so a guest spamming the unauthenticated hook routes cannot\ngrow daemon memory or push the platform's real firings out of the record.\n\nDefaulted like `hooks`: an older daemon omits it, and zero is the honest\nreading of a daemon that dropped nothing it could tell us about.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
         "identity_degraded": {
           "description": "Whether any startup identity repair step failed. True means the VM is serving\nwith a value from the shared image still in place — a duplicate machine-id or\nboot_id — which is a security-relevant condition an operator may want to\ndrain the VM over, but is never a reason for the daemon to refuse to serve.",
           "type": "boolean"
@@ -186,7 +201,29 @@
         "identity_degraded",
         "identity_repaired",
         "busy",
-        "execs"
+        "execs",
+        "hooks",
+        "hooks_dropped"
+      ],
+      "type": "object"
+    },
+    "HookObservation": {
+      "description": "One lifecycle-hook invocation, as the daemon observed it.\n\nA daemon-reported fact in the same trust class as an exec's exit code: the\ndaemon's word about a request it served, carrying nothing the guest printed.",
+      "properties": {
+        "fired_at": {
+          "description": "Seconds since the epoch on the daemon's clock when the invocation arrived.\n\nThe daemon's clock rather than any caller's, and recorded before the handler\ndoes any work — a run hook that was invoked and refused still fired.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "hook": {
+          "description": "Which hook, spelled the way the platform's routes spell it: `ready`,\n`validate`, `run`, `suspend`, `resume`, or `terminate`.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "hook",
+        "fired_at"
       ],
       "type": "object"
     },
@@ -529,7 +566,7 @@
           "meaning": "acknowledged. The platform terminates the VM on any other status, so there is no failure a hook can usefully report."
         }
       ],
-      "summary": "image-build readiness probe; answers 200 even before bootstrap, because the question is whether the daemon started"
+      "summary": "image-build readiness probe; answers 200 even before bootstrap, because the question is whether the daemon started. Every hook invocation is recorded and reported on /v1/health as `hooks`."
     },
     {
       "auth": "none (platform hook)",
@@ -544,7 +581,7 @@
           "meaning": "acknowledged. The platform terminates the VM on any other status, so there is no failure a hook can usefully report."
         }
       ],
-      "summary": "image-build validation probe; same reasoning as ready"
+      "summary": "image-build validation probe; same reasoning as ready. Recorded on /v1/health's `hooks`, which is the only trace this hook leaves — the platform writes no CloudWatch logs for it."
     },
     {
       "auth": "none (platform hook)",
@@ -1188,7 +1225,7 @@
           "meaning": "always, whether or not the daemon is bootstrapped. bootstrapped is how a client learns whether the control API is open yet; busy is how an orchestrator outside the VM learns whether a workload is still running, so its own poll doubles as the inbound traffic the platform's idle policy measures. An in-guest request cannot serve that purpose: the endpoint proxy terminates outside the guest."
         }
       ],
-      "summary": "liveness, daemon version, whether bootstrap has completed, and whether any exec is still running. `busy` exists so an orchestrator OUTSIDE the VM can hold it alive: the platform measures idleness by inbound traffic through the endpoint proxy, which terminates outside the guest, so a request from inside the guest cannot reset the idle timer. Polling this from outside is both the traffic and the decision."
+      "summary": "liveness, daemon version, whether bootstrap has completed, and whether any exec is still running. `busy` exists so an orchestrator OUTSIDE the VM can hold it alive: the platform measures idleness by inbound traffic through the endpoint proxy, which terminates outside the guest, so a request from inside the guest cannot reset the idle timer. Polling this from outside is both the traffic and the decision. `hooks` lists every lifecycle hook the daemon observed, oldest first, with `fired_at` epoch seconds on the daemon's clock, and `hooks_dropped` counts invocations past the cap. Hook routes are unauthenticated and loopback-reachable from inside the guest, so a hostile workload can forge ADDITIONAL entries — never remove or alter real ones; the cap keeps the earliest, which are the platform's."
     },
     {
       "auth": "none",

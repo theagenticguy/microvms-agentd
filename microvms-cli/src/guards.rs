@@ -215,6 +215,8 @@ fn aws_commands(binary: &std::path::Path) -> Vec<(&'static str, Command, Door)> 
                 memory: MemoryMib::Mib2048,
                 dockerfile: None,
                 repair_identity: false,
+                log_group: None,
+                log_stream: None,
                 egress: false,
                 launch_env: Vec::new(),
                 user: None,
@@ -247,6 +249,8 @@ fn aws_commands(binary: &std::path::Path) -> Vec<(&'static str, Command, Door)> 
                 memory: MemoryMib::Mib2048,
                 dockerfile: None,
                 repair_identity: false,
+                log_group: None,
+                log_stream: None,
                 reuse: false,
                 port: None,
                 region: region_flags(),
@@ -822,6 +826,8 @@ fn run_args_for_image(identifier: &str, state_dir: std::path::PathBuf) -> RunArg
         memory: MemoryMib::Mib2048,
         dockerfile: None,
         repair_identity: false,
+        log_group: None,
+        log_stream: None,
         egress: false,
         launch_env: Vec::new(),
         user: None,
@@ -1443,6 +1449,64 @@ async fn the_resolved_config_report_names_each_knobs_source() {
     assert_eq!(knob("image")["source"], "flag");
 }
 
+/// **The logging pair merges flag-over-file per knob, and a merged stream with no merged
+/// group is refused** — the combination neither layer can see alone.
+///
+/// The stream comes from the flag and the group from the file in the first case, which is
+/// the cross-layer pair the per-knob `pick` has to compose; the second case drops the
+/// file and the same flag stream becomes a refusal, because a stream inside a group the
+/// service names randomly is a location that does not exist.
+///
+/// **Falsification** — move the stream-needs-a-group check before the merge (test the
+/// flags alone) and the first case fails: the flag stream plus the file group is legal
+/// and would be refused.
+#[tokio::test]
+async fn the_log_knobs_merge_flag_over_file_and_a_cross_layer_stream_needs_its_group() {
+    let file = ConfigFile::new(
+        "log-knobs",
+        "log-group = \"/aws/lambda-microvms/from-file\"\nlog-stream = \"file-stream\"\n",
+    );
+    let mut args = run_args_for_image(
+        "arn:aws:lambda:us-east-1:123456789012:microvm-image/img",
+        std::env::temp_dir(),
+    );
+    args.config = crate::cli::ConfigFlags {
+        config: Some(file.0.clone()),
+        no_config: false,
+    };
+    args.log_stream = Some("flag-stream".into());
+
+    let merged = crate::commands::lifecycle::merge_config(&args, &|_| None).expect("merges");
+    let knob = |name: &str| merged.resolved[name].clone();
+    assert_eq!(knob("logGroup")["value"], "/aws/lambda-microvms/from-file");
+    assert_eq!(knob("logGroup")["source"], "config");
+    assert_eq!(knob("logStream")["value"], "flag-stream");
+    assert_eq!(
+        knob("logStream")["source"],
+        "flag",
+        "the typed flag beats the file's stream"
+    );
+    assert_eq!(
+        merged.args.log_group.as_deref(),
+        Some("/aws/lambda-microvms/from-file")
+    );
+    assert_eq!(merged.args.log_stream.as_deref(), Some("flag-stream"));
+
+    // The same flag stream with no file is a refusal: no layer supplied a group.
+    let mut orphan = run_args_for_image(
+        "arn:aws:lambda:us-east-1:123456789012:microvm-image/img",
+        std::env::temp_dir(),
+    );
+    orphan.log_stream = Some("flag-stream".into());
+    // A `match` rather than `expect_err`, because `MergedRunArgs` carries no `Debug` —
+    // deliberately, since `RunArgs` holds the agent-token-adjacent launch env.
+    let Err(error) = crate::commands::lifecycle::merge_config(&orphan, &|_| None) else {
+        panic!("a stream with no group from either layer must be refused");
+    };
+    assert_eq!(error.exit, Exit::InvalidArg, "{}", error.message);
+    assert!(error.message.contains("log group"), "{}", error.message);
+}
+
 /// **A typed `BINARY` positional suppresses the file's `image`, because the pair is one
 /// decision: `run` builds exactly when the merged image is absent.**
 ///
@@ -1644,6 +1708,8 @@ async fn a_reuse_build_whose_hash_name_exists_skips_the_build_entirely() {
         memory: MemoryMib::Mib2048,
         dockerfile: None,
         repair_identity: false,
+        log_group: None,
+        log_stream: None,
         reuse: true,
         port: None,
         region: region_flags(),
@@ -1727,6 +1793,8 @@ async fn a_reuse_build_whose_hash_name_is_absent_builds_under_the_derived_name()
         memory: MemoryMib::Mib2048,
         dockerfile: None,
         repair_identity: false,
+        log_group: None,
+        log_stream: None,
         reuse: true,
         port: None,
         region: region_flags(),
@@ -1788,6 +1856,8 @@ async fn a_plain_build_never_lists_and_reports_reused_false() {
         memory: MemoryMib::Mib2048,
         dockerfile: None,
         repair_identity: false,
+        log_group: None,
+        log_stream: None,
         reuse: false,
         port: None,
         region: region_flags(),
@@ -1844,6 +1914,8 @@ async fn a_locally_refused_dockerfile_costs_no_upload_and_no_call() {
         memory: MemoryMib::Mib2048,
         dockerfile: Some(dockerfile_path.clone()),
         repair_identity: false,
+        log_group: None,
+        log_stream: None,
         reuse: false,
         port: None,
         region: region_flags(),
@@ -1932,6 +2004,8 @@ async fn a_pinned_base_image_version_reaches_the_create_body_from_the_build_flag
         memory: MemoryMib::Mib2048,
         dockerfile: None,
         repair_identity: false,
+        log_group: None,
+        log_stream: None,
         reuse: false,
         port: None,
         region: region_flags(),
@@ -1949,6 +2023,158 @@ async fn a_pinned_base_image_version_reaches_the_create_body_from_the_build_flag
     assert_eq!(
         body["baseImageArn"],
         "arn:aws:lambda:us-east-1:aws:microvm-image:al2023-1"
+    );
+}
+
+/// **`build --log-group`/`--log-stream` reach the `CreateMicrovmImage` body with the
+/// per-build discriminator applied, and the envelope reports the resolved exact stream.**
+///
+/// Read off the emitted body for the base-image-version test's reason: the wiring runs
+/// through three hops — `BuildArgs`, `BuildSpec`, `CreateImageRequest` — any of which
+/// could drop it while every other test stayed green. The discriminator claim is the
+/// load-bearing one: the wire stream must be `<user value>/<16 hex>`, never verbatim,
+/// because the member is an exact stream name and one build is three VMs writing three
+/// streams (issue #98). And the envelope's `logStream` must equal the wire's byte for
+/// byte — the nonce is minted inside core's create call, so the envelope is the only
+/// place a caller can learn the name.
+///
+/// **Guard proof.** Run 2026-08-30. Set `log_stream: None` in `build`'s `BuildSpec` (the
+/// flag parsed, the spec ignores it) and the body assertion goes red with no `logging`
+/// member; every other CLI test stays green. Restored.
+#[tokio::test]
+async fn a_build_log_stream_reaches_the_wire_suffixed_and_the_envelope_reports_it() {
+    let binary = FakeBinary::new("log-stream");
+    let transport = Arc::new(ScriptedTransport::new());
+    transport
+        .answer(
+            "CreateMicrovmImage",
+            201,
+            r#"{"imageArn": "arn:aws:lambda:us-east-1:123456789012:microvm-image:img",
+                 "name": "img", "state": "CREATING", "createdAt": 1754524800,
+                 "baseImageArn": "arn:aws:lambda:us-east-1:aws:microvm-image:al2023-1",
+                 "buildRoleArn": "arn:aws:iam::123456789012:role/build",
+                 "codeArtifact": {"uri": "s3://a-bucket/img.zip"},
+                 "imageVersion": "1"}"#,
+        )
+        .answer(
+            "GetMicrovmImage",
+            200,
+            r#"{"imageArn": "arn:aws:lambda:us-east-1:123456789012:microvm-image:img",
+                 "name": "img", "state": "CREATED", "createdAt": 1754524800}"#,
+        );
+
+    let seam = ScriptedSeam {
+        transport: Arc::clone(&transport),
+        clock: Arc::new(YieldingClock::default()),
+    };
+    let command = Command::Build(BuildArgs {
+        binary: binary.0.clone(),
+        base_image_version: None,
+        artifact_uri: None,
+        name: Some("img".into()),
+        memory: MemoryMib::Mib2048,
+        dockerfile: None,
+        repair_identity: false,
+        log_group: Some("/aws/lambda-microvms/conformance-builds".into()),
+        log_stream: Some("img-ci".into()),
+        reuse: false,
+        port: None,
+        region: region_flags(),
+        infra: InfraFlags::default(),
+    });
+    let (result, _) = dispatch_with(&seam, &command, full_infra()).await;
+    let rendered = result.expect("builds");
+
+    let body = transport.first_body("CreateMicrovmImage");
+    assert_eq!(
+        body["logging"]["cloudWatch"]["logGroup"], "/aws/lambda-microvms/conformance-builds",
+        "the flag has to reach the wire: {body}"
+    );
+    let wire_stream = body["logging"]["cloudWatch"]["logStream"]
+        .as_str()
+        .expect("a stream was sent");
+    assert_ne!(
+        wire_stream, "img-ci",
+        "the flag's value must never reach the wire verbatim — an exact stream name \
+         collapses every build's three streams into one"
+    );
+    assert!(wire_stream.starts_with("img-ci/"), "{wire_stream}");
+    let suffix = &wire_stream["img-ci/".len()..];
+    assert_eq!(suffix.len(), 16, "{wire_stream}");
+    assert!(
+        suffix.bytes().all(|b| b.is_ascii_hexdigit()),
+        "{wire_stream}"
+    );
+
+    // The envelope reports the resolved name, byte-identical to the wire's, plus the
+    // configured group as buildLogGroup — not the derived default.
+    assert_eq!(rendered.data["logStream"], wire_stream);
+    assert_eq!(
+        rendered.data["buildLogGroup"],
+        "/aws/lambda-microvms/conformance-builds"
+    );
+}
+
+/// A build with no logging flags emits **no** `logging` member and a null `logStream`
+/// key: absent on the wire (byte-for-byte the request this CLI always sent), present as
+/// null in the envelope (so a consumer never guards for the key).
+#[tokio::test]
+async fn a_build_without_logging_flags_emits_no_logging_member_and_a_null_stream() {
+    let binary = FakeBinary::new("no-logging");
+    let transport = Arc::new(ScriptedTransport::new());
+    transport
+        .answer(
+            "CreateMicrovmImage",
+            201,
+            r#"{"imageArn": "arn:aws:lambda:us-east-1:123456789012:microvm-image:img",
+                 "name": "img", "state": "CREATING", "createdAt": 1754524800,
+                 "baseImageArn": "arn:aws:lambda:us-east-1:aws:microvm-image:al2023-1",
+                 "buildRoleArn": "arn:aws:iam::123456789012:role/build",
+                 "codeArtifact": {"uri": "s3://a-bucket/img.zip"},
+                 "imageVersion": "1"}"#,
+        )
+        .answer(
+            "GetMicrovmImage",
+            200,
+            r#"{"imageArn": "arn:aws:lambda:us-east-1:123456789012:microvm-image:img",
+                 "name": "img", "state": "CREATED", "createdAt": 1754524800}"#,
+        );
+
+    let seam = ScriptedSeam {
+        transport: Arc::clone(&transport),
+        clock: Arc::new(YieldingClock::default()),
+    };
+    let command = Command::Build(BuildArgs {
+        binary: binary.0.clone(),
+        base_image_version: None,
+        artifact_uri: None,
+        name: Some("img".into()),
+        memory: MemoryMib::Mib2048,
+        dockerfile: None,
+        repair_identity: false,
+        log_group: None,
+        log_stream: None,
+        reuse: false,
+        port: None,
+        region: region_flags(),
+        infra: InfraFlags::default(),
+    });
+    let (result, _) = dispatch_with(&seam, &command, full_infra()).await;
+    let rendered = result.expect("builds");
+
+    let body = transport.first_body("CreateMicrovmImage");
+    assert!(
+        body.get("logging").is_none(),
+        "an unconfigured build must emit byte-for-byte what this CLI always sent: {body}"
+    );
+    assert_eq!(
+        rendered.data["logStream"],
+        serde_json::Value::Null,
+        "the key is always present so a consumer never guards for it"
+    );
+    assert_eq!(
+        rendered.data["buildLogGroup"], "/aws/lambda-microvms/img",
+        "no configured group means the derived default"
     );
 }
 
@@ -3674,6 +3900,195 @@ async fn an_exec_appends_the_daemons_report_and_a_detached_one_appends_a_null_co
     );
 }
 
+/// **`resume` polls the thawed daemon and lands its hook observations in history.**
+/// (issue #80)
+///
+/// This is the moment suspend-hook firings become visible at all — a frozen VM cannot
+/// answer a poll — so the wiring deserves its own guard: delete the post-RUNNING
+/// health poll from `lifecycle::resume` and the hook read below is empty while the
+/// resume's envelope and exit are byte-identical, which is why nothing else catches it.
+#[tokio::test]
+async fn a_resume_polls_the_thawed_daemon_and_lands_its_hook_observations() {
+    /// `ScriptedSeam` for the control plane, `DaemonScript` for the attach the
+    /// post-RUNNING poll makes — `resume` is the one lifecycle command that uses both.
+    struct ResumeSeam {
+        transport: Arc<ScriptedTransport>,
+        clock: Arc<YieldingClock>,
+        daemon: Arc<DaemonScript>,
+    }
+    impl CoreSeam for ResumeSeam {
+        fn control_plane(&self, region: Region) -> BoxFuture<'_, Result<ControlPlane, Error>> {
+            let plane = ControlPlane::with_transport(
+                Arc::clone(&self.transport) as Arc<dyn Transport>,
+                region,
+                Arc::clone(&self.clock) as Arc<dyn Clock>,
+            );
+            Box::pin(async move { Ok(plane) })
+        }
+        fn open_sandbox(
+            &self,
+            _region: Region,
+            _port: Option<u16>,
+        ) -> BoxFuture<'_, Result<Sandbox, Error>> {
+            Box::pin(async move { Err(Error::new(ErrorKind::Platform, "resume never launches")) })
+        }
+        fn attach_session(
+            &self,
+            _region: Region,
+            _attach: Attach,
+        ) -> BoxFuture<'_, Result<Session, Error>> {
+            let backend = Arc::clone(&self.daemon) as Arc<dyn microvms_core::session::HttpBackend>;
+            let built = Session::builder("https://mvm-1.example", "")
+                .with_backend(backend)
+                .build();
+            Box::pin(async move { built })
+        }
+        fn put_artifact(&self, _uri: &str, _bytes: Vec<u8>) -> BoxFuture<'_, Result<(), Error>> {
+            Box::pin(async move { Ok(()) })
+        }
+    }
+
+    let dir = TempDir::new("history-resume-hooks");
+    let transport = Arc::new(ScriptedTransport::new());
+    transport.answer("ResumeMicrovm", 200, "{}").answer(
+        "GetMicrovm",
+        200,
+        &microvm_body("RUNNING"),
+    );
+    let daemon = DaemonScript::new();
+    daemon.reply(
+        200,
+        r#"{"version": "0.1.0", "bootstrapped": true, "disk": null,
+             "identity_degraded": false, "identity_repaired": true,
+             "hooks": [{"hook": "suspend", "fired_at": 1756500500},
+                       {"hook": "resume", "fired_at": 1756500600}],
+             "hooks_dropped": 0}"#,
+    );
+    let seam = ResumeSeam {
+        transport,
+        clock: Arc::new(YieldingClock::default()),
+        daemon: Arc::clone(&daemon),
+    };
+    let command = Command::Resume(ResumeArgs {
+        microvm_id: "mvm-abc123".into(),
+        timeout: 30.0,
+        state_dir: Some(dir.0.clone()),
+        region: region_flags(),
+    });
+    let (result, _) = dispatch_with(&seam, &command, full_infra()).await;
+    result.expect("the resume succeeds");
+
+    assert_eq!(
+        daemon.paths(),
+        ["GET /v1/health"],
+        "one poll, after RUNNING"
+    );
+    let read = crate::history::read_events(&dir.0, "mvm-abc123");
+    let hooks: Vec<(&str, u64)> = read
+        .iter()
+        .filter(|event| event["event"] == "hookObserved")
+        .map(|event| {
+            (
+                event["hook"].as_str().expect("a hook"),
+                event["firedAt"].as_u64().expect("an epoch"),
+            )
+        })
+        .collect();
+    assert_eq!(
+        hooks,
+        [("suspend", 1_756_500_500), ("resume", 1_756_500_600)],
+        "the thawed daemon's observations, verbatim: {read:?}"
+    );
+    // And the `resumed` event still precedes them — the poll is after RUNNING.
+    assert_eq!(read[0]["event"], "resumed");
+}
+
+/// **`microvm health` lands the daemon's hook observations in the VM's history,
+/// deduplicated on the (hook, firedAt) pair.** (issue #80)
+///
+/// Three polls prove three claims. The first appends the body's two observations with
+/// the daemon's own values — never anything the guest printed, which is the forgery
+/// property's letter; the daemon-reported caveat (an in-guest caller can forge
+/// *additional* firings by posting the unauthenticated hook paths) is documented in
+/// `history.rs` and does not change what this asserts, because the values on file are
+/// still exactly what the daemon reported. The second poll repeats the identical body
+/// and appends nothing. The third carries one new firing and appends exactly it, with
+/// `seq` continuing the one sequence.
+///
+/// **Guard proof.** Delete the `append_unseen_hooks` call from `attached::health` and
+/// the first read below is empty while the envelope still carries `hooks`; drop the
+/// dedup and the second read counts four. The dedup half was broken exactly so on
+/// 2026-08-30 (in `history.rs`'s own falsification), failed as stated, restored.
+#[tokio::test]
+async fn a_health_poll_lands_hook_observations_in_history_and_a_repeat_appends_nothing() {
+    let dir = TempDir::new("history-hooks");
+    let health_command = || {
+        Command::Health(HealthArgs {
+            attach: AttachFlags {
+                state_dir: Some(dir.0.clone()),
+                ..attach_flags()
+            },
+            region: region_flags(),
+        })
+    };
+    let body_two_hooks = r#"{"version": "0.1.0", "bootstrapped": true, "disk": null,
+             "identity_degraded": false, "identity_repaired": true,
+             "hooks": [{"hook": "validate", "fired_at": 1756500000},
+                       {"hook": "run", "fired_at": 1756500100}],
+             "hooks_dropped": 0}"#;
+
+    // First poll: both observations land, with the daemon's values.
+    let script = DaemonScript::new();
+    script.reply(200, body_two_hooks);
+    let (result, _, _) = against_daemon(&script, &health_command()).await;
+    let rendered = result.expect("health answers");
+    assert_eq!(
+        rendered.data["hooks"],
+        serde_json::json!([
+            {"hook": "validate", "firedAt": 1756500000_u64},
+            {"hook": "run", "firedAt": 1756500100_u64},
+        ]),
+        "the envelope carries the observations, camelCase like its neighbours"
+    );
+    assert_eq!(rendered.data["hooksDropped"], 0);
+    let read = crate::history::read_events(&dir.0, "mvm-1");
+    assert_eq!(read.len(), 2, "{read:?}");
+    assert_eq!(read[0]["event"], "hookObserved");
+    assert_eq!(read[0]["hook"], "validate");
+    assert_eq!(read[0]["firedAt"], 1_756_500_000_u64);
+    assert_eq!(read[1]["hook"], "run");
+
+    // Second poll, identical body: dedup proven — nothing appends.
+    let script = DaemonScript::new();
+    script.reply(200, body_two_hooks);
+    let (result, _, _) = against_daemon(&script, &health_command()).await;
+    result.expect("health answers again");
+    assert_eq!(
+        crate::history::read_events(&dir.0, "mvm-1").len(),
+        2,
+        "a repeat poll must append nothing"
+    );
+
+    // Third poll, one new firing: exactly it appends, and seq continues.
+    let script = DaemonScript::new();
+    script.reply(
+        200,
+        r#"{"version": "0.1.0", "bootstrapped": true, "disk": null,
+             "identity_degraded": false, "identity_repaired": true,
+             "hooks": [{"hook": "validate", "fired_at": 1756500000},
+                       {"hook": "run", "fired_at": 1756500100},
+                       {"hook": "suspend", "fired_at": 1756500900}],
+             "hooks_dropped": 0}"#,
+    );
+    let (result, _, _) = against_daemon(&script, &health_command()).await;
+    result.expect("health answers a third time");
+    let read = crate::history::read_events(&dir.0, "mvm-1");
+    assert_eq!(read.len(), 3, "{read:?}");
+    assert_eq!(read[2]["hook"], "suspend");
+    assert_eq!(read[2]["firedAt"], 1_756_500_900_u64);
+    assert_eq!(read[2]["seq"], 2, "one monotonic sequence across the polls");
+}
+
 // ── CLI-3's classification half ──────────────────────────────────────────────
 
 /// **CLI-3, table-driven over every non-zero row that a core failure can produce.**
@@ -4039,6 +4454,17 @@ async fn run_dir_uploads_the_tree_execs_in_it_and_brings_back_matched_artifacts(
             ("secrets.env", b"never asked for"),
         ]),
     ));
+    // The teardown's own health poll (issue #80), carrying the daemon's hook log. The
+    // hooks below are what a real launch reports: validate and ready fired in the
+    // snapshot VM, run fired in this one.
+    daemon.reply(
+        200,
+        r#"{"version": "0.1.0", "bootstrapped": true, "disk": null,
+                    "identity_degraded": false, "identity_repaired": true,
+                    "hooks": [{"hook": "validate", "fired_at": 1756500000},
+                              {"hook": "run", "fired_at": 1756500100}],
+                    "hooks_dropped": 0}"#,
+    );
 
     let seam = SyncSeam {
         transport: sync_launch_script(),
@@ -4116,6 +4542,27 @@ async fn run_dir_uploads_the_tree_execs_in_it_and_brings_back_matched_artifacts(
     );
     // One member: `main.py`. The `.git` tree was skipped whole.
     assert_eq!(rendered.data["sync"]["uploadedMembers"], 1);
+
+    // The teardown's health poll landed the daemon's hook observations in the VM's
+    // history, with the daemon's own values (issue #80). The daemon lane is where the
+    // values are proven; this is the wiring — a `run` that never polled would leave no
+    // hookObserved lines while every other assertion above stayed green.
+    let events = crate::history::read_events(&state.0, "mvm-abc123");
+    let hooks: Vec<(&str, u64)> = events
+        .iter()
+        .filter(|event| event["event"] == "hookObserved")
+        .map(|event| {
+            (
+                event["hook"].as_str().expect("a hook name"),
+                event["firedAt"].as_u64().expect("an epoch"),
+            )
+        })
+        .collect();
+    assert_eq!(
+        hooks,
+        [("validate", 1_756_500_000), ("run", 1_756_500_100)],
+        "the daemon's observations, verbatim: {events:?}"
+    );
 }
 
 /// **An exec that fails still gets its artifacts downloaded — CI wants the logs.**
@@ -4151,6 +4598,12 @@ async fn a_failing_exec_still_brings_the_artifacts_back() {
         .lock()
         .expect("not poisoned")
         .push_back((200, daemon_archive(&[("report/junit.xml", b"<failure/>")])));
+    // The teardown's health poll (issue #80); no hooks in this body, so nothing lands.
+    daemon.reply(
+        200,
+        r#"{"version": "0.1.0", "bootstrapped": true, "disk": null,
+                    "identity_degraded": false, "identity_repaired": true}"#,
+    );
 
     let seam = SyncSeam {
         transport: sync_launch_script(),

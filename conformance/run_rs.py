@@ -6,7 +6,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Live conformance run driving the **Rust** client stack through the `microvm` CLI.
 
-This is the only live suite, and it now expresses **every named check** — 104 of them, with
+This is the only live suite, and it now expresses **every named check** — 113 of them, with
 none recorded SKIP. `conformance/run.py` was the oracle — 56 checks through the Python
 client — and it went away with that client once both suites ran green against real AWS on
 the same commit (Python 56/56, this one 38/38 with 34 recorded SKIP). Those 34 were the
@@ -73,6 +73,30 @@ ciphertext), a tampered pin failing closed with nothing served, the restored rec
 verifying again, and the identity VM's own teardown. Live because the handshake's
 failure mode on the endpoint path is a silent 1006, which is exactly the shape that
 passes every stand-in and fails only against the real proxy.
+
+105 rather than 104: `drive_local_commands` adds one for issue #99 — the cost
+envelope's size object reporting `headroomMib` (peak minus baseline, both read from
+the sizing table) beside `baselineMib` and `peakMib`, asserted against the documented
+row for the class this suite launches with.
+
+109 rather than 105: hook observations, issue #80. `drive_health` adds two — the run
+hook the platform fired appearing on the health envelope with a wall-clock-bracketed
+timestamp, and an *informational* check for validate/ready surviving from the snapshot
+VM's memory (PASS either way; absence prints as a finding, because the survival is a
+design expectation no live run has yet confirmed). `drive_suspend_resume` adds two —
+the suspend and resume hooks on health after the thaw (the only moment a suspend
+observation is readable at all), and the local history JSONL carrying the cycle's
+hookObserved events exactly once each, read the way a user would, through
+`microvm history --json`.
+
+113 rather than 109: `drive_build_logging` adds four for issue #98 — the suite's own
+build configures `--log-group`/`--log-stream`, and after the build boto3 asserts the
+configured group is readable, the resolved stream exists carrying the user prefix + `/` +
+16 hex, no stream carries the configured name verbatim, and the stream is non-empty.
+Live because the claim is about what the service recorded: the discriminator's whole
+point is what CloudWatch ends up holding, and no fake can say the platform accepted the
+suffixed name. The configured group rides `drive_teardown`'s `extra_log_groups`, since
+the CLI's terminate derives only the default group name and cannot know to name this one.
 
 A hybrid driver, and both lanes are deliberate
 ----------------------------------------------
@@ -152,7 +176,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -847,6 +871,31 @@ def drive_local_commands(cli: Cli, results: Results) -> None:
         lambda: cli.call("cost", "--running-sec", "3600"),
     )
 
+    # The size object's static headroom (issue #99). The peak and the headroom are
+    # properties of the class, read from the sizing table — the peak is provisioned
+    # from the start and headroom is peak minus baseline, so both are asserted
+    # against the documented row for the class this suite launches with, not
+    # against `baseline * 4` arithmetic (TRAP-13's discipline, at the envelope).
+    estimate = cli.call(
+        "cost",
+        "--estimate",
+        "--running-sec",
+        "3600",
+        "--memory",
+        str(BASELINE_MEMORY_MIB),
+    )
+    size = estimate.data["report"]["size"]
+    # The documented row for 1024 MiB: peak 4096. Written as a literal pair rather
+    # than derived, for the same reason the core's table is data.
+    results.check(
+        "the cost size object reports its static headroom from the table",
+        size.get("baselineMib") == BASELINE_MEMORY_MIB
+        and size.get("peakMib") == 4096
+        and size.get("headroomMib") == size["peakMib"] - size["baselineMib"],
+        f"baselineMib={size.get('baselineMib')!r} peakMib={size.get('peakMib')!r} "
+        f"headroomMib={size.get('headroomMib')!r}",
+    )
+
     manifest = cli.call("manifest")
     commands = [entry["name"] for entry in manifest.data["commands"]]
     results.check(
@@ -876,13 +925,25 @@ def drive_local_commands(cli: Cli, results: Results) -> None:
 
 
 def drive_lifecycle(
-    cli: Cli, binary: Path, dockerfile: Path, results: Results
+    cli: Cli,
+    binary: Path,
+    dockerfile: Path,
+    results: Results,
+    log_group: str,
+    log_stream_prefix: str,
 ) -> Envelope:
     """`run --keep`, which is build plus launch plus exec in one invocation.
 
     `--keep` because every check after this one needs the VM, and the teardown is the
     caller's `finally` — the same shape the oracle used, for the same reason: a teardown
     that runs from inside the happy path is a teardown that does not run when it matters.
+
+    The build carries the configured logging pair (issue #98) so `drive_build_logging`
+    can assert the discriminator against real CloudWatch without a second 15-minute
+    build. The group stays under `/aws/lambda-microvms/` because that is the only prefix
+    the build role can write to (`conformance/infra/main.tf`, `WriteBuildLogs`) — a group
+    outside it builds with no logs at all, which would make the stream checks assert
+    against an IAM decision rather than against the client's suffixing.
     """
     print("\n== run (build + launch + exec) ==")
     launched = cli.call(
@@ -895,6 +956,10 @@ def drive_lifecycle(
         "--memory",
         str(BASELINE_MEMORY_MIB),
         "--repair-identity",
+        "--log-group",
+        log_group,
+        "--log-stream",
+        log_stream_prefix,
         "--keep",
         "--region",
         cli.region,
@@ -948,6 +1013,86 @@ def drive_lifecycle(
         f"{type(launched.data.get('cost')).__name__}",
     )
     return launched
+
+
+def drive_build_logging(
+    logs: Any,
+    log_group: str,
+    log_stream_prefix: str,
+    results: Results,
+) -> None:
+    """The configured build-logging pair, asserted against real CloudWatch (issue #98).
+
+    The suite's own build (in `drive_lifecycle`) configured `--log-group` and
+    `--log-stream`, so by the time this runs the build has finished and its streams
+    exist. What only a live read can say:
+
+    - the client's resolved stream really exists in the configured group — the wire
+      carried `<prefix>/<16 hex>`, not the caller's verbatim value, and the service
+      accepted it;
+    - the stream is non-empty — the build's three VMs actually wrote through the
+      configured destination rather than falling back to the service default;
+    - the name carries the user prefix, a `/`, and a 16-hex suffix — the discriminator
+      contract, measured rather than assumed.
+
+    Read through boto3 rather than the CLI for `read_daemon_logs`'s reason: `microvm
+    logs` refuses CloudWatch by design (CLI-2), and this check is about what the
+    *service* recorded. The suite's own credentials do the describe; the build role only
+    ever needed to write.
+    """
+    print("\n-- build logging (the configured group and the resolved stream) --")
+    try:
+        streams = logs.describe_log_streams(
+            logGroupName=log_group,
+            logStreamNamePrefix=f"{log_stream_prefix}/",
+        ).get("logStreams", [])
+    except Exception as exc:  # noqa: BLE001 - an unreadable group is the finding
+        results.check(
+            "the configured build log group exists and is readable",
+            False,
+            f"{log_group}: {type(exc).__name__}: {exc}",
+        )
+        return
+    results.check(
+        "the configured build log group exists and is readable",
+        True,
+        log_group,
+    )
+
+    names = [str(stream["logStreamName"]) for stream in streams]
+    suffixes = [name[len(log_stream_prefix) + 1 :] for name in names]
+    results.check(
+        "the resolved stream exists and carries the prefix, a slash, and 16 hex",
+        bool(names)
+        and all(
+            len(suffix) == 16 and all(c in "0123456789abcdef" for c in suffix)
+            for suffix in suffixes
+        ),
+        f"{names!r} — the client must suffix, never send the configured name verbatim",
+    )
+    results.check(
+        "no stream carries the configured name verbatim",
+        log_stream_prefix not in names,
+        f"{names!r} — a verbatim name would collapse every build's streams into one",
+    )
+
+    # Non-empty: the three build VMs wrote through the configured destination. One
+    # configured exact name means all three collapse into this stream, which is exactly
+    # the behaviour the per-build discriminator exists to scope to a single build.
+    events = 0
+    for name in names:
+        got = logs.get_log_events(
+            logGroupName=log_group,
+            logStreamName=name,
+            limit=10,
+            startFromHead=True,
+        )
+        events += len(got.get("events", []))
+    results.check(
+        "the resolved stream is non-empty",
+        events > 0,
+        f"{events} event(s) across {len(names)} stream(s)",
+    )
 
 
 def attach_args(cli: Cli, launched: Envelope, endpoint: str | None = None) -> list[str]:
@@ -1025,7 +1170,7 @@ def drive_exec(cli: Cli, launched: Envelope, results: Results) -> None:
 
 
 def drive_health(cli: Cli, launched: Envelope, results: Results) -> None:
-    """`microvm health` — five checks, and the identity pair is the one with a measurement.
+    """`microvm health` — seven checks, and the identity pair is the one with a measurement.
 
     `identity_degraded` is the only guard whose unit tests inject a fake layout, so this is
     the one place the real bind mount over real procfs is exercised. Measured 2026-08-06:
@@ -1034,6 +1179,14 @@ def drive_health(cli: Cli, launched: Envelope, results: Results) -> None:
     Asserting it here is what makes the capability requirement impossible to drop by
     accident — the launch above passes `--repair-identity`, and if core stopped injecting
     `["ALL"]` this check would be the thing that noticed.
+
+    The hook checks (issue #80) split guarantee from hypothesis. A launched VM's daemon
+    served the platform's run hook by definition — no traffic is forwarded before it
+    answers 200 — so the run observation is asserted hard. Validate/ready fire in the
+    *snapshot* VM, and their surviving into a launched VM rests on launch restoring the
+    snapshot's memory: designed for, expected, and informational here rather than
+    load-bearing until a live run confirms it. Its absence is printed as a finding, never
+    a failure — a red suite over a hypothesis is a suite people stop reading.
     """
     print("\n-- health --")
     attach = attach_args(cli, launched)
@@ -1056,6 +1209,33 @@ def drive_health(cli: Cli, launched: Envelope, results: Results) -> None:
     )
     results.eq(
         "identity repair actually ran", health.data.get("identityRepaired"), True
+    )
+
+    # The daemon's own record of the run hook, with a timestamp the wall clock brackets:
+    # after this suite started (minus generous build time is unnecessary — the hook fired
+    # during this run's launch) and not in the future. `bootstrapped: true` above says the
+    # hook succeeded; this says the *observation log* recorded it, which is the surface
+    # issue #80 added and the thing that would break independently.
+    hooks = health.data.get("hooks") or []
+    now = int(time.time())
+    run_hooks = [h for h in hooks if h.get("hook") == "run"]
+    results.check(
+        "health reports the run hook the platform fired",
+        bool(run_hooks)
+        and all(0 < int(h.get("firedAt", 0)) <= now + 60 for h in run_hooks),
+        f"hooks={hooks!r}",
+    )
+    # The snapshot-survival hypothesis, reported rather than asserted: validate and ready
+    # fire in the snapshot VM, and a launched VM restores that VM's memory, so its hook
+    # log should carry them. PASS either way — presence confirms the design, absence is a
+    # finding worth reading in the report, not a defect in this client.
+    build_hooks = sorted({h.get("hook") for h in hooks} & {"ready", "validate"})
+    results.check(
+        "build-time hook observations restored from the snapshot (informational)",
+        True,
+        f"present: {build_hooks!r}"
+        if build_hooks
+        else "ABSENT — the snapshot did not carry them; a finding, not a failure",
     )
 
 
@@ -1579,6 +1759,44 @@ def drive_suspend_resume(cli: Cli, launched: Envelope, results: Results) -> None
             f"phase={survived_record.data.get('phase')!r} "
             f"stdout={(survived_record.data.get('stdout') or '')[:40]!r}",
         )
+
+    # The daemon's hook log across the cycle (issue #80). The suspend observation is
+    # only ever readable after the thaw — a frozen VM answers nothing — so this is the
+    # moment it becomes visible at all. Timestamps are bracketed by this section's own
+    # wall clock: both hooks fired between the suspend call above and now.
+    after_health = cli.call("health", *after)
+    hooks = after_health.data.get("hooks") or []
+    now = int(time.time())
+    cycle_hooks = {
+        name: [int(h.get("firedAt", 0)) for h in hooks if h.get("hook") == name]
+        for name in ("suspend", "resume")
+    }
+    results.check(
+        "health reports the suspend and resume hooks with plausible timestamps",
+        bool(cycle_hooks["suspend"])
+        and bool(cycle_hooks["resume"])
+        and all(
+            0 < stamp <= now + 60 for stamps in cycle_hooks.values() for stamp in stamps
+        ),
+        f"suspend={cycle_hooks['suspend']!r} resume={cycle_hooks['resume']!r}",
+    )
+
+    # And the local history, read the way a user would. The `resume` above polled
+    # health and the `health` call just did too, each appending unseen observations
+    # deduplicated on (hook, firedAt) — so the JSONL carries hookObserved events for
+    # the cycle, and carrying each pair exactly once is the dedup working live.
+    story = cli.call("history", microvm_id)
+    observed = [
+        (event.get("hook"), event.get("firedAt"))
+        for event in (story.data.get("events") or [])
+        if event.get("event") == "hookObserved"
+    ]
+    results.check(
+        "the local history carries the cycle's hook observations exactly once each",
+        {"suspend", "resume", "run"} <= {hook for hook, _ in observed}
+        and len(observed) == len(set(observed)),
+        f"hookObserved={observed!r}",
+    )
 
 
 def drive_token_rotation(cli: Cli, launched: Envelope, results: Results) -> None:
@@ -2174,7 +2392,11 @@ def drive_idle_keepalive(
 
 
 def drive_teardown(
-    cli: Cli, launched: Envelope, results: Results, logs: Any = None
+    cli: Cli,
+    launched: Envelope,
+    results: Results,
+    logs: Any = None,
+    extra_log_groups: Sequence[str] = (),
 ) -> None:
     """`microvm terminate --delete-image`, what it names as left behind, and then this
     suite deleting that.
@@ -2239,12 +2461,21 @@ def drive_teardown(
     # The suite's own residue, removed by the suite. Asserted rather than best-effort:
     # a delete that quietly failed would put the tier back where it was, red on a leak
     # nobody meant to leave.
+    #
+    # `extra_log_groups` rides along: the configured build-logging group (issue #98) is
+    # one the CLI's terminate never names — its `undeletedLogGroups` derives the default
+    # `/aws/lambda-microvms/<image-name>` — so the suite that configured it is the only
+    # party that knows to delete it. Same delete, same assertion, same tolerance for a
+    # group the service never created.
+    to_delete = [str(group) for group in undeleted] + [
+        group for group in extra_log_groups if group not in undeleted
+    ]
     deleted: list[str] = []
     failures: list[str] = []
-    for group in undeleted:
+    for group in to_delete:
         try:
-            logs.delete_log_group(logGroupName=str(group))
-            deleted.append(str(group))
+            logs.delete_log_group(logGroupName=group)
+            deleted.append(group)
         except Exception as exc:  # noqa: BLE001 - the reason is the finding
             # An already-absent group is the desired end state, not a failure: the
             # service may never have created one for a build that produced no events.
@@ -2254,20 +2485,31 @@ def drive_teardown(
                 failures.append(f"{group}: {type(exc).__name__}: {exc}")
     results.check(
         "the suite deleted the build log group the CLI could not",
-        not failures and len(deleted) == len(undeleted),
+        not failures and len(deleted) == len(to_delete),
         f"deleted={deleted!r} failures={failures!r}",
     )
 
 
-def read_daemon_logs(logs: Any, image_name: str) -> list[str]:
+def read_daemon_logs(
+    logs: Any, image_name: str, extra_groups: Sequence[str] = ()
+) -> list[str]:
     """The daemon's own log lines, through boto3.
 
     Through boto3 rather than through the CLI on purpose: `microvm logs` refuses to read
     CloudWatch by design (CLI-2), and this check is about whether the *daemon* wrote
     anything. Same shape and same reason as the oracle's own log read.
+
+    `extra_groups` is checked first: the model documents the image's `logging` member as
+    covering "build-time and runtime logs", so a suite build that configured a group
+    (issue #98) may find the daemon's runtime lines there rather than in the default
+    location — the defaults stay in the list because that half of the claim is unmeasured.
     """
     lines: list[str] = []
-    for group in (f"/aws/lambda-microvms/{image_name}", "/aws/lambda-microvms"):
+    for group in (
+        *extra_groups,
+        f"/aws/lambda-microvms/{image_name}",
+        "/aws/lambda-microvms",
+    ):
         try:
             streams = logs.describe_log_streams(
                 logGroupName=group, orderBy="LastEventTime", descending=True, limit=5
@@ -2865,6 +3107,17 @@ def main() -> int:
     # `NameError` waiting for the one run that fails early — which would replace a real
     # failure with this file's own. Creating a boto3 session costs no API call.
     aws = boto3.Session(region_name=cli.region)
+    # The configured build-logging pair (issue #98), bound before the `try` for `aws`'s
+    # reason: the teardown in the `finally` deletes this group, and a name bound inside
+    # the block is a NameError on the one run that fails early. Under
+    # /aws/lambda-microvms/ because that is the only prefix the build role can write
+    # (infra/main.tf, WriteBuildLogs) — outside it the build writes nothing and the
+    # stream checks would measure IAM rather than the client's suffixing. The random
+    # component keeps concurrent suite runs out of each other's groups.
+    build_log_group = (
+        f"/aws/lambda-microvms/conformance-configured-{secrets.token_hex(4)}"
+    )
+    build_log_stream_prefix = "suite-build"
 
     with tempfile.TemporaryDirectory() as tmp:
         dockerfile = Path(tmp) / "Dockerfile"
@@ -2878,7 +3131,17 @@ def main() -> int:
             # left to announce. The summary still prints a skip count, which should read
             # zero — see `Results.skip`.
             drive_local_commands(cli, results)
-            launched = drive_lifecycle(cli, binary, dockerfile, results)
+            launched = drive_lifecycle(
+                cli,
+                binary,
+                dockerfile,
+                results,
+                build_log_group,
+                build_log_stream_prefix,
+            )
+            drive_build_logging(
+                aws.client("logs"), build_log_group, build_log_stream_prefix, results
+            )
 
             # The daemon lane pokes the VM the CLI launched, over raw HTTP. Composed
             # rather than duplicated: the Rust client launched it and this reaches
@@ -2931,7 +3194,9 @@ def main() -> int:
 
             print("\n== daemon logs ==")
             lines = read_daemon_logs(
-                aws.client("logs"), str(launched.data["imageName"])
+                aws.client("logs"),
+                str(launched.data["imageName"]),
+                extra_groups=(build_log_group,),
             )
             results.check(
                 "daemon logs reached CloudWatch under /aws/lambda-microvms/",
@@ -2955,7 +3220,13 @@ def main() -> int:
                 # created inside the block would be a `NameError` here on the one run that
                 # failed early, which would replace a real failure with this file's own.
                 try:
-                    drive_teardown(cli, launched, results, aws.client("logs"))
+                    drive_teardown(
+                        cli,
+                        launched,
+                        results,
+                        aws.client("logs"),
+                        extra_log_groups=(build_log_group,),
+                    )
                 except Exception as exc:  # noqa: BLE001 - a teardown failure is a finding
                     results.check("teardown completed", False, repr(exc))
 

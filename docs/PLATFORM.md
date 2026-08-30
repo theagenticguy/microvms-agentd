@@ -243,7 +243,7 @@ Measured 2026-08-07, us-east-1, `al2023-1`. Requesting
 Both match AWS's documented sizing table exactly (`microvms-images.html`), which
 pairs each baseline with a peak ceiling four times its size:
 
-| Baseline (billed while running) | Peak (burst ceiling) |
+| Baseline (billed while running) | Peak (provisioned ceiling) |
 | --- | --- |
 | 0.5 GB / 0.25 vCPU | 2 GB / 1 vCPU |
 | 1 GB / 0.5 vCPU | 4 GB / 2 vCPU |
@@ -256,20 +256,33 @@ So `minimumMemoryInMiB` chooses a size class, and the number the guest reports i
 the peak specifically is our inference from two matching measurements; AWS
 documents the table but not the `MemTotal` mapping.
 
+**The peak is provisioned from the start.** Confirmed with the service team,
+2026-08: the VM is provisioned at 4x the requested minimum from the moment it
+exists. There is no vertical scaling, no sampling, and no resize event of any
+kind — nothing changes size during a run, and app code never observes a resource
+change. The peak is always present. AWS's own pricing docs say "burst", which
+misleads (it implies dynamic scaling that does not happen); the service team
+committed to doc fixes the week of 2026-08-26. This repo used to inherit that
+"burst" vocabulary and no longer does.
+
 **Billing follows the baseline you requested, not the peak the guest reports.**
 AWS: "You pay the baseline rate while your MicroVM is running and only pay for what
 you actively use above the baseline, billed per second." An earlier version of this
 section said a caller "should not assume they are billed for the request", which was
-exactly backwards. The request is what you are billed for, and the extra memory is
-burst headroom charged only for the seconds it is actually consumed. Corrected
-2026-08-07 after reading the pricing page rather than inferring from the size.
+exactly backwards. The requested minimum is the bill's floor — 25% of the
+provisioned capacity, always paid while the VM runs — and usage above the minimum
+is billed by consumption, per second. Corrected 2026-08-07 after reading the
+pricing page rather than inferring from the size.
 
 Three consequences follow for a caller. You cannot use this field to *constrain* a VM, so a
 memory-pressure test must generate pressure against what the guest reports rather
 than what was requested. Guest swap is absent (`SwapTotal: 0 kB`), so pressure goes
-straight to the OOM killer with no paging phase. And picking a small baseline is a
-real cost lever rather than a cosmetic one, since baseline is the rate you pay for
-every running second.
+straight to the OOM killer with no paging phase — and the ceiling it enforces is the
+always-present peak, not the baseline. And picking a small baseline is a real cost
+lever rather than a cosmetic one, since baseline is the floor you pay for every
+running second while the 4x headroom above it bills only by what is consumed —
+which makes a low minimum the right choice for peaky workloads whose steady state
+is small.
 
 ## What actually costs money
 
@@ -573,6 +586,44 @@ then reports `reason=unknown` — which reads as the service failing to populate
 
 Build roles also need ECR permissions if any task points `docker_image` at a
 same-account ECR repository; without them the build fails outright.
+
+## An image build is three VMs and three log streams, and `logStream` is an exact name
+
+Measured 2026-08, us-east-1, API version 2025-09-09.
+
+One `CreateMicrovmImage` runs **three VMs**, each emitting its own log stream:
+
+1. **docker-build** — zip pull and docker image build, the VM that assembles the image
+   from the code artifact.
+2. **snapshot build for Graviton 3** — boots the image and snapshots it. The snapshot VM
+   is the one that **starts the app**, so application startup logs land here.
+3. **snapshot build for Graviton 4** — the same snapshot pass for the other chipset
+   generation; also starts the app.
+
+With no logging configuration (the default), the service creates a new log group per
+image and each stream gets a random name.
+
+The request's `logging` member (`{"disabled": {}} | {"cloudWatch": {logGroup, logStream}}`
+in the model) changes that — and its `logStream` is an **exact stream name, never a
+prefix**. Prefixes are unsupported (a feature request is filed). Setting both `logGroup`
+and `logStream` therefore collapses all three of a build's streams into **one** stream —
+and successive or concurrent builds of different images become indistinguishable inside
+it, because every build writes to the same exact name.
+
+This client's response is a per-build discriminator: it **never sends a configured
+`logStream` verbatim**. The configured value is treated as a family prefix and the wire
+carries `<configured>/<16 hex>` with fresh CSPRNG per create attempt (the same nonce
+mechanism as the `clientToken`, which is the other permanent-name trap on this call). The
+resolved exact name is returned on the create result and on `microvm build`'s envelope as
+`logStream`, because the discriminator exists nowhere else. A configured value is
+therefore capped at 495 characters — the shape's 512 minus the suffix's 17 — and refused
+when it carries `:` or `*` (the shape's pattern is `[^:*]*`).
+
+A configured `logGroup` must still be somewhere the build role can write:
+`logs:CreateLogGroup`/`CreateLogStream`/`PutLogEvents` on the group, or the build writes
+no logs at all — the same silent outcome as the wrong-prefix policy above. The
+conformance account grants `/aws/lambda-microvms/*` only, so configured groups there stay
+under that prefix.
 
 ## A failed build's `stateReason` lives on the **build**, not on the version or the image
 

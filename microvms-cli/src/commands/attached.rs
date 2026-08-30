@@ -618,6 +618,34 @@ pub async fn health<O: std::io::Write, E: std::io::Write>(
     // endpoint proxy terminates outside the guest.
     data.insert("busy".into(), json!(health.busy));
     data.insert("execs".into(), json!(health.execs));
+    // The daemon's hook observations, respelled camelCase like every other key here.
+    // These are daemon-reported facts in the exit code's trust class, with one caveat
+    // the history module documents: an in-guest caller can forge ADDITIONAL entries by
+    // posting the unauthenticated hook paths, never remove or alter real ones.
+    data.insert(
+        "hooks".into(),
+        json!(
+            health
+                .hooks
+                .iter()
+                .map(|observation| json!({
+                    "hook": observation.hook,
+                    "firedAt": observation.fired_at,
+                }))
+                .collect::<Vec<_>>()
+        ),
+    );
+    data.insert("hooksDropped".into(), json!(health.hooks_dropped));
+
+    // The observations also land in the VM's local history, deduplicated, so "did my
+    // validate hook even run?" is answerable after the VM is gone. The id is always in
+    // hand on this command — clap requires --microvm-id unless --name resolved one —
+    // and the append swallows its failures like every history write.
+    crate::history::append_unseen_hooks(
+        &state_dir(args.attach.state_dir.clone(), ctx.env),
+        &microvm_id,
+        &health.hooks,
+    );
 
     if health.identity_degraded {
         ctx.out.warn(
@@ -635,7 +663,7 @@ pub async fn health<O: std::io::Write, E: std::io::Write>(
         );
     }
 
-    let lines = [
+    let mut lines = vec![
         format!("daemon {} on {microvm_id}", health.version),
         format!("bootstrapped: {}", health.bootstrapped),
         format!(
@@ -671,14 +699,38 @@ pub async fn health<O: std::io::Write, E: std::io::Write>(
             health.execs,
         ),
     ];
+    // One line per hook the daemon observed, `hook=<name> firedAt=<secs>`, the same
+    // spelling the history renderer produces so the two reports read as one record.
+    // An old daemon reports none and prints none — a "hooks: (not reported)" line
+    // would claim knowledge of an absence this client cannot distinguish from an
+    // empty log.
+    for observation in &health.hooks {
+        lines.push(format!(
+            "hook={} firedAt={}",
+            observation.hook, observation.fired_at
+        ));
+    }
+    if health.hooks_dropped > 0 {
+        lines.push(format!(
+            "hooks dropped: {} — the daemon's log capped; the entries above are the \
+             earliest invocations, which are the platform's own",
+            health.hooks_dropped
+        ));
+    }
     let dense = format!(
-        "{}\t{}\t{}\t{}\t{}\t{}",
+        "{}\t{}\t{}\t{}\t{}\t{}\t{}",
         health.version,
         health.bootstrapped,
         health.identity_degraded,
         health.identity_repaired,
         health.busy,
         health.execs,
+        health
+            .hooks
+            .iter()
+            .map(|observation| format!("{}@{}", observation.hook, observation.fired_at))
+            .collect::<Vec<_>>()
+            .join(","),
     );
     let (kind, _) = response_type("health");
     let rendered = Rendered::ok(kind, data, lines.join("\n"), dense);

@@ -440,6 +440,25 @@ test('the session constants are the daemon’s wire contract', () => {
   assert.ok(constants.defaultRefreshAfterSeconds < constants.maxTokenLifetimeSeconds);
 });
 
+test('the build logging pair is on the typed surface, spelled as a prefix', async () => {
+  // `Image` and `BuildImageOptions` are `#[napi(object)]` shapes, so their members are
+  // only observable in the generated typings — an instance needs AWS. The typings are
+  // what a TS consumer compiles against, so a member missing there is a knob missing,
+  // whatever the Rust side compiled. `index.d.ts` sits beside the built `index.js` this
+  // suite already imports, so a run that got this far has one to read.
+  const { readFile } = await import('node:fs/promises');
+  const typings = await readFile(new URL('../index.d.ts', import.meta.url), 'utf8');
+
+  // The knob on the options, and the resolved name on the image.
+  assert.match(typings, /interface BuildImageOptions[\s\S]*?logGroup\?/, 'logGroup option');
+  assert.match(typings, /interface BuildImageOptions[\s\S]*?logStream\?/, 'logStream option');
+  assert.match(typings, /interface Image[\s\S]*?logStream\?/, 'the resolved stream on Image');
+
+  // The docs must say the value is a prefix the client suffixes: a caller who believes
+  // they named the exact stream greps CloudWatch for a name that does not exist.
+  assert.match(typings, /16 hex/, 'the discriminator contract travels with the typings');
+});
+
 test('the residency comparison carries its own counter-argument', () => {
   const comparison = compareResidency(SizeClass.defaultClass(), 86400, 1);
   assert.equal(comparison.cycles, 1);

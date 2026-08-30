@@ -86,6 +86,51 @@ pub struct Health {
     /// does not report a count.
     #[serde(default)]
     pub execs: usize,
+    /// Every lifecycle-hook invocation the daemon observed, oldest first.
+    ///
+    /// The platform writes no CloudWatch logs for the validate hook, so "did my
+    /// validate hook even run?" has no answer anywhere else. Each entry is the
+    /// daemon's own observation — the hook path that was posted and the daemon's
+    /// clock when it arrived — never anything the guest printed.
+    ///
+    /// One trust caveat travels with this field and is stated rather than implied:
+    /// the hook routes are unauthenticated and reachable over loopback from inside
+    /// the guest, so a hostile workload can *forge additional* entries by posting
+    /// the hook paths itself. It cannot remove or alter real ones — the daemon
+    /// records before it responds and the log is append-capped, keeping the
+    /// earliest entries — so the platform's real firings are the front of the list
+    /// and later spam is what the cap drops.
+    ///
+    /// Defaulted for `busy`'s reason: an older daemon omits the field, and an empty
+    /// list is the honest reading of a daemon that reports no observations.
+    #[serde(default)]
+    pub hooks: Vec<HookObservation>,
+    /// How many hook invocations were dropped once the log reached its cap.
+    ///
+    /// Non-zero means the list above is the *earliest* invocations only — the cap
+    /// keeps first-N so a guest spamming the unauthenticated hook routes cannot
+    /// grow daemon memory or push the platform's real firings out of the record.
+    ///
+    /// Defaulted like `hooks`: an older daemon omits it, and zero is the honest
+    /// reading of a daemon that dropped nothing it could tell us about.
+    #[serde(default)]
+    pub hooks_dropped: u64,
+}
+
+/// One lifecycle-hook invocation, as the daemon observed it.
+///
+/// A daemon-reported fact in the same trust class as an exec's exit code: the
+/// daemon's word about a request it served, carrying nothing the guest printed.
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+pub struct HookObservation {
+    /// Which hook, spelled the way the platform's routes spell it: `ready`,
+    /// `validate`, `run`, `suspend`, `resume`, or `terminate`.
+    pub hook: String,
+    /// Seconds since the epoch on the daemon's clock when the invocation arrived.
+    ///
+    /// The daemon's clock rather than any caller's, and recorded before the handler
+    /// does any work — a run hook that was invoked and refused still fired.
+    pub fired_at: u64,
 }
 
 /// The disk half of [`Health`].
@@ -118,6 +163,8 @@ mod tests {
             identity_repaired: true,
             busy: false,
             execs: 0,
+            hooks: Vec::new(),
+            hooks_dropped: 0,
         })
         .expect("serializes");
         assert!(written.contains(r#""disk":null"#), "{written}");
@@ -140,6 +187,8 @@ mod tests {
             identity_repaired: true,
             busy: false,
             execs: 7,
+            hooks: Vec::new(),
+            hooks_dropped: 0,
         })
         .expect("serializes");
         assert!(written.contains(r#""busy":false"#), "{written}");
@@ -148,5 +197,63 @@ mod tests {
         let read: Health = serde_json::from_str(&written).expect("deserializes");
         assert!(!read.busy);
         assert_eq!(read.execs, 7);
+    }
+
+    /// The hook observations round-trip, spelled as the routes spell them, with the
+    /// dropped count beside them.
+    #[test]
+    fn health_carries_hook_observations_and_the_dropped_count() {
+        let written = serde_json::to_string(&Health {
+            version: Cow::Borrowed("0.1.0"),
+            bootstrapped: true,
+            disk: None,
+            identity_degraded: false,
+            identity_repaired: true,
+            busy: false,
+            execs: 0,
+            hooks: vec![
+                HookObservation {
+                    hook: "validate".to_string(),
+                    fired_at: 1_756_500_000,
+                },
+                HookObservation {
+                    hook: "run".to_string(),
+                    fired_at: 1_756_500_100,
+                },
+            ],
+            hooks_dropped: 3,
+        })
+        .expect("serializes");
+        // The wire keys are pinned to the response's own convention — snake_case,
+        // like `identity_degraded` beside them. The CLI's history line respells
+        // `fired_at` as `firedAt` because the history file is camelCase; a spelling
+        // only one side writes fails exactly when someone reads it.
+        assert!(
+            written.contains(r#""hooks":[{"hook":"validate","fired_at":1756500000}"#),
+            "{written}"
+        );
+        assert!(written.contains(r#""hooks_dropped":3"#), "{written}");
+
+        let read: Health = serde_json::from_str(&written).expect("deserializes");
+        assert_eq!(read.hooks.len(), 2);
+        assert_eq!(read.hooks[0].hook, "validate");
+        assert_eq!(read.hooks[0].fired_at, 1_756_500_000);
+        assert_eq!(read.hooks_dropped, 3);
+    }
+
+    /// An old daemon's envelope — no `hooks`, no `hooks_dropped` — still parses, with
+    /// the empty defaults. The daemon is baked into an image while the client is
+    /// installed separately, so this is the compatibility floor, not an edge case.
+    #[test]
+    fn an_old_daemons_envelope_parses_with_no_hook_fields() {
+        let read: Health = serde_json::from_str(
+            r#"{"version": "0.1.0", "bootstrapped": true, "disk": null,
+                 "identity_degraded": false, "identity_repaired": true}"#,
+        )
+        .expect("deserializes");
+        assert!(read.hooks.is_empty());
+        assert_eq!(read.hooks_dropped, 0);
+        assert!(!read.busy);
+        assert_eq!(read.execs, 0);
     }
 }

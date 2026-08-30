@@ -330,6 +330,36 @@ pub fn merge_config(
         env_source,
     );
 
+    // The logging pair: Option-shaped knobs, so typed is `is_some()`. The file's values
+    // were already validated by the loader with the flags' own vocabulary; the
+    // stream-needs-a-group rule is re-checked on the *merged* pair, because a flag stream
+    // over a file with no group is a combination neither layer saw alone.
+    let log_group = crate::config::pick(
+        args.log_group.is_some(),
+        args.log_group.clone(),
+        config.log_group.clone().map(Some),
+    );
+    report("logGroup", json!(log_group.value), log_group.source);
+    merged.log_group = log_group.value;
+
+    let log_stream = crate::config::pick(
+        args.log_stream.is_some(),
+        args.log_stream.clone(),
+        config.log_stream.clone().map(Some),
+    );
+    report("logStream", json!(log_stream.value), log_stream.source);
+    merged.log_stream = log_stream.value;
+
+    if merged.log_stream.is_some() && merged.log_group.is_none() {
+        return Err(crate::exit::CliError::new(
+            Exit::InvalidArg,
+            "--log-stream needs a log group: the stream lives inside the group, and \
+             without one the service creates a group with random stream names, so the \
+             configured stream would name a location that does not exist.",
+        )
+        .suggest("pass --log-group, or set `log-group` in microvm.toml"));
+    }
+
     // Artifact globs have no flag spelling, so the file is their only source.
     let artifacts = config.artifacts.clone().unwrap_or_default();
     report(
@@ -576,6 +606,23 @@ pub async fn run<O: std::io::Write, E: std::io::Write>(
         ledger.record_image(&image.identifier, &image.name);
     }
 
+    // The daemon's hook log, read *before* the teardown because a terminated VM cannot
+    // answer, and best-effort throughout: this is the teardown path, and a health fetch
+    // that failed must not displace the run's real outcome. Short deadline for the same
+    // reason — a wedged endpoint must not hold the teardown hostage for the transport's
+    // full 60s. Only attempted when a session is in hand; a launch that never built one
+    // has no endpoint to ask.
+    let observed_hooks: Vec<microvms_core::protocol::health::HookObservation> =
+        match sandbox.session() {
+            Some(session) => {
+                match tokio::time::timeout(Duration::from_secs(5), session.health()).await {
+                    Ok(Ok(health)) => health.hooks,
+                    _ => Vec::new(),
+                }
+            }
+            None => Vec::new(),
+        };
+
     // Runs however the block above ended, which is CLI-6. Recorded as leaked *before* the
     // delete is attempted — the other order loses the identifier when the process dies inside
     // the call, which is exactly the interrupt case.
@@ -610,6 +657,12 @@ pub async fn run<O: std::io::Write, E: std::io::Write>(
                 writers_may_be_alive: exec.writers_may_be_alive,
             });
         }
+        // The daemon's own hook observations, fetched above while the VM could still
+        // answer. Deduplicated on (hook, firedAt) so a `run` against a VM some other
+        // command already polled appends only what is new. The run hook is the one a
+        // plain launch always produces; validate/ready appear when the snapshot VM's
+        // memory carried them into this one.
+        crate::history::append_unseen_hooks(&ledger_root, &vm.id, &observed_hooks);
         if !args.keep {
             history.append(Event::Terminated {
                 terminate_accepted: teardown.terminate_accepted,
@@ -1135,6 +1188,8 @@ pub async fn build<O: std::io::Write, E: std::io::Write>(
             repair_identity: args.repair_identity,
             artifact_uri: args.artifact_uri.as_deref(),
             base_image_version: args.base_image_version.as_deref(),
+            log_group: args.log_group.as_deref(),
+            log_stream: args.log_stream.as_deref(),
         },
     )?;
 
@@ -1161,6 +1216,10 @@ pub async fn build<O: std::io::Write, E: std::io::Write>(
                 "reusing {} — the build inputs are unchanged, so no build was started",
                 existing.image_arn
             ));
+            // The derived default group and a null stream, whatever the flags said: no
+            // build ran, so no stream was resolved, and the group the *original* build
+            // wrote to is not observable from a listing — the reuse identity is
+            // binary+Dockerfile only, so the earlier build's logging config may differ.
             return Ok(render_build(
                 &existing.image_arn,
                 &name,
@@ -1170,6 +1229,7 @@ pub async fn build<O: std::io::Write, E: std::io::Write>(
                     "{}/{name}",
                     microvms_core::control::image::BUILD_LOG_GROUP_PREFIX
                 ),
+                None,
             ));
         }
         ctx.out
@@ -1191,6 +1251,7 @@ pub async fn build<O: std::io::Write, E: std::io::Write>(
         size,
         false,
         &image.build_log_group(),
+        image.log_stream.as_deref(),
     ))
 }
 
@@ -1207,6 +1268,7 @@ fn render_build(
     size: microvms_core::SizeClass,
     reused: bool,
     build_log_group: &str,
+    log_stream: Option<&str>,
 ) -> Rendered {
     let mut data = Map::new();
     data.insert("imageIdentifier".into(), json!(identifier));
@@ -1215,6 +1277,11 @@ fn render_build(
     // `terraform destroy` leaves it behind — so the caller who built this image is the only
     // one who will ever know to delete it.
     data.insert("buildLogGroup".into(), json!(build_log_group));
+    // The RESOLVED exact stream name — the configured prefix plus the per-build `/<16
+    // hex>` discriminator — or null when no stream was configured. The discriminator is
+    // minted fresh inside core's create call, so this envelope is the only place a caller
+    // (or an agent) can learn which stream this build's logs went to.
+    data.insert("logStream".into(), json!(log_stream));
     data.insert("size".into(), json!(size.to_string()));
     data.insert("reused".into(), json!(reused));
 
@@ -1233,6 +1300,12 @@ fn render_build(
         lines.push(format!("size: {size}"));
     }
     lines.push(format!("build log group: {build_log_group}"));
+    if let Some(stream) = log_stream {
+        lines.push(format!(
+            "log stream: {stream} (the configured prefix plus this build's own suffix; \
+             all three build VMs write to this one exact stream)"
+        ));
+    }
     lines.push(
         "note: the service created that log group; terraform destroy will not remove it"
             .to_string(),
@@ -1268,6 +1341,11 @@ struct BuildSpec<'a> {
     /// would pin a base nothing could later read back. Someone who cares which base their
     /// image sits on is running `microvm build`, whose image outlives the command.
     pub base_image_version: Option<&'a str>,
+    /// `logging.cloudWatch.logGroup`, or `None` for the service default.
+    pub log_group: Option<&'a str>,
+    /// The caller's log-stream **prefix**; core appends the per-build discriminator and
+    /// the resolved exact name comes back on the image for the envelope to report.
+    pub log_stream: Option<&'a str>,
 }
 
 /// The create request for `run`'s arguments.
@@ -1289,6 +1367,11 @@ fn build_request<'a, O: std::io::Write, E: std::io::Write>(
             artifact_uri: args.artifact_uri.as_deref(),
             // See the field: `run`'s image is thrown away, so there is nothing to pin for.
             base_image_version: None,
+            // Unlike the pinned base, logging IS wired on `run`'s build arm: a throwaway
+            // image's build still writes logs, and the config file's whole audience is
+            // `microvm run` in a configured project.
+            log_group: args.log_group.as_deref(),
+            log_stream: args.log_stream.as_deref(),
         },
     )
 }
@@ -1309,6 +1392,8 @@ fn build_request_from<O: std::io::Write, E: std::io::Write>(
         repair_identity,
         artifact_uri,
         base_image_version,
+        log_group,
+        log_stream,
     } = spec;
     let bytes = std::fs::read(binary).map_err(|error| {
         Error::new(
@@ -1346,6 +1431,12 @@ fn build_request_from<O: std::io::Write, E: std::io::Write>(
     // uploaded, so there is no check here — the create call happens after the upload, and one
     // message about it in one place is the whole point of the guard living in core.
     request.base_image_version = base_image_version.map(str::to_string);
+    // The stream is a *prefix* by core's contract: the discriminator is appended inside
+    // `create_image` and the resolved exact name comes back on the image, so this CLI
+    // never holds — and can never leak into a report — a stream name the wire did not
+    // carry.
+    request.log_group = log_group.map(str::to_string);
+    request.log_stream = log_stream.map(str::to_string);
     // A *label* beside core's own per-attempt nonce, never a token. Core accepts no token at
     // all, which is what makes the wedge unwriteable rather than merely defaulted (TRAP-1).
     request.token_scope = Some(name.to_string());
@@ -1576,7 +1667,7 @@ pub async fn resume<O: std::io::Write, E: std::io::Write>(
     let region = args.region.resolve(ctx.env)?;
     let microvm_id =
         crate::commands::resolve_vm_identifier(ctx, &args.microvm_id, args.state_dir.clone())?;
-    let plane = ctx.seam.control_plane(region).await?;
+    let plane = ctx.seam.control_plane(region.clone()).await?;
     ctx.out.progress(&format!("resuming {}", microvm_id));
     plane.resume(&microvm_id).await?;
     let running = plane
@@ -1589,8 +1680,32 @@ pub async fn resume<O: std::io::Write, E: std::io::Write>(
         .await?;
 
     // The wait returned, so the service reported RUNNING — which is what `resumed` means.
-    History::for_vm(&state_dir(args.state_dir.clone(), ctx.env), &microvm_id)
-        .append(Event::Resumed);
+    let root = state_dir(args.state_dir.clone(), ctx.env);
+    History::for_vm(&root, &microvm_id).append(Event::Resumed);
+
+    // The daemon's hook log, best-effort, and this is the moment that makes suspend-hook
+    // firings visible at all: a frozen VM cannot answer a poll, so the record of the
+    // suspend hook is readable only after the thaw. `/v1/health` is unauthenticated at
+    // the daemon — no bearer is sent — so the attach carries an empty agent token; the
+    // proxy credential it does need is minted through the same seam every attached
+    // command uses. Every failure is swallowed: a resume whose VM is RUNNING must not
+    // fail over a history nicety, so the short deadline bounds what a wedged endpoint
+    // can cost.
+    let attach = crate::seam::Attach {
+        endpoint: running.endpoint.clone(),
+        agent_token: String::new(),
+        microvm_id: microvm_id.clone(),
+        port: None,
+    };
+    if let Ok(Ok(session)) = tokio::time::timeout(
+        Duration::from_secs(10),
+        ctx.seam.attach_session(region, attach),
+    )
+    .await
+        && let Ok(Ok(health)) = tokio::time::timeout(Duration::from_secs(5), session.health()).await
+    {
+        crate::history::append_unseen_hooks(&root, &microvm_id, &health.hooks);
+    }
 
     let mut data = Map::new();
     data.insert("microvmId".into(), json!(microvm_id));
