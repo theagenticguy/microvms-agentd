@@ -17,7 +17,7 @@ description = "Exec and file-transfer daemon for AWS Lambda MicroVMs"
 # know lives there, so a field renamed on one side fails to compile on the other —
 # which is earlier and cheaper than the schema artifact catching it in CI, and far
 # earlier than a consumer catching it at runtime.
-protocol = { package = "microvms-protocol", version = "0.3.0", path = "../protocol" }
+protocol = { package = "microvms-protocol", version = "0.4.0", path = "../protocol" }
 # `ws` is the TCP relay (`tunnel.rs`): the endpoint proxy carries a WebSocket to a
 # guest port but has no CONNECT method, so arbitrary TCP rides inside binary frames
 # (measured 2026-08-29 — see docs/PLATFORM.md). axum's own extractor rather than a

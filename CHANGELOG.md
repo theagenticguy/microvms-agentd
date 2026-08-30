@@ -6,6 +6,8 @@ Versions are [semantic](https://semver.org/spec/v2.0.0.html); the wire contract 
 
 ## Unreleased
 
+## [0.4.0] — 2026-08-30
+
 ### Added
 
 - **Configurable build-log destination with a per-build stream discriminator (#98).**
