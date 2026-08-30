@@ -27,7 +27,8 @@ RUN npm install -g @anthropic-ai/claude-code @openai/codex
 
 Two constraints are load-bearing. The `FROM` must be the registry ref paired
 with the managed base (`microvms-core` refuses a Dockerfile whose `FROM`
-disagrees with the `baseImageArn`), and the image must declare a `WORKDIR`
+disagrees with the `baseImageArn`; a `@sha256:` digest suffix on that same
+ref is accepted, and this example pins one), and the image must declare a `WORKDIR`
 because the base leaves it empty and the client requires one. The image
 contains no secret of any kind: the daemon's token arrives per-VM through the
 `runHookPayload` at launch, and model credentials arrive later over the

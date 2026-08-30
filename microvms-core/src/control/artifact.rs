@@ -528,6 +528,20 @@ pub fn require_matching_from(base: &BaseImage, dockerfile: &str) -> Result<(), E
     if found == base.docker_ref {
         return Ok(());
     }
+    // The digest-pinned spelling of the same ref: `<docker_ref>@sha256:<64 hex>`. A digest
+    // names one specific manifest of the ref this check already accepts, so it is a stricter
+    // statement of agreement rather than a disagreement — a supply-chain-conscious caller
+    // pins exactly this way, and refusing it would force them to un-pin to pass. The tag
+    // must still be present and identical: `alpine@sha256:...` against a docker_ref of
+    // `alpine:3` is a different claim and stays refused.
+    if let Some(digest) = found
+        .strip_prefix(base.docker_ref.as_str())
+        .and_then(|rest| rest.strip_prefix("@sha256:"))
+        && digest.len() == 64
+        && digest.bytes().all(|b| b.is_ascii_hexdigit())
+    {
+        return Ok(());
+    }
     Err(Error::invalid_arg(format!(
         "the Dockerfile's FROM is {found:?} but base image {:?} pairs with {:?}. These must \
          agree: baseImageArn and the FROM select the same base, and a mismatch builds against \
@@ -758,6 +772,31 @@ mod tests {
 
         require_matching_from(&base, &default_dockerfile(9000, None, &base))
             .expect("the derived Dockerfile agrees with its own base");
+    }
+
+    /// A digest-pinned `FROM` of the agreeing ref passes: it names one specific manifest of
+    /// the base this check already accepts, which is the spelling a supply-chain-conscious
+    /// caller uses. The boundary cases stay refused — a digest on a *different* ref is still
+    /// a disagreement, and a malformed digest is not a digest.
+    #[test]
+    fn a_digest_pinned_from_of_the_agreeing_ref_passes() {
+        let base = BaseImage::al2023();
+        let digest = "c439fb4994ea7ca529233d6256446d3f8b7b4efb58956073e015303a170011de";
+        let pinned = format!(
+            "FROM {}@sha256:{digest}\nCOPY agentd /agentd\n",
+            base.docker_ref
+        );
+        require_matching_from(&base, &pinned).expect("a digest pin of the same ref agrees");
+
+        require_matching_from(&base, &format!("FROM ubuntu:24.04@sha256:{digest}\n"))
+            .expect_err("a digest does not launder a different ref");
+        require_matching_from(&base, &format!("FROM {}@sha256:abc123\n", base.docker_ref))
+            .expect_err("a 6-character digest is not a digest");
+        require_matching_from(
+            &base,
+            &format!("FROM {}@sha256:{}\n", base.docker_ref, "g".repeat(64)),
+        )
+        .expect_err("64 non-hex characters are not a digest");
     }
 
     /// A Dockerfile with no `FROM` is not this check's business: the build will say so, and
