@@ -881,6 +881,8 @@ fn health_json(bootstrapped: bool) -> String {
         identity_repaired: true,
         busy: false,
         execs: 0,
+        hooks: Vec::new(),
+        hooks_dropped: 0,
     })
     .expect("serializes")
 }

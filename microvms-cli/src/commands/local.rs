@@ -463,6 +463,10 @@ mod tests {
             endpoint: "https://mvm-1.example".to_string(),
             region: "us-east-1".to_string(),
         });
+        file.append(crate::history::Event::HookObserved {
+            hook: "validate".to_string(),
+            fired_at: 1_756_500_000,
+        });
         file.append(crate::history::Event::Terminated {
             terminate_accepted: true,
             undeleted: Vec::new(),
@@ -487,18 +491,24 @@ mod tests {
             "the envelope is the file's own shape"
         );
         let lines: Vec<&str> = rendered.text.lines().collect();
-        assert_eq!(lines.len(), 2, "one line per event: {}", rendered.text);
+        assert_eq!(lines.len(), 3, "one line per event: {}", rendered.text);
         assert!(lines[0].contains("launched"), "{}", lines[0]);
         assert!(
             lines[0].contains("endpoint=https://mvm-1.example"),
             "{}",
             lines[0]
         );
-        assert!(lines[1].contains("terminated"), "{}", lines[1]);
+        // The hook line reads `hookObserved  firedAt=... hook=validate` — the generic
+        // field tail, which is what keeps a record from a newer build renderable too.
+        assert!(lines[1].contains("hookObserved"), "{}", lines[1]);
+        assert!(lines[1].contains("hook=validate"), "{}", lines[1]);
+        assert!(lines[1].contains("firedAt=1756500000"), "{}", lines[1]);
+        assert!(lines[2].contains("terminated"), "{}", lines[2]);
         // Dense is the same rows, tab-separated, with seq in field one.
         let dense: Vec<&str> = rendered.dense_text.lines().collect();
         assert!(dense[0].starts_with("0\t"), "{}", rendered.dense_text);
         assert!(dense[1].starts_with("1\t"), "{}", rendered.dense_text);
+        assert!(dense[2].starts_with("2\t"), "{}", rendered.dense_text);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
