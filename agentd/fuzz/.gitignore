@@ -1,0 +1,7 @@
+# cargo-fuzz run state: the corpus is a cache, the artifacts are crash
+# reproducers a finding would get committed with deliberately, and target/ is a
+# build directory like any other.
+corpus/
+artifacts/
+coverage/
+target/

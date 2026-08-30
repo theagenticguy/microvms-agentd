@@ -30,7 +30,7 @@ jobs:
       security-events: write # uploads the SARIF to code scanning
       id-token: write # signs the result for the public API; publish_results needs it
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false # scorecard's docs require it; the job never pushes
 

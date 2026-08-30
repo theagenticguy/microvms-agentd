@@ -2,13 +2,18 @@
 #
 # The FROM must stay `public.ecr.aws/amazonlinux/amazonlinux:2023-minimal`:
 # microvms-core pairs that ref with the managed `al2023-1` base and refuses a
-# Dockerfile whose FROM disagrees with the create call's baseImageArn.
+# Dockerfile whose FROM disagrees with the create call's baseImageArn. A
+# `@sha256:` digest suffix on that same ref is accepted (`require_matching_from`
+# reads it as a stricter statement of the same agreement), and this file pins
+# one so the base is a specific manifest rather than wherever the tag points
+# today. Dependabot does not watch this file; bump the digest when the tag
+# moves (resolved 2026-08-30).
 #
 # The agentd COPY/CMD lines mirror the client's default Dockerfile
 # (microvms-core/src/control/artifact.rs::default_dockerfile) — when you pass
 # --dockerfile, you are replacing that default, so you carry its daemon lines
 # yourself.
-FROM public.ecr.aws/amazonlinux/amazonlinux:2023-minimal
+FROM public.ecr.aws/amazonlinux/amazonlinux:2023-minimal@sha256:c439fb4994ea7ca529233d6256446d3f8b7b4efb58956073e015303a170011de
 
 COPY agentd /agentd
 RUN chmod 0755 /agentd

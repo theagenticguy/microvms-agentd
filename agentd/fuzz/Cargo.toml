@@ -1,0 +1,27 @@
+# Excluded from the parent workspace (see the root manifest): cargo-fuzz builds
+# this with sanitizer flags on nightly, and none of that belongs in the shipping
+# dependency graph. The empty [workspace] table below is what makes the
+# exclusion complete rather than an error.
+[package]
+name = "agentd-fuzz"
+version = "0.0.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+tempfile = "3"
+agentd = { path = "..", features = ["fuzzing"] }
+
+[[bin]]
+name = "tar_extract"
+path = "fuzz_targets/tar_extract.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]

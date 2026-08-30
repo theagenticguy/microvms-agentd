@@ -1,0 +1,49 @@
+name: codeql
+
+# Static analysis over the tree itself, which is the half `mise run security`
+# does not cover: semgrep there runs a curated rule set over shipped source,
+# CodeQL here runs dataflow queries over the whole program. Two languages, two
+# very different surfaces — `rust` is the daemon and the clients, `actions` is
+# the workflows, whose injection and untrusted-input patterns are exactly the
+# class a Rust-focused review never looks at.
+#
+# On every push and pull request rather than a schedule alone, because
+# Scorecard's SAST check counts *commits* analyzed, and a scheduled scan
+# attributes to whatever commit happens to be HEAD that morning. The schedule
+# exists so query-pack updates reach an otherwise-quiet repository.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: '30 10 * * 1' # Mondays, after scorecard.yml's 09:30 slot
+
+permissions: read-all
+
+jobs:
+  analyze:
+    name: codeql (${{ matrix.language }})
+    runs-on: ubuntu-latest
+    permissions:
+      security-events: write # uploads the SARIF to code scanning
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # `build-mode: none` for Rust: the extractor reads the source without
+          # a build, so this job spends no time on the release profile and needs
+          # no toolchain step. The `actions` extractor has no build at all.
+          - language: rust
+            build-mode: none
+          - language: actions
+            build-mode: none
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: github/codeql-action/init@cdf488f595d80d6e07e03d4674febd5ab45fa938 # v4
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: ${{ matrix.build-mode }}
+      - uses: github/codeql-action/analyze@cdf488f595d80d6e07e03d4674febd5ab45fa938 # v4
+        with:
+          category: '/language:${{ matrix.language }}'
