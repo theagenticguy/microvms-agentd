@@ -114,6 +114,13 @@ snow = { version = "0.10", default-features = false, features = [
 # tree — the exact duplication this crate was chosen to avoid. Revisit when snow bumps.
 x25519-dalek = { version = "2", default-features = false, features = ["static_secrets"] }
 
+[features]
+# Compiles the fuzz doorway in `fs.rs` (`fuzz_extract`), and nothing else. The
+# tar engine's entry points are handlers, which a fuzz target cannot hold; this
+# feature exposes the engine itself to `agentd/fuzz` without widening the
+# crate's real surface — no normal build enables it.
+fuzzing = []
+
 [dev-dependencies]
 proptest = "1.11"
 hyper = { version = "1.11", features = ["client", "http1"] }

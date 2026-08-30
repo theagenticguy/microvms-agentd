@@ -14,6 +14,13 @@ updates:
     schedule:
       interval: weekly
     open-pull-requests-limit: 5
+  # The fuzz crate is excluded from the workspace (sanitizer builds, nightly),
+  # so it carries its own lockfile that the root cargo entry never sees.
+  - package-ecosystem: cargo
+    directory: /agentd/fuzz
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 2
   - package-ecosystem: github-actions
     directory: /
     schedule:

@@ -9,6 +9,10 @@ members = [
     "protocol",
 ]
 resolver = "3"
+# Its own workspace, because cargo-fuzz builds it with sanitizer flags and a
+# nightly toolchain that must not leak into the shipping graph. It carries its
+# own lockfile for the same reason.
+exclude = ["agentd/fuzz"]
 
 # The daemon crate lands here as `agentd/` once the model settles. Keeping the
 # workspace in place from the first commit means adding it is a one-line change

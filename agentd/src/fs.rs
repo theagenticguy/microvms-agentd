@@ -614,6 +614,32 @@ struct Caps {
     max_bytes: u64,
 }
 
+/// The fuzz doorway over [`extract_into`], compiled only with the `fuzzing`
+/// feature (see `agentd/fuzz`).
+///
+/// A thin adapter rather than a re-export because everything [`extract_into`]
+/// takes is deliberately private: [`Caps`] so tests can run the engine at small
+/// bounds, [`Refusal`] so refusals only leave this module as HTTP responses.
+/// The guard's reserve is zero so disk pressure — the one refusal that depends
+/// on the host rather than the archive — cannot make a run irreproducible.
+#[cfg(feature = "fuzzing")]
+pub fn fuzz_extract(
+    root: &Path,
+    archive: &[u8],
+    max_members: u64,
+    max_bytes: u64,
+) -> Result<u64, String> {
+    let caps = Caps {
+        max_members,
+        max_bytes,
+    };
+    let guard = disk::Guard {
+        probe: disk::available_bytes,
+        reserve: 0,
+    };
+    extract_into(root, archive, caps, &guard).map_err(|refusal| format!("{refusal:?}"))
+}
+
 /// Extracts `archive` into `root`, enforcing the data-filter contract.
 ///
 /// Synchronous on purpose: `tar`'s reader is blocking, so callers hand this to

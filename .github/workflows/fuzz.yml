@@ -1,0 +1,54 @@
+name: fuzz
+
+# Runs the cargo-fuzz targets in `agentd/fuzz` for a bounded slice of time.
+# Two minutes per target on a weekly schedule is not a fuzzing campaign — it is
+# a regression harness: the targets stay buildable, the doorway feature stays
+# wired, and an input class the engine newly mishandles has a chance to surface
+# before a release does. A real campaign runs longer and locally
+# (`cargo +nightly fuzz run tar_extract` from `agentd/`).
+#
+# The PR trigger is path-scoped to the engine and the targets, because a fuzz
+# build compiles the whole graph with sanitizers and that cost buys nothing on
+# a docs change.
+on:
+  schedule:
+    - cron: '30 11 * * 1' # Mondays, after codeql.yml's 10:30 slot
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - 'agentd/fuzz/**'
+      - 'agentd/src/fs.rs'
+      - '.github/workflows/fuzz.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  fuzz:
+    name: fuzz (tar_extract, bounded)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      # Nightly, because libFuzzer instrumentation rides on `-Z` sanitizer
+      # flags that stable refuses. Only this workflow uses nightly; the
+      # shipping graph never does.
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          toolchain: nightly
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          workspaces: agentd/fuzz
+      - name: install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+      - name: fuzz tar_extract for two minutes
+        working-directory: agentd
+        run: cargo +nightly fuzz run tar_extract -- -max_total_time=120
+      # A crash writes a reproducer into artifacts/; surface it rather than
+      # letting it die with the runner.
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        if: failure()
+        with:
+          name: fuzz-artifacts
+          path: agentd/fuzz/artifacts/
+          if-no-files-found: ignore
