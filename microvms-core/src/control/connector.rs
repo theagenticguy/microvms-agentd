@@ -13,18 +13,27 @@
 //! Deriving the ARN from an intent means the caller states what they want and the
 //! spelling is not theirs to get wrong.
 //!
-//! # TRAP-11: what is deliberately absent
+//! # TRAP-11, revised: the shell connector is a variant, on measured ground
 //!
-//! `SHELL_INGRESS` exists in the API and is **not** a variant here. It gates
-//! `CreateMicrovmShellAuthToken`, whose documented flow is `ctr task exec` through a
-//! console terminal — scoped to debugging, and recommended disabled in production. It is
-//! not a programmatic exec path despite the name, and this client's whole reason to
-//! exist is that no such path exists.
+//! `SHELL_INGRESS` **is** a variant here, and it was not always. This module used to
+//! omit it on the claim that it gated a console-only debugging flow — "not a
+//! programmatic exec path despite the name" — and that omission made requesting it
+//! unwriteable. `docs/PLATFORM.md` (measured 2026-08-15) refutes the claim: the shell
+//! endpoint is a real PTY over a WebSocket, and it is programmatically drivable. The
+//! ground that actually holds is narrower — **one interactive session is not
+//! programmatic exec**: no exec ids, no idempotency, no separated stdout/stderr, no exit
+//! codes. So the variant exists for callers that want the PTY, and the exec path never
+//! requests it; the lifecycle test in [`crate::control::microvm`] asserts a launch
+//! carries exactly the connectors its caller asked for.
 //!
-//! Leaving it out of the enum is what makes requesting it **unwriteable** rather than
-//! merely discouraged: there is no `ConnectorIntent` value that renders it, and
-//! [`ConnectorIntent::ALL`] is the complete set a test can enumerate. The sibling half
-//! of TRAP-11 — never calling the shell-auth operation — is closed the same way, by the
+//! Two measured constraints travel with the variant (both from `docs/PLATFORM.md`):
+//! `ALL_INGRESS` cannot combine with any other ingress connector, and the platform says
+//! so only at token-mint time — `RunMicrovm` accepts the invalid set, the VM reaches
+//! RUNNING, and it bills until something asks for a shell token.
+//! [`crate::control::ControlPlane::run_microvm`] refuses the combination locally
+//! instead. The pair that works is `[HTTP_INGRESS, SHELL_INGRESS]`.
+//!
+//! The sibling half of TRAP-11 — the shell-auth operation — is still closed by the
 //! absence of a method on [`crate::control::ControlPlane`]; see that module's docs.
 
 use crate::region::Region;
@@ -38,7 +47,25 @@ use crate::region::Region;
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum ConnectorIntent {
     /// Lets the endpoint proxy reach the VM. Required for any session to work.
+    ///
+    /// The union that cannot be intersected: the platform refuses to combine it with
+    /// any other ingress connector, and only at token-mint time — see the module docs.
+    /// A VM that needs a shell requests [`ConnectorIntent::HttpIngress`] plus
+    /// [`ConnectorIntent::ShellIngress`] instead of this.
     AllIngress,
+    /// Lets the endpoint proxy reach the VM's HTTP surface, without the shell.
+    ///
+    /// The finer-grained sibling of [`ConnectorIntent::AllIngress`], and the half of the
+    /// measured pair `[HTTP_INGRESS, SHELL_INGRESS]` that keeps the daemon reachable
+    /// (`docs/PLATFORM.md`, measured 2026-08-15).
+    HttpIngress,
+    /// Lets the VM mint shell tokens and serve its PTY WebSocket.
+    ///
+    /// One interactive session, not programmatic exec — the module docs carry the
+    /// revision of TRAP-11 that admitted this variant. Never combined with
+    /// [`ConnectorIntent::AllIngress`]; the pair that launches and mints is with
+    /// [`ConnectorIntent::HttpIngress`].
+    ShellIngress,
     /// Lets the VM reach the internet.
     ///
     /// Omitted by default, which is how you get a VM with no outbound network — the
@@ -47,11 +74,17 @@ pub enum ConnectorIntent {
 }
 
 impl ConnectorIntent {
-    /// Both intents, so a test can enumerate the complete set.
+    /// Every intent, so a test can enumerate the complete set.
     ///
-    /// The TRAP-11 assertion reads this: a `SHELL_INGRESS` variant added later would
-    /// appear here and fail the test that pins the set to two.
-    pub const ALL: [ConnectorIntent; 2] = [ConnectorIntent::AllIngress, ConnectorIntent::Egress];
+    /// Maintained by hand; the tests below assert its length, so an edit here is a
+    /// deliberate one. The set grew from two to four when TRAP-11 was revised — see the
+    /// module docs.
+    pub const ALL: [ConnectorIntent; 4] = [
+        ConnectorIntent::AllIngress,
+        ConnectorIntent::HttpIngress,
+        ConnectorIntent::ShellIngress,
+        ConnectorIntent::Egress,
+    ];
 
     /// The connector's name as the ARN spells it.
     ///
@@ -60,6 +93,8 @@ impl ConnectorIntent {
     pub fn wire_name(self) -> &'static str {
         match self {
             ConnectorIntent::AllIngress => "ALL_INGRESS",
+            ConnectorIntent::HttpIngress => "HTTP_INGRESS",
+            ConnectorIntent::ShellIngress => "SHELL_INGRESS",
             ConnectorIntent::Egress => "INTERNET_EGRESS",
         }
     }
@@ -129,38 +164,68 @@ mod tests {
         );
     }
 
-    /// TRAP-11, the absence half. Two intents, neither of them shell — and the check is
-    /// on the rendered ARNs as well as on the variant count, because a variant named
-    /// something else could still render `SHELL_INGRESS`.
+    /// TRAP-11, rewritten on the ground that holds. This test used to assert no intent
+    /// names `SHELL_INGRESS`, standing on the claim that the shell was a console-only
+    /// debugging path — a claim `docs/PLATFORM.md` (measured 2026-08-15) refutes: the
+    /// shell endpoint is a real PTY and programmatically drivable. What holds instead is
+    /// that **one interactive session is not programmatic exec**, so the variant exists,
+    /// exactly one intent renders it, and the check on the rendered ARNs stays — a
+    /// variant named something else must not render `SHELL_INGRESS` either.
     ///
-    /// **Falsification** — add `ConnectorIntent::ShellIngress` with wire name
-    /// `SHELL_INGRESS` and this test fails on both assertions.
+    /// The other half of the revised guard — a launch carries exactly the connectors its
+    /// caller asked for — lives with the lifecycle test in `microvm.rs`.
+    ///
+    /// **Falsification** — add a second variant whose wire name contains `SHELL`, or
+    /// rename [`ConnectorIntent::ShellIngress`]'s wire name, and this fails.
     #[test]
-    fn no_intent_names_shell_ingress() {
+    fn shell_ingress_is_one_deliberate_intent() {
         assert_eq!(
             ConnectorIntent::ALL.len(),
-            2,
-            "two intents, and shell is not one"
+            4,
+            "four intents, and shell is deliberately one of them"
         );
-        for intent in ConnectorIntent::ALL {
-            let arn = intent.arn(&Region::UsEast1);
-            assert!(
-                !arn.contains("SHELL"),
-                "SHELL_INGRESS gates a debug console, not programmatic exec: {arn}"
-            );
-            assert!(!intent.wire_name().contains("SHELL"));
-        }
+        let shells: Vec<ConnectorIntent> = ConnectorIntent::ALL
+            .into_iter()
+            .filter(|intent| intent.wire_name().contains("SHELL"))
+            .collect();
+        assert_eq!(
+            shells,
+            vec![ConnectorIntent::ShellIngress],
+            "exactly one intent names the shell, and it is the one that says so"
+        );
+        assert_eq!(
+            ConnectorIntent::ShellIngress.arn(&Region::UsEast1),
+            "arn:aws:lambda:us-east-1:aws:network-connector:aws-network-connector:SHELL_INGRESS"
+        );
     }
 
-    /// The two intents render different ARNs. The string-replace shape this replaced
-    /// could produce two identical ARNs if the names ever became substrings of one
-    /// another, and that is the failure this asserts against.
+    /// `HTTP_INGRESS`, the measured literal — the finer-grained ingress that pairs with
+    /// the shell connector, since `ALL_INGRESS` cannot combine with either
+    /// (`docs/PLATFORM.md`, measured 2026-08-15).
     #[test]
-    fn the_two_intents_do_not_render_the_same_arn() {
-        let ingress = ConnectorIntent::AllIngress.arn(&Region::EuWest1);
-        let egress = ConnectorIntent::Egress.arn(&Region::EuWest1);
-        assert_ne!(ingress, egress);
-        assert!(!ingress.contains("INTERNET"), "{ingress}");
+    fn the_http_ingress_arn_is_the_measured_literal() {
+        assert_eq!(
+            ConnectorIntent::HttpIngress.arn(&Region::UsEast1),
+            "arn:aws:lambda:us-east-1:aws:network-connector:aws-network-connector:HTTP_INGRESS"
+        );
+    }
+
+    /// No two intents render the same ARN. The string-replace shape this replaced
+    /// could produce two identical ARNs if the names ever became substrings of one
+    /// another, and that is the failure this asserts against — now across the whole
+    /// set rather than the original pair.
+    #[test]
+    fn no_two_intents_render_the_same_arn() {
+        let arns: Vec<String> = ConnectorIntent::ALL
+            .iter()
+            .map(|intent| intent.arn(&Region::EuWest1))
+            .collect();
+        for (i, a) in arns.iter().enumerate() {
+            for b in &arns[i + 1..] {
+                assert_ne!(a, b);
+            }
+        }
+        assert!(!arns[0].contains("INTERNET"), "{}", arns[0]);
     }
 
     /// Every derived ARN clears the model's `NetworkConnector` bounds (min 1, max 2048),
