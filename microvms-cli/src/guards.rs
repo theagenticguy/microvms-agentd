@@ -261,6 +261,7 @@ fn aws_commands(binary: &std::path::Path) -> Vec<(&'static str, Command, Door)> 
                 timeout: 30.0,
                 max_idle_sec: 600,
                 suspended_sec: 600,
+                auto_resume: false,
                 max_duration_sec: 3600,
                 port: None,
                 state_dir: Some(std::env::temp_dir().join("microvm-guard-ledgers")),
@@ -882,6 +883,7 @@ fn run_args_for_image(identifier: &str, state_dir: std::path::PathBuf) -> RunArg
         timeout: 30.0,
         max_idle_sec: 600,
         suspended_sec: 600,
+        auto_resume: false,
         max_duration_sec: 3600,
         port: None,
         state_dir: Some(state_dir),
@@ -1338,6 +1340,7 @@ memory = 4096
 max-idle-sec = 120
 suspended-sec = 300
 egress = true
+auto-resume = true
 
 [env]
 RUST_LOG = "debug"
@@ -1387,6 +1390,10 @@ CI = "0"
             .as_array()
             .is_some_and(|connectors| !connectors.is_empty()),
         "egress = true in the file opts into the connector: {body}"
+    );
+    assert_eq!(
+        body["idlePolicy"]["autoResumeEnabled"], true,
+        "auto-resume = true in the file reaches the launch policy: {body}"
     );
     let payload: serde_json::Value =
         serde_json::from_str(body["runHookPayload"].as_str().expect("a payload string"))

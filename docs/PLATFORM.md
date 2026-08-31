@@ -1292,7 +1292,10 @@ to know a running VM's memory from the API is to fetch its image version.
 `IdlePolicy` structure and it is echoed here, and a client that always sends `false` is
 declining a platform feature — a VM with it enabled resumes itself on an incoming request
 rather than needing an explicit `ResumeMicrovm`. Its interaction with the idle timer was
-not measured.
+not measured. `run --auto-resume` now sends `true` (issue #68), and the conformance
+suite carries the measurement as a written section (`drive_auto_resume`: launch with the
+flag, suspend, exec with no explicit resume, then let the idle window elapse unpolled) —
+pending its first live run.
 
 ## A detached exec survives the 60-minute proxy-token ceiling
 

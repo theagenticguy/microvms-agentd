@@ -6,7 +6,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Live conformance run driving the **Rust** client stack through the `microvm` CLI.
 
-This is the only live suite, and it now expresses **every named check** — 118 of them, with
+This is the only live suite, and it now expresses **every named check** — 124 of them, with
 none recorded SKIP. `conformance/run.py` was the oracle — 56 checks through the Python
 client — and it went away with that client once both suites ran green against real AWS on
 the same commit (Python 56/56, this one 38/38 with 34 recorded SKIP). Those 34 were the
@@ -106,6 +106,14 @@ the asset, that `gh attestation verify` accepts it, or that the fetched bytes bo
 VM. Version-coupled on purpose (the fetch targets `v{CLI version}`), so between a version
 bump on main and that version's release publishing, this section fails naming the missing
 tag — the calendar, not the code.
+
+124 rather than 118: `drive_auto_resume` adds six for issue #68 — the new `run
+--auto-resume` VM suspending explicitly, an exec completing against it with no explicit
+resume (the platform resuming on the request itself), the marker file proving the same VM
+came back whole, the control plane reporting RUNNING with the resume latency recorded,
+the idle timer running *after* an auto-resume (the VM suspends again unpolled — the
+interaction `docs/PLATFORM.md` recorded as unmeasured), and the section's own teardown.
+Written for 0.6.0 and **not yet run live**; its first execution is the next sweep.
 
 A hybrid driver, and both lanes are deliberate
 ----------------------------------------------
@@ -2487,6 +2495,150 @@ def drive_idle_keepalive(
             )
 
 
+def drive_auto_resume(cli: Cli, launched: Envelope, aws: Any, results: Results) -> None:
+    """`run --auto-resume`: a suspended VM resumes itself on an incoming request (#68).
+
+    **New in 0.6.0 and not yet run live** — written for the next live-conformance sweep.
+    `docs/PLATFORM.md` flags `autoResumeEnabled` as the field this client always sent
+    `false` for, and records that "its interaction with the idle timer was not measured".
+    This section is that measurement as named checks, in two halves against one VM:
+
+    1. Launch with `--auto-resume`, write a marker, suspend explicitly, and then send an
+       exec **without ever calling `microvm resume`**. The exec completing is the platform
+       having resumed the VM on the request itself; the marker read proves it resumed the
+       same VM whole rather than answering from somewhere else.
+    2. Then stop all traffic and let the idle window elapse, sampled through the control
+       plane only (a health poll would reset the very timer being watched). The VM
+       suspending *again* is the unmeasured interaction, answered: the idle timer runs
+       after an auto-resume, so an auto-resumed VM left idle stops billing compute again
+       rather than running to `maximumDurationInSeconds`.
+
+    The billing record is the state transitions and their wall-clock brackets, printed as
+    check detail: SUSPENDED (storage only) → the exec arrives → RUNNING (compute billing
+    resumed, with the resume latency the caller paid measured as time-to-first-answer) →
+    SUSPENDED again once idle. Like `drive_idle_keepalive` this is a slow section (~4
+    minutes of deliberate waiting) on its own VM launched from the image the suite already
+    built, torn down in this function's own `finally`.
+    """
+    print("\n-- auto-resume on an incoming request (#68) --")
+    idle_window = 60  # the model's minimum, which is what makes half two affordable
+    print(
+        f"  slow check: suspend, one resume-by-exec, then a {idle_window}s idle window"
+    )
+    second = cli.call(
+        "run",
+        "--image",
+        str(launched.data["imageIdentifier"]),
+        "--name",
+        f"microvm-cli-conformance-autoresume-{secrets.token_hex(4)}",
+        "--memory",
+        str(BASELINE_MEMORY_MIB),
+        "--keep",
+        "--auto-resume",
+        "--region",
+        cli.region,
+        "--max-idle-sec",
+        str(idle_window),
+        "--suspended-sec",
+        "600",
+        "--max-duration-sec",
+        "1800",
+        timeout=15 * 60,
+    )
+    microvm_id = str(second.data["microvmId"])
+    attach = attach_args(cli, second)
+    plane = aws.client(SERVICE)
+
+    try:
+        # The marker: proof the exec after the thaw ran in the same VM, not a fresh one.
+        cli.call("exec", "echo 'written before the suspend' > /tmp/marker.txt", *attach)
+
+        print("  suspending")
+        suspended = cli.call("suspend", microvm_id, "--region", cli.region)
+        results.eq(
+            "the auto-resume VM suspends explicitly",
+            suspended.data.get("state"),
+            "SUSPENDED",
+        )
+        suspended_at = time.monotonic()
+        time.sleep(SUSPEND_WINDOW_SEC)
+
+        # Half one: the exec IS the resume. No `microvm resume` anywhere in this section —
+        # a retry loop because the thaw takes real seconds and the requests that land
+        # during it may be refused rather than queued; either behavior is within contract.
+        print("  sending an exec with no explicit resume")
+        first_attempt = time.monotonic()
+        answered = None
+        for _ in range(12):
+            try:
+                answered = cli.call("exec", "cat /tmp/marker.txt", *attach)
+                break
+            except KindError as exc:
+                print(f"    exec against the suspended VM: {exc!r}")
+                time.sleep(5)
+        answer_latency = time.monotonic() - first_attempt
+        results.check(
+            "an exec against a suspended auto-resume VM completes with no explicit resume",
+            answered is not None and answered.data.get("exitCode") == 0,
+            f"answered after {answer_latency:.0f}s against a VM suspended "
+            f"{time.monotonic() - suspended_at:.0f}s ago",
+        )
+        results.check(
+            "the auto-resumed VM is the same VM, filesystem intact",
+            answered is not None
+            and (answered.data.get("stdout") or "").strip()
+            == "written before the suspend",
+            repr(answered and answered.data.get("stdout")),
+        )
+        # The billing half of the record: the platform's own state, which is what meters.
+        # RUNNING here is compute billing having resumed on the strength of one request.
+        state = plane.get_microvm(microvmIdentifier=microvm_id)["state"]
+        results.check(
+            "the control plane reports RUNNING after the auto-resume (compute billing resumed)",
+            state == "RUNNING",
+            f"{state}, resume latency ~{answer_latency:.0f}s",
+        )
+
+        # Half two: the unmeasured interaction from docs/PLATFORM.md. Traffic stops, the
+        # idle window elapses, and the question is whether the idle timer is live after an
+        # auto-resume. Control-plane samples only — a health poll is inbound traffic and
+        # would reset the timer under measurement.
+        print(
+            f"  traffic stopped; waiting for the {idle_window}s idle window to elapse"
+        )
+        resuspended_state = None
+        wait_deadline = time.monotonic() + idle_window * 2.5
+        while time.monotonic() < wait_deadline:
+            time.sleep(20)
+            resuspended_state = plane.get_microvm(microvmIdentifier=microvm_id)["state"]
+            if resuspended_state != "RUNNING":
+                break
+        results.check(
+            "the idle timer runs after an auto-resume: the VM suspends again unpolled",
+            resuspended_state in {"SUSPENDING", "SUSPENDED"},
+            f"{resuspended_state} after the window elapsed with no traffic — an "
+            f"auto-resumed VM left idle stops billing compute again",
+        )
+    finally:
+        # This section's own VM, this section's own teardown, whatever state it ended in.
+        # `data.leaked` is read rather than only "no exception" for drive_idle_keepalive's
+        # reason: terminate reports a failed delete as a named leak on a success envelope.
+        try:
+            torn = cli.call(
+                "terminate", microvm_id, "--wait", "--region", cli.region, timeout=300.0
+            )
+        except Exception as exc:  # noqa: BLE001 - a teardown failure is a finding
+            results.check(
+                "the auto-resume VM was terminated", False, f"{microvm_id}: {exc!r}"
+            )
+        else:
+            results.check(
+                "the auto-resume VM was terminated",
+                not torn.data.get("leaked"),
+                f"{microvm_id} leaked={torn.data.get('leaked')!r}",
+            )
+
+
 def drive_teardown(
     cli: Cli,
     launched: Envelope,
@@ -3287,6 +3439,11 @@ def main() -> int:
             drive_provisioned_quickstart(
                 cli, Path(tmp) / "quickstart-state", aws.client("logs"), results
             )
+            # Auto-resume on its own VM (launched `--auto-resume` from the suite's image):
+            # the policy is set only at launch, so the suite's VM cannot carry it. NEW in
+            # 0.6.0 (#68) and not yet run live — first execution is the next sweep. Slow
+            # (~4 minutes of deliberate waiting), so it sits with the other slow section.
+            drive_auto_resume(cli, launched, aws, results)
             # The idle-keepalive section runs on its own VM (launched from the image this
             # suite already built, so no second build) and is the slowest section here —
             # its own output says how long. Last, so its four minutes of deliberate

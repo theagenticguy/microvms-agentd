@@ -109,6 +109,7 @@ fn check_config(flags: &crate::cli::ConfigFlags) -> Check {
                 ("memory", config.memory.is_some()),
                 ("region", config.region.is_some()),
                 ("egress", config.egress.is_some()),
+                ("auto-resume", config.auto_resume.is_some()),
                 ("max-idle-sec", config.max_idle_sec.is_some()),
                 ("suspended-sec", config.suspended_sec.is_some()),
                 ("max-duration-sec", config.max_duration_sec.is_some()),
