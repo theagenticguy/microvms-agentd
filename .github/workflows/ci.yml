@@ -212,8 +212,25 @@ jobs:
       # syft writes the SBOM, grype audits the SBOM, trivy audits the tree
       # (vulns + IaC misconfig + secrets), osv-scanner audits the lockfiles
       # against OSV directly. Three scanners because their databases disagree
-      # at the margins; every accepted finding lives in .trivyignore.yaml or
-      # osv-scanner.toml with its reason recorded.
+      # at the margins. Suppressions are tiered by finding kind:
+      #   - dependency VULNERABILITIES: .vex/microvms-agentd.openvex.json
+      #     (OpenVEX, consumed by grype via --vex and trivy via TRIVY_VEX;
+      #     osv-scanner can't read VEX, so its osv-scanner.toml mirrors it)
+      #   - MISCONFIG/secret findings: .trivyignore.yaml (VEX has no identity
+      #     for these)
+      # Either way the rule holds: every accepted finding carries its reason.
+      - name: validate the VEX document's shape
+        run: |
+          jq -e '
+            (.["@context"] and .["@id"] and .author and .timestamp and (.version >= 1)) and
+            (.statements | length > 0) and
+            (.statements | all(
+              (.vulnerability.name != null) and
+              (.products | length > 0 and all(.["@id"] != null)) and
+              ((.status == "not_affected" or .status == "affected" or .status == "fixed" or .status == "under_investigation")) and
+              (if .status == "not_affected" then (.justification != null or .impact_statement != null) else true end)
+            ))' .vex/microvms-agentd.openvex.json > /dev/null \
+            || { echo "::error file=.vex/microvms-agentd.openvex.json::OpenVEX document failed shape validation (see .vex/README.md)"; exit 1; }
       # Pinned version + sha256 per binary, not `install.sh | sh` off a branch:
       # this is the job whose entire output is supply-chain assurance, so its own
       # inputs are the last place an unpinned fetch belongs. Refreshing a pin
@@ -233,7 +250,9 @@ jobs:
             -o cyclonedx-json=sbom/microvms-agentd.cdx.json \
             -o spdx-json=sbom/microvms-agentd.spdx.json -q
       - name: grype (audits what the SBOM publishes)
-        run: grype sbom:sbom/microvms-agentd.cdx.json --fail-on high
+        # --vex turns the document's not_affected/fixed statements into ignore
+        # rules; anything else still fails at high.
+        run: grype sbom:sbom/microvms-agentd.cdx.json --fail-on high --vex .vex/microvms-agentd.openvex.json
       - name: trivy (vulns, IaC misconfig, secrets)
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
@@ -243,7 +262,11 @@ jobs:
           severity: HIGH,CRITICAL
           exit-code: '1'
           skip-dirs: conformance/infra/.terraform,target
+          # Misconfig/secret acceptances only; vulnerability overrides come
+          # from the VEX document via TRIVY_VEX below.
           trivyignores: .trivyignore.yaml
+        env:
+          TRIVY_VEX: .vex/microvms-agentd.openvex.json
       - name: osv-scanner (lockfiles against OSV; pinned, checksummed)
         run: |
           curl -sSfL -o osv-scanner https://github.com/google/osv-scanner/releases/download/v2.5.0/osv-scanner_linux_amd64

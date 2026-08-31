@@ -1,6 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # Accepted findings, each with its reason. An ignore without a reason is a
 # finding someone silenced; an ignore with one is a decision someone made.
+#
+# Scope: MISCONFIGURATION and secret findings only. Dependency-vulnerability
+# overrides live in .vex/microvms-agentd.openvex.json (OpenVEX), which trivy
+# reads via TRIVY_VEX in CI. See .vex/README.md.
 misconfigurations:
   - id: AVD-AWS-0132
     paths:
