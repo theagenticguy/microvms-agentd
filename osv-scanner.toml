@@ -1,6 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # Accepted findings, each with its reason (same rule as .trivyignore.yaml: an
 # ignore without a reason is a finding someone silenced).
+#
+# osv-scanner cannot consume VEX documents, so this file exists as a mirror:
+# every vulnerability ignored here MUST also carry a statement in
+# .vex/microvms-agentd.openvex.json, which is the canonical record grype and
+# trivy consume. See .vex/README.md.
 
 [[IgnoredVulns]]
 id = "RUSTSEC-2026-0235"

@@ -1,0 +1,23 @@
+{
+  "@context": "https://openvex.dev/ns/v0.2.0",
+  "@id": "https://github.com/theagenticguy/microvms-agentd/blob/main/.vex/microvms-agentd.openvex.json",
+  "author": "theagenticguy/microvms-agentd maintainers",
+  "timestamp": "2026-08-31T21:19:00Z",
+  "version": 1,
+  "statements": [
+    {
+      "vulnerability": {
+        "name": "RUSTSEC-2026-0235",
+        "description": "rkyv: insufficient archive validation can cause out-of-bounds reads in archives containing Rc/Arc"
+      },
+      "products": [
+        {
+          "@id": "pkg:cargo/rkyv@0.7.46"
+        }
+      ],
+      "status": "not_affected",
+      "justification": "vulnerable_code_not_present",
+      "impact_statement": "rkyv 0.7 appears in Cargo.lock only as an optional dependency of rust_decimal whose feature this workspace never enables. `cargo tree -i rkyv` prints 'nothing to print': no crate depends on it and it is never compiled into any artifact. The lockfile records optional dependencies regardless. Re-check if rust_decimal's `rkyv` feature is ever turned on."
+    }
+  ]
+}
