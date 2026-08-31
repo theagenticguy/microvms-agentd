@@ -124,6 +124,12 @@ cd ../..
 If you already have a bucket and roles, export those instead; the stack is a
 convenience, and the CLI only reads the three environment values.
 
+The stack also creates a managed policy for reading build logs
+(`terraform output -raw logs_read_policy_arn`). Attach it to the identity you
+run the AWS CLI with, and `microvm logs <image-name>` hands you a working
+`aws logs tail` command. That command needs **AWS CLI v2** — `aws logs tail`
+does not exist in v1.
+
 **2. Check the machine.**
 
 ```bash

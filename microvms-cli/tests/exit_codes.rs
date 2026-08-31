@@ -74,10 +74,13 @@ fn every_locally_reachable_row_exits_with_its_own_integer_and_code() {
             "",
         ),
         (
-            "a missing prerequisite",
+            // `logs` succeeds since the 0.6.0 ruling on #79: it names the group and prints
+            // the `aws logs tail` invocation that reads it. The ERR_PRECONDITION row this
+            // used to be is covered by "a binary that does not exist" below.
+            "a local success that names the log group",
             vec!["logs", "img", "--json"],
-            12,
-            "ERR_PRECONDITION",
+            0,
+            "",
             "",
         ),
         (

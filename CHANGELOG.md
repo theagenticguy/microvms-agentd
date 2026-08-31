@@ -6,6 +6,29 @@ Versions are [semantic](https://semver.org/spec/v2.0.0.html); the wire contract 
 
 ## Unreleased
 
+### Changed
+
+- **`microvm logs` succeeds with the working read command (#79).** The command
+  used to exit `ERR_PRECONDITION` with the `aws logs tail` invocation as a
+  suggestion on the failure; it now succeeds, printing the build log group, the
+  runnable `aws logs tail <group> --since 1h --format short` command
+  (`data.tailCommand`), and the version floor (`data.tailRequires`): the
+  subcommand is **AWS CLI v2 only** — it does not exist in v1 (verified present
+  in 2.35.7). `data.lines` stays explicitly `null`, never `[]`, so a consumer
+  cannot mistake "this client did not read the group" for "the group has no
+  events". The CLI still carries no CloudWatch client; both thinness guards are
+  untouched.
+
+### Added
+
+- **Terraform read grant for build logs (#79).** `conformance/infra/main.tf`
+  now ships a standalone managed policy granting `logs:FilterLogEvents`,
+  `logs:GetLogEvents`, and `logs:DescribeLogStreams` on
+  `/aws/lambda-microvms/*`, exported as `logs_read_policy_arn`. Attach it to
+  the identity that runs `aws logs tail`; previously those three actions were
+  granted to nobody, so the printed command failed with
+  `AccessDeniedException` on a fresh install.
+
 ## [0.5.0] — 2026-08-30
 
 ### Added

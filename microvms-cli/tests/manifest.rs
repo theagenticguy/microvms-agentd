@@ -116,9 +116,8 @@ fn every_published_domain_is_the_domain_the_parser_enforces() {
                 argv.extend(positional.iter().copied());
                 argv.extend([flag.as_str(), value, "--json"]);
                 let outcome = run(&argv, &[]);
-                // Not "it succeeded": `logs` deliberately fails with ERR_PRECONDITION. What is
-                // asserted is that it was not *rejected as an argument*, which is the only thing a
-                // domain claim is about.
+                // Not "it succeeded": what is asserted is that the value was not *rejected as
+                // an argument*, which is the only thing a domain claim is about.
                 assert_ne!(
                     outcome.exit_code(),
                     2,
@@ -180,7 +179,21 @@ fn the_published_exit_table_agrees_with_what_the_binary_exits() {
     assert_eq!(invalid.exit_code(), 2);
     assert_eq!(invalid.envelope()["code"], code_for(2));
 
-    let precondition = run(&["logs", "img", "--json"], &[]);
+    // `build` with a binary path that does not exist fails the local preflight — no AWS
+    // is involved. (`logs` used to be the ERR_PRECONDITION probe here; it succeeds since
+    // the 0.6.0 ruling on #79.)
+    let precondition = run(
+        &[
+            "build",
+            "/definitely/not/here/agentd",
+            "--build-role-arn",
+            "arn:aws:iam::123456789012:role/build",
+            "--artifact-uri",
+            "s3://bucket/img.zip",
+            "--json",
+        ],
+        &[],
+    );
     assert_eq!(precondition.exit_code(), 12);
     assert_eq!(precondition.envelope()["code"], code_for(12));
 }

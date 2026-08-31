@@ -217,12 +217,13 @@ pub enum Command {
     /// between execs.
     History(HistoryArgs),
 
-    /// Name an image's build log group, which is where a failed build's only evidence lives.
+    /// Name an image's build log group and print the `aws logs tail` command that reads it.
     ///
     /// The group is `/aws/lambda-microvms/<image-name>`, derived from the name rather than
     /// asked for: a build role granted the plausible-but-wrong `/aws/lambda/microvms/*`
     /// produces builds that write no logs at all, and every failure then reads
-    /// `reason=unknown`.
+    /// `reason=unknown`. The printed command requires AWS CLI v2 (`aws logs tail` does not
+    /// exist in v1) and an identity granted the Terraform stack's `logs_read_policy_arn`.
     Logs(LogsArgs),
 
     /// What a run cost, or what a plan will cost. Every figure labelled.
