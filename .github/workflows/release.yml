@@ -79,7 +79,7 @@ jobs:
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
         with:
           enable-cache: false
       - name: publish set, manifest metadata, and tag agreement
@@ -225,12 +225,12 @@ jobs:
       id-token: write # exchanged for a short-lived PyPI token, and signs the attestations
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           pattern: dist-*
           merge-multiple: true
           path: dist
-      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
         with:
           enable-cache: false
       # Every wheel against its own manylinux tag, before anything immutable is uploaded. pip
@@ -298,7 +298,7 @@ jobs:
           npx -y -p @napi-rs/cli@3 napi build
           --manifest-path ../Cargo.toml --package microvms-js
           --platform --release --target ${{ matrix.target }} ${{ matrix.cross }} --output-dir .
-      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
         if: matrix.cross != ''
         with:
           enable-cache: false
@@ -336,7 +336,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       # For the PEP 723 loader gate below. No cache: see `ci.yml`'s `security` job — there is
       # no lockfile here to key one on, and that script's dependency set is empty.
-      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
         with:
           enable-cache: false
       # Node 24, for npm 11.x. Trusted publishing requires npm >= 11.5.1 and Node >=
@@ -374,14 +374,14 @@ jobs:
       # The generated loader already prefers a local file — `require('./microvms.<triple>.node')`
       # is tried before `require('<package>-<suffix>')` — so one package carrying all four
       # binaries works with the loader unchanged and no `optionalDependencies` at all.
-      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           pattern: addon-*
           merge-multiple: true
           path: microvms-js
       # The loader and types, which the package cannot be published without: both are
       # gitignored and this job never runs `napi build`.
-      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: binding-js
           path: microvms-js
@@ -544,7 +544,7 @@ jobs:
           set -euo pipefail
           cp "${{ steps.attest.outputs.bundle-path }}" agentd.sigstore.json
           jq -c .dsseEnvelope agentd.sigstore.json > agentd.intoto.jsonl
-      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           pattern: cli-*
           merge-multiple: true

@@ -44,7 +44,7 @@ jobs:
       # last commit, and a shallow clone gives every file the same date — a claim that
       # every page changed together. And the citation rewriter resolves every cited
       # path with `git ls-tree` at the pinned commit, which is not reachable at depth 1.
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
 
@@ -60,7 +60,7 @@ jobs:
 
       # `cache: pnpm` needs pnpm already on PATH to resolve the store directory, which is why this
       # step follows the one above rather than leading.
-      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           # The HIGHEST floor in play, not Astro's. `astro@7` declares node >=22.12.0 and it is
           # tempting to pin that; pnpm 11.21 declares >=22.13 and fails this job outright with
