@@ -54,7 +54,7 @@ jobs:
       # Every `uses:` here is on a Node 24 major, for the reason `ci.yml`'s header
       # paragraph gives — including `configure-aws-credentials@v6`, whose rolling
       # v6 tag landed on node24 (checked against the tag's action.yml, 2026-08-09).
-      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
         with:
           # See `ci.yml`'s `security` job: `conformance/run_rs.py` and
           # `scripts/check-live-rates.py` are PEP 723 scripts carrying their own
