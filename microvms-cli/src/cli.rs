@@ -861,6 +861,20 @@ pub struct BuildArgs {
     #[arg(long)]
     pub dockerfile: Option<PathBuf>,
 
+    /// A project directory whose dependency files bake an environment layer into the
+    /// image (#74).
+    ///
+    /// Exactly one ecosystem's manifest+lockfile pair must be present in the directory:
+    /// pyproject.toml+uv.lock, package.json+package-lock.json, or Cargo.toml+Cargo.lock.
+    /// The pair is zipped into the build context beside the Dockerfile — nothing else in
+    /// the directory enters the shared image snapshot — and the derived Dockerfile
+    /// installs from the lockfile (`uv sync --locked`, `npm ci`, `cargo fetch`), so
+    /// launches skip dependency installation. With --reuse, the pair joins the content
+    /// hash: two projects with identical dependency files share an image, and a lockfile
+    /// edit builds a fresh one.
+    #[arg(long, value_name = "DIR")]
+    pub project: Option<PathBuf>,
+
     /// Pin the managed base image to one version instead of taking the service's default.
     ///
     /// Without this a build floats. The managed base's version list is not static —
