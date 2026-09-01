@@ -457,8 +457,9 @@ const LOCAL_ONLY: [(&str, &str); 7] = [
     ),
     (
         "logs",
-        "names the build log group and says it cannot read it — no CloudWatch client exists in \
-         either crate, and adding one to the CLI is what CLI-2 forbids",
+        "names the build log group and prints the aws logs tail invocation that reads it — no \
+         CloudWatch client exists in either crate, and adding one to the CLI is what CLI-2 \
+         forbids",
     ),
     (
         "cost",

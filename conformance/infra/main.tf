@@ -224,6 +224,40 @@ resource "aws_iam_role_policy" "execution" {
   policy = data.aws_iam_policy_document.execution.json
 }
 
+# ── build log read policy ───────────────────────────────────────────────
+# The build and execution roles above only *write* logs. Reading the build log
+# group — what `microvm logs` prints the `aws logs tail` invocation for — is
+# done by the caller's own identity, which this module cannot know (it may be a
+# user, a role, or an SSO session). So the read grant ships as a standalone
+# managed policy: attach it to whatever identity runs `aws logs tail`, via the
+# `logs_read_policy_arn` output. Without it, a fresh install's tail fails with
+# AccessDeniedException even though the group exists and holds the build logs.
+
+data "aws_iam_policy_document" "logs_read" {
+  statement {
+    sid    = "ReadBuildLogs"
+    effect = "Allow"
+    actions = [
+      "logs:FilterLogEvents",
+      "logs:GetLogEvents",
+      "logs:DescribeLogStreams",
+    ]
+    # Same prefix hazard as WriteBuildLogs above: the service writes to
+    # /aws/lambda-microvms/<image-name>, NOT /aws/lambda/microvms/*. The second
+    # resource form is the log-stream ARN shape GetLogEvents authorizes against.
+    resources = [
+      "arn:aws:logs:${var.region}:${data.aws_caller_identity.current.account_id}:log-group:/aws/lambda-microvms/*",
+      "arn:aws:logs:${var.region}:${data.aws_caller_identity.current.account_id}:log-group:/aws/lambda-microvms/*:log-stream:*",
+    ]
+  }
+}
+
+resource "aws_iam_policy" "logs_read" {
+  name        = "${var.name_prefix}-logs-read-${random_id.suffix.hex}"
+  description = "Read MicroVM image build log groups (/aws/lambda-microvms/*) — attach to the identity that runs `aws logs tail`"
+  policy      = data.aws_iam_policy_document.logs_read.json
+}
+
 # ── outputs ─────────────────────────────────────────────────────────────
 
 output "region" {
@@ -240,4 +274,8 @@ output "build_role_arn" {
 
 output "execution_role_arn" {
   value = aws_iam_role.execution.arn
+}
+
+output "logs_read_policy_arn" {
+  value = aws_iam_policy.logs_read.arn
 }

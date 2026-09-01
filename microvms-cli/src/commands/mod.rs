@@ -287,7 +287,17 @@ pub const RESPONSE_TYPES: [(&str, &str, &[&str]); 21] = [
     ),
     ("ls", "microvm.runs", &["runs"]),
     ("history", "microvm.history", &["microvmId", "events"]),
-    ("logs", "microvm.logs", &["logGroup", "lines", "streams"]),
+    (
+        "logs",
+        "microvm.logs",
+        &[
+            "logGroup",
+            "lines",
+            "streams",
+            "tailCommand",
+            "tailRequires",
+        ],
+    ),
     ("cost", "microvm.cost", &["report", "comparison"]),
     ("doctor", "microvm.doctor", &["checks", "ok"]),
     (

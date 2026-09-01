@@ -9,14 +9,15 @@
 //! net by someone writing its name in that list.
 //!
 //! `logs` is the exception that proves the rule: it is *about* an AWS resource and reaches no
-//! account, because neither this crate nor `microvms-core` carries a CloudWatch client. See
-//! [`logs`] for why that is reported as a failure rather than as an empty list.
+//! account, because neither this crate nor `microvms-core` carries a CloudWatch client. It
+//! succeeds by naming the group and printing the `aws logs tail` invocation that reads it —
+//! see [`logs`] for why the reading is the AWS CLI's job and why `lines` is still null.
 
 use serde_json::{Map, Value, json};
 
 use crate::cli::{DockerfileArgs, HistoryArgs, LogsArgs, LsArgs};
 use crate::commands::{Ctx, Rendered, response_type};
-use crate::exit::{CliError, Exit};
+use crate::exit::CliError;
 use crate::seam::state_dir;
 use crate::{history, ledger};
 
@@ -160,14 +161,24 @@ fn joined(value: &Value) -> String {
         .unwrap_or_default()
 }
 
-/// Names an image's build log group, and says why it cannot read it.
+/// Names an image's build log group and prints the `aws logs tail` invocation that reads it.
 ///
-/// # Why this fails rather than returning an empty list
+/// # A success, with the reading delegated to the AWS CLI
 ///
 /// `cli.py:2041` reads the group through boto3. Neither `microvms-core` nor this crate has a
 /// CloudWatch client, and adding one *here* would give the CLI a second path to AWS, which
 /// is exactly what CLI-2 forbids and what the thinness guard is. If log reading matters,
 /// the client belongs in core behind the seam.
+///
+/// The command used to exit `ERR_PRECONDITION` with the tail invocation as a suggestion — a
+/// failure whose remedy was on the failure itself. That inverted the developer experience:
+/// the caller asked a legitimate question ("where are my build logs and how do I read
+/// them?") and got a non-zero exit for asking. Per the 0.6.0 ruling on #79, the answer is a
+/// success: the group, the working `aws logs tail` command, and the AWS CLI v2 floor —
+/// `aws logs tail` does not exist in AWS CLI v1 (verified present in 2.35.7). The Terraform
+/// stack pairs this with a managed read policy (`logs_read_policy_arn`) granting
+/// `FilterLogEvents`/`GetLogEvents`/`DescribeLogStreams` on the build log groups, so the
+/// printed command works on a fresh install once that policy is attached to the caller.
 ///
 /// # Adding a reader to core was assessed and refused, and not on grounds of size
 ///
@@ -199,72 +210,57 @@ fn joined(value: &Value) -> String {
 /// identical either way. What a reader loses is one bit — whether the group was empty — and
 /// they can get that bit from the `aws logs tail` line this command already suggests.
 ///
-/// **And the read would most often fail with a permissions error, which is a worse
-/// diagnostic than this one.** `conformance/infra/main.tf` grants `logs:CreateLogGroup`,
-/// `CreateLogStream`, and `PutLogEvents` to the build and execution roles, and grants
-/// `FilterLogEvents`, `GetLogEvents`, and `DescribeLogStreams` to **nobody** — the caller's
-/// own identity included. So a reader shipped today would answer `AccessDeniedException` for
-/// a caller whose account is set up exactly as this project documents, and an
-/// `AccessDeniedException` about a log group is precisely the message that sends someone to
-/// audit the *build* role's log policy, which is the confusion the prefix finding exists to
-/// prevent. Making it work means also granting a read on the caller's identity, which is a
-/// Terraform change plus a documented new requirement — and at that point the caller has the
-/// `aws logs tail` invocation this command hands them anyway.
+/// **And the read grant is the caller's, not a role's.** `conformance/infra/main.tf` grants
+/// `logs:CreateLogGroup`, `CreateLogStream`, and `PutLogEvents` to the build and execution
+/// roles — the *write* side. The read side (`FilterLogEvents`, `GetLogEvents`,
+/// `DescribeLogStreams`) belongs to whatever identity runs the tail, which the module cannot
+/// know, so it ships as the standalone `logs_read_policy_arn` managed policy for the caller
+/// to attach. A reader baked into this client would have been exercising that same grant —
+/// with a second transport as the price and nothing the printed command does not already do.
 ///
-/// So: accepted. The remedy stays the suggestion below, and the honest reason it is a
-/// suggestion is that this client refuses to guess at a second service rather than that
-/// nobody has written the code.
-///
-/// So this command derives the group, names it in the payload, and exits `ERR_PRECONDITION`
-/// with the `aws logs` invocation that reads it. Deliberately a failure and not a success with
-/// `lines: []`, because an empty list is the wire shape for "the group exists and has no
-/// events" — and that is the *exact* confusion the build-role-prefix finding exists to
-/// prevent. A role granted the plausible-but-wrong `/aws/lambda/microvms/*` produces builds
-/// that write no logs at all, every failure then reads `reason=unknown`, and a client that
-/// answered identically for "I cannot read" and "there was nothing to read" would make that
-/// indistinguishable a second time.
+/// So this command derives the group, names it in the payload, and succeeds with the
+/// `aws logs tail` invocation that reads it. `lines` is still explicitly `null` and never
+/// `[]`, because an empty list is the wire shape for "the group exists and has no events" —
+/// and that is the *exact* confusion the build-role-prefix finding exists to prevent. A role
+/// granted the plausible-but-wrong `/aws/lambda/microvms/*` produces builds that write no
+/// logs at all, every failure then reads `reason=unknown`, and a client that implied it had
+/// read the group when it had not would make that indistinguishable a second time.
 ///
 /// (cli.py line numbers resolve at `git show 'c4d396e^:clients/python/src/microvms_agentd/cli.py'` — the retired oracle.)
 pub fn logs<O: std::io::Write, E: std::io::Write>(
-    _ctx: &mut Ctx<'_, O, E>,
+    ctx: &mut Ctx<'_, O, E>,
     args: &LogsArgs,
 ) -> Result<Rendered, CliError> {
+    // Resolved the same way every AWS command resolves it, and pinned into the printed
+    // command: without `--region`, the tail reads whatever region the caller's shell
+    // defaults to — ResourceNotFound at best, a same-named group in the wrong region at
+    // worst, and this command's whole product is that the printed line is runnable as-is.
+    let region = args.region.resolve(ctx.env)?;
     let group = format!(
         "{}/{}",
         microvms_core::control::image::BUILD_LOG_GROUP_PREFIX,
         args.image_name
     );
-    Err(CliError::new(
-        Exit::Precondition,
-        format!(
-            "the build log group for {} is {group}, and this client cannot read it: CloudWatch \
-             Logs is absent from microvms-core's dependency set, and an AWS SDK client in the CLI \
-             would give it a second path to AWS (CLI-2). The group name is the part that is easy \
-             to get wrong — a build role granted /aws/lambda/microvms/* instead of \
-             /aws/lambda-microvms/* produces builds that write no logs at all, and every failure \
-             then reads reason=unknown. Inside the group, one build is THREE streams — \
-             data.streams labels them by role — with random service-chosen names by default; a \
-             configured logStream collapses all three into one exact stream (the member is not a \
-             prefix), distinguished across builds only by the per-build /<16 hex> suffix this \
-             client appends, and the resolved name is on the build envelope's logStream.",
-            args.image_name,
-        ),
-    )
-    .suggest(format!("aws logs tail {group} --since 1h --format short"))
-    .suggest(format!(
-        "the build role must grant logs on {}/*",
-        microvms_core::control::image::BUILD_LOG_GROUP_PREFIX
-    ))
-    .with_data("logGroup", json!(group))
-    // Explicitly null rather than an empty array, so a consumer cannot read "no events".
-    .with_data("lines", Value::Null)
+    let tail = format!("aws logs tail {group} --since 1h --format short --region {region}");
+    let requires = "AWS CLI v2 — aws logs tail does not exist in v1 (verified present in \
+                    2.35.7)";
+
+    let mut data = Map::new();
+    data.insert("logGroup".into(), json!(group));
+    // Explicitly null rather than an empty array, so a consumer cannot read "no events":
+    // this client did not read the group, and an empty list is the wire shape for "the
+    // group exists and has no events" — the wrong-prefix signature this field must never
+    // counterfeit.
+    data.insert("lines".into(), Value::Null);
+    data.insert("tailCommand".into(), json!(tail));
+    data.insert("tailRequires".into(), json!(requires));
     // The build topology, labelled by role, so an agent handed this envelope knows what
     // it is looking for inside the group (issue #98). Measured 2026-08: one image build
     // runs three VMs and emits three log streams, and `logging.logStream` is an EXACT
     // stream name — so a configured stream collapses all three into one, distinguishable
     // across builds only by the per-build `/<16 hex>` suffix this client appends.
-    .with_data(
-        "streams",
+    data.insert(
+        "streams".into(),
         json!([
             {
                 "role": "docker-build",
@@ -282,7 +278,28 @@ pub fn logs<O: std::io::Write, E: std::io::Write>(
                                 for the other chipset generation; also starts the app",
             },
         ]),
-    ))
+    );
+
+    let (kind, _) = response_type("logs");
+    let text = format!(
+        "build log group: {group}\n\
+         read it with:    {tail}\n\
+         requires:        {requires}\n\
+         \n\
+         This client does not read CloudWatch (CLI-2: no second path to AWS). The identity \
+         running the tail needs logs:FilterLogEvents, logs:GetLogEvents and \
+         logs:DescribeLogStreams on the group — the Terraform stack's logs_read_policy_arn \
+         output is exactly that grant. The group name is the part that is easy to get wrong: \
+         a build role granted /aws/lambda/microvms/* instead of /aws/lambda-microvms/* \
+         produces builds that write no logs at all, and every failure then reads \
+         reason=unknown. Inside the group, one build is THREE streams — data.streams labels \
+         them by role — with random service-chosen names by default; a configured logStream \
+         collapses all three into one exact stream (the member is not a prefix), \
+         distinguished across builds only by the per-build /<16 hex> suffix this client \
+         appends, and the resolved name is on the build envelope's logStream."
+    );
+    let dense = format!("{group}\t{tail}\t{requires}");
+    Ok(Rendered::ok(kind, data, text, dense))
 }
 
 /// The whole command surface, derived from the clap tree.
@@ -543,48 +560,74 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// **`logs` fails rather than reporting an empty list, and names the group.**
+    /// **`logs` succeeds with the working `aws logs tail` command, and still refuses to
+    /// imply the group is empty.**
     ///
-    /// The distinction it protects: an empty `lines` array is the wire shape for "the group has
-    /// no events", which is exactly what a wrong build-role prefix produces — so a client that
-    /// answered identically for "cannot read" would recreate the confusion the finding exists
-    /// to prevent.
+    /// The success path is the 0.6.0 ruling on #79: asking where the build logs are and how
+    /// to read them is a legitimate question, so the answer is the group, the tail command,
+    /// and the AWS CLI v2 floor — exit 0. The distinction the old failure protected survives
+    /// unchanged: `lines` is explicitly null, never an empty array, because an empty array
+    /// is the wire shape for "the group has no events", which is exactly what a wrong
+    /// build-role prefix produces — and this client did not read the group.
     #[test]
-    fn logs_names_the_group_and_refuses_to_imply_it_is_empty() {
+    fn logs_succeeds_with_the_tail_command_and_refuses_to_imply_it_is_empty() {
         let mut out = Output::new(Format::Plain, false, Vec::new(), Vec::new());
         let env = |_: &str| None;
         let seam = crate::seam::PanickingSeam;
         let mut context = ctx(&mut out, &seam, &env);
-        let failure = logs(
+        let rendered = logs(
             &mut context,
             &LogsArgs {
                 image_name: "agentd-conformance".to_string(),
                 region: crate::cli::RegionFlags::default(),
             },
         )
-        .expect_err("this client cannot read CloudWatch");
+        .expect("naming the group and the command that reads it is a success");
 
-        assert_eq!(failure.exit, Exit::Precondition);
+        assert_eq!(rendered.kind, "microvm.logs");
+        assert_eq!(rendered.already_reported, None, "a plain success");
         assert_eq!(
-            failure.data["logGroup"],
+            rendered.data["logGroup"],
             "/aws/lambda-microvms/agentd-conformance"
         );
         assert_eq!(
-            failure.data["lines"],
+            rendered.data["lines"],
             Value::Null,
             "an empty array would read as 'the group has no events'"
         );
-        // The prefix that is easy to get wrong is named, and so is the way to read the group.
+        // The working command, verbatim and runnable, in the payload and both renderings —
+        // region-pinned, so it reads the same group this invocation resolved rather than
+        // whatever region the caller's shell happens to default to.
+        let tail = "aws logs tail /aws/lambda-microvms/agentd-conformance --since 1h \
+                    --format short --region us-east-1";
+        assert_eq!(rendered.data["tailCommand"], tail);
+        assert!(rendered.text.contains(tail), "{}", rendered.text);
         assert!(
-            failure.message.contains("/aws/lambda/microvms/*"),
-            "{failure:?}"
+            rendered.dense_text.contains(tail),
+            "{}",
+            rendered.dense_text
+        );
+        // The version floor travels beside the command: `aws logs tail` is v2-only.
+        let requires = rendered.data["tailRequires"]
+            .as_str()
+            .expect("a version note");
+        assert!(requires.contains("AWS CLI v2"), "{requires}");
+        assert!(rendered.text.contains("AWS CLI v2"), "{}", rendered.text);
+        assert!(
+            rendered.dense_text.contains("AWS CLI v2"),
+            "{}",
+            rendered.dense_text
+        );
+        // The prefix that is easy to get wrong is still named, and so is the read grant.
+        assert!(
+            rendered.text.contains("/aws/lambda/microvms/*"),
+            "{}",
+            rendered.text
         );
         assert!(
-            failure
-                .suggestions
-                .iter()
-                .any(|hint| hint.contains("aws logs tail")),
-            "{failure:?}"
+            rendered.text.contains("logs_read_policy_arn"),
+            "the Terraform read grant is where a fresh install's AccessDenied gets fixed: {}",
+            rendered.text
         );
 
         // The build topology, labelled by role (issue #98): one build is three VMs and
@@ -592,7 +635,9 @@ mod tests {
         // inside the group. Exactly three, each with a role and a description, and the
         // three roles are the measured ones — the snapshot VMs are the ones that start
         // the app, so the descriptions have to say where app logs land.
-        let streams = failure.data["streams"].as_array().expect("a streams array");
+        let streams = rendered.data["streams"]
+            .as_array()
+            .expect("a streams array");
         assert_eq!(streams.len(), 3, "one build is exactly three streams");
         let roles: Vec<&str> = streams
             .iter()
@@ -618,13 +663,54 @@ mod tests {
             "the snapshot VM is the one that starts the app, and the topology has to \
              say so: {streams:?}"
         );
-        // The collapse hazard is in the message: a configured logStream is an exact
+        // The collapse hazard is in the text: a configured logStream is an exact
         // name, not a prefix, and only the per-build suffix keeps builds apart.
         assert!(
-            failure.message.contains("collapses all three"),
-            "{failure:?}"
+            rendered.text.contains("collapses all three"),
+            "{}",
+            rendered.text
         );
-        assert!(failure.message.contains("/<16 hex>"), "{failure:?}");
+        assert!(rendered.text.contains("/<16 hex>"), "{}", rendered.text);
+    }
+
+    /// **The tail command is pinned to the resolved region, not the shell's default.**
+    ///
+    /// `--region` on `logs` resolves through the same [`crate::cli::RegionFlags::resolve`]
+    /// every AWS command uses, and the resolved name lands in `tailCommand`. Without the
+    /// pin, `microvm logs my-image --region eu-west-1` would hand back a command that reads
+    /// whatever region the caller's shell defaults to — ResourceNotFound at best, a
+    /// same-named group's logs from the wrong region at worst.
+    ///
+    /// **Falsification** — run 2026-08-31. Written while `logs` still discarded its `Ctx`
+    /// and never read `args.region`; both assertions failed (no `--region` in the command),
+    /// and resolving the region in `logs` turned it green.
+    #[test]
+    fn logs_pins_the_tail_command_to_the_resolved_region() {
+        let mut out = Output::new(Format::Plain, false, Vec::new(), Vec::new());
+        let env = |_: &str| None;
+        let seam = crate::seam::PanickingSeam;
+        let mut context = ctx(&mut out, &seam, &env);
+        let rendered = logs(
+            &mut context,
+            &LogsArgs {
+                image_name: "agentd-conformance".to_string(),
+                region: crate::cli::RegionFlags {
+                    region: Some(crate::cli::RegionArg::EuWest1),
+                    unlisted_region: None,
+                },
+            },
+        )
+        .expect("a resolvable region is a success");
+
+        let tail = rendered.data["tailCommand"].as_str().expect("a command");
+        assert!(
+            tail.ends_with("--region eu-west-1"),
+            "the flag's region is the command's region: {tail}"
+        );
+        assert!(
+            !tail.contains("us-east-1"),
+            "the default did not leak past an explicit flag: {tail}"
+        );
     }
 
     /// `constants` emits the bare object as its text rendering, keyed for the drift gate.
