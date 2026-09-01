@@ -278,9 +278,12 @@ where
 
     // The caller's size, sent before any keystroke: until a resize arrives the guest's
     // line discipline believes the terminal is 0x0, and the first full-screen program
-    // the user starts would render into that. `mark_unchanged` so the select loop below
-    // does not immediately re-send the same value as a "change".
-    let (cols, rows) = *resize.borrow();
+    // the user starts would render into that. `borrow_and_update` rather than `borrow` +
+    // a later `mark_unchanged`: the caller's poller is already publishing into this
+    // channel, and clearing the change flag in a separate step would eat a resize that
+    // landed in between — the stored value would then be what future sizes are compared
+    // against, and the missed resize would never be re-sent.
+    let (cols, rows) = *resize.borrow_and_update();
     if let Ok(frame) = resize_frame(cols, rows) {
         // A (0, 0) initial value is not an error here: the caller read the size from
         // something that is not a terminal (a pipe, a CI runner), and the session is
@@ -295,7 +298,6 @@ where
                 )
             })?;
     }
-    resize.mark_unchanged();
 
     let mut session_id: Option<String> = None;
     let mut buffer = vec![0_u8; SHELL_CHUNK_BYTES];
