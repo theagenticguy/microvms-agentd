@@ -24,23 +24,26 @@
 //!   and the type means an unchecked string cannot reach the field.
 //! * **TRAP-8** — [`ControlPlane::wait_for_running`]: a terminal state before RUNNING is
 //!   rejected with the state *and* `stateReason` attached. S2.
-//! * **TRAP-11, revised** — there is **no** `mint_shell_auth_token` method; that half is
-//!   still closed by absence, which is why the test for it counts calls a full lifecycle
-//!   made rather than asserting a refusal. The other half moved: `SHELL_INGRESS` **is**
-//!   a [`connector::ConnectorIntent`] variant now, and the lifecycle test asserts a
-//!   launch carries exactly the connectors its caller asked for. See [`connector`].
+//! * **TRAP-11, revised again** — `mint_shell_auth_token` exists now, and the guard
+//!   changed ground with it: the closure is no longer the method's absence but the exec
+//!   path's separation from it, which is why the test still counts the calls a full
+//!   lifecycle made and asserts zero shell operations among them. The connector half is
+//!   unchanged: `SHELL_INGRESS` is a [`connector::ConnectorIntent`] variant, and the
+//!   lifecycle test asserts a launch carries exactly the connectors its caller asked
+//!   for. See [`connector`].
 //!
 //! # TRAP-11 is the one that needs saying out loud
 //!
-//! `CreateMicrovmShellAuthToken` is in the service model and this client does not
-//! implement it yet — issue #69 builds `microvm shell` on it. The original reason for
-//! staying away — that the shell gates a console-only debugging flow, not a programmatic
-//! exec path — did not survive measurement: `docs/PLATFORM.md` (2026-08-15) found a real
-//! PTY over a WebSocket, programmatically drivable. What holds is narrower: **one
-//! interactive session is not programmatic exec** — no exec ids, no idempotency, no
-//! separated stdout/stderr, no exit codes — so the exec path never requests the shell
-//! connector, and the shell arrives as its own surface rather than as a method the exec
-//! path can wander into.
+//! `CreateMicrovmShellAuthToken` is implemented — issue #69 builds `microvm shell` on
+//! it, and [`ControlPlane::mint_shell_auth_token`] is its one door. The original reason
+//! for staying away entirely — that the shell gates a console-only debugging flow, not
+//! a programmatic exec path — did not survive measurement: `docs/PLATFORM.md`
+//! (2026-08-15) found a real PTY over a WebSocket, programmatically drivable. What
+//! holds is narrower: **one interactive session is not programmatic exec** — no exec
+//! ids, no idempotency, no separated stdout/stderr, no exit codes — so the exec path
+//! never requests the shell connector and never mints a shell token, and the shell is
+//! its own surface ([`crate::session::shell`]) rather than a method the exec path can
+//! wander into.
 //!
 //! # Nothing in this module reads the service model at runtime
 //!
@@ -497,6 +500,28 @@ impl RunMicrovmRequest {
     pub fn with_egress(mut self) -> Self {
         if !self.connectors.contains(&ConnectorIntent::Egress) {
             self.connectors.push(ConnectorIntent::Egress);
+        }
+        self
+    }
+
+    /// Requests a shell-capable launch: the ingress set becomes the measured pair,
+    /// `[HTTP_INGRESS, SHELL_INGRESS]`.
+    ///
+    /// **Replaces** `ALL_INGRESS` rather than adding beside it, because the platform
+    /// forbids the combination and says so only at token-mint time — the VM launches,
+    /// reaches RUNNING, and bills before the failure appears (`docs/PLATFORM.md`,
+    /// 2026-08-15). `[HTTP_INGRESS, SHELL_INGRESS]` is the set measured to both launch
+    /// and mint a shell token, and `HTTP_INGRESS` stays in the pair so the daemon
+    /// endpoint keeps working. Egress is untouched: shell access and outbound network
+    /// are separate questions.
+    #[must_use]
+    pub fn with_shell(mut self) -> Self {
+        self.connectors
+            .retain(|intent| *intent != ConnectorIntent::AllIngress);
+        for wanted in [ConnectorIntent::HttpIngress, ConnectorIntent::ShellIngress] {
+            if !self.connectors.contains(&wanted) {
+                self.connectors.push(wanted);
+            }
         }
         self
     }
@@ -1187,6 +1212,40 @@ mod tests {
             .with_egress()
             .with_egress();
         assert_eq!(request.connectors.len(), 2);
+    }
+
+    /// `with_shell` **replaces** `ALL_INGRESS` with the measured pair rather than adding
+    /// beside it: the platform accepts `ALL_INGRESS` + finer ingress at launch and
+    /// refuses it only when a shell token is minted, after the VM has run and billed —
+    /// and `run_microvm` refuses the combination client-side, so a `with_shell` that
+    /// merely appended would build a request this client's own validation rejects.
+    ///
+    /// **Falsification** — watched fail 2026-08-31: dropping the `retain` from
+    /// `with_shell` fails the first assertion with `ALL_INGRESS` still in the set.
+    #[test]
+    fn with_shell_replaces_all_ingress_with_the_measured_pair() {
+        let payload = RunHookPayload::for_agent_token("token").expect("a token fits");
+        let request = RunMicrovmRequest::new("arn:image", payload).with_shell();
+        assert_eq!(
+            request.connectors,
+            vec![ConnectorIntent::HttpIngress, ConnectorIntent::ShellIngress]
+        );
+
+        // Egress is a separate question and survives in either order.
+        let payload = RunHookPayload::for_agent_token("token").expect("a token fits");
+        let both = RunMicrovmRequest::new("arn:image", payload)
+            .with_egress()
+            .with_shell()
+            .with_shell();
+        assert_eq!(
+            both.connectors,
+            vec![
+                ConnectorIntent::Egress,
+                ConnectorIntent::HttpIngress,
+                ConnectorIntent::ShellIngress
+            ],
+            "egress survives, and asking twice adds nothing"
+        );
     }
 
     /// A client-side deadline is an `ErrorKind::Timeout` and says the resource was not

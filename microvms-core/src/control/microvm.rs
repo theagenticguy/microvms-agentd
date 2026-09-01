@@ -37,10 +37,13 @@
 //! the VM is gone, so `stateReason` is the only evidence left. [`ControlPlane::wait_for_running`]
 //! fails fast and attaches both the state and the reason.
 //!
-//! # TRAP-11, again: there is no shell-auth method here
+//! # TRAP-11, again: the shell mint is a separate surface, not a sibling of exec's
 //!
-//! [`ControlPlane::mint_auth_token`] calls `CreateMicrovmAuthToken`. There is no sibling for
-//! `CreateMicrovmShellAuthToken`, deliberately — see [`super`].
+//! [`ControlPlane::mint_auth_token`] calls `CreateMicrovmAuthToken` and is what the exec
+//! path uses. [`ControlPlane::mint_shell_auth_token`] calls `CreateMicrovmShellAuthToken`
+//! and exists for exactly one caller: `microvm shell`, the interactive PTY (issue #69).
+//! Nothing on the exec or session path reaches it — the lifecycle test below drives
+//! everything exec can do and asserts zero shell calls were emitted. See [`super`].
 
 use super::transport::{Call, paths, send_with_retry};
 use super::{ControlPlane, RunMicrovmRequest, WaitOpts, ops, timed_out, token};
@@ -341,11 +344,24 @@ impl ProxyToken {
         map: &std::collections::BTreeMap<String, String>,
         port: u16,
     ) -> Result<Self, Error> {
+        Self::from_operation_map("CreateMicrovmAuthToken", map, port)
+    }
+
+    /// [`ProxyToken::from_map`], naming the operation whose response the map came from.
+    ///
+    /// The shell mint reads the same `TokenParts` shape out of
+    /// `CreateMicrovmShellAuthToken`, and a missing-key failure that blamed the ordinary
+    /// mint would send the reader to the wrong operation's response.
+    pub fn from_operation_map(
+        operation: &str,
+        map: &std::collections::BTreeMap<String, String>,
+        port: u16,
+    ) -> Result<Self, Error> {
         let value = map.get(PROXY_AUTH_HEADER).ok_or_else(|| {
             Error::wire(
                 crate::error::WireKind::AuthTokenMint,
                 format!(
-                    "the CreateMicrovmAuthToken response carried no {PROXY_AUTH_HEADER} key. The \
+                    "the {operation} response carried no {PROXY_AUTH_HEADER} key. The \
                      authToken member is a map, not a string, and that key is the header value \
                      (keys present: {:?}).",
                     map.keys().collect::<Vec<_>>()
@@ -724,6 +740,47 @@ impl ControlPlane {
         let reply = send_with_retry(self.transport(), call).await?;
         let minted: ops::CreateAuthTokenResponseWire = reply.json("CreateMicrovmAuthToken")?;
         ProxyToken::from_map(&minted.auth_token, self.port())
+    }
+
+    /// Mints a shell token: the credential `microvm shell` opens the PTY WebSocket with.
+    ///
+    /// `CreateMicrovmShellAuthToken`, which the VM must have been launched with
+    /// `SHELL_INGRESS` to answer — a VM launched without it gets a `ValidationException`
+    /// naming the connector, and `RunMicrovmRequest::with_shell` is how a launch requests
+    /// the measured pair. The request takes only the expiration; there is no
+    /// `allowedPorts`, because the shell is not a port (`docs/PLATFORM.md`, 2026-08-15).
+    ///
+    /// # This is `microvm shell`'s method, not exec's (TRAP-11)
+    ///
+    /// One interactive session is not programmatic exec — no exec ids, no idempotency,
+    /// no separated stdout/stderr, no exit codes — so nothing on the exec or session
+    /// path calls this, and the lifecycle test asserts that absence. A caller holding
+    /// the returned token has a real root PTY on the VM; treat it like the credential
+    /// it is.
+    ///
+    /// The expiration is pinned at [`MAX_TOKEN_MINUTES`] for the reason
+    /// [`Self::mint_auth_token`] gives: over-asking is rejected in a way that reads like
+    /// a bad request rather than like a ceiling. A shell session held past the ceiling
+    /// keeps its already-open WebSocket — the expiry gates the *handshake*, not an
+    /// established session.
+    pub async fn mint_shell_auth_token(&self, id: &str) -> Result<ProxyToken, Error> {
+        super::require_valid_identifier("microvmIdentifier", id)?;
+        let wire = ops::CreateShellAuthTokenWire {
+            expiration_in_minutes: MAX_TOKEN_MINUTES,
+        };
+        let call = Call::post_json(
+            "CreateMicrovmShellAuthToken",
+            paths::shell_auth_token(id),
+            &wire,
+        )?;
+        let reply = send_with_retry(self.transport(), call).await?;
+        let minted: ops::CreateShellAuthTokenResponseWire =
+            reply.json("CreateMicrovmShellAuthToken")?;
+        ProxyToken::from_operation_map(
+            "CreateMicrovmShellAuthToken",
+            &minted.auth_token,
+            self.port(),
+        )
     }
 }
 
@@ -1480,6 +1537,64 @@ mod tests {
         assert_eq!(body["allowedPorts"][0]["port"], 9000);
     }
 
+    /// The shell mint posts to the model's `shell-auth-token` route with **only** the
+    /// expiration in its body, and reads the credential out of the `authToken` map —
+    /// the same `TokenParts` discipline as TRAP-7.
+    ///
+    /// The `allowedPorts` absence is asserted rather than assumed, because it is the
+    /// measured heart of the operation: `CreateMicrovmShellAuthToken` takes no ports at
+    /// all — the shell is not a port — and a client that sent them would be sending a
+    /// member the model does not declare (`docs/PLATFORM.md`, 2026-08-15).
+    ///
+    /// **Falsification** — watched fail 2026-08-31: pointing the call at
+    /// `paths::auth_token` fails the path assertion at the `assert_eq!` on `calls[0].path`.
+    #[tokio::test]
+    async fn the_shell_mint_names_its_own_route_and_sends_no_ports() {
+        let (plane, fake, _) = planted();
+        fake.answer(
+            "CreateMicrovmShellAuthToken",
+            Answer::ok(fake::auth_token_response("opaque-shell-jwe")),
+        );
+
+        let token = plane
+            .mint_shell_auth_token("mvm-1")
+            .await
+            .expect("mints a shell token");
+        assert_eq!(token.value(), "opaque-shell-jwe");
+
+        let calls = fake.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].operation, "CreateMicrovmShellAuthToken");
+        assert_eq!(calls[0].path, "/2025-09-09/microvms/mvm-1/shell-auth-token");
+
+        let body = fake.first_body("CreateMicrovmShellAuthToken");
+        assert_eq!(body["expirationInMinutes"], 60);
+        assert_eq!(
+            body.get("allowedPorts"),
+            None,
+            "the shell is not a port: the request declares no allowedPorts member"
+        );
+        assert_eq!(
+            body.as_object().map(serde_json::Map::len),
+            Some(1),
+            "expirationInMinutes is the body's only member: {body}"
+        );
+    }
+
+    /// The shell mint refuses an empty identifier locally, like every other
+    /// identifier-in-the-URI operation: an empty segment would address a route the model
+    /// does not declare.
+    #[tokio::test]
+    async fn the_shell_mint_refuses_an_empty_identifier_before_the_wire() {
+        let (plane, fake, _) = planted();
+        let error = plane
+            .mint_shell_auth_token("")
+            .await
+            .expect_err("an empty identifier is refused");
+        assert_eq!(error.kind(), ErrorKind::InvalidArg);
+        assert_eq!(fake.calls().len(), 0, "nothing may reach the wire");
+    }
+
     /// A launch request's `Debug` does not print the agent token.
     ///
     /// Asserted on the whole [`RunMicrovmRequest`] rather than on the payload alone,
@@ -1586,14 +1701,17 @@ mod tests {
     /// honest assertion is set-equality against the request: a caller that asked for
     /// `[ALL_INGRESS]` plus egress gets that set on the wire and no other.
     ///
-    /// The shell-auth scans stay as counts, because that half of TRAP-11 is still an
-    /// absence: there is no method on this client to call, so nothing *rejects* a shell
-    /// operation and the only honest assertion is that a full lifecycle never emits one.
+    /// The shell-auth scans stay as counts, and their ground moved once more:
+    /// `mint_shell_auth_token` exists now (issue #69, `microvm shell`'s method), so the
+    /// absence being pinned is no longer the method's but the **exec path's** — a
+    /// lifecycle that asked for no shell drives everything exec can do and emits zero
+    /// shell operations. Nothing here calls the shell mint, and that is the assertion.
     ///
-    /// **Falsification** — add a `mint_shell_auth_token` calling
-    /// `POST /2025-09-09/microvms/{id}/shell-auth-token` and call it here: the operation
-    /// scan and the path scan both fail. Make `run_microvm` inject a connector the
-    /// request did not carry: the set-equality assertions fail.
+    /// **Falsification** — make any lifecycle step (`run_microvm`, `mint_auth_token`,
+    /// suspend/resume/terminate) also touch the shell route, or call
+    /// `mint_shell_auth_token` from this lifecycle: the operation scan and the path scan
+    /// both fail. Make `run_microvm` inject a connector the request did not carry: the
+    /// set-equality assertions fail.
     #[tokio::test]
     async fn a_full_lifecycle_never_calls_shell_auth_and_requests_only_what_was_asked() {
         let (plane, fake, _) = planted();
@@ -1673,8 +1791,8 @@ mod tests {
         assert_eq!(
             fake.call_count("CreateMicrovmShellAuthToken"),
             0,
-            "this client has no shell-auth method, and a lifecycle that asked for no \
-             shell must mint no shell token: {operations:?}"
+            "the shell mint exists for `microvm shell` alone, and a lifecycle that asked \
+             for no shell must mint no shell token: {operations:?}"
         );
         for operation in &operations {
             assert!(

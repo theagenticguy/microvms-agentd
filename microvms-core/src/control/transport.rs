@@ -63,8 +63,8 @@ pub struct Call {
     /// The operation name, for diagnostics and for the recorder's ledger.
     ///
     /// Carried rather than derived from the path: the recorder's TRAP-11 assertion is
-    /// "no call named `CreateMicrovmShellAuthToken`", and matching that on a path is a
-    /// substring test that a renamed route would slip past.
+    /// "an exec lifecycle emits no call named `CreateMicrovmShellAuthToken`", and
+    /// matching that on a path is a substring test that a renamed route would slip past.
     pub operation: &'static str,
     /// `GET`, `POST`, `PATCH`, or `DELETE` — the four the model's `http` traits use for the
     /// operations this client implements.
@@ -884,6 +884,16 @@ pub mod paths {
     pub fn auth_token(id: &str) -> String {
         format!("{}/auth-token", microvm(id))
     }
+
+    /// `POST /2025-09-09/microvms/{microvmIdentifier}/shell-auth-token`
+    ///
+    /// The shell token's route, its own path rather than a parameter on
+    /// [`auth_token`]: the two operations take different bodies (`allowedPorts` exists
+    /// only on the ordinary one — the shell is not a port), and the exec path must never
+    /// be one boolean away from minting a shell credential (TRAP-11).
+    pub fn shell_auth_token(id: &str) -> String {
+        format!("{}/shell-auth-token", microvm(id))
+    }
 }
 
 #[cfg(test)]
@@ -970,6 +980,10 @@ mod tests {
         assert_eq!(
             paths::auth_token("mvm-1"),
             "/2025-09-09/microvms/mvm-1/auth-token"
+        );
+        assert_eq!(
+            paths::shell_auth_token("mvm-1"),
+            "/2025-09-09/microvms/mvm-1/shell-auth-token"
         );
     }
 

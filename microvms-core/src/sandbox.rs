@@ -188,6 +188,11 @@ pub struct RunRequest {
     pub identity: bool,
     /// Whether to request the egress connector. Off means no outbound network.
     pub egress: bool,
+    /// Whether to launch shell-capable: the ingress set becomes the measured pair
+    /// `[HTTP_INGRESS, SHELL_INGRESS]` instead of `ALL_INGRESS`, which is what
+    /// `CreateMicrovmShellAuthToken` requires and what `microvm shell` attaches to.
+    /// Off (the default) launches byte-for-byte what this client always sent.
+    pub shell: bool,
     /// `idlePolicy.maxIdleDurationSeconds`.
     pub max_idle_sec: u32,
     /// `idlePolicy.suspendedDurationSeconds` — the window STATE-12 refuses past.
@@ -212,6 +217,7 @@ impl Default for RunRequest {
             launch_env: std::collections::HashMap::new(),
             identity: false,
             egress: false,
+            shell: false,
             max_idle_sec: 600,
             suspended_sec: 600,
             auto_resume: false,
@@ -240,6 +246,13 @@ impl RunRequest {
     #[must_use]
     pub fn with_egress(mut self) -> Self {
         self.egress = true;
+        self
+    }
+
+    /// Requests a shell-capable launch. See [`RunRequest::shell`].
+    #[must_use]
+    pub fn with_shell(mut self) -> Self {
+        self.shell = true;
         self
     }
 
@@ -769,6 +782,9 @@ impl Sandbox {
         wire.token_scope = request.token_scope.clone();
         if request.egress {
             wire = wire.with_egress();
+        }
+        if request.shell {
+            wire = wire.with_shell();
         }
 
         let launched = self.control.run_microvm(wire).await?;

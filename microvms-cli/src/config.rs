@@ -68,6 +68,9 @@ pub struct ProjectConfig {
     pub region: Option<String>,
     /// `run --egress`: give the VM outbound network.
     pub egress: Option<bool>,
+    /// `run --shell`: launch shell-capable (`[HTTP_INGRESS, SHELL_INGRESS]`), so
+    /// `microvm shell` can attach later.
+    pub shell: Option<bool>,
     /// `run --auto-resume`: let the platform resume a suspended VM on an incoming request.
     pub auto_resume: Option<bool>,
     /// `run --max-idle-sec`: suspend after this much inbound-traffic idleness.
@@ -450,6 +453,7 @@ memory = 4096
 region = "us-west-2"
 egress = true
 auto-resume = true
+shell = true
 max-idle-sec = 120
 suspended-sec = 300
 max-duration-sec = 7200
@@ -472,6 +476,7 @@ CI = "1"
         assert_eq!(config.region.as_deref(), Some("us-west-2"));
         assert_eq!(config.egress, Some(true));
         assert_eq!(config.auto_resume, Some(true));
+        assert_eq!(config.shell, Some(true));
         assert_eq!(config.max_idle_sec, Some(120));
         assert_eq!(config.suspended_sec, Some(300));
         assert_eq!(config.max_duration_sec, Some(7200));

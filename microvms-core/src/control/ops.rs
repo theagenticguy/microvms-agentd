@@ -427,6 +427,23 @@ pub struct CreateAuthTokenWire {
     pub allowed_ports: Vec<PortSpecification>,
 }
 
+/// `CreateMicrovmShellAuthTokenRequest`'s body members. `microvmIdentifier` is a URI
+/// parameter and so is not in the body.
+///
+/// # There is no `allowedPorts` here, and its absence is the model's
+///
+/// The request declares exactly two members and one of them is in the URI. The shell is
+/// not a port: the token it mints opens the endpoint's single PTY session, not a route to
+/// a listener, which is why nothing in this shape can name a port (`docs/PLATFORM.md`,
+/// measured 2026-08-15).
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateShellAuthTokenWire {
+    /// Maximum 60 minutes, the same service ceiling the ordinary proxy token has —
+    /// the two JWEs carry the identical protected header and differ only by payload.
+    pub expiration_in_minutes: u32,
+}
+
 /// `PortSpecification`, the model's tagged union: one port, a range, or all of them.
 ///
 /// A union rather than the single-field struct this was, and the change is a defect fix
@@ -932,6 +949,18 @@ pub struct MicrovmResponseWire {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CreateAuthTokenResponseWire {
+    pub auth_token: std::collections::BTreeMap<String, String>,
+}
+
+/// `CreateMicrovmShellAuthTokenResponse`.
+///
+/// Its own transcription rather than a reuse of [`CreateAuthTokenResponseWire`], because
+/// the model declares it as its own shape — the two happen to carry one identical member
+/// (`authToken`, a `TokenParts` map whose `X-aws-proxy-auth` key is the credential), and a
+/// shared struct would silently bind this client to the coincidence holding forever.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateShellAuthTokenResponseWire {
     pub auth_token: std::collections::BTreeMap<String, String>,
 }
 

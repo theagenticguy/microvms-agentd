@@ -276,6 +276,12 @@ pub fn merge_config(
     report("autoResume", json!(auto_resume.value), auto_resume.source);
     merged.auto_resume = auto_resume.value;
 
+    // `--shell` is SetTrue like `--egress` and merges the same way. A project whose
+    // workflow is `run --keep` then `shell` turns it on in the file once.
+    let shell = crate::config::pick(args.shell, args.shell, config.shell);
+    report("shell", json!(shell.value), shell.source);
+    merged.shell = shell.value;
+
     // The region: a config value joins the flag chain *above* the environment, because the
     // file is project state and the environment is machine state. The closed set only —
     // the loader already refused an unlisted name with the flag's own remedy (and doctor
@@ -985,6 +991,9 @@ async fn launch_and_exec<O: std::io::Write, E: std::io::Write>(
     }
     if args.egress {
         request = request.with_egress();
+    }
+    if args.shell {
+        request = request.with_shell();
     }
 
     ctx.out.progress("launching");

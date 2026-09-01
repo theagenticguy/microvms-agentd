@@ -423,6 +423,9 @@ async fn handle<O: std::io::Write, E: std::io::Write>(
         // ending rather than an abort.
         Command::Tunnel(args) => commands::attached::tunnel(ctx, args, interrupt).await,
         Command::PortForward(args) => commands::attached::port_forward(ctx, args, interrupt).await,
+        // No interrupt: the terminal is raw for the session, so Ctrl-C is a keystroke
+        // delivered to the guest shell rather than a signal this process ever sees.
+        Command::Shell(args) => commands::attached::shell(ctx, args).await,
         Command::Suspend(args) => commands::lifecycle::suspend(ctx, args).await,
         Command::Resume(args) => commands::lifecycle::resume(ctx, args).await,
         Command::Terminate(args) => commands::lifecycle::terminate(ctx, args).await,

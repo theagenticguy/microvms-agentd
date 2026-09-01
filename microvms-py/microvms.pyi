@@ -961,7 +961,7 @@ class Sandbox:
         token survived the freeze, and re-delivering it would hit the daemon's one-shot
         bootstrap and be refused — a 409 that reads like a broken VM.
         """
-    def run(self, /, *, image_identifier: str |None = None, image_version: str |None = None, execution_role_arn: str |None = None, agent_token: str |None = None, launch_env: dict[str, str] |None = None, egress: bool = False, max_idle_sec: int |None = None, suspended_sec: int |None = None, auto_resume: bool = False, max_duration_sec: int |None = None, ready_timeout: float |None = None, token_scope: str |None = None) -> Session:
+    def run(self, /, *, image_identifier: str |None = None, image_version: str |None = None, execution_role_arn: str |None = None, agent_token: str |None = None, launch_env: dict[str, str] |None = None, egress: bool = False, shell: bool = False, max_idle_sec: int |None = None, suspended_sec: int |None = None, auto_resume: bool = False, max_duration_sec: int |None = None, ready_timeout: float |None = None, token_scope: str |None = None) -> Session:
         """
         Launches a MicroVM, waits for RUNNING, and returns its session.
         

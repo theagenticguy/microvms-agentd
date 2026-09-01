@@ -58,11 +58,15 @@ serde_json = "1"
 # entry carries no runtime feature). `signal` is CLI-6's interrupt: `ctrl_c()` is a
 # future the launch path selects against, which is what makes the guard testable
 # without sending a real signal to a test process.
+# `io-std` is `shell`'s: the PTY passthrough reads raw keystrokes from stdin and
+# writes terminal bytes to stdout as async streams, and tokio's wrappers are the
+# maintained way to do that without hand-rolling a blocking-thread pump.
 tokio = { version = "1.53", features = [
     "rt-multi-thread",
     "macros",
     "signal",
     "time",
+    "io-std",
 ] }
 # The project config file (`microvm.toml`, issue #73). Parse-only in practice:
 # `toml::from_str` into a serde struct with `deny_unknown_fields`, so a typo'd key is

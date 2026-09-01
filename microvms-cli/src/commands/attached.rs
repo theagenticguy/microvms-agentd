@@ -1550,6 +1550,200 @@ pub async fn tunnel<O: std::io::Write, E: std::io::Write>(
     Ok(Rendered::ok(kind, data, text, dense))
 }
 
+// ── shell ───────────────────────────────────────────────────────────────────
+
+/// How often the shell session re-reads the terminal size, to turn a window drag into a
+/// resize control frame.
+///
+/// A poll rather than SIGWINCH, deliberately: the signal is Unix-only and this binary
+/// ships on Windows, the size read is one cheap ioctl, and a poll cannot race the raw
+/// stdin reader the way an event stream consuming stdin would. Half a second is far
+/// below how long a human takes to finish dragging a window.
+const RESIZE_POLL_INTERVAL: Duration = Duration::from_millis(500);
+
+/// Puts the local terminal into raw mode and guarantees it comes back.
+///
+/// A drop guard rather than paired calls, because every early return between the two —
+/// a dropped connection, a `?` on a core error — would otherwise leave the caller's
+/// terminal eating its own keystrokes. `enable` failing is not an error: a piped stdin
+/// has no terminal to make raw, and the session still works line-buffered.
+struct RawModeGuard {
+    enabled: bool,
+}
+
+impl RawModeGuard {
+    fn enable() -> Self {
+        Self {
+            enabled: ratatui::crossterm::terminal::enable_raw_mode().is_ok(),
+        }
+    }
+}
+
+impl Drop for RawModeGuard {
+    fn drop(&mut self) {
+        if self.enabled {
+            let _ = ratatui::crossterm::terminal::disable_raw_mode();
+        }
+    }
+}
+
+/// The local terminal's size, or `(0, 0)` when there is no terminal to ask.
+///
+/// `(0, 0)` is what core's `resize_frame` refuses to send, so a piped invocation simply
+/// never resizes — the guest keeps its size-unknown default, which is the honest state.
+fn local_terminal_size() -> (u16, u16) {
+    ratatui::crossterm::terminal::size().unwrap_or((0, 0))
+}
+
+/// Opens an interactive PTY in a running MicroVM and pumps raw terminal bytes until the
+/// shell exits or this side hangs up.
+///
+/// # The order of operations is the safety story
+///
+/// Resolve (zero AWS calls), then mint through the control-plane door, then — only once
+/// there is a session to run — raw mode. A refusal at the mint (the common failure: a VM
+/// launched without `run --shell` answers with a ValidationException naming
+/// `SHELL_INGRESS`) therefore never touches the caller's terminal.
+///
+/// # No interrupt parameter, deliberately
+///
+/// In raw mode Ctrl-C is a `0x03` byte on stdin, delivered to the guest shell as SIGINT
+/// — which is the whole point of a PTY. Leaving is `exit` or Ctrl-D, and closing stdin
+/// ends the session cleanly.
+///
+/// # This command's exit code says nothing about commands run inside the shell
+///
+/// The protocol has no exit-status channel (docs/PLATFORM.md, 2026-08-15): the shell's
+/// exit is a WebSocket close, and a caller who needs a command's status asks the shell
+/// (`echo $?`). Reporting one here would be inventing data.
+pub async fn shell<O: std::io::Write, E: std::io::Write>(
+    ctx: &mut Ctx<'_, O, E>,
+    args: &crate::cli::ShellArgs,
+) -> Result<Rendered, CliError> {
+    use microvms_core::session::shell as core_shell;
+
+    // Which VM, resolved locally — the same name-or-explicit precedence `attach` has,
+    // minus the agent token the shell never sends.
+    let (endpoint, microvm_id, region) = if let Some(name) = &args.name {
+        let root = state_dir(args.state_dir.clone(), ctx.env);
+        let names = crate::ledger::Names::new(&root);
+        let Some(record) = names.lookup(name) else {
+            return Err(CliError::new(
+                Exit::Precondition,
+                format!(
+                    "no VM named {name:?} in {}. Names are local: `run --keep --vm-name \
+                     {name}` registers one here, and a name registered on another machine \
+                     lives in that machine's state directory.",
+                    root.join("names").display(),
+                ),
+            )
+            .suggest("`microvm ls` shows this state directory's outstanding runs")
+            .suggest("pass --endpoint and --microvm-id directly"));
+        };
+        let region = if args.region.region.is_some() || args.region.unlisted_region.is_some() {
+            args.region.resolve(ctx.env)?
+        } else {
+            microvms_core::Region::unlisted(&record.region)
+        };
+        (record.endpoint, record.microvm_id, region)
+    } else {
+        let expect = |value: &Option<String>, flag: &str| -> Result<String, CliError> {
+            value.clone().ok_or_else(|| {
+                // Unreachable through the parser (`required_unless_present = "name"`),
+                // but the struct is constructible in code and a message beats a panic.
+                CliError::new(
+                    Exit::InvalidArg,
+                    format!("--{flag} is required unless --name is given"),
+                )
+            })
+        };
+        (
+            expect(&args.endpoint, "endpoint")?,
+            expect(&args.microvm_id, "microvm-id")?,
+            args.region.resolve(ctx.env)?,
+        )
+    };
+
+    // The mint, through the control-plane door. This is where a VM launched without
+    // `run --shell` fails, with the service naming the missing connector — before raw
+    // mode, before any terminal state is touched.
+    let plane = ctx.seam.control_plane(region).await?;
+    let token = plane.mint_shell_auth_token(&microvm_id).await?;
+
+    ctx.out.progress(&format!(
+        "shell to {microvm_id} — leave with `exit` or Ctrl-D; Ctrl-C goes to the guest"
+    ));
+
+    // The size feed: current value now (sent as the session's first control frame —
+    // the guest believes the terminal is 0x0 until told otherwise), then a poll that
+    // publishes only actual changes, so the watch channel wakes the relay only when a
+    // resize frame is genuinely due.
+    let (size_tx, size_rx) = tokio::sync::watch::channel(local_terminal_size());
+    let poller = tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(RESIZE_POLL_INTERVAL).await;
+            let size = local_terminal_size();
+            size_tx.send_if_modified(|current| {
+                if *current == size {
+                    false
+                } else {
+                    *current = size;
+                    true
+                }
+            });
+        }
+    });
+
+    // Raw mode last, so every failure above leaves the terminal untouched; the guard
+    // restores it on every path out, early `?` returns included.
+    let raw = RawModeGuard::enable();
+    let outcome = core_shell::run_shell(
+        tokio::io::stdin(),
+        tokio::io::stdout(),
+        &endpoint,
+        token.value(),
+        size_rx,
+    )
+    .await;
+    drop(raw);
+    poller.abort();
+    let outcome = outcome?;
+
+    let (end, close_reason) = match outcome.end {
+        core_shell::ShellEnd::Exited { reason } => ("shell-exited", reason),
+        core_shell::ShellEnd::LocalClosed => ("local-closed", String::new()),
+        core_shell::ShellEnd::Disconnected { code, reason } => {
+            let said = if reason.is_empty() {
+                String::new()
+            } else {
+                format!(", reason {reason:?}")
+            };
+            return Err(CliError::new(
+                Exit::Platform,
+                format!(
+                    "the shell session ended without the shell exiting: close code \
+                     {code}{said}. 1006 with no reason is what every endpoint-proxy \
+                     failure collapses to — a dropped connection, or a VM that suspended \
+                     or terminated mid-session."
+                ),
+            )
+            .suggest("`microvm health` against the same VM says whether it is still up")
+            .suggest("a suspended VM resumes with `microvm resume`; then open a new shell"));
+        }
+    };
+
+    let mut data = Map::new();
+    data.insert("microvmId".into(), json!(microvm_id));
+    data.insert("sessionId".into(), json!(outcome.session_id));
+    data.insert("end".into(), json!(end));
+    data.insert("closeReason".into(), json!(close_reason));
+
+    let text = format!("shell to {microvm_id} ended: {end}");
+    let dense = format!("shell {microvm_id} end={end}");
+    let (kind, _) = response_type("shell");
+    Ok(Rendered::ok(kind, data, text, dense))
+}
+
 /// Re-exported so [`ErrorKind`] is nameable in this module's documentation.
 #[allow(unused_imports, reason = "named in the documentation above")]
 use ErrorKind as _DocsOnly;

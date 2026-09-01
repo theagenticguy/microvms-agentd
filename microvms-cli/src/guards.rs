@@ -252,6 +252,7 @@ fn aws_commands(binary: &std::path::Path) -> Vec<(&'static str, Command, Door)> 
                 log_group: None,
                 log_stream: None,
                 egress: false,
+                shell: false,
                 launch_env: Vec::new(),
                 user: None,
                 group: None,
@@ -393,6 +394,22 @@ fn aws_commands(binary: &std::path::Path) -> Vec<(&'static str, Command, Door)> 
                 region: region_flags(),
             }),
             Door::AttachSession,
+        ),
+        (
+            // The shell's door is the control plane — its credential is a fresh
+            // `CreateMicrovmShellAuthToken` mint per session, not the agent token — and
+            // the door fails before raw mode is ever enabled, which is also what this
+            // row proves: a guard entry that put the test harness's terminal into raw
+            // mode would be a guard nobody could read the output of.
+            "shell",
+            Command::Shell(crate::cli::ShellArgs {
+                endpoint: Some("vm-guard.example.aws".into()),
+                microvm_id: Some("mvm-1".into()),
+                name: None,
+                state_dir: Some(std::env::temp_dir().join("microvm-guard-history")),
+                region: region_flags(),
+            }),
+            Door::ControlPlane,
         ),
         (
             "suspend",
@@ -875,6 +892,7 @@ fn run_args_for_image(identifier: &str, state_dir: std::path::PathBuf) -> RunArg
         log_group: None,
         log_stream: None,
         egress: false,
+        shell: false,
         launch_env: Vec::new(),
         user: None,
         group: None,
