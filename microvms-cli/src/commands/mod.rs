@@ -105,7 +105,7 @@ pub struct Ctx<'a, O: Write, E: Write> {
 /// command added without an entry fails rather than shipping undescribed. That check is the
 /// only thing that keeps this table from being the hand-maintained artifact the manifest is
 /// forbidden to be.
-pub const RESPONSE_TYPES: [(&str, &str, &[&str]); 22] = [
+pub const RESPONSE_TYPES: [(&str, &str, &[&str]); 23] = [
     (
         "run",
         "microvm.run",
@@ -238,6 +238,28 @@ pub const RESPONSE_TYPES: [(&str, &str, &[&str]); 22] = [
         "cp",
         "microvm.copy",
         &["direction", "bytes", "local", "remote", "tar"],
+    ),
+    (
+        "sync",
+        "microvm.sync",
+        &[
+            "microvmId",
+            "workdir",
+            // Bytes and members that actually travelled. Zero on an unchanged tree —
+            // issue #71's acceptance line, visible in the envelope rather than implied.
+            "uploadedBytes",
+            "uploadedMembers",
+            // Locally-vanished paths removed in the guest this invocation.
+            "deleted",
+            // No guest manifest existed (or --full ignored it): the whole tree travelled.
+            "full",
+            // The manifest already matched; nothing travelled at all.
+            "unchanged",
+            // Sync passes performed: 1 without --watch, one per debounced change batch
+            // with it. The watch totals above are sums across all of them.
+            "passes",
+            "watched",
+        ],
     ),
     (
         "tunnel",

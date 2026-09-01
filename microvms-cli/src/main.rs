@@ -426,6 +426,10 @@ async fn handle<O: std::io::Write, E: std::io::Write>(
         Command::Ack(args) => commands::attached::ack(ctx, args).await,
         Command::Stdin(args) => commands::attached::stdin(ctx, args).await,
         Command::Cp(args) => commands::attached::cp(ctx, args).await,
+        // The third command that takes the interrupt, and like the other two it is the
+        // expected ending rather than an abort: `sync --watch` runs until the caller
+        // stops it, and Ctrl-C resolves into the summary envelope.
+        Command::Sync(args) => commands::attached::sync(ctx, args, interrupt).await,
         // The second command that races the interrupt, and the only one for which the
         // interrupt is the *expected* ending rather than an abort: a tunnel runs until the
         // caller stops it. See `attached::port_forward` on why that exits 0.

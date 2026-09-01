@@ -98,6 +98,14 @@ unicode-width = "0.2"
 # way core's artifact hash does — sha2 0.11's output type carries no LowerHex impl.
 sha2 = "0.11"
 const-hex = "1.19"
+# `sync --watch` (issue #71): filesystem events for the live edit loop. The
+# cross-platform watcher the ecosystem settled on (inotify/FSEvents/ReadDirectory-
+# ChangesW behind one API) — hand-rolling any one of those would be a platform's
+# worth of edge cases for one flag. NOT a second path to AWS: it watches the local
+# tree, and the bytes still travel through `microvms-core`'s session like every
+# other upload. Correctness never depends on its event stream — every event only
+# triggers a re-hash, and the hash compare is what decides whether bytes move.
+notify = "8"
 
 # ── the fast install path (issue #76) ───────────────────────────────────────
 #
