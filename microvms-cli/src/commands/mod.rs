@@ -105,7 +105,7 @@ pub struct Ctx<'a, O: Write, E: Write> {
 /// command added without an entry fails rather than shipping undescribed. That check is the
 /// only thing that keeps this table from being the hand-maintained artifact the manifest is
 /// forbidden to be.
-pub const RESPONSE_TYPES: [(&str, &str, &[&str]); 21] = [
+pub const RESPONSE_TYPES: [(&str, &str, &[&str]); 22] = [
     (
         "run",
         "microvm.run",
@@ -266,6 +266,24 @@ pub const RESPONSE_TYPES: [(&str, &str, &[&str]); 21] = [
             "upgrades",
             "proxyTokenMints",
             "interrupted",
+        ],
+    ),
+    (
+        "shell",
+        "microvm.shell",
+        &[
+            "microvmId",
+            // From the platform's session_init greeting; null when the stream started
+            // without one.
+            "sessionId",
+            // How the session ended: "shell-exited" (the platform closed 1000) or
+            // "local-closed" (this side's stdin reached EOF). A disconnect is an error
+            // envelope instead. Deliberately NOT a command exit status — the shell
+            // protocol has no exit-status channel, and inventing one here would be a lie
+            // an agent would branch on.
+            "end",
+            // The platform's close reason on a clean exit ("shell exited"), else empty.
+            "closeReason",
         ],
     ),
     ("suspend", "microvm.state", &["microvmId", "state"]),

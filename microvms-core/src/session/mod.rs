@@ -34,6 +34,7 @@ pub mod files;
 pub mod forward;
 pub mod http;
 pub mod proxy;
+pub mod shell;
 pub mod sse;
 pub mod tunnel;
 

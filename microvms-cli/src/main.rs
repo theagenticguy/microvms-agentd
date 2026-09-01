@@ -147,7 +147,17 @@ fn main() -> ExitCode {
         }
     };
 
-    runtime.block_on(run(&mut out, parsed))
+    let code = runtime.block_on(run(&mut out, parsed));
+    // `shutdown_background` rather than an implicit drop: `shell` always leaves a blocking
+    // stdin read in flight when the session ends (tokio's `io::Stdin` reads on a blocking
+    // thread that cannot be cancelled), and dropping the runtime joins that thread — the
+    // process would print the session's end and then hang until the user pressed Enter.
+    // Every destructor inside `run` has already fired by this line, so nothing is skipped;
+    // the orphaned reader thread dies with the process. Verified by repro 2026-08-31: with
+    // a pending stdin read, `drop(runtime)` hangs until the pipe closes and
+    // `shutdown_background()` returns immediately.
+    runtime.shutdown_background();
+    code
 }
 
 /// Runs one parsed invocation.
@@ -423,6 +433,9 @@ async fn handle<O: std::io::Write, E: std::io::Write>(
         // ending rather than an abort.
         Command::Tunnel(args) => commands::attached::tunnel(ctx, args, interrupt).await,
         Command::PortForward(args) => commands::attached::port_forward(ctx, args, interrupt).await,
+        // No interrupt: the terminal is raw for the session, so Ctrl-C is a keystroke
+        // delivered to the guest shell rather than a signal this process ever sees.
+        Command::Shell(args) => commands::attached::shell(ctx, args).await,
         Command::Suspend(args) => commands::lifecycle::suspend(ctx, args).await,
         Command::Resume(args) => commands::lifecycle::resume(ctx, args).await,
         Command::Terminate(args) => commands::lifecycle::terminate(ctx, args).await,

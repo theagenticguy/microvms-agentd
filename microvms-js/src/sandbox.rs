@@ -324,6 +324,9 @@ pub struct RunOptions {
     pub launch_env: Option<std::collections::HashMap<String, String>>,
     /// Whether to request the egress connector. Off means no outbound network.
     pub egress: Option<bool>,
+    /// Whether to launch shell-capable: the ingress set becomes the measured pair
+    /// `[HTTP_INGRESS, SHELL_INGRESS]`, which is what `microvm shell` attaches to.
+    pub shell: Option<bool>,
     pub max_idle_sec: Option<u32>,
     /// The window a resume is refused past (STATE-12). Exists **only** in the launch request:
     /// `GetMicrovm` does not return it, so this client is the only party that can name it.
@@ -546,6 +549,7 @@ impl Sandbox {
             // binding-level verify API exists to consume the material.
             identity: defaults.identity,
             egress: options.egress.unwrap_or(defaults.egress),
+            shell: options.shell.unwrap_or(defaults.shell),
             max_idle_sec: options.max_idle_sec.unwrap_or(defaults.max_idle_sec),
             suspended_sec: options.suspended_sec.unwrap_or(defaults.suspended_sec),
             auto_resume: options.auto_resume.unwrap_or(defaults.auto_resume),

@@ -6,6 +6,28 @@ Versions are [semantic](https://semver.org/spec/v2.0.0.html); the wire contract 
 
 ## Unreleased
 
+### Added
+
+- **`microvm shell` — an interactive PTY into a running VM (#69).** A thin
+  client over the platform's shell WebSocket (Option B): `session_init`, then
+  binary terminal bytes both ways, resize as a validated JSON control frame,
+  close code 1000 as the clean end. No exit-status channel exists on the wire,
+  so the command reports transport facts and never fakes an exit code. Control
+  frames are validated client-side before sending, because the server injects
+  unrecognized control frames into the shell as literal keystrokes.
+- **`run --shell` and the `shell` `microvm.toml` key.** A launch that wants a
+  shell requests the measured `[HTTP_INGRESS, SHELL_INGRESS]` connector pair
+  (replacing `ALL_INGRESS`, which the platform refuses to combine with finer
+  ingress). The Python and JS SDKs gain the matching `shell` parameter.
+- **Connector variants `HTTP_INGRESS` and `SHELL_INGRESS` (#114).** Requested
+  sets are validated client-side before anything launches or bills:
+  `ALL_INGRESS` cannot combine with finer ingress, and `SHELL_INGRESS` without
+  `HTTP_INGRESS` is refused.
+- **`run --auto-resume` (#68).** The platform resumes a suspended VM on an
+  incoming request; flag, `auto-resume` toml key, and wire field
+  `idlePolicy.autoResumeEnabled`. Its idle-timer interaction ships as a
+  live-conformance scenario pending its first run.
+
 ### Changed
 
 - **`microvm logs` succeeds with the working read command (#79).** The command

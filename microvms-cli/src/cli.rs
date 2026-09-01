@@ -179,6 +179,18 @@ pub enum Command {
     /// second layer.
     PortForward(PortForwardArgs),
 
+    /// Open an interactive root shell in a running MicroVM — a real PTY, with job
+    /// control, signals, and resize.
+    ///
+    /// The VM must have been launched with `run --shell` (the `SHELL_INGRESS` connector
+    /// cannot be added later). The terminal goes raw for the session, so Ctrl-C reaches
+    /// the guest as SIGINT instead of ending this command; leave with `exit` or Ctrl-D.
+    /// The session's raw bytes are this command's output, and the envelope follows them
+    /// — the same stdout exception `exec --stream` documents. There is no exit-status
+    /// channel: this command's exit code is about the transport, and a command's status
+    /// inside the shell is the shell's to answer (`echo $?`).
+    Shell(ShellArgs),
+
     /// Freeze a MicroVM. It keeps its memory, filesystem, token, and endpoint.
     ///
     /// A freeze and restore, not a stop and start — measured, not assumed. A suspended 2 GB
@@ -645,6 +657,15 @@ pub struct RunArgs {
     #[arg(long)]
     pub egress: bool,
 
+    /// Launch shell-capable, so `microvm shell` can attach later.
+    ///
+    /// Requests the ingress pair `[HTTP_INGRESS, SHELL_INGRESS]` instead of
+    /// `ALL_INGRESS` — the one combination measured to both launch and mint a shell
+    /// token. Shell access cannot be added to a running VM; a VM launched without this
+    /// answers `microvm shell` with a ValidationException naming the connector.
+    #[arg(long)]
+    pub shell: bool,
+
     /// Set one launch-environment variable for every exec in the VM, as KEY=VALUE.
     /// Repeatable.
     ///
@@ -1092,6 +1113,41 @@ pub struct TunnelArgs {
 
     #[command(flatten)]
     pub attach: AttachFlags,
+
+    #[command(flatten)]
+    pub region: RegionFlags,
+}
+
+/// `shell`'s arguments: which VM, spelled as a name or as endpoint + id.
+///
+/// Not [`AttachFlags`], deliberately: the shell never talks to the daemon, so demanding
+/// `--agent-token` on the explicit spelling would require a credential this command
+/// never sends. The shell's credential is minted fresh per session from the MicroVM id
+/// (`CreateMicrovmShellAuthToken` via the control plane), which is why `--microvm-id`
+/// and the region are what the explicit spelling needs.
+#[derive(Args, Debug)]
+pub struct ShellArgs {
+    /// The VM's endpoint, as reported by `run`.
+    #[arg(long, required_unless_present = "name")]
+    pub endpoint: Option<String>,
+
+    /// The MicroVM id, needed to mint the shell token.
+    #[arg(long, required_unless_present = "name")]
+    pub microvm_id: Option<String>,
+
+    /// The name `run --keep --vm-name` registered, standing in for endpoint and id.
+    ///
+    /// Resolved through the local name registry with zero AWS calls, exactly as the
+    /// attached commands resolve it. Conflicts with the explicit pair, because a name
+    /// *is* the pair and a caller supplying both is two answers to "which VM".
+    #[arg(long, value_name = "NAME", conflicts_with_all = ["endpoint", "microvm_id"])]
+    pub name: Option<String>,
+
+    /// Where the local state lives — the name registry. Defaults to
+    /// $MICROVM_STATE_DIR or ~/.microvm/runs, the same resolution the attached
+    /// commands use.
+    #[arg(long)]
+    pub state_dir: Option<PathBuf>,
 
     #[command(flatten)]
     pub region: RegionFlags,
@@ -1664,13 +1720,14 @@ mod tests {
         assert!(big.contains("65535"), "{big}");
     }
 
-    /// Twenty subcommands, named as the manifest and the response table name them.
+    /// Twenty-two subcommands, named as the manifest and the response table name them.
     ///
-    /// The seven after `exec` are the attached block — `health`, `ack`, `stdin`, `cp`, `tunnel`,
-    /// and `port-forward` beside it — and their position is asserted rather than incidental, because
-    /// `--help`'s reading order is the only documentation of which commands need the identifier
-    /// triple. `history` sits beside `ls` because both are local reads of this machine's own
-    /// state directory.
+    /// The block after `exec` is the attached one — `health`, `ack`, `stdin`, `cp`, `tunnel`,
+    /// `port-forward`, and `shell` beside it — and their position is asserted rather than incidental,
+    /// because `--help`'s reading order is the only documentation of which commands need the
+    /// identifier triple (`shell` sits with them because it addresses a running VM, though its
+    /// credential is the minted shell token rather than the agent token). `history` sits beside
+    /// `ls` because both are local reads of this machine's own state directory.
     #[test]
     fn the_tree_registers_the_lifecycle_commands_the_attached_block_and_the_local_ones() {
         let registered: Vec<String> = Cli::command()
@@ -1690,6 +1747,7 @@ mod tests {
                 "cp",
                 "tunnel",
                 "port-forward",
+                "shell",
                 "suspend",
                 "resume",
                 "terminate",

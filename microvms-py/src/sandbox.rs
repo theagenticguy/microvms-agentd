@@ -601,6 +601,7 @@ impl PySandbox {
         agent_token=None,
         launch_env=None,
         egress=false,
+        shell=false,
         max_idle_sec=None,
         suspended_sec=None,
         auto_resume=false,
@@ -633,6 +634,7 @@ impl PySandbox {
         // parameter is a compile error.
         launch_env: Option<std::collections::HashMap<String, String>>,
         egress: bool,
+        shell: bool,
         max_idle_sec: Option<u32>,
         suspended_sec: Option<u32>,
         auto_resume: bool,
@@ -656,6 +658,7 @@ impl PySandbox {
             // binding-level verify API exists to consume the material.
             identity: defaults.identity,
             egress,
+            shell,
             max_idle_sec: max_idle_sec.unwrap_or(defaults.max_idle_sec),
             suspended_sec: suspended_sec.unwrap_or(defaults.suspended_sec),
             auto_resume,
