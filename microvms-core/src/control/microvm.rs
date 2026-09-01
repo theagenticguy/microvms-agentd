@@ -430,6 +430,26 @@ impl ControlPlane {
             ));
         }
 
+        // The other half of the same measured constraint: the pair that launches and
+        // mints a shell token is `[HTTP_INGRESS, SHELL_INGRESS]`. A shell-only ingress
+        // set has no measured success path, and the platform accepts an invalid set at
+        // launch — so it too is refused here, before anything launches or bills.
+        let has_shell_ingress = request
+            .connectors
+            .contains(&super::ConnectorIntent::ShellIngress);
+        let has_http_ingress = request
+            .connectors
+            .contains(&super::ConnectorIntent::HttpIngress);
+        if has_shell_ingress && !has_http_ingress {
+            return Err(Error::invalid_arg(
+                "SHELL_INGRESS was requested without HTTP_INGRESS. The measured pair that \
+                 launches and mints a shell token is [HTTP_INGRESS, SHELL_INGRESS] \
+                 (docs/PLATFORM.md); the platform accepts an invalid ingress set at launch \
+                 and the VM runs and bills before any failure appears — so it is refused \
+                 here.",
+            ));
+        }
+
         // Ingress and egress go in separate members, so they are split by intent rather
         // than concatenated into one list.
         let ingress: Vec<String> = request
@@ -1755,6 +1775,42 @@ mod tests {
                 .to_string()
                 .contains("HTTP_INGRESS and/or SHELL_INGRESS"),
             "the refusal names the pair that works: {error}"
+        );
+        assert_eq!(
+            fake.call_count("RunMicrovm"),
+            0,
+            "nothing launched, so nothing billed"
+        );
+    }
+
+    /// **W1, measured constraint 1, second half.** `SHELL_INGRESS` without `HTTP_INGRESS`
+    /// is the same launches-bills-fails-late shape as `ALL_INGRESS` plus a finer connector:
+    /// the measured pair that launches and mints a shell token is `[HTTP_INGRESS,
+    /// SHELL_INGRESS]` (`docs/PLATFORM.md`), no measurement says a shell-only ingress set
+    /// even mints, and the platform accepts an invalid set at launch — the VM reaches
+    /// RUNNING and bills before any refusal appears. Refused here instead, before the wire.
+    ///
+    /// **Falsification** — run 2026-08-31. This test was written before the guard clause
+    /// existed and failed on both assertions (`run_microvm` reached the wire and launched);
+    /// adding the shell-without-HTTP refusal in `run_microvm` turned it green.
+    #[tokio::test]
+    async fn shell_ingress_without_http_ingress_is_refused_before_the_wire() {
+        let (plane, fake, _) = planted();
+
+        let payload = RunHookPayload::for_agent_token("agent-token").expect("fits");
+        let mut request = RunMicrovmRequest::new("arn:image", payload);
+        request.connectors = vec![
+            super::super::ConnectorIntent::ShellIngress,
+            super::super::ConnectorIntent::Egress,
+        ];
+        let error = plane
+            .run_microvm(request)
+            .await
+            .expect_err("shell ingress without HTTP ingress is refused locally");
+
+        assert!(
+            error.to_string().contains("HTTP_INGRESS"),
+            "the refusal names the missing connector: {error}"
         );
         assert_eq!(
             fake.call_count("RunMicrovm"),
