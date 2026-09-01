@@ -1,0 +1,16 @@
+# SPDX-License-Identifier: Apache-2.0
+# Project config for the S3-prefetch example. `run.sh` passes it with
+# `--config`, and `microvm doctor --config` validates the same file through
+# the same loader.
+
+# The demo VM only proves the prefetched tree is present, so it takes the
+# cheapest floor: a 512 MiB minimum under the always-present 4x ceiling.
+# Size your real workload's memory on its own merits — the sizing rule is
+# documented in examples/coding-agents-on-bedrock/microvm.toml.
+memory = 512
+
+# No egress, deliberately — that is the demonstration. The data this VM
+# reads from /opt/prefetch arrived at image-build time and rides the
+# snapshot, so the launched VM needs no outbound network and makes no S3
+# call at all.
+egress = false
