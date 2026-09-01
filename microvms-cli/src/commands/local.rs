@@ -228,15 +228,20 @@ fn joined(value: &Value) -> String {
 ///
 /// (cli.py line numbers resolve at `git show 'c4d396e^:clients/python/src/microvms_agentd/cli.py'` — the retired oracle.)
 pub fn logs<O: std::io::Write, E: std::io::Write>(
-    _ctx: &mut Ctx<'_, O, E>,
+    ctx: &mut Ctx<'_, O, E>,
     args: &LogsArgs,
 ) -> Result<Rendered, CliError> {
+    // Resolved the same way every AWS command resolves it, and pinned into the printed
+    // command: without `--region`, the tail reads whatever region the caller's shell
+    // defaults to — ResourceNotFound at best, a same-named group in the wrong region at
+    // worst, and this command's whole product is that the printed line is runnable as-is.
+    let region = args.region.resolve(ctx.env)?;
     let group = format!(
         "{}/{}",
         microvms_core::control::image::BUILD_LOG_GROUP_PREFIX,
         args.image_name
     );
-    let tail = format!("aws logs tail {group} --since 1h --format short");
+    let tail = format!("aws logs tail {group} --since 1h --format short --region {region}");
     let requires = "AWS CLI v2 — aws logs tail does not exist in v1 (verified present in \
                     2.35.7)";
 
@@ -590,9 +595,11 @@ mod tests {
             Value::Null,
             "an empty array would read as 'the group has no events'"
         );
-        // The working command, verbatim and runnable, in the payload and both renderings.
+        // The working command, verbatim and runnable, in the payload and both renderings —
+        // region-pinned, so it reads the same group this invocation resolved rather than
+        // whatever region the caller's shell happens to default to.
         let tail = "aws logs tail /aws/lambda-microvms/agentd-conformance --since 1h \
-                    --format short";
+                    --format short --region us-east-1";
         assert_eq!(rendered.data["tailCommand"], tail);
         assert!(rendered.text.contains(tail), "{}", rendered.text);
         assert!(
@@ -664,6 +671,46 @@ mod tests {
             rendered.text
         );
         assert!(rendered.text.contains("/<16 hex>"), "{}", rendered.text);
+    }
+
+    /// **The tail command is pinned to the resolved region, not the shell's default.**
+    ///
+    /// `--region` on `logs` resolves through the same [`crate::cli::RegionFlags::resolve`]
+    /// every AWS command uses, and the resolved name lands in `tailCommand`. Without the
+    /// pin, `microvm logs my-image --region eu-west-1` would hand back a command that reads
+    /// whatever region the caller's shell defaults to — ResourceNotFound at best, a
+    /// same-named group's logs from the wrong region at worst.
+    ///
+    /// **Falsification** — run 2026-08-31. Written while `logs` still discarded its `Ctx`
+    /// and never read `args.region`; both assertions failed (no `--region` in the command),
+    /// and resolving the region in `logs` turned it green.
+    #[test]
+    fn logs_pins_the_tail_command_to_the_resolved_region() {
+        let mut out = Output::new(Format::Plain, false, Vec::new(), Vec::new());
+        let env = |_: &str| None;
+        let seam = crate::seam::PanickingSeam;
+        let mut context = ctx(&mut out, &seam, &env);
+        let rendered = logs(
+            &mut context,
+            &LogsArgs {
+                image_name: "agentd-conformance".to_string(),
+                region: crate::cli::RegionFlags {
+                    region: Some(crate::cli::RegionArg::EuWest1),
+                    unlisted_region: None,
+                },
+            },
+        )
+        .expect("a resolvable region is a success");
+
+        let tail = rendered.data["tailCommand"].as_str().expect("a command");
+        assert!(
+            tail.ends_with("--region eu-west-1"),
+            "the flag's region is the command's region: {tail}"
+        );
+        assert!(
+            !tail.contains("us-east-1"),
+            "the default did not leak past an explicit flag: {tail}"
+        );
     }
 
     /// `constants` emits the bare object as its text rendering, keyed for the drift gate.
