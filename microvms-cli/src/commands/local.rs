@@ -31,10 +31,19 @@ pub fn ls<O: std::io::Write, E: std::io::Write>(
 
     let mut data = Map::new();
     data.insert("runs".into(), json!(runs));
+    // Null rather than absent, the `run` envelope's `sync`/`agentd` precedent: the
+    // key an agent branches on exists on every `microvm.runs` envelope, and null is
+    // how a plain `ls` says "this was one read, not a watch".
+    data.insert("watch".into(), Value::Null);
     let (kind, _) = response_type("ls");
+    let dense = runs_dense(&runs);
+    let text = runs_text(&runs);
+    Ok(Rendered::ok(kind, data, text, dense))
+}
 
-    let dense = runs
-        .iter()
+/// The tab-separated rendering of the ledger's runs, one row each.
+fn runs_dense(runs: &[Value]) -> String {
+    runs.iter()
         .map(|run| {
             format!(
                 "{}\t{}\t{}",
@@ -44,27 +53,148 @@ pub fn ls<O: std::io::Write, E: std::io::Write>(
             )
         })
         .collect::<Vec<_>>()
-        .join("\n");
-    let text = if runs.is_empty() {
-        "nothing outstanding".to_string()
-    } else {
-        runs.iter()
-            .map(|run| {
-                format!(
-                    "{}  microvm={} image={} leaked={}",
-                    run["runId"].as_str().unwrap_or_default(),
-                    run["microvmId"].as_str().unwrap_or("-"),
-                    run["imageIdentifier"].as_str().unwrap_or("-"),
-                    if joined(&run["leaked"]).is_empty() {
-                        "-".to_string()
-                    } else {
-                        joined(&run["leaked"])
-                    },
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
+        .join("\n")
+}
+
+/// The human rendering of the ledger's runs, or the empty-ledger sentence.
+fn runs_text(runs: &[Value]) -> String {
+    if runs.is_empty() {
+        return "nothing outstanding".to_string();
+    }
+    runs.iter()
+        .map(|run| {
+            format!(
+                "{}  microvm={} image={} leaked={}",
+                run["runId"].as_str().unwrap_or_default(),
+                run["microvmId"].as_str().unwrap_or("-"),
+                run["imageIdentifier"].as_str().unwrap_or("-"),
+                if joined(&run["leaked"]).is_empty() {
+                    "-".to_string()
+                } else {
+                    joined(&run["leaked"])
+                },
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// What `ls --watch` touches, and the measured trap it deliberately avoids.
+///
+/// In the *output* rather than only here, per the 0.6.0 ruling on #78: the cheapest
+/// wrong "improvement" to this command is re-pointing the loop at `/v1/health` for
+/// live state, and the person about to make it is reading the watch output, not
+/// this file.
+const WATCH_LEDGER_ONLY: &str = "watch: local ledger reads only — zero platform calls per \
+     refresh (no GetMicrovm, no /v1/health), so watching resets no idle timer, keeps no VM \
+     alive, and bills nothing. Measured for the alternative (docs/PLATFORM.md, idle-timer \
+     section): an outside /v1/health poll DOES reset the idle timer — a polled VM stayed \
+     RUNNING through 311s of a 60s window while the unpolled control suspended at 66s — so \
+     a health-polling watcher would keep every VM it watched billing. That is also why the \
+     2s default interval is safe here; state read from the ledger is what this CLI last \
+     recorded, not the platform's live word.";
+
+/// `ls --watch`: re-reads the ledger on an interval until Ctrl-C (#78).
+///
+/// # The `port-forward` shape, for the same reason
+///
+/// Snapshots are progress on stderr; the one success envelope at the end is a
+/// summary (last snapshot, refresh count, interval). A caller piping `--json` gets
+/// one envelope and nothing interleaved (CLI-4), and Ctrl-C is the expected ending
+/// of a watch the caller chose to stop — exit 0, `port-forward`'s reasoning
+/// verbatim.
+///
+/// # Why this loop is allowed to be cheap
+///
+/// [`WATCH_LEDGER_ONLY`] is the whole design: `ls` enumerates the local ledger, so
+/// a watch over it is free and its interval is a comfort knob. The measured trap it
+/// sidesteps rides in the envelope (`watch.calls`), the text, and the start-of-watch
+/// stderr line, because the output is where the next editor of this loop is looking
+/// when they reach for `/v1/health`.
+pub async fn watch<O: std::io::Write, E: std::io::Write>(
+    ctx: &mut Ctx<'_, O, E>,
+    args: &LsArgs,
+    interrupt: crate::commands::lifecycle::Interrupt<'_>,
+) -> Result<Rendered, CliError> {
+    // A busy-loop is refused, not clamped: 0.1s of silence costs nothing, and a
+    // caller who typed 0 was expressing "as fast as possible", which over a disk
+    // read is a spin.
+    if !args.interval_sec.is_finite() || args.interval_sec < 0.1 {
+        return Err(
+            crate::exit::classify(&microvms_core::Error::invalid_arg(format!(
+                "a watch interval must be a finite number of seconds, at least 0.1: {}",
+                args.interval_sec
+            )))
+            .suggest("--interval-sec was the flag; the default is 2"),
+        );
+    }
+    if args.max_refreshes == Some(0) {
+        return Err(crate::exit::classify(&microvms_core::Error::invalid_arg(
+            "a watch of zero refreshes reads nothing and reports nothing",
+        ))
+        .suggest("--max-refreshes takes 1 or more; omit it to watch until Ctrl-C"));
+    }
+
+    let root = state_dir(args.state_dir.clone(), ctx.env);
+    ctx.out.progress(WATCH_LEDGER_ONLY);
+
+    let mut interrupt = interrupt;
+    let mut refreshes: u64 = 0;
+    let mut interrupted = false;
+    let runs: Vec<Value> = loop {
+        let snapshot = ledger::read_all(&root);
+        refreshes += 1;
+        ctx.out.progress(&format!(
+            "[refresh {refreshes}] {} run(s) outstanding\n{}",
+            snapshot.len(),
+            runs_text(&snapshot),
+        ));
+        if args.max_refreshes.is_some_and(|max| refreshes >= max) {
+            break snapshot;
+        }
+        tokio::select! {
+            // Biased, `port-forward`'s reasoning: the caller pressed the key, and
+            // one more snapshot first would look like the key did nothing.
+            biased;
+            () = &mut interrupt => {
+                interrupted = true;
+                break snapshot;
+            }
+            () = tokio::time::sleep(std::time::Duration::from_secs_f64(args.interval_sec)) => {}
+        }
     };
+
+    let mut data = Map::new();
+    data.insert("runs".into(), json!(runs));
+    data.insert(
+        "watch".into(),
+        json!({
+            "refreshes": refreshes,
+            "intervalSeconds": args.interval_sec,
+            "interrupted": interrupted,
+            // Which calls the loop made, stated flatly so a consumer never has to
+            // infer it from the docs: ledger reads, and nothing on the wire.
+            "calls": {
+                "ledgerReadsPerRefresh": 1,
+                "platformCallsPerRefresh": 0,
+                "healthPollsPerRefresh": 0,
+                "resetsIdleTimer": false,
+            },
+        }),
+    );
+    let (kind, _) = response_type("ls");
+    let text = format!(
+        "{}\nwatched {refreshes} refresh(es) at {}s intervals{}\n{WATCH_LEDGER_ONLY}",
+        runs_text(&runs),
+        args.interval_sec,
+        if interrupted { ", ended by ctrl-c" } else { "" },
+    );
+    let dense = format!(
+        "{}\nwatch\t{refreshes}\t{}s\tledger-only: 0 platform calls, 0 health polls, resets \
+         no idle timer",
+        runs_dense(&runs),
+        args.interval_sec,
+    );
     Ok(Rendered::ok(kind, data, text, dense))
 }
 
@@ -457,11 +587,170 @@ mod tests {
             &mut context,
             &LsArgs {
                 state_dir: Some(std::path::PathBuf::from("/nonexistent-microvm-state")),
+                watch: false,
+                interval_sec: 2.0,
+                max_refreshes: None,
             },
         )
         .expect("ls never fails");
         assert_eq!(rendered.text, "nothing outstanding");
         assert_eq!(rendered.data["runs"], json!([]));
+        // Null, not absent: the key an agent branches on exists on every
+        // `microvm.runs` envelope, and null says "one read, not a watch".
+        assert_eq!(rendered.data["watch"], Value::Null);
+    }
+
+    /// The `LsArgs` for a watch over `dir`, bounded to `max_refreshes` snapshots.
+    fn watch_args(dir: &std::path::Path, max_refreshes: Option<u64>) -> LsArgs {
+        LsArgs {
+            state_dir: Some(dir.to_path_buf()),
+            watch: true,
+            interval_sec: 0.1,
+            max_refreshes,
+        }
+    }
+
+    /// Drives `watch` over buffers and hands back the result plus stderr.
+    async fn run_watch(
+        args: LsArgs,
+        interrupt: crate::commands::lifecycle::Interrupt<'static>,
+    ) -> (Result<Rendered, crate::exit::CliError>, String) {
+        let mut out = Output::new(Format::Plain, false, Vec::new(), Vec::new());
+        let env = |_: &str| None;
+        let seam = crate::seam::PanickingSeam;
+        let result = {
+            let mut context = ctx(&mut out, &seam, &env);
+            watch(&mut context, &args, interrupt).await
+        };
+        let stderr = String::from_utf8(out.into_streams().1).expect("utf8");
+        (result, stderr)
+    }
+
+    /// **`--watch` is a bounded loop of local reads, and the output says exactly
+    /// which calls it makes.** (#78)
+    ///
+    /// The claim under test is the work order's: because `ls` enumerates the local
+    /// ledger, a watch over it makes zero platform calls and resets no idle timer —
+    /// and that fact has to ride in the OUTPUT (envelope, text, stderr), not only
+    /// in the docs, because the measured trap (`docs/PLATFORM.md`, idle-timer
+    /// section: a `/v1/health`-polled VM stayed RUNNING through 311s of a 60s
+    /// window while the unpolled control suspended at 66s) is exactly what the
+    /// next editor of this loop would walk into by re-pointing it at health.
+    ///
+    /// **Falsification** — drop `{WATCH_LEDGER_ONLY}` from the summary text and
+    /// the text assertions go red (run 2026-09-01, red at the stderr/text loop);
+    /// the machine-readable half pins `calls` the same way. Verified.
+    #[tokio::test]
+    async fn a_watch_is_ledger_only_and_the_output_says_which_calls_it_makes() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let (result, stderr) = run_watch(
+            watch_args(dir.path(), Some(2)),
+            crate::commands::lifecycle::never(),
+        )
+        .await;
+        let rendered = result.expect("a bounded watch of an empty ledger succeeds");
+
+        assert_eq!(rendered.kind, "microvm.runs");
+        assert_eq!(
+            rendered.already_reported, None,
+            "a completed watch is a plain success"
+        );
+        assert_eq!(rendered.data["runs"], json!([]));
+        let watch = &rendered.data["watch"];
+        assert_eq!(watch["refreshes"], 2);
+        assert_eq!(watch["intervalSeconds"], 0.1);
+        assert_eq!(watch["interrupted"], false);
+        // Which calls, stated flatly — the machine-readable half of the trap note.
+        assert_eq!(watch["calls"]["platformCallsPerRefresh"], 0, "{watch}");
+        assert_eq!(watch["calls"]["healthPollsPerRefresh"], 0, "{watch}");
+        assert_eq!(watch["calls"]["resetsIdleTimer"], false, "{watch}");
+        assert_eq!(watch["calls"]["ledgerReadsPerRefresh"], 1, "{watch}");
+
+        // The human half, in the summary text and on stderr at watch start: the
+        // measurement, the consequence, and why the short default is safe.
+        for output in [&rendered.text, &stderr] {
+            assert!(
+                output.contains("zero platform calls") && output.contains("/v1/health"),
+                "{output}"
+            );
+            assert!(
+                output.contains("311s") && output.contains("66"),
+                "the measured trap travels with the loop it warns about: {output}"
+            );
+        }
+        assert!(
+            rendered.text.contains("watched 2 refresh(es)"),
+            "{}",
+            rendered.text
+        );
+        assert!(
+            rendered
+                .dense_text
+                .contains("ledger-only: 0 platform calls"),
+            "{}",
+            rendered.dense_text
+        );
+        // Two snapshots reached stderr, one per refresh.
+        assert_eq!(stderr.matches("[refresh ").count(), 2, "{stderr}");
+    }
+
+    /// **Ctrl-C ends a watch as a success, `port-forward`'s reasoning verbatim:**
+    /// the caller pressed the key that stops the thing they started, and a non-zero
+    /// exit for that teaches people to ignore exit codes.
+    #[tokio::test]
+    async fn an_interrupt_ends_a_watch_as_a_success() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        // Already-fired: the first snapshot lands, then the biased select sees it.
+        let interrupt: crate::commands::lifecycle::Interrupt<'static> =
+            Box::pin(std::future::ready(()));
+        let (result, _) = run_watch(watch_args(dir.path(), None), interrupt).await;
+        let rendered = result.expect("an interrupted watch did its job");
+        assert_eq!(rendered.already_reported, None, "exit 0");
+        assert_eq!(rendered.data["watch"]["refreshes"], 1);
+        assert_eq!(rendered.data["watch"]["interrupted"], true);
+        assert!(
+            rendered.text.contains("ended by ctrl-c"),
+            "{}",
+            rendered.text
+        );
+    }
+
+    /// A spin interval and a zero-refresh watch are refused before the loop, with
+    /// the flag named — ERR_INVALID_ARG, the local-refusal row.
+    #[tokio::test]
+    async fn a_spin_interval_or_an_empty_watch_is_refused() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        for interval in [0.0, 0.05, -1.0, f64::NAN, f64::INFINITY] {
+            let mut args = watch_args(dir.path(), Some(1));
+            args.interval_sec = interval;
+            let (result, _) = run_watch(args, crate::commands::lifecycle::never()).await;
+            let error = result.expect_err(&format!("{interval}"));
+            assert_eq!(error.code(), "ERR_INVALID_ARG", "{interval}");
+            assert!(
+                error
+                    .suggestions
+                    .iter()
+                    .any(|line| line.contains("--interval-sec")),
+                "{:?}",
+                error.suggestions
+            );
+        }
+
+        let (result, _) = run_watch(
+            watch_args(dir.path(), Some(0)),
+            crate::commands::lifecycle::never(),
+        )
+        .await;
+        let error = result.expect_err("--max-refreshes 0");
+        assert_eq!(error.code(), "ERR_INVALID_ARG");
+        assert!(
+            error
+                .suggestions
+                .iter()
+                .any(|line| line.contains("--max-refreshes")),
+            "{:?}",
+            error.suggestions
+        );
     }
 
     /// `history` for a VM this state dir never saw is a clean empty success.

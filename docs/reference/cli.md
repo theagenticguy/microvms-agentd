@@ -274,6 +274,9 @@ Lists what this CLI created and could not confirm it deleted. It reads the local
 Flags:
 
 - `--state-dir <STATE_DIR>` — where the ledgers live; defaults to `$MICROVM_STATE_DIR` or `~/.microvm/runs`. `microvms-cli/src/cli.rs:733-734`.
+- `--watch` — re-read the ledger on an interval until Ctrl-C, `port-forward` style: snapshots on stderr, one summary envelope at the end (`data.watch = {refreshes, intervalSeconds, interrupted, calls}`, `null` for a plain `ls`), Ctrl-C exits 0 (#78). The loop is **ledger-only**: zero platform calls per refresh — no `GetMicrovm`, no `/v1/health` — so it resets no idle timer, keeps no VM alive, and bills nothing; `data.watch.calls` states that flatly and the text carries the measurement behind it. The distinction matters because an outside `/v1/health` poll *does* reset the platform idle timer (`docs/PLATFORM.md`, idle-timer section: a polled VM stayed RUNNING through 311s of a 60s window while the unpolled control suspended at 66s), so a health-polling watcher would keep every watched VM billing. The corollary: what a watch shows is what this CLI last recorded, not the platform's live state — a VM the platform suspended at its idle window still reads as this ledger wrote it. `microvms-cli/src/commands/local.rs`, `watch`.
+- `--interval-sec <SECONDS>` — seconds between ledger re-reads under `--watch`; default `2`, floor `0.1`. The default can be short *because* the loop is local-only; a health-polling watcher would instead need its interval judged against every watched VM's `maxIdleDurationSeconds`.
+- `--max-refreshes <N>` — stop after N snapshots instead of on Ctrl-C, for scripts; `0` is refused.
 
 ## history
 

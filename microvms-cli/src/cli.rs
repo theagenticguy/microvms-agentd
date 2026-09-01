@@ -1375,6 +1375,33 @@ pub struct LsArgs {
     /// Where the ledgers live. Defaults to $MICROVM_STATE_DIR or ~/.microvm/runs.
     #[arg(long)]
     pub state_dir: Option<PathBuf>,
+
+    /// Re-read the ledger on an interval until Ctrl-C, port-forward style (#78).
+    ///
+    /// Snapshots go to stderr as progress; the single success envelope at the end
+    /// summarises the watch. Local file reads only: this loop makes **zero**
+    /// platform calls — in particular it never polls `/v1/health`, which is the
+    /// call that resets a VM's idle timer (measured in `docs/PLATFORM.md`) — so
+    /// watching keeps nothing alive and bills for nothing.
+    #[arg(long)]
+    pub watch: bool,
+
+    /// Seconds between ledger re-reads under `--watch`; default 2.
+    ///
+    /// The default can be this short *because* the loop is ledger-only. A watcher
+    /// that polled `/v1/health` instead would need its interval judged against
+    /// every watched VM's `maxIdleDurationSeconds`, because each poll resets that
+    /// timer and keeps the VM billing.
+    #[arg(long, default_value_t = 2.0, requires = "watch")]
+    pub interval_sec: f64,
+
+    /// Stop after this many snapshots instead of on Ctrl-C.
+    ///
+    /// The bounded form, for scripts and tests — `port-forward
+    /// --max-connections`'s reasoning: an unattended watch should be able to end
+    /// itself.
+    #[arg(long, requires = "watch")]
+    pub max_refreshes: Option<u64>,
 }
 
 #[derive(Args, Debug)]

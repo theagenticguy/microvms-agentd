@@ -439,6 +439,10 @@ async fn handle<O: std::io::Write, E: std::io::Write>(
         Command::Suspend(args) => commands::lifecycle::suspend(ctx, args).await,
         Command::Resume(args) => commands::lifecycle::resume(ctx, args).await,
         Command::Terminate(args) => commands::lifecycle::terminate(ctx, args).await,
+        // The third command for which the interrupt is the expected ending: a watch
+        // runs until the caller stops it, and `--watch` is the only `ls` that polls
+        // anything — the local ledger, never the platform (see `local::watch`).
+        Command::Ls(args) if args.watch => commands::local::watch(ctx, args, interrupt).await,
         Command::Ls(args) => commands::local::ls(ctx, args),
         Command::History(args) => commands::local::history(ctx, args),
         Command::Logs(args) => commands::local::logs(ctx, args),

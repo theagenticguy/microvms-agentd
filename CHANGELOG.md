@@ -43,6 +43,18 @@ Versions are [semantic](https://semver.org/spec/v2.0.0.html); the wire contract 
 
 ### Added
 
+- **`ls --watch` (#78).** Fleet watching on the command that already enumerates
+  it, `port-forward` style: snapshots on stderr, one summary envelope at the end
+  (`data.watch`), Ctrl-C exits 0; `--interval-sec` (default 2, floor 0.1) and
+  `--max-refreshes` bound it for scripts. The loop is ledger-only — zero
+  platform calls per refresh, no `/v1/health` — so it resets no idle timer and
+  bills nothing, and the output says so in both machine (`data.watch.calls`)
+  and human form, with the measured reason: an outside `/v1/health` poll DOES
+  reset the idle timer (a polled VM stayed RUNNING through 311s of a 60s window
+  while the unpolled control suspended at 66s, `docs/PLATFORM.md`), so a
+  health-polling watcher would keep every watched VM alive and billing. There
+  is deliberately no `status` subcommand.
+
 - **Terraform read grant for build logs (#79).** `conformance/infra/main.tf`
   now ships a standalone managed policy granting `logs:FilterLogEvents`,
   `logs:GetLogEvents`, and `logs:DescribeLogStreams` on
