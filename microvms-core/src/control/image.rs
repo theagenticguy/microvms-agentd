@@ -336,7 +336,7 @@ impl ControlPlane {
             Some(dockerfile) => dockerfile.to_string(),
             None => artifact::default_dockerfile(self.port, None, &request.base_image),
         };
-        artifact::build_artifact(&request.binary, &dockerfile)
+        artifact::build_artifact(&request.binary, &dockerfile, request.project_files.as_ref())
     }
 
     /// Polls until the image is usable, distinguishing a stalled build from a slow one.

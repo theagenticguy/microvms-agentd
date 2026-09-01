@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
-//! The build artifact: a zip of the daemon binary and a Dockerfile.
+//! The build artifact: a zip of the daemon binary, a Dockerfile, and — when the caller
+//! passes [`ProjectFiles`] — the project's dependency files.
 //!
 //! What `CreateMicrovmImage`'s `codeArtifact.uri` points at (`sandbox.py:523`
-//! `build_artifact`). Two entries, and both of them carry a measured constraint.
+//! `build_artifact`). Two entries always, both carrying a measured constraint, plus an
+//! ecosystem-named manifest/lockfile pair when the image bakes an environment layer (#74).
 //!
 //! # The execute bit has to be in the zip entry
 //!
@@ -38,11 +40,76 @@ const AGENTD_ENTRY: &str = "agentd";
 /// See the module docs: a non-executable binary here becomes a run-hook timeout later.
 const AGENTD_MODE: u32 = 0o755;
 
-/// Zips `binary` with `dockerfile` into the bytes `codeArtifact.uri` will point at.
+/// An ecosystem whose dependency files may enter the build artifact (#74).
+///
+/// The variant fixes **both entry names**. That is the TRAP-5 half of the design: the
+/// artifact is a shared image snapshot, so what may enter it is an allowlist of
+/// dependency-defining files, not a caller-named list — there is no field anywhere in this
+/// module a caller could put `.env` or a credentials file's name into. The byte-scan test
+/// at the bottom of this file covers the entries this type admits.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Ecosystem {
+    /// Python under uv: `pyproject.toml` + `uv.lock`.
+    Uv,
+    /// Node under npm: `package.json` + `package-lock.json`.
+    Npm,
+    /// Rust under cargo: `Cargo.toml` + `Cargo.lock`.
+    Cargo,
+}
+
+impl Ecosystem {
+    /// Every ecosystem, in detection order.
+    pub const ALL: [Self; 3] = [Self::Uv, Self::Npm, Self::Cargo];
+
+    /// The manifest's file name, which is also its zip entry name.
+    pub fn manifest_name(self) -> &'static str {
+        match self {
+            Self::Uv => "pyproject.toml",
+            Self::Npm => "package.json",
+            Self::Cargo => "Cargo.toml",
+        }
+    }
+
+    /// The lockfile's file name, which is also its zip entry name — and the file the
+    /// environment layer is keyed on (#74).
+    pub fn lockfile_name(self) -> &'static str {
+        match self {
+            Self::Uv => "uv.lock",
+            Self::Npm => "package-lock.json",
+            Self::Cargo => "Cargo.lock",
+        }
+    }
+}
+
+/// A project's dependency files: the lockfile plus the manifest that owns it.
+///
+/// Bytes rather than paths, for the reason [`build_artifact`]'s `binary` is bytes: the
+/// caller owns the read, and this module keeps no filesystem behaviour to stub in a test.
+/// The entry names come from [`Ecosystem`], never from the caller — see the type's docs
+/// for why that is a TRAP-5 property rather than a convenience.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProjectFiles {
+    /// Which ecosystem's pair this is, fixing both entry names.
+    pub ecosystem: Ecosystem,
+    /// The manifest's bytes (`pyproject.toml`, `package.json`, `Cargo.toml`).
+    pub manifest: Vec<u8>,
+    /// The lockfile's bytes (`uv.lock`, `package-lock.json`, `Cargo.lock`).
+    pub lockfile: Vec<u8>,
+}
+
+/// Zips `binary` with `dockerfile` — and, when given, the project's dependency files —
+/// into the bytes `codeArtifact.uri` will point at.
 ///
 /// `binary` is the daemon's bytes rather than a path, so the caller owns the read and this
-/// function has no filesystem behaviour to stub in a test.
-pub fn build_artifact(binary: &[u8], dockerfile: &str) -> Result<Vec<u8>, Error> {
+/// function has no filesystem behaviour to stub in a test. `project` adds exactly two more
+/// entries, named by its [`Ecosystem`], at the archive root beside the Dockerfile — which
+/// is the build context root, so a `COPY pyproject.toml uv.lock …` in the Dockerfile finds
+/// them.
+pub fn build_artifact(
+    binary: &[u8],
+    dockerfile: &str,
+    project: Option<&ProjectFiles>,
+) -> Result<Vec<u8>, Error> {
     use zip::write::{SimpleFileOptions, ZipWriter};
 
     let mut writer = ZipWriter::new(std::io::Cursor::new(Vec::new()));
@@ -63,6 +130,18 @@ pub fn build_artifact(binary: &[u8], dockerfile: &str) -> Result<Vec<u8>, Error>
 
     write_entry(DOCKERFILE_ENTRY, dockerfile.as_bytes(), deflated)?;
     write_entry(AGENTD_ENTRY, binary, deflated.unix_permissions(AGENTD_MODE))?;
+    if let Some(project) = project {
+        write_entry(
+            project.ecosystem.manifest_name(),
+            &project.manifest,
+            deflated,
+        )?;
+        write_entry(
+            project.ecosystem.lockfile_name(),
+            &project.lockfile,
+            deflated,
+        )?;
+    }
 
     let bytes = writer
         .finish()
@@ -559,7 +638,7 @@ mod tests {
     /// looks for them.
     #[test]
     fn the_artifact_holds_a_dockerfile_and_the_daemon() {
-        let bytes = build_artifact(b"\x7fELF fake daemon", "FROM scratch\n").expect("zips");
+        let bytes = build_artifact(b"\x7fELF fake daemon", "FROM scratch\n", None).expect("zips");
         let mut archive =
             zip::ZipArchive::new(std::io::Cursor::new(bytes)).expect("a readable zip");
 
@@ -582,7 +661,7 @@ mod tests {
     /// is a test that would have sent someone to debug the writer.
     #[test]
     fn the_daemon_entry_carries_the_execute_bit() {
-        let bytes = build_artifact(b"binary", "FROM scratch\n").expect("zips");
+        let bytes = build_artifact(b"binary", "FROM scratch\n", None).expect("zips");
         let mut archive =
             zip::ZipArchive::new(std::io::Cursor::new(bytes)).expect("a readable zip");
         let mode = archive
@@ -611,7 +690,7 @@ mod tests {
         // Deliberately includes a NUL and a high byte, which is what a real ELF has and
         // what a text-mode write would mangle.
         let binary: Vec<u8> = (0u8..=255).cycle().take(4096).collect();
-        let bytes = build_artifact(&binary, "FROM scratch\n").expect("zips");
+        let bytes = build_artifact(&binary, "FROM scratch\n", None).expect("zips");
         let mut archive =
             zip::ZipArchive::new(std::io::Cursor::new(bytes)).expect("a readable zip");
         let mut read = Vec::new();
@@ -624,16 +703,20 @@ mod tests {
     }
 
     /// **AC-2-3, the byte-scan guard.** The agent token must not appear anywhere in the
-    /// artifact's raw bytes.
+    /// artifact's raw bytes — including the project-file entries #74 added.
     ///
     /// A byte scan rather than an API review, because the leak this guards against is a
     /// *value* turning up somewhere — in the Dockerfile as an `ENV`, in a baked config
     /// file, in a stray argument — not a parameter being declared. Scanning the compressed
     /// bytes and the decompressed entries both, since deflate would hide a literal from a
-    /// naive scan of the archive.
+    /// naive scan of the archive. The artifact under scan carries a full project-file
+    /// pair, and the entry count is asserted so the scan cannot silently sweep fewer
+    /// members than the artifact holds.
     ///
     /// **Falsification** — add the token to the Dockerfile (`ENV AGENT_TOKEN=…`, the
-    /// plausible mistake) and the decompressed scan fails.
+    /// plausible mistake) and the decompressed scan fails. Re-run for the #74 members
+    /// (2026-08-31): append the token to the lockfile entry inside `build_artifact` and
+    /// the per-entry scan fails naming `uv.lock`; it was restored.
     #[test]
     fn the_artifact_never_carries_the_agent_token() {
         use std::io::Read as _;
@@ -645,7 +728,12 @@ mod tests {
             "the default Dockerfile must not mention a token"
         );
 
-        let bytes = build_artifact(b"binary", &dockerfile).expect("zips");
+        let project = ProjectFiles {
+            ecosystem: Ecosystem::Uv,
+            manifest: b"[project]\nname = \"demo\"\n".to_vec(),
+            lockfile: b"version = 1\n".to_vec(),
+        };
+        let bytes = build_artifact(b"binary", &dockerfile, Some(&project)).expect("zips");
         assert!(
             !bytes
                 .windows(token.len())
@@ -655,6 +743,11 @@ mod tests {
 
         let mut archive =
             zip::ZipArchive::new(std::io::Cursor::new(bytes)).expect("a readable zip");
+        assert_eq!(
+            archive.len(),
+            4,
+            "the scan below must sweep every member this artifact can hold"
+        );
         for index in 0..archive.len() {
             let mut entry = archive.by_index(index).expect("entry");
             let name = entry.name().to_string();
@@ -668,6 +761,70 @@ mod tests {
                  launched from it, so a token here is a token shared with every VM"
             );
         }
+    }
+
+    /// **#74, the build-context half.** A project's manifest and lockfile enter the
+    /// archive under their ecosystem's fixed names, at the root beside the Dockerfile —
+    /// the build context root, where the generated `COPY` finds them — and their bytes
+    /// survive the round trip.
+    #[test]
+    fn project_files_enter_the_artifact_under_their_ecosystem_names() {
+        use std::io::Read as _;
+
+        for (ecosystem, manifest_name, lockfile_name) in [
+            (Ecosystem::Uv, "pyproject.toml", "uv.lock"),
+            (Ecosystem::Npm, "package.json", "package-lock.json"),
+            (Ecosystem::Cargo, "Cargo.toml", "Cargo.lock"),
+        ] {
+            let project = ProjectFiles {
+                ecosystem,
+                manifest: b"manifest-bytes".to_vec(),
+                lockfile: b"lockfile-bytes".to_vec(),
+            };
+            let bytes = build_artifact(b"binary", "FROM scratch\n", Some(&project)).expect("zips");
+            let mut archive =
+                zip::ZipArchive::new(std::io::Cursor::new(bytes)).expect("a readable zip");
+
+            let mut names: Vec<String> = (0..archive.len())
+                .map(|index| archive.by_index(index).expect("entry").name().to_string())
+                .collect();
+            names.sort();
+            let mut expected = vec![
+                "Dockerfile".to_string(),
+                "agentd".to_string(),
+                manifest_name.to_string(),
+                lockfile_name.to_string(),
+            ];
+            expected.sort();
+            assert_eq!(names, expected, "{ecosystem:?}");
+
+            let mut lockfile = Vec::new();
+            archive
+                .by_name(lockfile_name)
+                .expect("the lockfile entry")
+                .read_to_end(&mut lockfile)
+                .expect("reads");
+            assert_eq!(lockfile, b"lockfile-bytes", "{ecosystem:?}");
+        }
+    }
+
+    /// **#74's TRAP-5 design guard, the compile surface.** [`ProjectFiles`] has no field
+    /// that could carry an entry *name* — the names come from the [`Ecosystem`] variant —
+    /// so a caller cannot put `.env` or a credentials file into the shared snapshot
+    /// through this type. Asserted by destructuring, the same shape as TRAP-1's
+    /// `no_request_type_carries_a_caller_supplied_client_token`: a `name`/`path` field
+    /// added later fails to compile this test.
+    #[test]
+    fn project_files_carry_no_caller_named_entry() {
+        let ProjectFiles {
+            ecosystem: _,
+            manifest: _,
+            lockfile: _,
+        } = ProjectFiles {
+            ecosystem: Ecosystem::Npm,
+            manifest: Vec::new(),
+            lockfile: Vec::new(),
+        };
     }
 
     /// The content hash is a pure function of the two inputs: equal inputs agree, either

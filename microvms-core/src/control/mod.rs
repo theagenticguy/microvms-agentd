@@ -92,7 +92,9 @@ pub mod transport;
 use std::sync::Arc;
 use std::time::Duration;
 
-pub use artifact::{BaseImage, artifact_content_hash, build_artifact, default_dockerfile};
+pub use artifact::{
+    BaseImage, Ecosystem, ProjectFiles, artifact_content_hash, build_artifact, default_dockerfile,
+};
 pub use connector::ConnectorIntent;
 pub use image::{Image, WaitOpts};
 pub use microvm::{Microvm, ProxyToken, RunHookPayload};
@@ -314,6 +316,15 @@ pub struct CreateImageRequest {
     pub dockerfile: Option<String>,
     /// The daemon binary's bytes, zipped into the artifact.
     pub binary: Vec<u8>,
+    /// The project's dependency files — the lockfile plus its manifest — zipped into the
+    /// artifact beside the Dockerfile, or `None` for an image with no environment layer.
+    ///
+    /// This is what lets the derived Dockerfile's install step (`uv sync --locked`,
+    /// `npm ci`, `cargo fetch` per [`Ecosystem`]) see the files it installs from (#74).
+    /// The entry names are fixed by the ecosystem; there is no way to put an arbitrary
+    /// file into the shared snapshot through this field, which is the TRAP-5 property
+    /// restated as a type.
+    pub project_files: Option<ProjectFiles>,
     /// Where the artifact is uploaded to. This client does not upload — S3 is not in the
     /// crate's dependency set — so the caller puts the bytes there and passes the URI.
     pub code_artifact_uri: String,
@@ -403,6 +414,7 @@ impl CreateImageRequest {
             base_image_version: None,
             dockerfile: None,
             binary,
+            project_files: None,
             code_artifact_uri: code_artifact_uri.into(),
             build_role_arn: build_role_arn.into(),
             size: SizeClass::DEFAULT,
@@ -1289,6 +1301,9 @@ mod tests {
             base_image_version: _,
             dockerfile: _,
             binary: _,
+            // Dependency-file *bytes* under ecosystem-fixed entry names — nothing
+            // token-shaped, and no field a caller could name an arbitrary file into.
+            project_files: _,
             code_artifact_uri: _,
             build_role_arn: _,
             size: _,
