@@ -24,17 +24,23 @@
 //!   and the type means an unchecked string cannot reach the field.
 //! * **TRAP-8** — [`ControlPlane::wait_for_running`]: a terminal state before RUNNING is
 //!   rejected with the state *and* `stateReason` attached. S2.
-//! * **TRAP-11** — there is **no** `mint_shell_auth_token` method and no `SHELL_INGRESS`
-//!   intent. Both halves are closed by absence, which is why the test for them counts
-//!   calls a full lifecycle made rather than asserting a refusal.
+//! * **TRAP-11, revised** — there is **no** `mint_shell_auth_token` method; that half is
+//!   still closed by absence, which is why the test for it counts calls a full lifecycle
+//!   made rather than asserting a refusal. The other half moved: `SHELL_INGRESS` **is**
+//!   a [`connector::ConnectorIntent`] variant now, and the lifecycle test asserts a
+//!   launch carries exactly the connectors its caller asked for. See [`connector`].
 //!
 //! # TRAP-11 is the one that needs saying out loud
 //!
 //! `CreateMicrovmShellAuthToken` is in the service model and this client does not
-//! implement it. That is not an omission to be filled in later: it gates `ctr task exec`
-//! through a console terminal, scoped to debugging and recommended disabled in
-//! production, and it is not a programmatic exec path despite the name. The absence *is*
-//! the closure — a method here would be a method a caller could reach.
+//! implement it yet — issue #69 builds `microvm shell` on it. The original reason for
+//! staying away — that the shell gates a console-only debugging flow, not a programmatic
+//! exec path — did not survive measurement: `docs/PLATFORM.md` (2026-08-15) found a real
+//! PTY over a WebSocket, programmatically drivable. What holds is narrower: **one
+//! interactive session is not programmatic exec** — no exec ids, no idempotency, no
+//! separated stdout/stderr, no exit codes — so the exec path never requests the shell
+//! connector, and the shell arrives as its own surface rather than as a method the exec
+//! path can wander into.
 //!
 //! # Nothing in this module reads the service model at runtime
 //!

@@ -406,12 +406,63 @@ impl ControlPlane {
             super::require_valid_role_arn("executionRoleArn", role)?;
         }
 
+        // `ALL_INGRESS` cannot be combined with any other ingress connector, and the
+        // platform says so only at token-mint time: `RunMicrovm` accepts the invalid
+        // set, the VM reaches RUNNING, and it bills until something asks for a shell
+        // token (`docs/PLATFORM.md`, measured 2026-08-15). Refused here instead, before
+        // anything launches or bills. The pair that works is `[HTTP_INGRESS,
+        // SHELL_INGRESS]`.
+        let has_all_ingress = request
+            .connectors
+            .contains(&super::ConnectorIntent::AllIngress);
+        let has_finer_ingress = request.connectors.iter().any(|intent| {
+            matches!(
+                intent,
+                super::ConnectorIntent::HttpIngress | super::ConnectorIntent::ShellIngress
+            )
+        });
+        if has_all_ingress && has_finer_ingress {
+            return Err(Error::invalid_arg(
+                "ALL_INGRESS cannot be combined with other ingress connectors; use \
+                 HTTP_INGRESS and/or SHELL_INGRESS instead. The platform accepts the \
+                 combination at launch and rejects it only when a shell token is minted, \
+                 after the VM has launched and billed — so it is refused here.",
+            ));
+        }
+
+        // The other half of the same measured constraint: the pair that launches and
+        // mints a shell token is `[HTTP_INGRESS, SHELL_INGRESS]`. A shell-only ingress
+        // set has no measured success path, and the platform accepts an invalid set at
+        // launch — so it too is refused here, before anything launches or bills.
+        let has_shell_ingress = request
+            .connectors
+            .contains(&super::ConnectorIntent::ShellIngress);
+        let has_http_ingress = request
+            .connectors
+            .contains(&super::ConnectorIntent::HttpIngress);
+        if has_shell_ingress && !has_http_ingress {
+            return Err(Error::invalid_arg(
+                "SHELL_INGRESS was requested without HTTP_INGRESS. The measured pair that \
+                 launches and mints a shell token is [HTTP_INGRESS, SHELL_INGRESS] \
+                 (docs/PLATFORM.md); the platform accepts an invalid ingress set at launch \
+                 and the VM runs and bills before any failure appears — so it is refused \
+                 here.",
+            ));
+        }
+
         // Ingress and egress go in separate members, so they are split by intent rather
         // than concatenated into one list.
         let ingress: Vec<String> = request
             .connectors
             .iter()
-            .filter(|intent| matches!(intent, super::ConnectorIntent::AllIngress))
+            .filter(|intent| {
+                matches!(
+                    intent,
+                    super::ConnectorIntent::AllIngress
+                        | super::ConnectorIntent::HttpIngress
+                        | super::ConnectorIntent::ShellIngress
+                )
+            })
             .map(|intent| intent.arn(&self.region))
             .collect();
         let egress: Vec<String> = request
@@ -1523,25 +1574,28 @@ mod tests {
         );
     }
 
-    /// **TRAP-11, across a full lifecycle.** Drive create, wait, launch, wait, mint, suspend,
-    /// resume, terminate, delete — and then assert the recorder saw **zero** shell-auth calls
-    /// and **zero** `SHELL_INGRESS` anywhere.
+    /// **TRAP-11, revised, across a full lifecycle.** Drive create, wait, launch, wait,
+    /// mint, suspend, resume, terminate, delete — and then assert the recorder saw
+    /// **zero** shell-auth calls, and that the launch request carried **exactly the
+    /// connectors the caller asked for**, nothing added and nothing dropped.
     ///
-    /// A count rather than a refusal, because the closure is an absence: there is no method
-    /// to call and no intent to name, so there is nothing that *rejects* a shell request.
-    /// The only honest assertion is that a client doing everything it can do never emits one.
+    /// The body scan used to assert zero `SHELL_INGRESS` anywhere, standing on the claim
+    /// that no intent could name it. `ConnectorIntent::ShellIngress` exists now — the
+    /// measured ground is that one interactive session is not programmatic exec, not
+    /// that the connector is unspeakable (`docs/PLATFORM.md`, 2026-08-15) — so the
+    /// honest assertion is set-equality against the request: a caller that asked for
+    /// `[ALL_INGRESS]` plus egress gets that set on the wire and no other.
     ///
-    /// Three independent scans, because a single one would be easy to satisfy accidentally:
-    /// the operation names (a method added later), the request paths (a route reached under a
-    /// different operation name), and the raw request bodies (a connector value however it
-    /// got there).
+    /// The shell-auth scans stay as counts, because that half of TRAP-11 is still an
+    /// absence: there is no method on this client to call, so nothing *rejects* a shell
+    /// operation and the only honest assertion is that a full lifecycle never emits one.
     ///
     /// **Falsification** — add a `mint_shell_auth_token` calling
     /// `POST /2025-09-09/microvms/{id}/shell-auth-token` and call it here: the operation
-    /// scan and the path scan both fail. Add `ConnectorIntent::ShellIngress` and request it:
-    /// the body scan fails.
+    /// scan and the path scan both fail. Make `run_microvm` inject a connector the
+    /// request did not carry: the set-equality assertions fail.
     #[tokio::test]
-    async fn a_full_lifecycle_never_calls_shell_auth_or_requests_shell_ingress() {
+    async fn a_full_lifecycle_never_calls_shell_auth_and_requests_only_what_was_asked() {
         let (plane, fake, _) = planted();
         fake.answer(
             "CreateMicrovmImage",
@@ -1619,7 +1673,8 @@ mod tests {
         assert_eq!(
             fake.call_count("CreateMicrovmShellAuthToken"),
             0,
-            "shell auth gates a debug console, not programmatic exec: {operations:?}"
+            "this client has no shell-auth method, and a lifecycle that asked for no \
+             shell must mint no shell token: {operations:?}"
         );
         for operation in &operations {
             assert!(
@@ -1633,13 +1688,135 @@ mod tests {
                 "no request may reach a shell route: {path}"
             );
         }
-        for body in fake.bodies_as_text() {
-            assert!(
-                !body.contains("SHELL_INGRESS"),
-                "no request may name the shell connector: {body}"
-            );
-            assert!(!body.contains("SHELL"), "{body}");
-        }
+
+        // The launch carried exactly the connector set the caller asked for —
+        // `ALL_INGRESS` from the default plus the egress `with_egress` added — and this
+        // client injected nothing of its own. Set-equality cuts both ways: a connector
+        // the caller never named (the shell, or anything else) fails it, and so does a
+        // dropped one.
+        let launch = fake.first_body("RunMicrovm");
+        assert_eq!(
+            launch["ingressNetworkConnectors"],
+            serde_json::json!([
+                "arn:aws:lambda:us-east-1:aws:network-connector:aws-network-connector:ALL_INGRESS"
+            ]),
+            "ingress is exactly what the caller asked for"
+        );
+        assert_eq!(
+            launch["egressNetworkConnectors"],
+            serde_json::json!([
+                "arn:aws:lambda:us-east-1:aws:network-connector:aws-network-connector:INTERNET_EGRESS"
+            ]),
+            "egress is exactly what the caller asked for"
+        );
+    }
+
+    /// The measured pair `[HTTP_INGRESS, SHELL_INGRESS]` reaches the wire intact — the
+    /// combination `docs/PLATFORM.md` (2026-08-15) records as launching and minting a
+    /// shell token successfully. Both are ingress connectors, so both must land in
+    /// `ingressNetworkConnectors`; a split that only recognized `ALL_INGRESS` as ingress
+    /// would silently drop them, and this is the test that catches that.
+    #[tokio::test]
+    async fn http_plus_shell_ingress_is_the_pair_that_reaches_the_wire() {
+        let (plane, fake, _) = planted();
+        fake.answer(
+            "RunMicrovm",
+            Answer::ok(fake::microvm_response("PENDING", None)),
+        );
+
+        let payload = RunHookPayload::for_agent_token("agent-token").expect("fits");
+        let mut request = RunMicrovmRequest::new("arn:image", payload);
+        request.connectors = vec![
+            super::super::ConnectorIntent::HttpIngress,
+            super::super::ConnectorIntent::ShellIngress,
+        ];
+        plane.run_microvm(request).await.expect("launches");
+
+        let launch = fake.first_body("RunMicrovm");
+        assert_eq!(
+            launch["ingressNetworkConnectors"],
+            serde_json::json!([
+                "arn:aws:lambda:us-east-1:aws:network-connector:aws-network-connector:HTTP_INGRESS",
+                "arn:aws:lambda:us-east-1:aws:network-connector:aws-network-connector:SHELL_INGRESS"
+            ]),
+            "both fine-grained ingress connectors reach the wire, in the order asked"
+        );
+        assert_eq!(
+            launch.get("egressNetworkConnectors"),
+            None,
+            "no egress was asked for, so the member is absent rather than empty"
+        );
+    }
+
+    /// `ALL_INGRESS` combined with the shell connector is refused **before the wire**.
+    /// The platform accepts the invalid set at launch — the VM reaches RUNNING and bills
+    /// — and rejects it only when a shell token is minted (`docs/PLATFORM.md`,
+    /// 2026-08-15). A local refusal is the only one that costs nothing.
+    ///
+    /// **Falsification** — run 2026-08-31: with the combination guard in
+    /// [`ControlPlane::run_microvm`] disabled, this failed on the error assertion.
+    /// Restored.
+    #[tokio::test]
+    async fn all_ingress_combined_with_shell_ingress_is_refused_before_the_wire() {
+        let (plane, fake, _) = planted();
+
+        let payload = RunHookPayload::for_agent_token("agent-token").expect("fits");
+        let mut request = RunMicrovmRequest::new("arn:image", payload);
+        request
+            .connectors
+            .push(super::super::ConnectorIntent::ShellIngress);
+        let error = plane
+            .run_microvm(request)
+            .await
+            .expect_err("the invalid combination is refused locally");
+
+        assert!(
+            error
+                .to_string()
+                .contains("HTTP_INGRESS and/or SHELL_INGRESS"),
+            "the refusal names the pair that works: {error}"
+        );
+        assert_eq!(
+            fake.call_count("RunMicrovm"),
+            0,
+            "nothing launched, so nothing billed"
+        );
+    }
+
+    /// **W1, measured constraint 1, second half.** `SHELL_INGRESS` without `HTTP_INGRESS`
+    /// is the same launches-bills-fails-late shape as `ALL_INGRESS` plus a finer connector:
+    /// the measured pair that launches and mints a shell token is `[HTTP_INGRESS,
+    /// SHELL_INGRESS]` (`docs/PLATFORM.md`), no measurement says a shell-only ingress set
+    /// even mints, and the platform accepts an invalid set at launch — the VM reaches
+    /// RUNNING and bills before any refusal appears. Refused here instead, before the wire.
+    ///
+    /// **Falsification** — run 2026-08-31. This test was written before the guard clause
+    /// existed and failed on both assertions (`run_microvm` reached the wire and launched);
+    /// adding the shell-without-HTTP refusal in `run_microvm` turned it green.
+    #[tokio::test]
+    async fn shell_ingress_without_http_ingress_is_refused_before_the_wire() {
+        let (plane, fake, _) = planted();
+
+        let payload = RunHookPayload::for_agent_token("agent-token").expect("fits");
+        let mut request = RunMicrovmRequest::new("arn:image", payload);
+        request.connectors = vec![
+            super::super::ConnectorIntent::ShellIngress,
+            super::super::ConnectorIntent::Egress,
+        ];
+        let error = plane
+            .run_microvm(request)
+            .await
+            .expect_err("shell ingress without HTTP ingress is refused locally");
+
+        assert!(
+            error.to_string().contains("HTTP_INGRESS"),
+            "the refusal names the missing connector: {error}"
+        );
+        assert_eq!(
+            fake.call_count("RunMicrovm"),
+            0,
+            "nothing launched, so nothing billed"
+        );
     }
 
     /// **Issue #23.** The fleet listing follows `nextToken`, so a fleet larger than one page
