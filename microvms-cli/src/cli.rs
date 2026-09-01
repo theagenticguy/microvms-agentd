@@ -1792,6 +1792,7 @@ mod tests {
                 "ack",
                 "stdin",
                 "cp",
+                "sync",
                 "tunnel",
                 "port-forward",
                 "shell",

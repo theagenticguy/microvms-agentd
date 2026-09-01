@@ -1325,7 +1325,10 @@ async fn sync_pass<O: std::io::Write, E: std::io::Write>(
 /// compare decides whether bytes move. So a false positive costs hashing time and a false
 /// negative would cost correctness — which is why the list here is exactly the pack's own
 /// skip list plus the manifest name, and nothing cleverer.
-fn watch_relevant(root: &std::path::Path, path: &std::path::Path) -> bool {
+///
+/// `pub(crate)` for the guard in `crate::guards`: the filter's misses are invisible in an
+/// integration run (a filtered event just means no pass), so its table is pinned directly.
+pub(crate) fn watch_relevant(root: &std::path::Path, path: &std::path::Path) -> bool {
     let Ok(relative) = path.strip_prefix(root) else {
         // Outside the tree — a watcher handed us something we never asked about.
         return false;
