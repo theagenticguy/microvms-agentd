@@ -269,6 +269,13 @@ pub fn merge_config(
     report("egress", json!(egress.value), egress.source);
     merged.egress = egress.value;
 
+    // `--auto-resume` is SetTrue like `--egress` and merges the same way: the file can
+    // enable it for a project, the flag can only add it, and `auto-resume = false` in a
+    // file is the default restated rather than an override.
+    let auto_resume = crate::config::pick(args.auto_resume, args.auto_resume, config.auto_resume);
+    report("autoResume", json!(auto_resume.value), auto_resume.source);
+    merged.auto_resume = auto_resume.value;
+
     // The region: a config value joins the flag chain *above* the environment, because the
     // file is project state and the environment is machine state. The closed set only —
     // the loader already refused an unlisted name with the flag's own remedy (and doctor
@@ -963,6 +970,7 @@ async fn launch_and_exec<O: std::io::Write, E: std::io::Write>(
     request.image_version = args.image_version.clone();
     request.execution_role_arn = ctx.infra.execution_role_arn.clone();
     request.max_idle_sec = args.max_idle_sec;
+    request.auto_resume = args.auto_resume;
     request.max_duration_sec = args.max_duration_sec;
     request.token_scope = Some(name.to_string());
     // One pair at a time through the builder rather than assigning the collected vector,

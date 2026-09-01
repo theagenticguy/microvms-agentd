@@ -73,6 +73,7 @@ Flags:
 - `--timeout <TIMEOUT>` — how long to wait for the exec, in seconds; default `300`. `microvms-cli/src/cli.rs:409-410`.
 - `--max-idle-sec <MAX_IDLE_SEC>` — suspend the VM after this much inbound-traffic idleness; default `600`. `microvms-cli/src/cli.rs:413-414`.
 - `--suspended-sec <SUSPENDED_SEC>` — terminate the VM after this long suspended; a resume attempted after this window fails because the VM no longer exists. Default `600`. `microvms-cli/src/cli.rs:417-418`.
+- `--auto-resume` — let the platform resume a suspended VM on an incoming request, instead of requiring an explicit `microvm resume`; omitted by default. Sets `idlePolicy.autoResumeEnabled` on the launch. Also a `microvm.toml` key (`auto-resume`). `microvms-cli/src/cli.rs`, merge in `merge_config`.
 - `--max-duration-sec <MAX_DURATION_SEC>` — hard ceiling on the VM's life; refused above 28800 before any call. Default `3600`. `microvms-cli/src/cli.rs:421-422`.
 - `--port <PORT>` — the daemon's port inside the guest. `microvms-cli/src/cli.rs:425-426`.
 - `--state-dir <STATE_DIR>` — where the run ledger is written; defaults to `$MICROVM_STATE_DIR` or `~/.microvm/runs`. `microvms-cli/src/cli.rs:429-430`.
@@ -419,6 +420,7 @@ exec = "make test"           # run --exec
 memory = 4096                # run --memory; same closed set as the flag
 region = "us-west-2"         # any region string, resolved where the flag's is
 egress = true                # run --egress
+auto-resume = true           # run --auto-resume
 max-idle-sec = 600           # run --max-idle-sec
 suspended-sec = 600          # run --suspended-sec
 max-duration-sec = 3600      # run --max-duration-sec

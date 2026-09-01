@@ -734,6 +734,10 @@ pub struct RunArgs {
     #[arg(long, default_value_t = 600)]
     pub suspended_sec: u32,
 
+    /// Let the platform resume a suspended VM on an incoming request.
+    #[arg(long)]
+    pub auto_resume: bool,
+
     /// Hard ceiling on the VM's life. Refused above 28800 (eight hours) before any call.
     #[arg(long, default_value_t = 3600)]
     pub max_duration_sec: u32,
