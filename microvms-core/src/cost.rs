@@ -542,6 +542,31 @@ impl EstimatedUsd {
     pub fn amount_string(self) -> String {
         render_amount(self.0)
     }
+
+    /// A dollar figure from a caller's decimal string — a budget, typically.
+    ///
+    /// A string and not an f64, so this is not a third float boundary beside
+    /// [`gb_decimal`] and [`seconds_of`]: the caller typed a decimal, and parsing
+    /// the text they typed keeps `0.1` meaning a tenth rather than the nearest
+    /// binary float. Negative is refused here rather than compared later, because
+    /// every total this could be compared against is non-negative and a negative
+    /// budget can only ever be a sign error the comparison would launder into
+    /// "always breached".
+    pub fn parse(text: &str) -> Result<EstimatedUsd, Error> {
+        let amount = Decimal::from_str(text.trim()).map_err(|source| {
+            Error::invalid_arg(format!(
+                "{text:?} is not a dollar figure: money arithmetic here is decimal end to \
+                 end, so the value must read as a plain decimal like 1.50"
+            ))
+            .with_source(source)
+        })?;
+        if amount.is_sign_negative() {
+            return Err(Error::invalid_arg(format!(
+                "a budget cannot be negative: {text}"
+            )));
+        }
+        Ok(EstimatedUsd(amount))
+    }
 }
 
 impl std::ops::Add for EstimatedUsd {
@@ -2104,6 +2129,42 @@ mod tests {
     /// The pinned table, which every arithmetic test computes against.
     fn rates() -> RateTable {
         pinned_rates()
+    }
+
+    /// A budget parses from the text the caller typed, exactly.
+    ///
+    /// `0.1` as text is a tenth; `0.1f64` is not. The assertion against `dec!` is
+    /// what pins that the parse goes through the string rather than through a float
+    /// on the way.
+    #[test]
+    fn a_budget_parses_from_the_text_the_caller_typed() {
+        assert_eq!(
+            EstimatedUsd::parse("1.50").expect("a plain decimal"),
+            EstimatedUsd::new(dec!(1.50))
+        );
+        assert_eq!(
+            EstimatedUsd::parse(" 0.1 ").expect("whitespace is not meaning"),
+            EstimatedUsd::new(dec!(0.1))
+        );
+        assert_eq!(
+            EstimatedUsd::parse("0").expect("zero is a legitimate budget"),
+            EstimatedUsd::ZERO
+        );
+    }
+
+    /// Non-decimal text and a negative figure are both refused as invalid arguments.
+    ///
+    /// Negative is refused at the parse rather than at a comparison, because a
+    /// negative budget compared against any non-negative total reads as "always
+    /// breached" — a sign error laundered into a confident verdict.
+    #[test]
+    fn a_budget_that_does_not_read_as_money_is_refused() {
+        // `1.5e3` is absent on purpose: `Decimal::from_str` reads scientific
+        // notation exactly, so it is a legitimate spelling rather than a refusal.
+        for text in ["abc", "", "$1.50", "-0.01"] {
+            let error = EstimatedUsd::parse(text).expect_err(text);
+            assert_eq!(error.kind(), ErrorKind::InvalidArg, "{text}");
+        }
     }
 
     /// One phase's amount, asserting it was priced at all.
