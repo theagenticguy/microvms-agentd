@@ -513,7 +513,7 @@ pub fn dockerfile<O: std::io::Write, E: std::io::Write>(
         base.docker_ref = from.to_string();
     }
     let stanza =
-        microvms_core::control::default_dockerfile(args.port, args.workdir.as_deref(), &base);
+        microvms_core::control::default_dockerfile(args.port, args.workdir.as_deref(), &base, None);
 
     let mut header = vec![
         "# agentd wrapper stanza — append your own RUN layers below the chmod line.".to_string(),

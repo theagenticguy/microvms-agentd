@@ -79,6 +79,47 @@ impl Ecosystem {
             Self::Cargo => "Cargo.lock",
         }
     }
+
+    /// The whole `RUN` line that installs the environment layer: toolchain bootstrap on
+    /// the managed al2023 base, then the lockfile-faithful install.
+    ///
+    /// # The install commands are the lockfile-faithful spellings
+    ///
+    /// `uv sync --locked`, `npm ci`, and `cargo fetch --locked` each **refuse** a lockfile
+    /// that disagrees with its manifest rather than quietly re-resolving — which is what
+    /// keeps the baked layer the thing the content hash says it is. `uv sync` without
+    /// `--locked`, `npm install`, or a bare `cargo fetch` would install *something* and
+    /// the hash would then name an environment the build did not produce.
+    ///
+    /// # The bootstrap packages are measured, the full build is not yet
+    ///
+    /// The managed base is al2023-minimal and ships no toolchain, so each line installs
+    /// its own. Package names and the binaries they land were verified against the
+    /// Amazon Linux 2023 repos (2026-08-31): `python3.12-pip` puts `pip3.12` on PATH,
+    /// `nodejs22-npm` puts `npm` and `node` on PATH, `cargo` puts `cargo` on PATH.
+    /// `install_weak_deps=0` keeps the layer minimal. A full in-guest build of each line
+    /// is the live-conformance scenario #74's acceptance defers to — see the issue.
+    ///
+    /// Cargo is the one that needs a stub: `cargo fetch` refuses a package with no
+    /// targets, so the line creates an empty `src/main.rs` first. The working tree synced
+    /// at launch lands over it.
+    pub fn install_run_line(self) -> &'static str {
+        match self {
+            Self::Uv => {
+                "RUN dnf -y --setopt=install_weak_deps=0 install python3.12 python3.12-pip \
+                 && dnf clean all && pip3.12 install --no-cache-dir uv && uv sync --locked"
+            }
+            Self::Npm => {
+                "RUN dnf -y --setopt=install_weak_deps=0 install nodejs22-npm \
+                 && dnf clean all && npm ci"
+            }
+            Self::Cargo => {
+                "RUN dnf -y --setopt=install_weak_deps=0 install cargo \
+                 && dnf clean all && mkdir -p src && touch src/main.rs \
+                 && cargo fetch --locked"
+            }
+        }
+    }
 }
 
 /// A project's dependency files: the lockfile plus the manifest that owns it.
@@ -249,6 +290,14 @@ impl Default for BaseImage {
     }
 }
 
+/// Where the environment layer lives when the caller named no workdir of their own.
+///
+/// A constant rather than `/` because the install commands resolve everything against the
+/// current directory — `uv sync` writes `.venv` beside the manifest, `npm ci` writes
+/// `node_modules` — and the working tree synced at launch has to land in the same place
+/// for the layer to be *its* environment.
+pub const DEFAULT_PROJECT_WORKDIR: &str = "/project";
+
 /// A Dockerfile that makes the daemon the container `CMD`.
 ///
 /// `ENTRYPOINT []` plus `CMD ["/agentd"]` is the deployment invariant the trust boundary
@@ -259,18 +308,46 @@ impl Default for BaseImage {
 /// The `FROM` is derived from `base` rather than written here, so it cannot disagree with
 /// the `baseImageArn` the create call sends.
 ///
+/// `project` bakes the environment layer (#74): the manifest+lockfile pair is copied into
+/// the working directory — `workdir` when given, [`DEFAULT_PROJECT_WORKDIR`] otherwise —
+/// and the ecosystem's [`Ecosystem::install_run_line`] installs from the lockfile. Without
+/// it the derived Dockerfile installs nothing, which was the measured state this closes:
+/// every launch then pays dependency installation inside the guest, the 31–48% of launch
+/// time `docs/STRATEGY.md` attributes to environment init.
+///
 /// The invariant is *unenforced*: a base image that starts its own background process
 /// before bootstrap breaks it, and enforcing that belongs to whoever builds the image
 /// (`docs/PROTOCOL.md`, "Trust boundary").
-pub fn default_dockerfile(port: u16, workdir: Option<&str>, base: &BaseImage) -> String {
+pub fn default_dockerfile(
+    port: u16,
+    workdir: Option<&str>,
+    base: &BaseImage,
+    project: Option<Ecosystem>,
+) -> String {
     let mut lines = vec![
         format!("FROM {}", base.docker_ref),
         "COPY agentd /agentd".to_string(),
         "RUN chmod 0755 /agentd".to_string(),
     ];
-    if let Some(workdir) = workdir.filter(|dir| !dir.is_empty()) {
+    let workdir = match (workdir.filter(|dir| !dir.is_empty()), project) {
+        (Some(dir), _) => Some(dir),
+        // The layer needs a directory to live in even when the caller named none.
+        (None, Some(_)) => Some(DEFAULT_PROJECT_WORKDIR),
+        (None, None) => None,
+    };
+    if let Some(workdir) = workdir {
         lines.push(format!("RUN mkdir -p {workdir}"));
         lines.push(format!("WORKDIR {workdir}"));
+    }
+    if let Some(ecosystem) = project {
+        // Relative destination, resolving against the WORKDIR set above — the same
+        // directory the install command runs in.
+        lines.push(format!(
+            "COPY {} {} ./",
+            ecosystem.manifest_name(),
+            ecosystem.lockfile_name(),
+        ));
+        lines.push(ecosystem.install_run_line().to_string());
     }
     lines.extend([
         format!("ENV AGENTD_PORT={port}"),
@@ -592,6 +669,39 @@ pub fn require_daemon_cmd(dockerfile: &str) -> Result<(), Error> {
     }
 }
 
+/// Rejects a caller Dockerfile that never mentions the lockfile the request carries.
+///
+/// The project files enter the artifact unconditionally once the request holds them, so a
+/// custom Dockerfile that ignores them builds cleanly and produces an image with **no
+/// environment layer** — and the symptom appears at launch, as every dependency
+/// installing inside the guest, with nothing anywhere naming the `COPY` that was never
+/// written. That is the silent-degradation shape: the caller asked for the layer, paid
+/// the build, and got an image indistinguishable from one that never asked.
+///
+/// Weak-form on purpose, like [`require_daemon_cmd`]: a substring test for the lockfile's
+/// name rather than parsing `COPY` syntax, because the check exists to catch a Dockerfile
+/// that plainly ignores the files, not to validate how it consumes them.
+pub fn require_project_install(project: &ProjectFiles, dockerfile: &str) -> Result<(), Error> {
+    let lockfile = project.ecosystem.lockfile_name();
+    if dockerfile.contains(lockfile) {
+        return Ok(());
+    }
+    Err(Error::invalid_arg(format!(
+        "the request carries project files ({lockfile} and {manifest}) but the Dockerfile \
+         never mentions {lockfile}, so the image would bake no environment layer: the build \
+         succeeds, and every launch still installs dependencies inside the guest with \
+         nothing naming the COPY that was never written. Copy the pair and install from \
+         the lockfile ({install}), or build with default_dockerfile, which derives both \
+         lines — or drop the project files if the layer is not wanted.",
+        manifest = project.ecosystem.manifest_name(),
+        install = match project.ecosystem {
+            Ecosystem::Uv => "uv sync --locked",
+            Ecosystem::Npm => "npm ci",
+            Ecosystem::Cargo => "cargo fetch --locked",
+        },
+    )))
+}
+
 /// Rejects a Dockerfile whose `FROM` is not the selected base image.
 ///
 /// The build runs the Dockerfile *on top of* the base named in `baseImageArn`, so the two
@@ -722,7 +832,7 @@ mod tests {
         use std::io::Read as _;
 
         let token = "s3cr3t-agent-token-do-not-bake-me";
-        let dockerfile = default_dockerfile(9000, Some("/opt/work"), &BaseImage::al2023());
+        let dockerfile = default_dockerfile(9000, Some("/opt/work"), &BaseImage::al2023(), None);
         assert!(
             !dockerfile.contains(token),
             "the default Dockerfile must not mention a token"
@@ -867,7 +977,7 @@ mod tests {
     #[test]
     fn the_default_dockerfile_derives_its_from_from_the_base_image() {
         let base = BaseImage::al2023();
-        let dockerfile = default_dockerfile(9000, None, &base);
+        let dockerfile = default_dockerfile(9000, None, &base, None);
         assert_eq!(
             dockerfile_from_ref(&dockerfile),
             Some(base.docker_ref.as_str())
@@ -886,14 +996,117 @@ mod tests {
     #[test]
     fn a_workdir_is_created_and_set_or_absent_entirely() {
         let base = BaseImage::al2023();
-        let with = default_dockerfile(9000, Some("/opt/baked-workdir"), &base);
+        let with = default_dockerfile(9000, Some("/opt/baked-workdir"), &base, None);
         assert!(with.contains("RUN mkdir -p /opt/baked-workdir"));
         assert!(with.contains("WORKDIR /opt/baked-workdir"));
 
         for none in [None, Some("")] {
-            let without = default_dockerfile(9000, none, &base);
+            let without = default_dockerfile(9000, none, &base, None);
             assert!(!without.contains("WORKDIR"), "{without}");
         }
+    }
+
+    /// **#74 step 2, the install.** A project Dockerfile copies the ecosystem's pair into
+    /// the working directory and installs from the lockfile with the lockfile-faithful
+    /// spelling — `uv sync --locked`, `npm ci`, `cargo fetch --locked` — where the
+    /// projectless Dockerfile installs nothing (the measured pre-#74 state).
+    ///
+    /// **Falsification** — run 2026-08-31: the `COPY` line was dropped from
+    /// `default_dockerfile` and the copies-its-pair assertion went red for all three
+    /// ecosystems; restored.
+    #[test]
+    fn a_project_dockerfile_installs_from_the_lockfile_it_can_see() {
+        let base = BaseImage::al2023();
+        for (ecosystem, install) in [
+            (Ecosystem::Uv, "uv sync --locked"),
+            (Ecosystem::Npm, "npm ci"),
+            (Ecosystem::Cargo, "cargo fetch --locked"),
+        ] {
+            let dockerfile = default_dockerfile(9000, None, &base, Some(ecosystem));
+            assert!(
+                dockerfile.contains(&format!(
+                    "COPY {} {} ./",
+                    ecosystem.manifest_name(),
+                    ecosystem.lockfile_name(),
+                )),
+                "copies its pair: {dockerfile}"
+            );
+            assert!(dockerfile.contains(install), "{dockerfile}");
+            // The layer needs a directory even when the caller named none, because the
+            // install resolves everything against the current directory.
+            assert!(
+                dockerfile.contains(&format!("WORKDIR {DEFAULT_PROJECT_WORKDIR}")),
+                "{dockerfile}"
+            );
+
+            // A caller-named workdir is where the layer lives instead.
+            let placed = default_dockerfile(9000, Some("/srv/app"), &base, Some(ecosystem));
+            assert!(placed.contains("WORKDIR /srv/app"), "{placed}");
+            assert!(!placed.contains(DEFAULT_PROJECT_WORKDIR), "{placed}");
+        }
+
+        let without = default_dockerfile(9000, None, &base, None);
+        for install in ["uv sync", "npm ci", "cargo fetch", "COPY pyproject"] {
+            assert!(!without.contains(install), "{without}");
+        }
+    }
+
+    /// The project Dockerfile passes every guard the plain one does: the `FROM` matches
+    /// its base, the port agrees, the daemon stays the `CMD`, and the pair it copies
+    /// satisfies [`require_project_install`]. A derived Dockerfile that failed its own
+    /// preflight would refuse every `--project` build at the door.
+    #[test]
+    fn the_project_dockerfile_passes_its_own_guards() {
+        let base = BaseImage::al2023();
+        for ecosystem in Ecosystem::ALL {
+            let dockerfile = default_dockerfile(9000, None, &base, Some(ecosystem));
+            require_matching_from(&base, &dockerfile).expect("its FROM is its base");
+            require_matching_agentd_port(9000, &dockerfile).expect("its port agrees");
+            require_daemon_cmd(&dockerfile).expect("the daemon is still the CMD");
+            let project = ProjectFiles {
+                ecosystem,
+                manifest: Vec::new(),
+                lockfile: Vec::new(),
+            };
+            require_project_install(&project, &dockerfile)
+                .expect("it copies the pair it was derived for");
+        }
+    }
+
+    /// **#74's silent-degradation guard.** A caller Dockerfile that never mentions the
+    /// lockfile bakes no environment layer while building cleanly — the symptom is every
+    /// launch still installing dependencies, with nothing naming the missing `COPY` — so
+    /// it is refused up front, naming the lockfile, the install command, and both ways
+    /// out.
+    ///
+    /// **Falsification** — run 2026-08-31: the `contains` check was inverted and both
+    /// halves went red (the ignoring Dockerfile passed, the copying one was refused);
+    /// restored.
+    #[test]
+    fn a_dockerfile_that_ignores_the_project_files_is_refused() {
+        let project = ProjectFiles {
+            ecosystem: Ecosystem::Npm,
+            manifest: b"{}".to_vec(),
+            lockfile: b"{}".to_vec(),
+        };
+        let error = require_project_install(
+            &project,
+            "FROM public.ecr.aws/amazonlinux/amazonlinux:2023-minimal\n\
+             COPY agentd /agentd\n\
+             ENTRYPOINT []\nCMD [\"/agentd\"]\n",
+        )
+        .expect_err("no mention of the lockfile bakes no layer");
+        assert_eq!(error.kind(), ErrorKind::InvalidArg);
+        let message = error.to_string();
+        assert!(message.contains("package-lock.json"), "{message}");
+        assert!(message.contains("npm ci"), "{message}");
+        assert!(message.contains("no environment layer"), "{message}");
+
+        require_project_install(
+            &project,
+            "FROM x\nCOPY package.json package-lock.json ./\nRUN npm ci\nCMD [\"/agentd\"]\n",
+        )
+        .expect("a Dockerfile that copies the pair agrees");
     }
 
     /// `FROM` parsing tolerates the decoration a real Dockerfile carries: lowercase,
@@ -927,7 +1140,7 @@ mod tests {
             "{message}"
         );
 
-        require_matching_from(&base, &default_dockerfile(9000, None, &base))
+        require_matching_from(&base, &default_dockerfile(9000, None, &base, None))
             .expect("the derived Dockerfile agrees with its own base");
     }
 
@@ -994,6 +1207,7 @@ mod tests {
                 crate::control::DEFAULT_AGENT_PORT,
                 Some("/work"),
                 &BaseImage::al2023(),
+                None,
             ),
         )
         .expect("the derived Dockerfile agrees with the port it was derived from");
@@ -1097,6 +1311,7 @@ mod tests {
                 crate::control::DEFAULT_AGENT_PORT,
                 Some("/work"),
                 &BaseImage::al2023(),
+                None,
             ),
         )
         .expect("the derived Dockerfile sets no keepalive");
@@ -1149,6 +1364,7 @@ mod tests {
             9000,
             Some("/work"),
             &BaseImage::al2023(),
+            None,
         ))
         .expect("the derived Dockerfile is the invariant");
         require_daemon_cmd("FROM x\nENTRYPOINT []\nCMD [\"/agentd\"]\n").expect("the invariant");

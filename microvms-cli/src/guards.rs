@@ -1772,6 +1772,7 @@ fn expected_reuse_name(prefix: &str, binary: &std::path::Path) -> String {
         9000,
         None,
         &microvms_core::control::BaseImage::al2023(),
+        None,
     );
     let hash = microvms_core::control::artifact_content_hash(&bytes, &dockerfile);
     format!("{prefix}-{}", &hash[..12])
