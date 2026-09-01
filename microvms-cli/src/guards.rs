@@ -3703,9 +3703,10 @@ fn manifest_body_for(dir: &std::path::Path) -> String {
 /// log is the assertion that cannot be faked by rendering.
 ///
 /// **Falsification** — make `sync_pass` upload unconditionally (drop the
-/// `delta.is_empty()` early return) and the "only request" assertion goes red with a
-/// `PUT /v1/fs/tar` in the log. Done on 2026-09-01 while writing this; failed as stated
-/// (three requests recorded, tar PUT second); restored.
+/// `delta.is_empty()` early return) and this goes red before its own assertions run:
+/// the script authorizes exactly one reply, so the unauthorized `PUT /v1/fs/tar` panics
+/// the scripted daemon with "ran out of replies" naming that request. Done on
+/// 2026-09-01; failed exactly there; restored.
 #[tokio::test]
 async fn a_second_sync_of_an_unchanged_tree_sends_no_archive() {
     let dir = TempDir::new("sync-unchanged");
@@ -3865,10 +3866,10 @@ async fn an_edit_uploads_only_the_change_and_deletes_what_vanished() {
 /// filtered before the exec is built; with no legitimate deletion left, **no exec starts
 /// at all**.
 ///
-/// **Falsification** — drop the `deletable` filter in `sync_pass` and this goes red on
-/// the request count, with a `POST /v1/exec/start` naming both paths in the log. Done on
-/// 2026-09-01 while writing this; failed as stated (four requests, the exec start third,
-/// both hostile paths in its argv); restored.
+/// **Falsification** — drop the `deletable` filter in `sync_pass` and this goes red at
+/// the unauthorized `POST /v1/exec/start`: the script holds no reply for an exec, so the
+/// scripted daemon panics with "ran out of replies" naming that request. Done on
+/// 2026-09-01; failed exactly there; restored.
 #[tokio::test]
 async fn a_hostile_guest_manifest_cannot_order_deletions_outside_the_workspace() {
     let dir = TempDir::new("sync-hostile-manifest");
@@ -3924,7 +3925,7 @@ async fn a_hostile_guest_manifest_cannot_order_deletions_outside_the_workspace()
 ///
 /// **Falsification** — drop `classify_upload` from the tar upload (plain `?`) and both
 /// assertions go red: the exit arrives as `Exit::Retryable` and the marker is absent.
-/// Done on 2026-09-01 while writing this; failed as stated; restored.
+/// Done on 2026-09-01; failed as stated (left: Retryable, right: Platform); restored.
 #[tokio::test]
 async fn a_disk_pressure_507_is_platform_with_the_remedy_not_retryable() {
     let dir = TempDir::new("sync-507");
