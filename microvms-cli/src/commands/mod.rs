@@ -105,7 +105,7 @@ pub struct Ctx<'a, O: Write, E: Write> {
 /// command added without an entry fails rather than shipping undescribed. That check is the
 /// only thing that keeps this table from being the hand-maintained artifact the manifest is
 /// forbidden to be.
-pub const RESPONSE_TYPES: [(&str, &str, &[&str]); 23] = [
+pub const RESPONSE_TYPES: [(&str, &str, &[&str]); 24] = [
     (
         "run",
         "microvm.run",
@@ -259,6 +259,25 @@ pub const RESPONSE_TYPES: [(&str, &str, &[&str]); 23] = [
             // with it. The watch totals above are sums across all of them.
             "passes",
             "watched",
+        ],
+    ),
+    (
+        "attach",
+        "microvm.attach",
+        &[
+            "name",
+            "microvmId",
+            "endpoint",
+            "region",
+            // The Noise KK handshake ran and the far end verified against the pinned VM
+            // key; false for a token-only adopt. Issue #66's security line, on the envelope.
+            "verifiedIdentity",
+            // The same VM was already registered under this name and its record was
+            // refreshed. A different VM under the name is ERR_NAME_TAKEN, never `true`.
+            "replaced",
+            // Where the record was written. The agent token is in that file and nowhere
+            // in this envelope.
+            "statePath",
         ],
     ),
     (
@@ -437,7 +456,11 @@ pub fn resolve_vm_identifier<O: Write, E: Write>(
             ),
         )
         .suggest("`microvm ls` shows this state directory's outstanding runs")
-        .suggest("a MicroVM id (mvm-…) is accepted directly")),
+        .suggest("a MicroVM id (mvm-…) is accepted directly")
+        .suggest(
+            "`microvm attach --from <FILE>` adopts the record from the other machine's state \
+             directory, so the name works here from then on",
+        )),
     }
 }
 
