@@ -83,9 +83,39 @@ Versions are [semantic](https://semver.org/spec/v2.0.0.html); the wire contract 
   `ERR_RETRYABLE` — retrying an identical upload against a full disk cannot
   succeed. With `microvm port-forward` in a second terminal this closes the
   "feels local" loop: edit here, reload there.
+- **`microvm attach` — adopt a VM another machine launched (#66).** Registers
+  a name here for a running VM this state directory did not launch, so every
+  later `--name` command on this machine can act on it. Two spellings of the
+  same facts: `--from <FILE|->` reads a name record exactly as the registry
+  writes it (the export format is the existing
+  `<state-dir>/names/<name>.json`, so `attach --from <(ssh other cat …)` needs
+  no export command; `--name` renames on the way in), or the explicit
+  `--name/--microvm-id/--endpoint/--agent-token` from a `run` envelope.
+  Nothing is written until the VM has answered one authenticated request with
+  the token being registered — a zero-byte read of `/dev/null` through the
+  session seam, deliberately not `/v1/health`, which is an open route and
+  would accept a wrong token. A dead endpoint or a refused token surfaces
+  with the daemon's own class (`ERR_CREDENTIALS`, `data.kind: Unauthorized`)
+  and leaves the registry untouched. A name already held here by a
+  *different* VM is `ERR_NAME_TAKEN` before any AWS call, `run --vm-name`'s
+  own row; the same VM under the same name is an idempotent success with
+  `replaced: true`. `--verify-identity` runs the same Noise KK handshake
+  `tunnel --verify-identity` runs (`session::tunnel::verify_identity`, the
+  tunnel's open-and-handshake step with no relay after it) against the
+  record's pinned VM key and refuses up front when the record carries no
+  identity pair; an adopt without the flag keeps whatever pin the record
+  carried, so a later verified tunnel still works. The envelope carries
+  `{name, microvmId, endpoint, region, verifiedIdentity, replaced,
+  statePath}` and never the token. The "no VM named" refusals now suggest
+  `attach --from` as the cross-machine remedy.
 
 ### Changed
 
+- **`terminate` releases every name a registry holds for the VM, not the first
+  match.** `Names::release_by_vm` returned after one hit; with `attach` able to
+  register one VM under two names in one state directory, a terminate through
+  one alias left the other as a record pointing at a terminated VM (observed
+  live, 2026-09-02). It now removes every matching record and reports each.
 - **`microvm logs` succeeds with the working read command (#79).** The command
   used to exit `ERR_PRECONDITION` with the `aws logs tail` invocation as a
   suggestion on the failure; it now succeeds, printing the build log group, the

@@ -169,6 +169,19 @@ pub enum Command {
     /// reload there.
     Sync(SyncArgs),
 
+    /// Register a name for a running MicroVM this state directory did not launch.
+    ///
+    /// Cross-machine adoption (issue #66): a kept VM is already addressable by `--name` on
+    /// the machine that launched it, because `run --keep --vm-name` wrote a record there. This
+    /// writes that record here, from either spelling of the same facts — the record file
+    /// another machine's registry holds (`--from`, so `microvm attach --from <(ssh other cat
+    /// ~/.microvm/runs/names/ci.json)` needs no export command), or the triple a `run`
+    /// envelope printed. Nothing is written until the VM has answered one authenticated
+    /// request with the token being registered: an attach authenticates the token, not the
+    /// machine, and the probe is the only proof the triple is live. `--verify-identity` adds
+    /// the same Noise KK handshake `tunnel --verify-identity` runs, against the pinned VM key.
+    Attach(AttachArgs),
+
     /// Tunnel arbitrary TCP to a guest port, so `psql` or `ssh` here reaches a server in the VM.
     ///
     /// Where `port-forward` speaks HTTP, this speaks bytes: each local connection becomes a
@@ -1364,6 +1377,90 @@ pub struct SyncArgs {
     pub region: RegionFlags,
 }
 
+/// `attach`'s arguments: a record file, or the triple plus the name to register it under.
+///
+/// Not [`AttachFlags`], deliberately. There `--name` *resolves* a registered record and so
+/// conflicts with the explicit triple; here `--name` is the name to *register*, and the
+/// explicit spelling needs it beside the triple. Reusing the struct would have made the one
+/// legal explicit invocation a clap conflict.
+#[derive(Args, Debug)]
+pub struct AttachArgs {
+    /// A name record as the registry writes it (`<state-dir>/names/<name>.json`), or `-`
+    /// for stdin.
+    ///
+    /// The file another machine's `run --keep --vm-name` wrote is the export format, so
+    /// there is nothing to convert: `ssh other cat ~/.microvm/runs/names/ci.json | microvm
+    /// attach --from -`. The record's own name is registered unless `--name` renames it on
+    /// the way in. Identity material in the record is kept — the host seed is in the same
+    /// trust domain as the agent token beside it (see `NameRecord`), and the VM pin is what
+    /// a later `tunnel --name --verify-identity` checks against.
+    #[arg(
+        long,
+        value_name = "FILE",
+        conflicts_with_all = ["endpoint", "agent_token", "microvm_id", "identity_host_seed", "identity_vm_public_key"]
+    )]
+    pub from: Option<PathBuf>,
+
+    /// The name to register. Required with the explicit triple; renames a `--from` record.
+    ///
+    /// Validated like `run --vm-name`: ASCII letters, digits, `-`, `_`, never an id prefix.
+    /// A name already registered here to a *different* VM is refused with ERR_NAME_TAKEN —
+    /// a name is a promise about which VM answers, and nothing overwrites one silently.
+    /// The same VM under the same name is an idempotent success that refreshes the record.
+    #[arg(long, value_name = "NAME", required_unless_present = "from")]
+    pub name: Option<String>,
+
+    /// The VM's endpoint, as reported by `run` on the machine that launched it.
+    #[arg(long, required_unless_present = "from")]
+    pub endpoint: Option<String>,
+
+    /// The agent token delivered to the VM at launch. Never echoed in the envelope.
+    #[arg(long, required_unless_present = "from")]
+    pub agent_token: Option<String>,
+
+    /// The MicroVM id, needed to mint the endpoint proxy token.
+    #[arg(long, required_unless_present = "from")]
+    pub microvm_id: Option<String>,
+
+    /// The launching host's identity secret, base64, from `run --identity`'s envelope.
+    ///
+    /// Stored on the record so a later `tunnel --name --verify-identity` can run the
+    /// handshake; the Noise KK pattern proves this side too, so the pin alone is not enough.
+    #[arg(long, value_name = "BASE64", requires = "identity_vm_public_key")]
+    pub identity_host_seed: Option<String>,
+
+    /// The VM's public key, base64, from `run --identity`'s envelope. The pin.
+    #[arg(long, value_name = "BASE64", requires = "identity_host_seed")]
+    pub identity_vm_public_key: Option<String>,
+
+    /// Prove the far end is the VM the record was created for, before writing anything.
+    ///
+    /// Runs `tunnel --verify-identity`'s Noise KK handshake against the record's pinned VM
+    /// key. Refused up front when the record carries no identity material — identity is
+    /// generated at launch and cannot be added to a running VM — and refused, with nothing
+    /// written, when the handshake fails: a VM launched without `--identity` (4401), a
+    /// record replayed from another VM (the reply does not verify against the pin). Without
+    /// the flag the record is adopted on the strength of the token alone and keeps whatever
+    /// pin it carried, so a later `tunnel --name <NAME> --verify-identity` still works.
+    #[arg(long)]
+    pub verify_identity: bool,
+
+    /// The daemon's port inside the guest, for the probe. Not recorded.
+    #[arg(long)]
+    pub port: Option<u16>,
+
+    /// Where the local state lives — the registry this record is written into.
+    /// Defaults to $MICROVM_STATE_DIR or ~/.microvm/runs.
+    #[arg(long)]
+    pub state_dir: Option<PathBuf>,
+
+    /// The region the record stores and the probe mints against. With `--from`, the
+    /// record's own region is the default and a flag overrides it — the precedence every
+    /// `--name` command uses.
+    #[command(flatten)]
+    pub region: RegionFlags,
+}
+
 #[derive(Args, Debug)]
 pub struct SuspendArgs {
     /// The MicroVM to freeze.
@@ -1870,6 +1967,7 @@ mod tests {
                 "stdin",
                 "cp",
                 "sync",
+                "attach",
                 "tunnel",
                 "port-forward",
                 "shell",

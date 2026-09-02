@@ -2102,7 +2102,7 @@ pub async fn terminate<O: std::io::Write, E: std::io::Write>(
     // name still addresses it.
     if !leaked.contains(&microvm_id) {
         let names = crate::ledger::Names::new(&state_dir(args.state_dir.clone(), ctx.env));
-        if let Some(freed) = names.release_by_vm(&microvm_id) {
+        for freed in names.release_by_vm(&microvm_id) {
             ctx.out
                 .progress(&format!("released name {freed} — it can be reused"));
         }
@@ -2179,8 +2179,8 @@ fn wait_opts(timeout_sec: f64) -> WaitOpts {
     }
 }
 
-/// Seconds since the epoch, for a per-invocation image name.
-fn epoch_secs() -> u64 {
+/// Seconds since the epoch, for a per-invocation image name and a registry record's `at`.
+pub(crate) fn epoch_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|since| since.as_secs())

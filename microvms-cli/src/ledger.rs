@@ -255,7 +255,8 @@ impl Names {
         }
     }
 
-    fn path_of(&self, name: &str) -> PathBuf {
+    /// Where `name`'s record lives, whether or not one is registered.
+    pub fn path_of(&self, name: &str) -> PathBuf {
         self.root.join(format!("{name}.json"))
     }
 
@@ -301,15 +302,20 @@ impl Names {
         Ok(())
     }
 
-    /// Releases whatever name is registered to `microvm_id`, returning it.
+    /// Releases every name registered to `microvm_id`, returning them.
     ///
     /// By VM id rather than by name, because the terminate path resolves its identifier
     /// before this runs — the id is the one spelling it always holds, whichever the caller
-    /// typed. Failures are swallowed (a registry error must not displace the teardown's
-    /// real outcome); a record that survives costs one stale collision refusal, whose
-    /// message names the file.
-    pub fn release_by_vm(&self, microvm_id: &str) -> Option<String> {
-        let entries = std::fs::read_dir(&self.root).ok()?;
+    /// typed. Every match rather than the first: `attach` can register one VM under two
+    /// names in one registry (measured live 2026-09-02: a terminate through one alias left
+    /// the other as a stale record pointing at a VM that no longer exists). Failures are
+    /// swallowed (a registry error must not displace the teardown's real outcome); a record
+    /// that survives costs one stale collision refusal, whose message names the file.
+    pub fn release_by_vm(&self, microvm_id: &str) -> Vec<String> {
+        let Ok(entries) = std::fs::read_dir(&self.root) else {
+            return Vec::new();
+        };
+        let mut released = Vec::new();
         for entry in entries.filter_map(Result::ok) {
             let path = entry.path();
             if path.extension().is_none_or(|ext| ext != "json") {
@@ -323,10 +329,11 @@ impl Names {
             };
             if record.microvm_id == microvm_id {
                 let _ = std::fs::remove_file(&path);
-                return Some(record.name);
+                released.push(record.name);
             }
         }
-        None
+        released.sort();
+        released
     }
 }
 
@@ -548,18 +555,33 @@ mod tests {
         assert!(Names::new(&dir.0).lookup("other").is_none());
     }
 
-    /// A release by VM id frees exactly that VM's name and no other.
+    /// A release by VM id frees every name that VM holds and no other.
+    ///
+    /// Two names for one VM is the shape `attach` produces (the same record adopted twice
+    /// under different names, or adopted beside the launch's own). Releasing only the first
+    /// match left the second as a record pointing at a terminated VM — observed live on
+    /// 2026-09-02 — so both must go.
     #[test]
-    fn a_release_by_vm_id_frees_that_name_and_no_other() {
+    fn a_release_by_vm_id_frees_every_name_that_vm_holds_and_no_other() {
         let dir = TempDir::new("names-release");
         let names = Names::new(&dir.0);
         names.register(&a_record("a", "mvm-1")).expect("registers");
         names.register(&a_record("b", "mvm-2")).expect("registers");
+        names
+            .register(&a_record("b-alias", "mvm-2"))
+            .expect("registers");
 
-        assert_eq!(names.release_by_vm("mvm-2").as_deref(), Some("b"));
+        assert_eq!(names.release_by_vm("mvm-2"), ["b", "b-alias"]);
         assert!(names.lookup("b").is_none());
+        assert!(
+            names.lookup("b-alias").is_none(),
+            "every alias goes, not the first"
+        );
         assert!(names.lookup("a").is_some(), "the other name is untouched");
-        assert_eq!(names.release_by_vm("mvm-99"), None, "nothing to release");
+        assert!(
+            names.release_by_vm("mvm-99").is_empty(),
+            "nothing to release"
+        );
     }
 
     /// A torn record reads as taken rather than as free.

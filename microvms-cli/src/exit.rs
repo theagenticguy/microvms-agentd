@@ -99,7 +99,8 @@ pub enum Exit {
     /// platform, the credentials, or this CLI — a CI caller needs to tell "your tests
     /// failed" from "we never got a VM", and one shared code cannot say both.
     ExecFailed = 13,
-    /// `run --keep --vm-name` named a name the local registry already holds for a live VM.
+    /// `run --keep --vm-name` (or `attach --name`) named a name the local registry already
+    /// holds for a different live VM.
     ///
     /// Its own row rather than `ERR_INVALID_ARG`, because the two demand different next
     /// actions: an invalid argument is fixed by editing the flag, and a taken name is fixed

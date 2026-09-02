@@ -430,6 +430,10 @@ async fn handle<O: std::io::Write, E: std::io::Write>(
         // expected ending rather than an abort: `sync --watch` runs until the caller
         // stops it, and Ctrl-C resolves into the summary envelope.
         Command::Sync(args) => commands::attached::sync(ctx, args, interrupt).await,
+        // Registers a record for a VM another state directory launched (#66). Through the
+        // attached module because its one AWS call is the same door the others use: the
+        // probe that proves the triple is live before anything is written.
+        Command::Attach(args) => commands::attached::attach_vm(ctx, args).await,
         // The second command that races the interrupt, and the only one for which the
         // interrupt is the *expected* ending rather than an abort: a tunnel runs until the
         // caller stops it. See `attached::port_forward` on why that exits 0.

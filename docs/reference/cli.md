@@ -1,6 +1,6 @@
 # microvms-agentd · CLI
 
-The `microvm` binary has twenty-three subcommands, declared as one `clap` `Subcommand` enum in `microvms-cli/src/cli.rs` and built from `microvms-cli/Cargo.toml:20-22`.
+The `microvm` binary has twenty-four subcommands, declared as one `clap` `Subcommand` enum in `microvms-cli/src/cli.rs` and built from `microvms-cli/Cargo.toml:20-22`.
 
 ## Global flags
 
@@ -231,6 +231,38 @@ Flags:
 
 A disk-pressure refusal (the daemon's 507, with the byte counts in the body) surfaces as `ERR_PLATFORM` with the free-space remedy and `data.diskUnderPressure: true` — never `ERR_RETRYABLE`, because retrying an identical upload against a full disk cannot succeed.
 
+## attach
+
+```
+microvm attach --from <FILE|-> [--name <NEW_NAME>] [--verify-identity] [--state-dir <DIR>]
+microvm attach --name <NAME> --microvm-id <ID> --endpoint <URL> --agent-token <TOKEN> [--region <R>] [--identity-host-seed <BASE64> --identity-vm-public-key <BASE64>] [--verify-identity]
+```
+
+Registers a name for a running MicroVM this state directory did not launch, so every later `--name` command here can act on it. Cross-machine adoption (issue #66): same-machine adoption already exists through the registry `run --keep --vm-name` writes, and what was missing was moving that record between machines. Two spellings of the same facts, mutually exclusive: `--from` reads a name record exactly as the registry writes it (`<state-dir>/names/<name>.json` on the launching machine — the export format is the existing file, so `microvm attach --from <(ssh other cat ~/.microvm/runs/names/ci.json)` needs no export command), and the explicit triple is for a caller holding a `run` envelope from another machine. Nothing is written until the VM has answered one authenticated request with the token being registered.
+
+`microvms-cli/src/commands/attached.rs`, `attach_vm`
+
+Flags:
+
+- `--from <FILE>` — a name record file, or `-` for stdin. The record's own name is registered unless `--name` renames it; its region is the default unless a region flag is given. Identity material in the record is kept: the VM pin is what a later `tunnel --name <NAME> --verify-identity` checks against, and the host seed is in the same trust domain as the agent token beside it. Conflicts with the explicit triple.
+- `--name <NAME>` — the name to register. Required with the explicit triple; optional rename with `--from`. Validated like `run --vm-name`.
+- `--endpoint <URL>`, `--agent-token <TOKEN>`, `--microvm-id <ID>` — the explicit triple, from a `run` envelope. Required unless `--from` is given.
+- `--identity-host-seed <BASE64>`, `--identity-vm-public-key <BASE64>` — the pair from `run --identity`'s envelope, stored on the record for a later verified tunnel. Each requires the other: the Noise KK pattern proves this side too, so the pin alone cannot run a handshake.
+- `--verify-identity` — prove the far end is the VM the record was created for before writing anything, with the same Noise KK handshake `tunnel --verify-identity` runs (`microvms-core/src/session/tunnel.rs`, `verify_identity` — the tunnel's open-and-handshake step with no relay after it). Refused up front when the record carries no identity pair, naming the missing field.
+- `--port <PORT>` — the daemon's port inside the guest, for the probe. Not recorded.
+- `--state-dir <DIR>` — the registry the record is written into; defaults to `$MICROVM_STATE_DIR` or `~/.microvm/runs`.
+- Plus `RegionFlags`.
+
+Refusals, each before anything is written:
+
+- A name already registered here to a *different* MicroVM id is `ERR_NAME_TAKEN` (14) before any AWS call, with `data.holder` naming the VM that holds it — the same row and the same reasoning as `run --keep --vm-name`, and a torn record reads as taken. The same VM under the same name is an idempotent success with `replaced: true` and a refreshed record.
+- The probe is one authenticated read (`GET /v1/fs/file?path=/dev/null`), not `/v1/health`: health is an open route on the daemon, so a probe that stopped there would accept a wrong token. A dead endpoint, a wrong token (`ERR_CREDENTIALS`, `data.kind: Unauthorized`), or an unbootstrapped daemon (`data.kind: NotBootstrapped`) surfaces with the daemon's own class and leaves the registry untouched.
+- `--verify-identity` without the pair, a VM launched without `--identity` (close 4401), or a record replayed from another VM (the daemon's reply does not verify against the pin) is `ERR_PRECONDITION`, and nothing is written.
+
+The envelope is `{name, microvmId, endpoint, region, verifiedIdentity, replaced, statePath}` — never the agent token, which is in the owner-only (0600 on Unix) record file at `statePath`. Text rendering is one line.
+
+A `terminate` releases a name only in the state directory it ran against: a record adopted into a second machine stays there until that machine terminates by the name or deletes the file.
+
 ## suspend
 
 ```
@@ -275,7 +307,7 @@ Tears down a MicroVM and optionally its image and build log group. When part of 
 
 Flags:
 
-- `<MICROVM_ID>` — the MicroVM to terminate: a MicroVM id, or a registered name (resolved locally). An accepted terminate releases the VM's registered name whichever spelling addressed it, so the name is reusable. Required.
+- `<MICROVM_ID>` — the MicroVM to terminate: a MicroVM id, or a registered name (resolved locally). An accepted terminate releases every name this state directory registered to the VM, whichever spelling addressed it — the launch's own and any `attach` alias — so the names are reusable. Required.
 - `--image-identifier <IMAGE_IDENTIFIER>` — the image to delete, if `--delete-image` is given. `microvms-cli/src/cli.rs:709-710`.
 - `--image-name <IMAGE_NAME>` — the image's name, needed to name its build log group; the service created that group, so `terraform destroy` never removes it. `microvms-cli/src/cli.rs:715-716`.
 - `--delete-image` — also delete the image and name its build log group; requires `--image-identifier`. `microvms-cli/src/cli.rs:719-720`.

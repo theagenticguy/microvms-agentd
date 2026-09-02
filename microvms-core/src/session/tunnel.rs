@@ -187,17 +187,65 @@ where
     .await
 }
 
-async fn relay_connection_inner<S>(
-    mut local: S,
+/// Proves the far end is the VM `identity` was minted for, and nothing more.
+///
+/// The same handshake [`relay_connection_verified`] runs before its first relayed byte — one
+/// code path, so `microvm attach --verify-identity` and `microvm tunnel --verify-identity`
+/// cannot disagree about what "verified" means — with no local connection to relay: the
+/// socket is closed cleanly the moment the daemon's reply authenticates. The guest port is
+/// the daemon's own, because the daemon dials it after the handshake and it is the one port
+/// every VM is guaranteed to have a listener on.
+///
+/// Returns [`TunnelEnd::Closed`] when the pin verified, [`TunnelEnd::Refused`] with the
+/// daemon's close code when it refused (4401 no seed at launch, 4403 refused), and an error
+/// when the daemon's reply did not authenticate against the pin — the wrong-VM case as seen
+/// from this side.
+pub async fn verify_identity(
+    endpoint: &str,
+    agent_token: &str,
+    auth: &Arc<ProxyAuth>,
+    identity: &crate::identity::TunnelIdentity,
+) -> Result<TunnelEnd, Error> {
+    let guest_port = auth.port();
+    match open(endpoint, guest_port, agent_token, auth, Some(identity)).await? {
+        Opened::Refused(end) => Ok(end),
+        Opened::Ready(mut ready) => {
+            let _ = ready.socket.send(Message::Close(None)).await;
+            Ok(TunnelEnd::Closed)
+        }
+    }
+}
+
+/// An open tunnel WebSocket, past the identity handshake when one was asked for.
+///
+/// The ready half is boxed because a WebSocket plus a Noise transport state is several
+/// hundred bytes beside a two-word refusal, and clippy's `large_enum_variant` is right that
+/// every `Refused` would otherwise carry that much padding.
+enum Opened {
+    Ready(Box<Ready>),
+    Refused(TunnelEnd),
+}
+
+struct Ready {
+    socket: TunnelSocket,
+    noise: Option<snow::TransportState>,
+}
+
+type TunnelSocket =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+/// Opens the tunnel WebSocket to `guest_port` and, when `identity` is given, runs the Noise KK
+/// handshake over it before returning.
+///
+/// Shared by the relay and by [`verify_identity`], so the token scoping, the two credentials
+/// on the upgrade, and the handshake ordering are written once.
+async fn open(
     endpoint: &str,
     guest_port: u16,
     agent_token: &str,
     auth: &Arc<ProxyAuth>,
     identity: Option<&crate::identity::TunnelIdentity>,
-) -> Result<TunnelEnd, Error>
-where
-    S: AsyncRead + AsyncWrite + Unpin,
-{
+) -> Result<Opened, Error> {
     // **The token is scoped to the DAEMON's port, not to `guest_port`, and that inversion is
     // the whole subtlety of this route.**
     //
@@ -266,12 +314,33 @@ where
     // the CLI renders the code's explanation), and a reply that fails *our* verification is
     // an error naming the pin — that is the wrong-pin case as seen from this side, and the
     // one piece of diagnosis the daemon cannot do.
-    let mut noise = match identity {
+    let noise = match identity {
         None => None,
         Some(identity) => match initiate(&mut socket, identity, guest_port).await? {
             Initiated::Transport(transport) => Some(transport),
-            Initiated::Refused(end) => return Ok(end),
+            Initiated::Refused(end) => return Ok(Opened::Refused(end)),
         },
+    };
+    Ok(Opened::Ready(Box::new(Ready { socket, noise })))
+}
+
+async fn relay_connection_inner<S>(
+    mut local: S,
+    endpoint: &str,
+    guest_port: u16,
+    agent_token: &str,
+    auth: &Arc<ProxyAuth>,
+    identity: Option<&crate::identity::TunnelIdentity>,
+) -> Result<TunnelEnd, Error>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let Ready {
+        mut socket,
+        mut noise,
+    } = match open(endpoint, guest_port, agent_token, auth, identity).await? {
+        Opened::Ready(ready) => *ready,
+        Opened::Refused(end) => return Ok(end),
     };
 
     // The verified path reads smaller chunks so plaintext plus the 16-byte tag fits one
@@ -394,9 +463,7 @@ enum Initiated {
 
 /// Runs the initiator's half of the Noise KK handshake over the open WebSocket.
 async fn initiate(
-    socket: &mut tokio_tungstenite::WebSocketStream<
-        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-    >,
+    socket: &mut TunnelSocket,
     identity: &crate::identity::TunnelIdentity,
     guest_port: u16,
 ) -> Result<Initiated, Error> {

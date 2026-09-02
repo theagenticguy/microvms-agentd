@@ -40,7 +40,9 @@ use microvms_core::session::{EndReason, ExecEvent, Session, StreamOptions};
 use microvms_core::{Error, ErrorKind};
 use serde_json::{Map, Value, json};
 
-use crate::cli::{AckArgs, AttachFlags, CpArgs, ExecArgs, HealthArgs, RegionFlags, StdinArgs};
+use crate::cli::{
+    AckArgs, AttachArgs, AttachFlags, CpArgs, ExecArgs, HealthArgs, RegionFlags, StdinArgs,
+};
 use crate::commands::{Ctx, Rendered, STREAM_RESPONSE, response_type};
 use crate::exit::{CliError, Exit};
 use crate::history::{Event, History};
@@ -119,7 +121,11 @@ fn resolve_attach<O: std::io::Write, E: std::io::Write>(
                 ),
             )
             .suggest("`microvm ls` shows this state directory's outstanding runs")
-            .suggest("pass the --endpoint/--agent-token/--microvm-id triple directly"));
+            .suggest("pass the --endpoint/--agent-token/--microvm-id triple directly")
+            .suggest(
+                "`microvm attach --from <FILE>` adopts the record from the other machine's \
+                 state directory, so `--name` works here from then on",
+            ));
         };
         // The flag wins over the record, so `exec --name x --region us-west-2` means what it
         // says; the record's region is the default that makes the flag unnecessary.
@@ -1573,6 +1579,375 @@ fn report_pass<O: std::io::Write, E: std::io::Write>(ctx: &mut Ctx<'_, O, E>, pa
     }
 }
 
+// ── attach: adopting a record this state directory did not write ─────────────
+
+/// The path the authenticated probe reads: zero bytes, present in every Linux guest.
+///
+/// **Not `/v1/health`.** That route is `Auth::Open` (`agentd/src/routes.rs`, the health row:
+/// the platform forwards no external traffic until the run hook returns 200, so reaching it
+/// implies nothing about the bearer), and a probe that stopped there would register a record
+/// whose token the daemon refuses on every later `exec --name` — the phantom this command
+/// exists to prevent. `GET /v1/fs/file` sits behind `auth::require_token`, and `/dev/null` is
+/// the one path a read cannot fail on for a reason that is about the file.
+const PROBE_PATH: &str = "/dev/null";
+
+/// Registers a name for a running MicroVM this state directory did not launch.
+///
+/// Issue #66's cross-machine half. Same-machine adoption already exists: `run --keep
+/// --vm-name` writes a [`crate::ledger::NameRecord`] and every `--name` command reads it
+/// back with zero AWS calls. What was missing is moving that record between machines, which
+/// was `scp`. This command takes the record — as the file the other registry holds
+/// (`--from`), or as the triple a `run` envelope printed — and writes it here, so the export
+/// format is the registry's own file and there is no export command to add.
+///
+/// # Nothing is written until the VM has answered with the token being registered
+///
+/// An attach authenticates the token, not the machine (the issue's own sentence), so the
+/// probe is the only proof the triple is live. One authenticated read of [`PROBE_PATH`]
+/// through the session seam: a dead endpoint, a wrong token (401), or an unbootstrapped daemon
+/// (503) fails here with the daemon's own class and leaves the registry untouched. The probe
+/// goes through [`crate::seam::CoreSeam::attach_session`] like every other attached command,
+/// which is what keeps CLI-2's door guard true for this one.
+///
+/// # A name is a promise
+///
+/// A name already registered here to a *different* MicroVM id is refused with `ERR_NAME_TAKEN`
+/// before any probe — the same row and the same reasoning as `run --keep --vm-name`, and a
+/// torn record reads as taken for the same reason. The same VM under the same name is an
+/// idempotent success: the record is refreshed and the envelope says `replaced: true`.
+///
+/// # What `--verify-identity` adds, and what an unflagged adopt keeps
+///
+/// With the flag, the record must carry both halves of the identity pair (refused otherwise,
+/// naming the missing field) and the probe is followed by the Noise KK handshake `tunnel
+/// --verify-identity` runs — [`microvms_core::session::tunnel::verify_identity`] is that
+/// code path with no relay after it, not a copy. Without the flag, the record is adopted on
+/// the token alone and keeps whatever identity material it carried: the VM pin, so a later
+/// `tunnel --name <NAME> --verify-identity` still works, and the host seed, which
+/// `NameRecord` documents as the same trust domain as the agent token beside it.
+///
+/// # The envelope never carries the token
+///
+/// `{name, microvmId, endpoint, region, verifiedIdentity, replaced, statePath}`. The token
+/// is on disk, owner-only, where every `--name` command reads it; printing it would put a
+/// bearer credential in a CI log for no caller's benefit.
+pub async fn attach_vm<O: std::io::Write, E: std::io::Write>(
+    ctx: &mut Ctx<'_, O, E>,
+    args: &AttachArgs,
+) -> Result<Rendered, CliError> {
+    let root = state_dir(args.state_dir.clone(), ctx.env);
+    let names = crate::ledger::Names::new(&root);
+    let region_flag_given = args.region.region.is_some() || args.region.unlisted_region.is_some();
+
+    let (mut record, region) = match &args.from {
+        Some(source) => {
+            let text = read_record_source(source)?;
+            let mut record: crate::ledger::NameRecord =
+                serde_json::from_str(&text).map_err(|error| {
+                    CliError::new(
+                        Exit::InvalidArg,
+                        format!(
+                            "{} is not a name record: {error}. The format is the registry's \
+                             own file, `<state-dir>/names/<name>.json` on the machine that \
+                             ran `run --keep --vm-name`.",
+                            shown(source)
+                        ),
+                    )
+                })?;
+            if let Some(name) = &args.name {
+                record.name = name.clone();
+            }
+            // The flag wins over the record, the precedence every `--name` command uses;
+            // the record's launch region is the default that makes the flag unnecessary.
+            let region = if region_flag_given {
+                args.region.resolve(ctx.env)?
+            } else {
+                microvms_core::Region::unlisted(&record.region)
+            };
+            record.region = region.as_str().to_string();
+            (record, region)
+        }
+        None => {
+            let expect = |value: &Option<String>, flag: &str| -> Result<String, CliError> {
+                value.clone().ok_or_else(|| {
+                    // Unreachable through the parser — `required_unless_present = "from"` —
+                    // but the struct is constructible in code, and a message beats a panic.
+                    CliError::new(
+                        Exit::InvalidArg,
+                        format!("--{flag} is required unless --from is given"),
+                    )
+                })
+            };
+            let region = args.region.resolve(ctx.env)?;
+            (
+                crate::ledger::NameRecord {
+                    name: expect(&args.name, "name")?,
+                    microvm_id: expect(&args.microvm_id, "microvm-id")?,
+                    endpoint: expect(&args.endpoint, "endpoint")?,
+                    agent_token: expect(&args.agent_token, "agent-token")?,
+                    region: region.as_str().to_string(),
+                    at: 0,
+                    identity_host_seed: args.identity_host_seed.clone(),
+                    identity_vm_public_key: args.identity_vm_public_key.clone(),
+                },
+                region,
+            )
+        }
+    };
+    // This registry's clock, not the launching machine's: `at` is when *this* record was
+    // written, which is the fact `ls`-style tooling here can act on.
+    record.at = crate::commands::lifecycle::epoch_secs();
+
+    crate::ledger::validate_name(&record.name)
+        .map_err(|detail| CliError::new(Exit::InvalidArg, format!("--name: {detail}")))?;
+    for (value, key) in [
+        (&record.microvm_id, "microvmId"),
+        (&record.endpoint, "endpoint"),
+        (&record.agent_token, "agentToken"),
+    ] {
+        if value.trim().is_empty() {
+            return Err(CliError::new(
+                Exit::InvalidArg,
+                format!(
+                    "the record's {key} is empty, so no later `--name {}` could address a VM \
+                     with it",
+                    record.name
+                ),
+            ));
+        }
+    }
+
+    // The collision check, before any AWS call and before any probe: a refusal here costs
+    // nothing and a name that pointed two ways would make every later command ambiguous
+    // about which VM it addresses. A torn record reads as taken (`Names::lookup`), so the
+    // empty id it reports lands in the refusal arm rather than the idempotent one.
+    let record_path = names.path_of(&record.name);
+    let replaced = match names.lookup(&record.name) {
+        None => false,
+        Some(existing) if existing.microvm_id == record.microvm_id => true,
+        Some(existing) => {
+            return Err(CliError::new(
+                Exit::NameTaken,
+                format!(
+                    "{:?} is already registered here to {} ({}), and this attach names {}. A \
+                     name is a promise about which VM answers to it, and nothing overwrites \
+                     one silently.",
+                    record.name,
+                    if existing.microvm_id.is_empty() {
+                        "an unreadable record".to_string()
+                    } else {
+                        existing.microvm_id.clone()
+                    },
+                    record_path.display(),
+                    record.microvm_id,
+                ),
+            )
+            .suggest("pass a different --name")
+            .suggest("`microvm terminate <NAME>` releases the name when the VM holding it is done")
+            .with_data("holder", json!(existing.microvm_id))
+            .with_data("statePath", json!(record_path.display().to_string())));
+        }
+    };
+
+    // The identity material, resolved before the probe so a record that cannot be verified
+    // pays no AWS call. Fails closed: `--verify-identity` with material missing is a
+    // refusal naming the missing field, never a silent downgrade to a token-only adopt.
+    let identity = if args.verify_identity {
+        match (&record.identity_host_seed, &record.identity_vm_public_key) {
+            (Some(seed), Some(pin)) => Some(
+                microvms_core::identity::TunnelIdentity::from_encoded_parts(seed, pin)?,
+            ),
+            (seed, pin) => {
+                let missing: Vec<&str> = [
+                    (seed.is_none(), "identityHostSeed"),
+                    (pin.is_none(), "identityVmPublicKey"),
+                ]
+                .into_iter()
+                .filter_map(|(absent, key)| absent.then_some(key))
+                .collect();
+                return Err(CliError::new(
+                    Exit::Precondition,
+                    format!(
+                        "the record for {:?} carries no {}, so there is nothing to verify the \
+                         VM against. Identity is generated at launch (`run --identity`) and \
+                         cannot be added to a running VM.",
+                        record.name,
+                        missing.join(" or "),
+                    ),
+                )
+                .suggest("drop --verify-identity to adopt on the strength of the token alone")
+                .suggest(
+                    "the explicit spelling takes --identity-host-seed and \
+                     --identity-vm-public-key from `run --identity`'s envelope",
+                ));
+            }
+        }
+    } else {
+        None
+    };
+
+    ctx.out.progress(&format!(
+        "probing {} before registering it as {:?}",
+        record.microvm_id, record.name
+    ));
+    let session = ctx
+        .seam
+        .attach_session(
+            region,
+            Attach {
+                endpoint: record.endpoint.clone(),
+                agent_token: record.agent_token.clone(),
+                microvm_id: record.microvm_id.clone(),
+                port: args.port,
+            },
+        )
+        .await?;
+    // Either answer proves the bearer was accepted: the 404 arm sits behind the same auth
+    // layer as the 200, and a 401 or 503 propagates with the daemon's own class.
+    session.file_exists(PROBE_PATH).await?;
+
+    let verified_identity = match identity {
+        None => false,
+        Some(identity) => {
+            ctx.out.progress(&format!(
+                "verifying {} against the pinned VM key",
+                record.microvm_id
+            ));
+            let Some(auth) = session.proxy_auth().cloned() else {
+                return Err(CliError::new(
+                    Exit::Precondition,
+                    "this session reaches the daemon directly rather than through the \
+                     endpoint proxy, so there is no port-scoped token to open the identity \
+                     handshake with. --verify-identity proves the VM across the proxy; a \
+                     direct session is already on the other side of it."
+                        .to_string(),
+                ));
+            };
+            let outcome = microvms_core::session::tunnel::verify_identity(
+                session.endpoint(),
+                session.agent_token(),
+                &auth,
+                &identity,
+            )
+            .await
+            .map_err(|error| {
+                // Core reports a reply that fails *our* verification as `Unexpected`, which
+                // the exit table describes as a bug in this CLI. It is not one here: the far
+                // end holds a different seed than the record was made with, which is a
+                // record that does not describe this VM.
+                CliError::new(
+                    Exit::Precondition,
+                    format!("identity verification refused the record: {error}"),
+                )
+                .suggest("drop --verify-identity to adopt on the strength of the token alone")
+            })?;
+            if let microvms_core::session::tunnel::TunnelEnd::Refused { code, reason } = outcome {
+                let detail = if reason.is_empty() {
+                    microvms_core::session::tunnel::explain_close(code, auth.port()).unwrap_or_else(
+                        || format!("the identity handshake closed with code {code}"),
+                    )
+                } else {
+                    reason
+                };
+                return Err(CliError::new(
+                    Exit::Precondition,
+                    format!("identity verification refused the record: {detail}"),
+                )
+                .suggest("drop --verify-identity to adopt on the strength of the token alone")
+                .with_data("closeCode", json!(code)));
+            }
+            true
+        }
+    };
+
+    // Written last, after every proof: a register that failed here has cost one AWS
+    // round trip and left the registry exactly as it was.
+    names.register(&record).map_err(|error| {
+        CliError::new(
+            Exit::Precondition,
+            format!(
+                "the VM answered, but its record could not be written to {}: {error}",
+                record_path.display()
+            ),
+        )
+    })?;
+
+    let mut data = Map::new();
+    data.insert("name".into(), json!(record.name));
+    data.insert("microvmId".into(), json!(record.microvm_id));
+    data.insert("endpoint".into(), json!(record.endpoint));
+    data.insert("region".into(), json!(record.region));
+    data.insert("verifiedIdentity".into(), json!(verified_identity));
+    data.insert("replaced".into(), json!(replaced));
+    data.insert("statePath".into(), json!(record_path.display().to_string()));
+
+    let (kind, _) = response_type("attach");
+    let text = format!(
+        "attached {:?} -> {} ({}, {}){}{} in {}",
+        record.name,
+        record.microvm_id,
+        record.endpoint,
+        record.region,
+        if verified_identity {
+            ", identity verified"
+        } else {
+            ""
+        },
+        if replaced {
+            ", replaced the previous record"
+        } else {
+            ""
+        },
+        record_path.display(),
+    );
+    let dense = format!(
+        "attach\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+        record.name,
+        record.microvm_id,
+        record.endpoint,
+        record.region,
+        verified_identity,
+        replaced,
+        record_path.display(),
+    );
+    Ok(Rendered::ok(kind, data, text, dense))
+}
+
+/// The bytes of `--from`, from the named file or from stdin for `-`.
+fn read_record_source(source: &std::path::Path) -> Result<String, CliError> {
+    if source == std::path::Path::new("-") {
+        use std::io::Read as _;
+        let mut text = String::new();
+        std::io::stdin().read_to_string(&mut text).map_err(|error| {
+            CliError::new(
+                Exit::InvalidArg,
+                format!("could not read the record from stdin: {error}"),
+            )
+            .suggest("`--from -` expects the record on stdin, e.g. `ssh other cat ~/.microvm/runs/names/ci.json | microvm attach --from -`")
+        })?;
+        return Ok(text);
+    }
+    std::fs::read_to_string(source).map_err(|error| {
+        CliError::new(
+            Exit::InvalidArg,
+            format!("could not read {}: {error}", source.display()),
+        )
+        .suggest(
+            "the record is `<state-dir>/names/<name>.json` on the machine that ran `run --keep \
+             --vm-name`; `~/.microvm/runs` is the default state directory",
+        )
+    })
+}
+
+/// `--from`'s source as a message names it.
+fn shown(source: &std::path::Path) -> String {
+    if source == std::path::Path::new("-") {
+        "stdin".to_string()
+    } else {
+        source.display().to_string()
+    }
+}
+
 // ── port-forward ────────────────────────────────────────────────────────────
 
 /// Serves a guest port on localhost until Ctrl-C, or until `--max-connections` is reached.
@@ -2117,7 +2492,11 @@ pub async fn shell<O: std::io::Write, E: std::io::Write>(
                 ),
             )
             .suggest("`microvm ls` shows this state directory's outstanding runs")
-            .suggest("pass --endpoint and --microvm-id directly"));
+            .suggest("pass --endpoint and --microvm-id directly")
+            .suggest(
+                "`microvm attach --from <FILE>` adopts the record from the other machine's \
+                 state directory, so `--name` works here from then on",
+            ));
         };
         let region = if args.region.region.is_some() || args.region.unlisted_region.is_some() {
             args.region.resolve(ctx.env)?

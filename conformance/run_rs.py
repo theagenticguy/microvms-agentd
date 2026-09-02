@@ -6,7 +6,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Live conformance run driving the **Rust** client stack through the `microvm` CLI.
 
-This is the only live suite, and it now expresses **every named check** — 131 of them, with
+This is the only live suite, and it now expresses **every named check** — 136 of them, with
 none recorded SKIP. `conformance/run.py` was the oracle — 56 checks through the Python
 client — and it went away with that client once both suites ran green against real AWS on
 the same commit (Python 56/56, this one 38/38 with 34 recorded SKIP). Those 34 were the
@@ -121,6 +121,16 @@ build reusing, a VM launched from the image importing the locked dependency with
 egress, and the section's own VM/image and log-group teardown. Live because the derived
 Dockerfile's toolchain bootstrap runs on the platform's arm64 builder against the real
 base image, and no local guard sees past the Dockerfile's text.
+
+136 rather than 131: `microvm attach` (issue #66) adds five. Three in `drive_named_vm` —
+the launched record adopted `--from` its file into a second state directory that never
+launched the VM, an `exec --name` through that adopted record reaching the VM, and an
+attach with a wrong token refused with the daemon's own `Unauthorized` and writing
+nothing. Two in `drive_tunnel_identity` — `attach --verify-identity` proving the identity
+VM against its pinned key through the real proxy, and the same attach against the
+tampered pin refused with nothing written. Live for the named-VMs reason and one more:
+the probe's whole claim is that a wrong token is refused *by the daemon* before a record
+exists, and only the real daemon's bearer check can refuse one.
 
 A hybrid driver, and both lanes are deliberate
 ----------------------------------------------
@@ -1905,9 +1915,10 @@ def drive_token_rotation(cli: Cli, launched: Envelope, results: Results) -> None
 def drive_named_vm(
     cli: Cli, launched: Envelope, state_dir: Path, results: Results
 ) -> None:
-    """Named VMs (issue #67): register at launch, address by name, collide, release.
+    """Named VMs (issue #67): register at launch, address by name, collide, release —
+    and adopt across state directories (issue #66).
 
-    Five checks against a VM this section launches and terminates itself, from the image
+    Eight checks against a VM this section launches and terminates itself, from the image
     the suite already built (`run --image`, no second build). Its own VM rather than the
     suite's because registration happens only at launch — the suite's VM was launched
     before any name existed to give it.
@@ -1963,6 +1974,78 @@ def drive_named_vm(
             and "named" in (first.data.get("stdout") or ""),
             f"exit={first.data.get('exitCode')} stdout={first.data.get('stdout')!r}",
         )
+
+        # Cross-machine adoption (issue #66), with a second state directory standing in
+        # for the second machine: the file this launch wrote is the export format, and a
+        # registry that never launched the VM can act on it after one probe. Then the
+        # negative: the same record with its token altered must be refused by the real
+        # daemon's bearer check — the whole reason the probe is an authenticated read
+        # and not `/v1/health` — and must leave the second registry untouched.
+        adopted_dir = state_dir.parent / f"{state_dir.name}-adopted"
+        record_path = state_dir / "names" / f"{vm_name}.json"
+        adopted_name = f"adopted-{secrets.token_hex(4)}"
+        adopted = cli.call(
+            "attach",
+            "--from",
+            str(record_path),
+            "--name",
+            adopted_name,
+            "--state-dir",
+            str(adopted_dir),
+        )
+        results.check(
+            "attach --from adopted the record into a state dir that never launched the VM",
+            adopted.type == "microvm.attach"
+            and adopted.data.get("name") == adopted_name
+            and adopted.data.get("microvmId") == microvm_id
+            and adopted.data.get("verifiedIdentity") is False
+            and adopted.data.get("replaced") is False
+            and "agentToken" not in adopted.data
+            and (adopted_dir / "names" / f"{adopted_name}.json").exists(),
+            f"type={adopted.type} keys={sorted(adopted.data)} microvm={adopted.data.get('microvmId')}",
+        )
+        through = cli.call(
+            "exec",
+            "echo adopted",
+            "--name",
+            adopted_name,
+            "--state-dir",
+            str(adopted_dir),
+        )
+        results.check(
+            "exec --name through the adopted record reached the VM",
+            through.data.get("exitCode") == 0
+            and "adopted" in (through.data.get("stdout") or ""),
+            f"exit={through.data.get('exitCode')} stdout={through.data.get('stdout')!r}",
+        )
+        record = json.loads(record_path.read_text())
+        wrong_token = json.dumps({**record, "agentToken": record["agentToken"] + "x"})
+        wrong_name = f"wrong-{secrets.token_hex(4)}"
+        wrong_path = adopted_dir / "wrong-token.json"
+        wrong_path.write_text(wrong_token)
+        try:
+            cli.call(
+                "attach",
+                "--from",
+                str(wrong_path),
+                "--name",
+                wrong_name,
+                "--state-dir",
+                str(adopted_dir),
+            )
+            results.check(
+                "attach with a wrong token is refused by the daemon and writes nothing",
+                False,
+                "no refusal",
+            )
+        except KindError as exc:
+            results.check(
+                "attach with a wrong token is refused by the daemon and writes nothing",
+                exc.kind == "Unauthorized"
+                and exc.code == "ERR_CREDENTIALS"
+                and not (adopted_dir / "names" / f"{wrong_name}.json").exists(),
+                f"kind={exc.kind} code={exc.code} written={(adopted_dir / 'names' / f'{wrong_name}.json').exists()}",
+            )
 
         # The collision: a second launch under the live name must be refused locally,
         # with the appended row, before anything is billed. The refusal arriving at all
@@ -2071,7 +2154,8 @@ def _tunnel_fetch(
 def drive_tunnel_identity(
     cli: Cli, launched: Envelope, state_dir: Path, results: Results
 ) -> None:
-    """Tunnel identity (issue #70 layer 3): prove the VM, fail closed. Six checks.
+    """Tunnel identity (issue #70 layer 3): prove the VM, fail closed. Eight checks,
+    two of them `attach --verify-identity` (issue #66) over the same pin.
 
     Its own VM, launched `--identity` from the image the suite already built: the seed is
     delivered only at launch, so the suite's VM — launched without one — cannot carry it.
@@ -2151,6 +2235,29 @@ def drive_tunnel_identity(
             f"body: {verified[:80] if verified else verified!r}",
         )
 
+        # `attach --verify-identity` (issue #66) runs the tunnel's handshake with no relay
+        # after it, into a second state directory. Live because the handshake's proxy-side
+        # failure mode is a silent 1006, the same reason the tunnel checks are live.
+        adopted_dir = state_dir.parent / f"{state_dir.name}-adopted"
+        adopted_name = f"adopted-ident-{secrets.token_hex(4)}"
+        verified_attach = cli.call(
+            "attach",
+            "--from",
+            str(record_path),
+            "--name",
+            adopted_name,
+            "--verify-identity",
+            "--state-dir",
+            str(adopted_dir),
+        )
+        results.check(
+            "attach --verify-identity proved the VM against the pinned key",
+            verified_attach.data.get("verifiedIdentity") is True
+            and verified_attach.data.get("microvmId") == microvm_id
+            and (adopted_dir / "names" / f"{adopted_name}.json").exists(),
+            f"verifiedIdentity={verified_attach.data.get('verifiedIdentity')!r}",
+        )
+
         # The replayed-record case: one flipped pin character mid-base64 (length and
         # padding stay legal), handshake must fail, nothing served.
         pin = record["identityVmPublicKey"]
@@ -2161,6 +2268,32 @@ def drive_tunnel_identity(
             _tunnel_fetch(cli, vm_name, state_dir, 18444, AGENT_PORT, verify=True),
             None,
         )
+        # And the same tampered record cannot be adopted under the flag: the handshake
+        # reply fails to verify against the flipped pin, and no record is written.
+        tampered_name = f"tampered-{secrets.token_hex(4)}"
+        try:
+            cli.call(
+                "attach",
+                "--from",
+                str(record_path),
+                "--name",
+                tampered_name,
+                "--verify-identity",
+                "--state-dir",
+                str(adopted_dir),
+            )
+            results.check(
+                "attach --verify-identity with a tampered pin is refused and writes nothing",
+                False,
+                "no refusal",
+            )
+        except KindError as exc:
+            results.check(
+                "attach --verify-identity with a tampered pin is refused and writes nothing",
+                exc.code == "ERR_PRECONDITION"
+                and not (adopted_dir / "names" / f"{tampered_name}.json").exists(),
+                f"code={exc.code} written={(adopted_dir / 'names' / f'{tampered_name}.json').exists()}",
+            )
         record_path.write_text(json.dumps(record))
 
         # And the same record still works untampered — so the refusal above was the flip,
