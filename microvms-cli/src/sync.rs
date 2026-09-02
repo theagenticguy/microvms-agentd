@@ -157,6 +157,200 @@ fn collect(dir: &Path, walk: &mut Walk) -> Result<(), SyncError> {
     Ok(())
 }
 
+/// Where the incremental manifest lives in the guest: inside the workspace, deliberately.
+///
+/// The manifest is a cache of what the last sync put in `/workspace`, and a cache must die
+/// with the thing it describes. A workload that wipes the workspace (a clean step, a fresh
+/// checkout) also wipes the manifest, so the next `microvm sync` sees no manifest and does
+/// a full upload instead of trusting a description of files that are gone. Stored outside
+/// the workspace it would survive the wipe and the next sync would skip everything.
+///
+/// The name is excluded from packing and from the deletion diff (see [`diff`]), so the
+/// manifest never deletes itself and a local file of the same name never travels.
+pub const MANIFEST_PATH: &str = "/workspace/.microvm-sync-manifest.json";
+
+/// The manifest's member name relative to the workspace, for the exclusions.
+pub const MANIFEST_NAME: &str = ".microvm-sync-manifest.json";
+
+/// What one sync left in the guest: every member's identity, keyed by relative path.
+///
+/// Paths are `/`-separated on every platform — the manifest crosses machines (a VM synced
+/// from Linux can be resynced from Windows), so the host's separator must not leak into
+/// the keys. Maps are ordered so the serialized form is deterministic and a test can
+/// assert on bytes.
+#[derive(Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Manifest {
+    /// The format version, for a future reader deciding whether it understands this.
+    pub version: u32,
+    /// Regular files: relative path → sha256 of the contents, lowercase hex.
+    pub files: std::collections::BTreeMap<String, String>,
+    /// Symlinks: relative path → link target, verbatim. The target string is the
+    /// identity — two links to different targets are different members.
+    pub symlinks: std::collections::BTreeMap<String, String>,
+    /// Directories, including empty ones a build script expects to exist.
+    pub dirs: std::collections::BTreeSet<String>,
+}
+
+/// The manifest format this build writes.
+const MANIFEST_VERSION: u32 = 1;
+
+/// A path relative to the synced root, `/`-separated regardless of platform.
+fn relative_key(path: &Path, root: &Path) -> String {
+    path.strip_prefix(root)
+        .expect("collected under the root")
+        .components()
+        .map(|component| component.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+/// Hashes and classifies the tree under `dir` into a [`Manifest`].
+///
+/// The walk is [`collect`] — the same skip list, the same budgets, the same symlink
+/// stance as [`pack`] — so the manifest describes exactly the set a pack would upload.
+/// A second walk elsewhere would be a second set of rules to keep in step.
+///
+/// Files are hashed streaming rather than read whole: the byte budget admits trees up
+/// to 512 MiB, and a `Vec` of the largest admissible file per hash would be an
+/// allocation the archive path never needs.
+pub fn manifest(dir: &Path) -> Result<Manifest, SyncError> {
+    use sha2::{Digest as _, Sha256};
+
+    let mut walk = Walk::default();
+    collect(dir, &mut walk)?;
+
+    let mut built = Manifest {
+        version: MANIFEST_VERSION,
+        ..Manifest::default()
+    };
+    for path in &walk.paths {
+        let key = relative_key(path, dir);
+        let kind = path
+            .symlink_metadata()
+            .map_err(|error| SyncError(format!("reading {}: {error}", path.display())))?;
+        let file_type = kind.file_type();
+        if file_type.is_symlink() {
+            let target = std::fs::read_link(path)
+                .map_err(|error| SyncError(format!("reading link {}: {error}", path.display())))?;
+            built
+                .symlinks
+                .insert(key, target.to_string_lossy().into_owned());
+        } else if file_type.is_dir() {
+            built.dirs.insert(key);
+        } else {
+            use std::io::Read as _;
+            let mut file = std::fs::File::open(path)
+                .map_err(|error| SyncError(format!("reading {}: {error}", path.display())))?;
+            let mut hasher = Sha256::new();
+            let mut buffer = [0u8; 64 * 1024];
+            loop {
+                let read = file
+                    .read(&mut buffer)
+                    .map_err(|error| SyncError(format!("hashing {}: {error}", path.display())))?;
+                if read == 0 {
+                    break;
+                }
+                hasher.update(&buffer[..read]);
+            }
+            built
+                .files
+                .insert(key, const_hex::encode(hasher.finalize()));
+        }
+    }
+    Ok(built)
+}
+
+/// What an incremental sync has to do: which members travel, which remote paths die.
+#[derive(Debug, Default, PartialEq)]
+pub struct Delta {
+    /// Relative paths to pack and upload: new members, changed files, retargeted links.
+    pub upload: Vec<String>,
+    /// Relative paths present remotely and gone locally, deepest first — so a directory's
+    /// contents are named before the directory, and a non-recursive remove would still
+    /// work in order.
+    pub delete: Vec<String>,
+}
+
+impl Delta {
+    /// Nothing to send and nothing to remove: the tree is already what the manifest says.
+    pub fn is_empty(&self) -> bool {
+        self.upload.is_empty() && self.delete.is_empty()
+    }
+}
+
+/// What changed between the tree as it is (`local`) and as the last sync left it
+/// (`remote`).
+///
+/// Identity is category-scoped: a path that was a file and is now a symlink appears in
+/// both the upload set (the new member travels) and nowhere in the delete set — the
+/// upload overwrites the name in place, which is the daemon's own extraction contract
+/// (`agentd/src/fs.rs`: "an upload can legitimately overwrite a name").
+///
+/// [`MANIFEST_NAME`] never appears in either set: the manifest is not a member of the
+/// tree it describes, and without this exclusion every incremental sync would order the
+/// deletion of its own bookkeeping.
+pub fn diff(local: &Manifest, remote: &Manifest) -> Delta {
+    let mut delta = Delta::default();
+    for (path, hash) in &local.files {
+        if remote.files.get(path) != Some(hash) {
+            delta.upload.push(path.clone());
+        }
+    }
+    for (path, target) in &local.symlinks {
+        if remote.symlinks.get(path) != Some(target) {
+            delta.upload.push(path.clone());
+        }
+    }
+    for path in &local.dirs {
+        if !remote.dirs.contains(path) {
+            delta.upload.push(path.clone());
+        }
+    }
+    let lives_on = |path: &String| {
+        local.files.contains_key(path)
+            || local.symlinks.contains_key(path)
+            || local.dirs.contains(path)
+            || path == MANIFEST_NAME
+    };
+    delta.delete.extend(
+        remote
+            .files
+            .keys()
+            .chain(remote.symlinks.keys())
+            .chain(remote.dirs.iter())
+            .filter(|path| !lives_on(path))
+            .cloned(),
+    );
+    delta.upload.sort();
+    // Deepest first: `a/b/c` before `a/b`, so removing in order never needs recursion.
+    delta.delete.sort_by(|a, b| b.cmp(a));
+    delta
+}
+
+/// Packs exactly the named relative paths under `dir`, in sorted member order.
+///
+/// The selective sibling of [`pack`]: same builder settings, same determinism, but the
+/// member set is the caller's diff rather than a walk — which is the whole incremental
+/// bet, an archive proportional to the edit rather than to the tree.
+pub fn pack_paths(dir: &Path, paths: &[String]) -> Result<Packed, SyncError> {
+    let mut sorted: Vec<&String> = paths.iter().collect();
+    sorted.sort();
+    let mut builder = tar::Builder::new(Vec::new());
+    builder.follow_symlinks(false);
+    let mut members = 0usize;
+    for relative in sorted {
+        let path = dir.join(relative);
+        builder
+            .append_path_with_name(&path, relative)
+            .map_err(|error| SyncError(format!("packing {}: {error}", path.display())))?;
+        members += 1;
+    }
+    let archive = builder
+        .into_inner()
+        .map_err(|error| SyncError(format!("finishing the archive: {error}")))?;
+    Ok(Packed { archive, members })
+}
+
 /// One artifact brought back, for the envelope's `sync.artifacts` list.
 pub struct Artifact {
     pub path: String,
@@ -446,6 +640,116 @@ mod tests {
         let got = extract_artifacts(&archive, &["**".into()], &inner).expect("extracts nothing");
         assert!(got.is_empty(), "{:?}", got.len());
         assert!(!tree.0.join("escape.txt").exists());
+    }
+
+    /// The manifest names every member kind with a stable identity, and the same tree
+    /// manifests identically twice.
+    #[test]
+    fn a_manifest_is_deterministic_and_covers_every_member_kind() {
+        let tree = TempTree::new("manifest");
+        std::fs::create_dir_all(tree.0.join("src")).expect("dir");
+        std::fs::create_dir_all(tree.0.join("empty")).expect("empty dir");
+        std::fs::write(tree.0.join("src/main.rs"), b"fn main() {}").expect("file");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("src/main.rs", tree.0.join("link.rs")).expect("link");
+
+        let first = manifest(&tree.0).expect("manifests");
+        let second = manifest(&tree.0).expect("manifests");
+        assert_eq!(first, second, "same tree, same manifest");
+        assert_eq!(first.version, MANIFEST_VERSION);
+        // sha256("fn main() {}"), computed independently with sha256sum.
+        assert_eq!(
+            first.files["src/main.rs"],
+            "ef32637cb9c3ec2e3968c9cbdf26a5e9c172be94f88af533e14bd43f892d5297"
+        );
+        assert!(first.dirs.contains("empty"), "{:?}", first.dirs);
+        #[cfg(unix)]
+        assert_eq!(first.symlinks["link.rs"], "src/main.rs");
+    }
+
+    /// The manifest walks with the pack's own skip list — what never uploads never
+    /// appears, so a skipped directory cannot show up as a deletion either.
+    #[test]
+    fn a_manifest_skips_what_packing_skips() {
+        let tree = TempTree::new("manifest-skip");
+        std::fs::create_dir_all(tree.0.join(".git")).expect("git");
+        std::fs::write(tree.0.join(".git/HEAD"), b"ref: main").expect("head");
+        std::fs::write(tree.0.join("kept.rs"), b"fn main() {}").expect("source");
+
+        let built = manifest(&tree.0).expect("manifests");
+        assert_eq!(built.files.len(), 1, "{:?}", built.files);
+        assert!(built.files.contains_key("kept.rs"));
+        assert!(built.dirs.is_empty(), "{:?}", built.dirs);
+    }
+
+    /// An unchanged tree diffs to an empty delta — the fact that makes the second sync
+    /// of an unchanged tree transfer ~0 bytes (issue #71's acceptance line).
+    #[test]
+    fn an_unchanged_tree_diffs_to_nothing() {
+        let tree = TempTree::new("diff-unchanged");
+        std::fs::write(tree.0.join("a.txt"), b"a").expect("file");
+        let local = manifest(&tree.0).expect("manifests");
+        let remote = manifest(&tree.0).expect("manifests");
+        let delta = diff(&local, &remote);
+        assert!(delta.is_empty(), "{delta:?}");
+    }
+
+    /// Each change class lands in the right half of the delta: edits and additions
+    /// upload, disappearances delete, and the unchanged member stays home.
+    #[test]
+    fn a_diff_names_changed_new_and_deleted_members_and_nothing_else() {
+        let mut remote = Manifest {
+            version: MANIFEST_VERSION,
+            ..Manifest::default()
+        };
+        remote.files.insert("same.txt".into(), "hash-same".into());
+        remote.files.insert("edited.txt".into(), "hash-old".into());
+        remote.files.insert("removed.txt".into(), "hash-x".into());
+        remote.dirs.insert("gone-dir".into());
+        remote.dirs.insert("gone-dir/nested".into());
+        remote.symlinks.insert("link".into(), "old-target".into());
+
+        let mut local = Manifest {
+            version: MANIFEST_VERSION,
+            ..Manifest::default()
+        };
+        local.files.insert("same.txt".into(), "hash-same".into());
+        local.files.insert("edited.txt".into(), "hash-new".into());
+        local.files.insert("added.txt".into(), "hash-add".into());
+        local.symlinks.insert("link".into(), "new-target".into());
+
+        let delta = diff(&local, &remote);
+        assert_eq!(delta.upload, ["added.txt", "edited.txt", "link"]);
+        // Deepest first, so a non-recursive remove works in this order.
+        assert_eq!(delta.delete, ["removed.txt", "gone-dir/nested", "gone-dir"]);
+    }
+
+    /// The manifest never orders its own deletion.
+    ///
+    /// It lives in the workspace (see [`MANIFEST_PATH`] on why) and is therefore in the
+    /// remote tree without being in any local one — the one permanent asymmetry the
+    /// diff has to know about.
+    #[test]
+    fn a_diff_never_deletes_the_manifest_itself() {
+        let mut remote = Manifest::default();
+        remote.files.insert(MANIFEST_NAME.into(), "hash".into());
+        let delta = diff(&Manifest::default(), &remote);
+        assert!(delta.is_empty(), "{delta:?}");
+    }
+
+    /// A selective pack carries exactly the named members — the archive is proportional
+    /// to the edit, not to the tree.
+    #[test]
+    fn packing_selected_paths_carries_them_and_nothing_else() {
+        let tree = TempTree::new("pack-paths");
+        std::fs::create_dir_all(tree.0.join("src")).expect("dir");
+        std::fs::write(tree.0.join("src/changed.rs"), b"edited").expect("file");
+        std::fs::write(tree.0.join("src/unchanged.rs"), b"same").expect("file");
+
+        let packed =
+            pack_paths(&tree.0, &["src/changed.rs".to_string()]).expect("packs the selection");
+        assert_eq!(packed.members, 1);
+        assert_eq!(member_names(&packed.archive), ["src/changed.rs"]);
     }
 
     /// A symlink member is never extracted, even when a glob matches it.

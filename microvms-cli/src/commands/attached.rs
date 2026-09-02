@@ -1094,6 +1094,485 @@ fn resolve_paths(src: &str, dst: &str) -> Result<(Direction, String, String), Cl
     }
 }
 
+// ── sync ─────────────────────────────────────────────────────────────────────
+
+/// A [`crate::sync::SyncError`] as the `ERR_SYNC` row — the same mapping `run <DIR>` uses,
+/// spelled here because `lifecycle.rs`'s copy is private to it and the message is the row's
+/// contract, not either command's.
+fn sync_failure(error: crate::sync::SyncError) -> CliError {
+    CliError::new(Exit::Sync, error.to_string())
+        .suggest("the failure is on this machine's filesystem; the platform was not involved")
+}
+
+/// Re-classifies the daemon's disk-pressure refusal; everything else converts as usual.
+///
+/// The daemon answers 507 when a write would take the target filesystem under its
+/// configured reserve, and its own rationale (`agentd/src/fs.rs`) says why the default
+/// classification is wrong for it: a 507 arrives as a 5xx, 5xx maps to `ERR_RETRYABLE`,
+/// and retrying an identical upload against a full disk is "correct for a defect and
+/// actively harmful for a full disk". So the one status whose remedy is *free space, then
+/// retry* is surfaced as `ERR_PLATFORM` — the row for a platform-side condition — with the
+/// daemon's own byte counts kept in the message and the remedy attached. No new exit code:
+/// the vocabulary already has the right row, the default mapping just cannot know this
+/// body means "not until space is freed".
+fn classify_upload(error: microvms_core::Error) -> CliError {
+    let pressure = error.wire_kind() == Some(microvms_core::WireKind::ServerError)
+        && error.to_string().contains("-> 507");
+    if !pressure {
+        return error.into();
+    }
+    CliError::new(
+        Exit::Platform,
+        format!(
+            "the VM's disk is under pressure: {error}. diskUnderPressure means a write \
+             would be refused right now; the sync was not applied."
+        ),
+    )
+    .suggest("free space in the VM: `microvm exec --name <vm> -- rm -rf /workspace/<big-dir>`")
+    .suggest("`microvm health` reports diskAvailableBytes and diskUnderPressure")
+    .with_data("diskUnderPressure", json!(true))
+}
+
+/// What one sync pass did, for the envelope and the watch loop's running totals.
+struct SyncPass {
+    uploaded_bytes: usize,
+    uploaded_members: usize,
+    deleted: usize,
+    /// No manifest was found (or `--full` ignored it), so the whole tree travelled.
+    full: bool,
+    /// The manifest already matched the tree; nothing travelled at all.
+    unchanged: bool,
+    /// The tree as this pass left it in the guest — the next pass's baseline.
+    manifest: crate::sync::Manifest,
+}
+
+/// The guest's manifest, or `None` when no sync has written one (or it does not parse).
+///
+/// A manifest that fails to parse is treated as absent rather than as an error: it means a
+/// different version (or a workload) wrote that path, and the safe reading of "I cannot
+/// tell what is over there" is the same as "nothing is over there" — a full upload, which
+/// re-establishes a manifest this build understands.
+async fn remote_manifest<O: std::io::Write, E: std::io::Write>(
+    ctx: &mut Ctx<'_, O, E>,
+    session: &Session,
+) -> Result<Option<crate::sync::Manifest>, CliError> {
+    match session.download_file(crate::sync::MANIFEST_PATH).await {
+        Ok(bytes) => match serde_json::from_slice::<crate::sync::Manifest>(&bytes) {
+            Ok(manifest) => Ok(Some(manifest)),
+            Err(error) => {
+                ctx.out.progress(&format!(
+                    "the guest manifest does not parse ({error}); syncing the whole tree"
+                ));
+                Ok(None)
+            }
+        },
+        Err(error) if error.wire_kind() == Some(microvms_core::WireKind::NotFound) => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// Whether a deletion path from the guest manifest is safe to hand to an in-guest `rm`.
+///
+/// The manifest is read *from the VM*, and the VM is where untrusted work runs — the same
+/// trust asymmetry [`crate::sync::extract_artifacts`] documents for the returned archive.
+/// A workload that rewrites the manifest to claim `../../etc/passwd` or `/root/.ssh` was
+/// synced would otherwise get this CLI to order that deletion on its behalf. Only a
+/// relative path with no `..` and no empty component qualifies; anything else is skipped
+/// like a hostile archive member, not executed.
+fn deletable(path: &str) -> bool {
+    !path.is_empty()
+        && !path.starts_with('/')
+        && !path.contains('\\')
+        && path
+            .split('/')
+            .all(|component| !component.is_empty() && component != "..")
+}
+
+/// One incremental pass: hash, diff, upload what changed, delete what vanished, and
+/// rewrite the guest manifest. `remote` is the baseline; `None` means upload everything.
+async fn sync_pass<O: std::io::Write, E: std::io::Write>(
+    ctx: &mut Ctx<'_, O, E>,
+    session: &Session,
+    dir: &std::path::Path,
+    remote: Option<crate::sync::Manifest>,
+    delete_timeout: f64,
+) -> Result<SyncPass, CliError> {
+    let local = crate::sync::manifest(dir).map_err(sync_failure)?;
+    let full = remote.is_none();
+    let baseline = remote.unwrap_or_default();
+    let delta = crate::sync::diff(&local, &baseline);
+
+    if delta.is_empty() && !full {
+        return Ok(SyncPass {
+            uploaded_bytes: 0,
+            uploaded_members: 0,
+            deleted: 0,
+            full: false,
+            unchanged: true,
+            manifest: local,
+        });
+    }
+
+    let mut uploaded_bytes = 0usize;
+    let mut uploaded_members = 0usize;
+    if !delta.upload.is_empty() {
+        let packed = crate::sync::pack_paths(dir, &delta.upload).map_err(sync_failure)?;
+        ctx.out.progress(&format!(
+            "uploading {} member(s) ({} bytes) to vm:{}",
+            packed.members,
+            packed.archive.len(),
+            crate::sync::REMOTE_WORKDIR,
+        ));
+        session
+            .upload_tar(crate::sync::REMOTE_WORKDIR, &packed.archive)
+            .await
+            .map_err(classify_upload)?;
+        uploaded_bytes = packed.archive.len();
+        uploaded_members = packed.members;
+    }
+
+    let mut deleted = 0usize;
+    let doomed: Vec<&String> = delta.delete.iter().filter(|path| deletable(path)).collect();
+    if doomed.len() < delta.delete.len() {
+        ctx.out.progress(&format!(
+            "skipping {} manifest deletion path(s) that are not plain relative paths — \
+             the manifest is the VM's word, and a path that points outside /workspace is \
+             refused, not executed",
+            delta.delete.len() - doomed.len(),
+        ));
+    }
+    if !doomed.is_empty() {
+        ctx.out.progress(&format!(
+            "removing {} deleted path(s) in the VM",
+            doomed.len()
+        ));
+        let mut command: Vec<String> = vec!["rm".into(), "-rf".into(), "--".into()];
+        command.extend(doomed.iter().map(|path| (*path).clone()));
+        let exec_id = format!(
+            "microvm-sync-rm-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|epoch| epoch.as_nanos())
+                .unwrap_or_default(),
+        );
+        let result = session
+            .run_sync(
+                microvms_core::protocol::exec::StartRequest {
+                    exec_id,
+                    command,
+                    shell: false,
+                    cwd: Some(crate::sync::REMOTE_WORKDIR.into()),
+                    env: Default::default(),
+                    user: None,
+                    group: None,
+                    timeout_sec: Some(delete_timeout),
+                    stdin: false,
+                },
+                Duration::from_secs_f64(delete_timeout.max(1.0) + 30.0),
+            )
+            .await?;
+        match result.outcome {
+            Some(outcome) if outcome.exit_code == Some(0) => deleted = doomed.len(),
+            outcome => {
+                return Err(CliError::new(
+                    Exit::ExecFailed,
+                    format!(
+                        "the in-guest removal of {} deleted path(s) failed: {}. The uploaded \
+                         members landed; the guest manifest was left as it was, so the next \
+                         sync will order these deletions again.",
+                        doomed.len(),
+                        outcome
+                            .map(|outcome| {
+                                let detail = outcome.stderr.trim();
+                                if detail.is_empty() {
+                                    format!("exit {:?}", outcome.exit_code)
+                                } else {
+                                    detail.to_string()
+                                }
+                            })
+                            .unwrap_or_else(|| "still running at the deadline".into()),
+                    ),
+                ));
+            }
+        }
+    }
+
+    let body = serde_json::to_vec(&local).map_err(|error| {
+        CliError::new(
+            Exit::Unexpected,
+            format!("the manifest will not serialize: {error}"),
+        )
+    })?;
+    session
+        .upload_file(crate::sync::MANIFEST_PATH, &body, None)
+        .await
+        .map_err(classify_upload)?;
+
+    Ok(SyncPass {
+        uploaded_bytes,
+        uploaded_members,
+        deleted,
+        full,
+        unchanged: false,
+        manifest: local,
+    })
+}
+
+/// Whether a watch event under `root` can affect what a sync would upload.
+///
+/// A filter, not a gate: an event this lets through only triggers a re-hash, and the hash
+/// compare decides whether bytes move. So a false positive costs hashing time and a false
+/// negative would cost correctness — which is why the list here is exactly the pack's own
+/// skip list plus the manifest name, and nothing cleverer.
+///
+/// `pub(crate)` for the guard in `crate::guards`: the filter's misses are invisible in an
+/// integration run (a filtered event just means no pass), so its table is pinned directly.
+pub(crate) fn watch_relevant(root: &std::path::Path, path: &std::path::Path) -> bool {
+    let Ok(relative) = path.strip_prefix(root) else {
+        // Outside the tree — a watcher handed us something we never asked about.
+        return false;
+    };
+    relative.components().all(|component| {
+        let name = component.as_os_str();
+        name != crate::sync::MANIFEST_NAME
+            && ![".git", "target", "node_modules", ".venv"]
+                .iter()
+                .any(|skipped| name == *skipped)
+    })
+}
+
+/// The watched root in both spellings the OS may use for it.
+///
+/// `notify` reports paths as the kernel spells them, not as the caller typed them. On macOS
+/// that is the resolved path: a tree under `/var/folders/…` comes back as
+/// `/private/var/folders/…`, and a filter that strips only the caller's spelling drops
+/// every event as "outside the tree" — the watch looks alive and never re-syncs. Both
+/// spellings are accepted. The canonical one is computed once; if the root cannot be
+/// resolved, or resolves to itself, there is only the one spelling.
+pub(crate) struct WatchRoot {
+    given: std::path::PathBuf,
+    canonical: Option<std::path::PathBuf>,
+}
+
+impl WatchRoot {
+    pub(crate) fn new(dir: &std::path::Path) -> Self {
+        let canonical = std::fs::canonicalize(dir)
+            .ok()
+            .filter(|resolved| resolved != dir);
+        Self {
+            given: dir.to_path_buf(),
+            canonical,
+        }
+    }
+
+    pub(crate) fn relevant(&self, path: &std::path::Path) -> bool {
+        watch_relevant(&self.given, path)
+            || self
+                .canonical
+                .as_deref()
+                .is_some_and(|root| watch_relevant(root, path))
+    }
+}
+
+/// Starts the `notify` watcher over `dir` and returns it with the channel it feeds.
+///
+/// The watcher is returned rather than leaked so the caller's binding keeps it alive for
+/// exactly the loop it wakes; dropping it stops the stream.
+fn start_watcher(
+    dir: &std::path::Path,
+) -> Result<
+    (
+        notify::RecommendedWatcher,
+        tokio::sync::mpsc::UnboundedReceiver<Vec<std::path::PathBuf>>,
+    ),
+    CliError,
+> {
+    use notify::Watcher as _;
+    let (sender, events) = tokio::sync::mpsc::unbounded_channel::<Vec<std::path::PathBuf>>();
+    let mut watcher =
+        notify::recommended_watcher(move |event: Result<notify::Event, notify::Error>| {
+            if let Ok(event) = event {
+                let _ = sender.send(event.paths);
+            }
+        })
+        .map_err(|error| {
+            CliError::new(
+                Exit::Precondition,
+                format!("could not start the filesystem watcher: {error}"),
+            )
+        })?;
+    watcher
+        .watch(dir, notify::RecursiveMode::Recursive)
+        .map_err(|error| {
+            CliError::new(
+                Exit::Precondition,
+                format!("could not watch {}: {error}", dir.display()),
+            )
+        })?;
+    Ok((watcher, events))
+}
+
+/// Syncs a project directory into a running VM's workspace, incrementally.
+///
+/// The incremental half of issue #71. The batch half (`run <DIR>`, issue #72) is
+/// launch-coupled: the tree travels once, at launch, whole. This command addresses a VM
+/// that is already running — the attach door, like every command in this file — and makes
+/// the *n*th transfer proportional to the edit rather than to the tree: hash the local
+/// tree, read the manifest the previous sync left in the guest, upload only the members
+/// whose identity changed, remove in the guest only what vanished locally.
+///
+/// # The second sync of an unchanged tree transfers no archive
+///
+/// That is the acceptance line on the issue, and it falls out of the design rather than
+/// being a special case: an unchanged tree diffs to an empty delta, an empty delta packs
+/// nothing, uploads nothing, deletes nothing, and leaves the guest manifest untouched.
+/// The pass costs one manifest read and the local hashing.
+///
+/// # `--watch` trusts hashes, not events
+///
+/// The watcher (the `notify` crate) exists to *wake* the loop, never to decide what
+/// changed: every batch of events collapses, after a short debounce, into the same
+/// hash-diff-upload pass a bare `sync` runs. A missed event costs staleness until the
+/// next event, a spurious one costs a re-hash that uploads nothing — neither costs
+/// correctness. Ctrl-C ends the loop as a success carrying the totals, the
+/// `port-forward` precedent: a watch the user closed did its job.
+pub async fn sync<O: std::io::Write, E: std::io::Write>(
+    ctx: &mut Ctx<'_, O, E>,
+    args: &crate::cli::SyncArgs,
+    interrupt: crate::commands::lifecycle::Interrupt<'_>,
+) -> Result<Rendered, CliError> {
+    if !args.dir.is_dir() {
+        return Err(CliError::new(
+            Exit::Precondition,
+            format!(
+                "{} is not a directory. `sync` moves a project tree; a single file is \
+                 `microvm cp <file> vm:{}/<file>`.",
+                args.dir.display(),
+                crate::sync::REMOTE_WORKDIR,
+            ),
+        ));
+    }
+    let (session, microvm_id) = attach(ctx, &args.region, &args.attach).await?;
+
+    // Armed before the first pass, not after it: an edit that lands while the initial
+    // upload is in flight must wake the loop too. Registering the watcher afterwards
+    // leaves a window in which a save is silently lost until the next one. Events the
+    // first pass itself provokes are harmless: they wake one re-hash that diffs to an
+    // empty delta.
+    let watch = if args.watch {
+        Some(start_watcher(&args.dir)?)
+    } else {
+        None
+    };
+
+    let baseline = if args.full {
+        None
+    } else {
+        remote_manifest(ctx, &session).await?
+    };
+    let first = sync_pass(ctx, &session, &args.dir, baseline, args.timeout).await?;
+
+    let mut passes = 1usize;
+    let mut totals = SyncPass { ..first };
+    if let Some((_watcher, mut events)) = watch {
+        let root = WatchRoot::new(&args.dir);
+        report_pass(ctx, &totals);
+        ctx.out.progress(&format!(
+            "watching {} — Ctrl-C stops and reports the totals",
+            args.dir.display()
+        ));
+
+        let mut interrupt = interrupt;
+        loop {
+            let batch = tokio::select! {
+                batch = events.recv() => batch,
+                () = &mut interrupt => break,
+            };
+            let Some(batch) = batch else { break };
+            let mut relevant = batch.iter().any(|path| root.relevant(path));
+            // The debounce: one save fans out into create/modify/rename events, and one
+            // sync pass should absorb them all. A quarter second of quiet is the line.
+            while let Ok(Some(more)) =
+                tokio::time::timeout(Duration::from_millis(250), events.recv()).await
+            {
+                relevant |= more.iter().any(|path| root.relevant(path));
+            }
+            if !relevant {
+                continue;
+            }
+            let baseline = std::mem::take(&mut totals.manifest);
+            let pass = sync_pass(ctx, &session, &args.dir, Some(baseline), args.timeout).await?;
+            passes += 1;
+            report_pass(ctx, &pass);
+            totals.uploaded_bytes += pass.uploaded_bytes;
+            totals.uploaded_members += pass.uploaded_members;
+            totals.deleted += pass.deleted;
+            totals.unchanged = false;
+            totals.manifest = pass.manifest;
+        }
+    }
+
+    let mut data = Map::new();
+    data.insert("microvmId".into(), json!(microvm_id));
+    data.insert("workdir".into(), json!(crate::sync::REMOTE_WORKDIR));
+    data.insert("uploadedBytes".into(), json!(totals.uploaded_bytes));
+    data.insert("uploadedMembers".into(), json!(totals.uploaded_members));
+    data.insert("deleted".into(), json!(totals.deleted));
+    data.insert("full".into(), json!(totals.full));
+    data.insert("unchanged".into(), json!(totals.unchanged));
+    data.insert("passes".into(), json!(passes));
+    data.insert("watched".into(), json!(args.watch));
+
+    let (kind, _) = response_type("sync");
+    let text = if args.watch {
+        format!(
+            "watched {}: {} pass(es), {} member(s) ({} bytes) uploaded, {} deleted",
+            args.dir.display(),
+            passes,
+            totals.uploaded_members,
+            totals.uploaded_bytes,
+            totals.deleted,
+        )
+    } else if totals.unchanged {
+        format!(
+            "{} is already what vm:{} holds — nothing uploaded (0 bytes)",
+            args.dir.display(),
+            crate::sync::REMOTE_WORKDIR,
+        )
+    } else {
+        format!(
+            "synced {} -> vm:{} ({} member(s), {} bytes uploaded, {} deleted{})",
+            args.dir.display(),
+            crate::sync::REMOTE_WORKDIR,
+            totals.uploaded_members,
+            totals.uploaded_bytes,
+            totals.deleted,
+            if totals.full { ", full" } else { "" },
+        )
+    };
+    let dense = format!(
+        "sync\t{}\t{}\t{}\t{}\t{}",
+        microvm_id, totals.uploaded_bytes, totals.uploaded_members, totals.deleted, passes,
+    );
+    Ok(Rendered::ok(kind, data, text, dense))
+}
+
+/// One progress line per pass, so a `--watch` session reads as a log of what moved.
+fn report_pass<O: std::io::Write, E: std::io::Write>(ctx: &mut Ctx<'_, O, E>, pass: &SyncPass) {
+    if pass.unchanged {
+        ctx.out.progress("unchanged — nothing uploaded (0 bytes)");
+    } else {
+        ctx.out.progress(&format!(
+            "synced {} member(s) ({} bytes), {} deleted{}",
+            pass.uploaded_members,
+            pass.uploaded_bytes,
+            pass.deleted,
+            if pass.full { ", full" } else { "" },
+        ));
+    }
+}
+
 // ── port-forward ────────────────────────────────────────────────────────────
 
 /// Serves a guest port on localhost until Ctrl-C, or until `--max-connections` is reached.

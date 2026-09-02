@@ -30,6 +30,7 @@ allow = [
   "Unlicense",
   "Unicode-3.0",  # unicode-ident's ICU data tables
   "CDLA-Permissive-2.0",  # webpki-roots' root store data
+  "CC0-1.0",  # notify (the fs watcher behind `sync --watch`): public-domain dedication
 ]
 confidence-threshold = 0.93
 

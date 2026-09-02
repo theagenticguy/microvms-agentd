@@ -1,6 +1,6 @@
 # microvms-agentd · CLI
 
-The `microvm` binary has eighteen subcommands, declared as one `clap` `Subcommand` enum in `microvms-cli/src/cli.rs` and built from `microvms-cli/Cargo.toml:20-22`.
+The `microvm` binary has twenty-three subcommands, declared as one `clap` `Subcommand` enum in `microvms-cli/src/cli.rs` and built from `microvms-cli/Cargo.toml:20-22`.
 
 ## Global flags
 
@@ -25,7 +25,7 @@ Flags:
 - `--region <REGION>` — AWS region; defaults to `$AWS_REGION`, then `$AWS_DEFAULT_REGION`, then `us-east-1`. Closed set: `us-east-1`, `us-east-2`, `us-west-2`, `eu-west-1`, `ap-northeast-1`. `microvms-cli/src/cli.rs:292-293`, domain at `microvms-cli/src/cli.rs:258-270`.
 - `--unlisted-region <NAME>` — use a region this client has not seen carry MicroVMs; conflicts with `--region`. An unsupported region answers `AccessDeniedException` with a null message, which looks like an IAM denial, so the caller loses the real diagnostic. `microvms-cli/src/cli.rs:299-300`.
 
-`AttachFlags` — the identifiers that address a VM this invocation did not launch: the explicit triple, or a registered name standing in for it. Carried by `exec`, `health`, `ack`, `stdin`, and `cp`. `microvms-cli/src/cli.rs`, `AttachFlags`.
+`AttachFlags` — the identifiers that address a VM this invocation did not launch: the explicit triple, or a registered name standing in for it. Carried by `exec`, `health`, `ack`, `stdin`, `cp`, and `sync`. `microvms-cli/src/cli.rs`, `AttachFlags`.
 
 Flags:
 
@@ -209,6 +209,26 @@ Flags:
 - `--tar` — move a whole directory tree as an uncompressed tar archive; the `vm:` side is a directory the daemon packs or extracts, the local side is a `.tar` file. `microvms-cli/src/cli.rs:656-657`.
 - `--mode <OCTAL>` — permissions for an uploaded file, octal as a string; conflicts with `--tar`, since a tar carries its members' own modes. `microvms-cli/src/cli.rs:664-665`.
 - Plus `AttachFlags` and `RegionFlags`. `microvms-cli/src/cli.rs:667-671`.
+
+## sync
+
+```
+microvm sync [OPTIONS] --name <NAME> <DIR>
+```
+
+Syncs a project directory into a running MicroVM's `/workspace`, incrementally: the first sync uploads the tree and writes a content manifest beside it in the guest; every later sync hashes the local tree, diffs against that manifest, and uploads only the members whose bytes differ. A second sync of an unchanged tree sends no archive — one manifest read, zero uploads. Locally deleted paths are removed in the guest by one argv `rm -rf --` exec rooted in `/workspace`, and deletion paths are validated first: the manifest is the VM's word, and it cannot order deletions outside the workspace. The incremental half of #71; `run <DIR>` is the launch-coupled batch half.
+
+`microvms-cli/src/commands/attached.rs`, `sync`
+
+Flags:
+
+- `<DIR>` — the project directory; packed with `run <DIR>`'s rules (`.git`, `target`, `node_modules`, `.venv` stay home; symlinks travel as links; the daemon's budgets enforced during the walk). Required.
+- `--watch` — keep syncing on debounced filesystem changes until Ctrl-C, which resolves into the summary envelope. Events only wake a re-hash; the hash compare decides whether bytes move. With `microvm port-forward` in a second terminal, an edit here is a reload there.
+- `--full` — upload the whole tree even where the guest manifest claims members are unchanged; the recovery when a workload edited `/workspace` behind sync's back.
+- `--timeout <SECONDS>` — budget for the in-guest deletion exec; default `60`.
+- Plus `AttachFlags` and `RegionFlags`.
+
+A disk-pressure refusal (the daemon's 507, with the byte counts in the body) surfaces as `ERR_PLATFORM` with the free-space remedy and `data.diskUnderPressure: true` — never `ERR_RETRYABLE`, because retrying an identical upload against a full disk cannot succeed.
 
 ## suspend
 

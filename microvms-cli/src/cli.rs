@@ -158,6 +158,17 @@ pub enum Command {
     /// extractor in the system.
     Cp(CpArgs),
 
+    /// Sync a project directory into a running MicroVM's /workspace, uploading only what changed.
+    ///
+    /// The incremental half of issue #71 (`run <DIR>` is the launch-coupled batch half). The
+    /// first sync uploads the tree and writes a content manifest beside it in the guest; every
+    /// later sync hashes the local tree, diffs it against that manifest, and uploads only the
+    /// members whose bytes actually differ — a second sync of an unchanged tree transfers no
+    /// archive at all. Files deleted locally are removed in the guest. `--watch` keeps the loop
+    /// alive on filesystem events; with `port-forward` in a second terminal, an edit here is a
+    /// reload there.
+    Sync(SyncArgs),
+
     /// Tunnel arbitrary TCP to a guest port, so `psql` or `ssh` here reaches a server in the VM.
     ///
     /// Where `port-forward` speaks HTTP, this speaks bytes: each local connection becomes a
@@ -1303,6 +1314,42 @@ pub struct CpArgs {
 }
 
 #[derive(Args, Debug)]
+pub struct SyncArgs {
+    /// The project directory to sync. Packed with `run <DIR>`'s rules: `.git`, `target`,
+    /// `node_modules` and `.venv` stay home, symlinks travel as links, and the daemon's
+    /// body and member budgets are enforced during the walk.
+    #[arg(value_name = "DIR")]
+    pub dir: PathBuf,
+
+    /// Keep syncing on filesystem changes until Ctrl-C.
+    ///
+    /// Events only trigger a re-hash; the hash compare against the guest manifest is what
+    /// decides whether any bytes move, so a noisy watcher costs hashing time and never a
+    /// redundant upload. Changes are debounced briefly so one save producing several
+    /// events becomes one sync pass.
+    #[arg(long)]
+    pub watch: bool,
+
+    /// Upload the whole tree even when the guest manifest claims members are unchanged.
+    ///
+    /// The manifest describes what the last sync left in /workspace; a workload that
+    /// edits the workspace behind sync's back makes it stale. This flag is the recovery:
+    /// one full upload, and the manifest is true again.
+    #[arg(long)]
+    pub full: bool,
+
+    /// How long the in-guest deletion of locally-removed paths may take, in seconds.
+    #[arg(long, default_value_t = 60.0)]
+    pub timeout: f64,
+
+    #[command(flatten)]
+    pub attach: AttachFlags,
+
+    #[command(flatten)]
+    pub region: RegionFlags,
+}
+
+#[derive(Args, Debug)]
 pub struct SuspendArgs {
     /// The MicroVM to freeze.
     #[arg(value_name = "MICROVM_ID")]
@@ -1807,6 +1854,7 @@ mod tests {
                 "ack",
                 "stdin",
                 "cp",
+                "sync",
                 "tunnel",
                 "port-forward",
                 "shell",

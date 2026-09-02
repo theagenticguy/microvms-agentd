@@ -38,6 +38,31 @@ Versions are [semantic](https://semver.org/spec/v2.0.0.html); the wire contract 
   incoming request; flag, `auto-resume` toml key, and wire field
   `idlePolicy.autoResumeEnabled`. Its idle-timer interaction ships as a
   live-conformance scenario pending its first run.
+- **`microvm sync` — incremental sync into a running VM (#71).** The
+  incremental half of #71 (`run <DIR>`, shipped 0.3.0, remains the
+  launch-coupled batch half). The first sync uploads the tree and writes a
+  content manifest beside it in the guest (`/workspace/.microvm-sync-manifest.json`,
+  inside the workspace so a workload that wipes the tree also wipes its
+  description); every later sync hashes locally, diffs against that manifest,
+  and uploads only the members whose bytes differ — a second sync of an
+  unchanged tree sends no archive at all, just one manifest read. Locally
+  deleted paths are removed in the guest by one argv `rm -rf --` exec rooted in
+  `/workspace`; deletion paths are validated before the exec is built, because
+  the manifest is the VM's word and must not be able to order deletions outside
+  the workspace. `--watch` (the `notify` crate) keeps the loop alive on
+  debounced filesystem events — events only wake a re-hash, the hash compare
+  decides whether bytes move — and Ctrl-C resolves into the summary envelope.
+  The watcher is armed before the first pass, so an edit that lands while the
+  initial upload is in flight is not lost until the next save, and the filter
+  accepts the kernel's spelling of the root as well as the caller's: macOS
+  reports a `/var/folders/…` tree as `/private/var/folders/…`, and the first
+  cut dropped every such event as outside the tree.
+  `--full` forces a whole-tree upload when a workload has edited the workspace
+  behind sync's back. The daemon's disk-pressure refusal (507) surfaces as
+  `ERR_PLATFORM` with the byte counts and the free-space remedy, never as
+  `ERR_RETRYABLE` — retrying an identical upload against a full disk cannot
+  succeed. With `microvm port-forward` in a second terminal this closes the
+  "feels local" loop: edit here, reload there.
 
 ### Changed
 
