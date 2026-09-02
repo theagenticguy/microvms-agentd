@@ -316,7 +316,11 @@ pub const RESPONSE_TYPES: [(&str, &str, &[&str]); 22] = [
             "tailRequires",
         ],
     ),
-    ("cost", "microvm.cost", &["report", "comparison"]),
+    // `budget` is the `--max-cost` verdict — {maxUsd, onBreach, basis, breached,
+    // overageAtLeastUsd} — and null when no budget was given (#77). `basis` says
+    // whether the compared total was exact or a lower bound, because a verdict from
+    // a floor is a different claim than a verdict from a whole estimate.
+    ("cost", "microvm.cost", &["report", "comparison", "budget"]),
     ("doctor", "microvm.doctor", &["checks", "ok"]),
     (
         "manifest",

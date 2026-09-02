@@ -13,8 +13,8 @@
 //! field a `Measured` value could be written into.
 
 use microvms_core::cost::{
-    CalendarDate, DurationP, PlanUsage, RunUsage, compare_residency, estimate_run, pinned_rates,
-    run_report,
+    CalendarDate, DurationP, EstimatedUsd, PlanUsage, RunUsage, compare_residency, estimate_run,
+    pinned_rates, run_report,
 };
 use serde_json::{Map, Value};
 
@@ -137,18 +137,146 @@ pub fn cost<O: std::io::Write, E: std::io::Write>(
         comparison_json = comparison_to_json(&comparison)?;
     }
 
+    // ── the budget gate (#77) ─────────────────────────────────────────────
+    //
+    // Checked against `Total::floor()`, which is the whole estimate when every line
+    // priced and a *lower bound* otherwise (COST-4). The design consequence rides
+    // every rendering below: a breach detected from a lower bound has already been
+    // exceeded by an unknown margin, so whether it warns or aborts is `--on-breach`,
+    // required beside `--max-cost` at parse time rather than defaulted here.
+    let mut budget_json = Value::Null;
+    let mut budget_text = String::new();
+    let mut budget_dense = String::new();
+    let mut breach_exit = None;
+    if let Some(max_cost) = args.max_cost.as_deref() {
+        // Clap's `requires` guarantees this pair for a parsed invocation; a handler
+        // driven directly (a test, tomorrow's refactor) gets the same refusal the
+        // parser gives, not a panic and not a silently-defaulted judgement.
+        let Some(on_breach) = args.on_breach else {
+            return Err(crate::exit::classify(&microvms_core::Error::invalid_arg(
+                "--max-cost without --on-breach: whether a breach of a lower-bound total \
+                 warns or aborts is the caller's judgement, so there is no default",
+            ))
+            .suggest("--on-breach <warn|abort> is required beside --max-cost"));
+        };
+        let budget = EstimatedUsd::parse(max_cost).map_err(|error| {
+            crate::exit::classify(&error).suggest(format!("--max-cost was {max_cost:?}"))
+        })?;
+        // The caller's own figure, echoed at the scale they typed it (`1.50` stays
+        // `1.50`), where `amount_string` would restate it at report precision.
+        let budget_figure = budget.amount().to_string();
+
+        let total = report.total();
+        let floor = total.floor();
+        let breached = floor > budget;
+        let unpriced = total.unpriced_phase_names();
+        let caveat = if unpriced.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " — and {} line(s) are unpriced ({}), so the true figure is larger by an \
+                 unknown margin",
+                unpriced.len(),
+                unpriced.join(", ")
+            )
+        };
+        let overage = if breached {
+            Some(EstimatedUsd::new(floor.amount() - budget.amount()).amount_string())
+        } else {
+            None
+        };
+
+        budget_text = if breached {
+            let at_least = if unpriced.is_empty() { "" } else { "at least " };
+            format!(
+                "budget: the {} total ${} exceeds --max-cost ${} by {at_least}${}{caveat}",
+                if unpriced.is_empty() {
+                    "estimated"
+                } else {
+                    "priced-floor"
+                },
+                floor.amount_string(),
+                budget.amount_string(),
+                overage.as_deref().unwrap_or_default(),
+            )
+        } else if unpriced.is_empty() {
+            format!(
+                "budget: the estimated total ${} is within --max-cost ${}",
+                floor.amount_string(),
+                budget_figure
+            )
+        } else {
+            // An under-budget verdict from a lower bound proves nothing, and a line
+            // that said "within budget" without this half would be the report lying
+            // by omission — the exact figure COST-4 exists to keep honest.
+            format!(
+                "budget: the priced floor ${} is within --max-cost ${}, but that floor is a \
+                 lower bound{caveat}",
+                floor.amount_string(),
+                budget_figure
+            )
+        };
+        budget_dense = format!(
+            "budget\t{}\t{}\t{}\t{}",
+            budget_figure,
+            if unpriced.is_empty() {
+                "exact"
+            } else {
+                "lower-bound"
+            },
+            if breached { "breached" } else { "within" },
+            overage.as_deref().unwrap_or("-"),
+        );
+        budget_json = serde_json::json!({
+            "maxUsd": budget_figure,
+            "onBreach": match on_breach {
+                crate::cli::OnBreach::Warn => "warn",
+                crate::cli::OnBreach::Abort => "abort",
+            },
+            "basis": if unpriced.is_empty() { "exact" } else { "lower-bound" },
+            "breached": breached,
+            "overageAtLeastUsd": overage,
+        });
+
+        if breached {
+            // `warn` rather than `progress`, so `--quiet` does not swallow it: the
+            // same reasoning as the staleness warning above, for a bigger figure.
+            ctx.out.warn(&budget_text);
+            if on_breach == crate::cli::OnBreach::Abort {
+                breach_exit = Some(crate::exit::Exit::Precondition);
+            }
+        }
+    } else if args.on_breach.is_some() {
+        // Accepted rather than refused — the manifest's domain round-trip feeds every
+        // published choice back through the parser alone — but never silent: a flag
+        // that gates nothing and says nothing would read as a gate that passed.
+        ctx.out
+            .warn("--on-breach without --max-cost gates nothing; give --max-cost <USD> to gate");
+    }
+
     let mut data = Map::new();
     data.insert("report".into(), report_to_json(&report));
     data.insert("comparison".into(), comparison_json);
+    data.insert("budget".into(), budget_json);
 
     let (kind, _) = response_type("cost");
-    let text = [report.render(), comparison_text]
+    let text = [report.render(), comparison_text, budget_text]
         .into_iter()
         .filter(|part| !part.is_empty())
         .collect::<Vec<_>>()
         .join("\n");
-    let dense = report_dense(&report);
-    Ok(Rendered::ok(kind, data, text, dense))
+    let dense = [report_dense(&report), budget_dense]
+        .into_iter()
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let rendered = Rendered::ok(kind, data, text, dense);
+    // Read by the dispatcher *after* the envelope is written (`AlreadyReported`): the
+    // report the caller asked for is still the answer; the exit code carries the gate.
+    Ok(match breach_exit {
+        Some(exit) => rendered.reporting(exit),
+        None => rendered,
+    })
 }
 
 #[cfg(test)]
@@ -200,6 +328,8 @@ mod tests {
             image_gb: None,
             cycles: 1,
             hold_sec: 3600.0,
+            max_cost: None,
+            on_breach: None,
         }
     }
 
@@ -434,6 +564,208 @@ mod tests {
                 .is_empty(),
             "zero omits the phase rather than refusing it: {}",
             rendered.data["report"]["items"]
+        );
+    }
+
+    /// **`--max-cost` against an exact total: the verdict is in the envelope, the
+    /// breach is a warning, and `--on-breach warn` leaves the exit alone.**
+    ///
+    /// The same plan under a budget it fits reports `breached: false` and says
+    /// "within" — asserted beside the breach so the gate is about the figures
+    /// rather than unconditionally alarmed.
+    ///
+    /// **Falsification** — invert the comparison to `floor < budget` and both
+    /// halves go red: the breach reports within and the fitting budget reports
+    /// breached. Verified 2026-09-01.
+    #[test]
+    fn a_breach_from_an_exact_total_warns_without_changing_the_exit() {
+        let mut over = args(crate::cli::MemoryMib::Mib2048);
+        over.running_sec = 3600.0;
+        over.max_cost = Some("0.001".into());
+        over.on_breach = Some(crate::cli::OnBreach::Warn);
+        let (rendered, stderr) = run_cost(over);
+
+        assert_eq!(
+            rendered.already_reported, None,
+            "warn never touches the exit"
+        );
+        let budget = &rendered.data["budget"];
+        assert_eq!(budget["breached"], true, "{budget}");
+        assert_eq!(budget["basis"], "exact", "every line here is priced");
+        assert_eq!(budget["onBreach"], "warn");
+        assert_eq!(budget["maxUsd"], "0.001");
+        assert!(
+            budget["overageAtLeastUsd"].is_string(),
+            "a breach names its margin: {budget}"
+        );
+        assert!(
+            stderr.contains("warning: budget:"),
+            "a breach is a warning, not a progress line --quiet can swallow: {stderr}"
+        );
+        assert!(
+            rendered.text.contains("exceeds --max-cost"),
+            "{}",
+            rendered.text
+        );
+        assert!(
+            rendered
+                .dense_text
+                .lines()
+                .last()
+                .unwrap_or_default()
+                .starts_with("budget\t"),
+            "{}",
+            rendered.dense_text
+        );
+
+        let mut under = args(crate::cli::MemoryMib::Mib2048);
+        under.running_sec = 3600.0;
+        under.max_cost = Some("1000".into());
+        under.on_breach = Some(crate::cli::OnBreach::Warn);
+        let (rendered, stderr) = run_cost(under);
+        assert_eq!(rendered.data["budget"]["breached"], false);
+        assert!(
+            rendered.text.contains("is within --max-cost"),
+            "{}",
+            rendered.text
+        );
+        assert!(
+            !stderr.contains("budget"),
+            "no breach, no warning: {stderr}"
+        );
+    }
+
+    /// **`--on-breach abort` exits ERR_PRECONDITION (12) with the report intact.**
+    ///
+    /// The success envelope is still the right answer — the arithmetic worked and
+    /// the caller paid for a report — so the gate rides `already_reported`, the
+    /// same mechanism `run`'s non-zero workload uses, rather than an error that
+    /// would replace the report with a message about it. ERR_PRECONDITION is an
+    /// existing row (the work order forbids a new one): the budget is a
+    /// precondition the caller set, and 12 is distinguishable in a CI branch from
+    /// the parse-refusal 2.
+    ///
+    /// **Falsification** — drop the `reporting(exit)` arm and the first assertion
+    /// reads `None`. Verified 2026-09-01.
+    #[test]
+    fn an_abort_breach_reports_err_precondition_with_the_report_intact() {
+        let mut bad = args(crate::cli::MemoryMib::Mib2048);
+        bad.running_sec = 3600.0;
+        bad.max_cost = Some("0.001".into());
+        bad.on_breach = Some(crate::cli::OnBreach::Abort);
+        let (rendered, stderr) = run_cost(bad);
+
+        assert_eq!(
+            rendered.already_reported,
+            Some(crate::exit::Exit::Precondition),
+            "the envelope is written first; the exit carries the gate"
+        );
+        assert_eq!(rendered.data["budget"]["onBreach"], "abort");
+        assert_eq!(rendered.data["budget"]["breached"], true);
+        assert!(
+            rendered.data["report"]["items"]
+                .as_array()
+                .is_some_and(|items| !items.is_empty()),
+            "the report the caller asked for is still in the envelope"
+        );
+        assert!(stderr.contains("warning: budget:"), "{stderr}");
+    }
+
+    /// **A verdict from a lower bound says so, in both directions.**
+    ///
+    /// `--build-sec` puts an unpriced line on the report, so the total is
+    /// [`microvms_core::cost::Total::AtLeast`] — a floor. A breach of a floor has
+    /// already been exceeded by an unknown margin (the design consequence the
+    /// roadmap ruled on), and "within budget" measured against a floor proves
+    /// nothing; a budget line that said either without the caveat would be the
+    /// report lying by omission.
+    ///
+    /// **Falsification** — build the caveat from `unpriced.is_empty()` inverted
+    /// and both directions lose their qualifier. Verified 2026-09-01.
+    #[test]
+    fn a_lower_bound_verdict_carries_the_unknown_margin_in_both_directions() {
+        let mut over = args(crate::cli::MemoryMib::Mib2048);
+        over.running_sec = 3600.0;
+        over.build_sec = 600.0; // unpriced: AWS does not publish the build rate
+        over.max_cost = Some("0.001".into());
+        over.on_breach = Some(crate::cli::OnBreach::Warn);
+        let (rendered, _) = run_cost(over);
+        let budget = &rendered.data["budget"];
+        assert_eq!(budget["basis"], "lower-bound", "{budget}");
+        assert_eq!(budget["breached"], true);
+        assert!(
+            rendered.text.contains("by at least") && rendered.text.contains("unknown margin"),
+            "a floor breach is a floor on the overage too: {}",
+            rendered.text
+        );
+
+        let mut under = args(crate::cli::MemoryMib::Mib2048);
+        under.running_sec = 3600.0;
+        under.build_sec = 600.0;
+        under.max_cost = Some("1000".into());
+        under.on_breach = Some(crate::cli::OnBreach::Warn);
+        let (rendered, _) = run_cost(under);
+        assert_eq!(rendered.data["budget"]["breached"], false);
+        assert!(
+            rendered.text.contains("lower bound"),
+            "within-a-floor is not within-a-total, and the line has to say so: {}",
+            rendered.text
+        );
+    }
+
+    /// A budget that does not read as money is refused as an invalid argument,
+    /// with the flag named in a suggestion — the same split as the negative
+    /// durations above: the library says what is wrong, the CLI says which flag.
+    #[test]
+    fn a_budget_that_does_not_read_as_money_is_refused() {
+        for bad_text in ["abc", "-1", "$2"] {
+            let mut bad = args(crate::cli::MemoryMib::Mib2048);
+            bad.max_cost = Some(bad_text.into());
+            bad.on_breach = Some(crate::cli::OnBreach::Warn);
+            let (result, _) = try_cost(bad);
+            let error = result.expect_err(bad_text);
+            assert_eq!(error.code(), "ERR_INVALID_ARG", "{bad_text}");
+            assert!(
+                error
+                    .suggestions
+                    .iter()
+                    .any(|line| line.contains("--max-cost")),
+                "{:?}",
+                error.suggestions
+            );
+        }
+    }
+
+    /// **The warn-vs-abort judgement is never defaulted.** `--max-cost` without
+    /// `--on-breach` is refused (clap's `requires` for a parsed invocation; the
+    /// same refusal here for a driven handler), and `--on-breach` alone gates
+    /// nothing but says so on stderr — accepted rather than refused because the
+    /// manifest's domain round-trip feeds each published choice back through the
+    /// parser by itself, and silence would read as a gate that passed.
+    #[test]
+    fn the_warn_vs_abort_judgement_is_never_defaulted() {
+        let mut half = args(crate::cli::MemoryMib::Mib2048);
+        half.max_cost = Some("1.50".into());
+        let (result, _) = try_cost(half);
+        let error = result.expect_err("--max-cost with no --on-breach");
+        assert_eq!(error.code(), "ERR_INVALID_ARG");
+        assert!(
+            error
+                .suggestions
+                .iter()
+                .any(|line| line.contains("--on-breach")),
+            "{:?}",
+            error.suggestions
+        );
+
+        let mut idle = args(crate::cli::MemoryMib::Mib2048);
+        idle.on_breach = Some(crate::cli::OnBreach::Abort);
+        let (rendered, stderr) = run_cost(idle);
+        assert_eq!(rendered.data["budget"], Value::Null, "nothing was gated");
+        assert_eq!(rendered.already_reported, None);
+        assert!(
+            stderr.contains("gates nothing"),
+            "an inert flag must say it is inert: {stderr}"
         );
     }
 

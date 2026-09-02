@@ -626,6 +626,10 @@ async fn no_local_command_touches_a_seam_door() {
             image_gb: None,
             cycles: 1,
             hold_sec: 3600.0,
+            // The budget gate is arithmetic over the same local report, so a gated
+            // invocation is exercised here too: still no seam door.
+            max_cost: Some("0.001".into()),
+            on_breach: Some(crate::cli::OnBreach::Abort),
         }),
         Command::Manifest,
         Command::Constants(crate::cli::ConstantsArgs { emit_json: true }),

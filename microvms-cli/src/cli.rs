@@ -1444,6 +1444,41 @@ pub struct CostArgs {
     /// The hold to compare running against suspended over, in seconds.
     #[arg(long, default_value_t = 3600.0)]
     pub hold_sec: f64,
+
+    /// A budget in USD the report's total is checked against (#77).
+    ///
+    /// Checked against the *priced* total, which is a lower bound whenever any line
+    /// is unpriced — so a breach means the true cost is at least this far over, by
+    /// an unknown margin. That is why `--on-breach` is required beside this flag
+    /// rather than defaulted: whether a figure that is already known to understate
+    /// should warn or abort is the caller's call, not this CLI's.
+    #[arg(long, value_name = "USD", requires = "on_breach")]
+    pub max_cost: Option<String>,
+
+    /// What a `--max-cost` breach does: warn and exit 0, or abort with
+    /// ERR_PRECONDITION (exit 12).
+    ///
+    /// Required whenever `--max-cost` is given, and deliberately without a default
+    /// (see `--max-cost`). Without `--max-cost` this flag gates nothing; the
+    /// handler says so on stderr rather than silently ignoring it.
+    #[arg(long, value_enum)]
+    pub on_breach: Option<OnBreach>,
+}
+
+/// What a `--max-cost` breach does. A closed set, and deliberately not defaulted.
+///
+/// The totals this budget is compared against are lower bounds whenever a line is
+/// unpriced (COST-4), so a detected breach has already been exceeded by an unknown
+/// margin. Whether that warrants a warning or a non-zero exit depends on what the
+/// caller is gating — a dashboard wants the report either way, a CI budget gate
+/// wants the exit — and a default would quietly make that judgement for them.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum OnBreach {
+    /// Report as usual, with the breach as a warning on stderr. Exit 0.
+    Warn,
+    /// Report as usual, then exit ERR_PRECONDITION (12) — the budget precondition
+    /// the caller set does not hold.
+    Abort,
 }
 
 #[derive(Args, Debug)]

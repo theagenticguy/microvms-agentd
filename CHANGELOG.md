@@ -8,6 +8,17 @@ Versions are [semantic](https://semver.org/spec/v2.0.0.html); the wire contract 
 
 ### Added
 
+- **`cost --max-cost <USD> --on-breach <warn|abort>` (#77).** A budget gate over
+  the report's total. The compared figure is the priced total, which is a *lower
+  bound* whenever any line is unpriced — a detected breach has therefore already
+  been exceeded by an unknown margin, which is why warn-vs-abort is a required
+  flag rather than a default. The verdict ships in `data.budget`
+  (`{maxUsd, onBreach, basis, breached, overageAtLeastUsd}`), in both text
+  renderings, and as a stderr warning `--quiet` does not swallow; `abort` exits
+  `ERR_PRECONDITION` (12, an existing row — no new exit vocabulary) after the
+  full report is written, so a CI gate still receives the figures it is gating
+  on.
+
 - **`microvm shell` — an interactive PTY into a running VM (#69).** A thin
   client over the platform's shell WebSocket (Option B): `session_init`, then
   binary terminal bytes both ways, resize as a validated JSON control frame,
