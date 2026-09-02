@@ -134,9 +134,9 @@ requirements sharing vocabulary with no peer need a glossary link, not a looser 
 - `agentd/` — the in-VM daemon (exec, file transfer, one-shot bootstrap)
 - `model/` — stateright models of daemon and client lifecycle
 - `microvms-core/` — the client library; the type system carries every trap closure
-- `microvms-cli/` — the `microvm` binary: 18 commands, JSON envelopes, `manifest`.
+- `microvms-cli/` — the `microvm` binary: 24 commands, JSON envelopes, `manifest`.
   No lib target; allowlisted deps (6), asserted by `tests/thinness.rs`. The count is
-  compile-enforced by `RESPONSE_TYPES: [_; 18]` in `src/commands/mod.rs`.
+  compile-enforced by `RESPONSE_TYPES: [_; 24]` in `src/commands/mod.rs`.
 - `microvms-py/`, `microvms-js/` — thin PyO3 / napi-rs bindings over core. Only the
   Python side has a drift gate: `microvms.pyi` is checked by `stubs:check`, while
   `microvms-js/index.d.ts` is gitignored and nothing compares it to the crate.

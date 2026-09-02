@@ -6,6 +6,8 @@ Versions are [semantic](https://semver.org/spec/v2.0.0.html); the wire contract 
 
 ## Unreleased
 
+## [0.6.0] — 2026-09-02
+
 ### Added
 
 - **`build --project` — lockfile-keyed environment layers (#74).** The build

@@ -1,6 +1,6 @@
 [package]
 name = "microvms-core"
-version = "0.5.0"
+version = "0.6.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -23,7 +23,7 @@ categories = ["api-bindings", "virtualization"]
 # alternative is a client that redefines `Phase`, `Outcome`, and the SSE event
 # payloads locally, which is precisely the drift the protocol crate was extracted to
 # make impossible. A field renamed in `protocol/` must break this crate's build.
-protocol = { package = "microvms-protocol", version = "0.5.0", path = "../protocol" }
+protocol = { package = "microvms-protocol", version = "0.6.0", path = "../protocol" }
 # The error taxonomy's Display impls. 2.x rather than 1.x: `#[error]` on an enum
 # with `#[from]` is the same surface, and the 2.0 line is what receives fixes.
 thiserror = "2.0.19"
