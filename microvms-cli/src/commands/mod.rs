@@ -303,7 +303,10 @@ pub const RESPONSE_TYPES: [(&str, &str, &[&str]); 22] = [
             "state",
         ],
     ),
-    ("ls", "microvm.runs", &["runs"]),
+    // `watch` is `--watch`'s summary — {refreshes, intervalSeconds, interrupted,
+    // calls} with `calls` stating flatly that a refresh is one ledger read and zero
+    // platform calls (#78) — and null for a plain single-read `ls`.
+    ("ls", "microvm.runs", &["runs", "watch"]),
     ("history", "microvm.history", &["microvmId", "events"]),
     (
         "logs",

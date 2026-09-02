@@ -607,6 +607,17 @@ async fn no_local_command_touches_a_seam_door() {
     let commands = [
         Command::Ls(LsArgs {
             state_dir: Some(std::path::PathBuf::from("/nonexistent-guard-ledgers")),
+            watch: false,
+            interval_sec: 2.0,
+            max_refreshes: None,
+        }),
+        // The watch path is the same local read in a loop, so it is under the same
+        // guard: bounded to one refresh, and still no seam door.
+        Command::Ls(LsArgs {
+            state_dir: Some(std::path::PathBuf::from("/nonexistent-guard-ledgers")),
+            watch: true,
+            interval_sec: 2.0,
+            max_refreshes: Some(1),
         }),
         Command::History(crate::cli::HistoryArgs {
             microvm_id: "mvm-1".into(),
