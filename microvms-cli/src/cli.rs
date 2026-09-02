@@ -920,7 +920,8 @@ pub struct BuildArgs {
     /// name can serve a stale snapshot (measured — the same hazard class as the
     /// clientToken replay in docs/PLATFORM.md). Keying the name to the content hash gives
     /// both properties at once: unchanged inputs reuse their image, changed inputs get a
-    /// fresh name and therefore a fresh build. The match is on binary+Dockerfile only —
+    /// fresh name and therefore a fresh build. The match is on binary+Dockerfile (plus
+    /// the --project pair when given) —
     /// `--memory` is not part of the identity, so a reused image keeps the size class it
     /// was created with.
     #[arg(long)]

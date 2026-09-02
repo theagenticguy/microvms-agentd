@@ -196,20 +196,37 @@ pub fn build_artifact(
     Ok(bytes)
 }
 
-/// The sha256 of the artifact's two inputs, as lowercase hex.
+/// The sha256 of the artifact's inputs, as lowercase hex.
 ///
 /// # What is hashed, and why not the zip
 ///
-/// The **inputs** — the daemon binary's bytes and the Dockerfile text — rather than the
-/// bytes [`build_artifact`] produces. The zip is a container: its byte identity depends on
-/// the `zip` crate's version, its compression level, and its header defaults, so an
-/// upgraded dependency would silently change every image name and orphan every reuse. The
-/// inputs are what a build actually consumes, and two builds with equal inputs produce
-/// interchangeable images — which is the property content-addressed reuse rests on.
+/// The **inputs** — the daemon binary's bytes, the Dockerfile text, and the project
+/// files when the artifact carries them — rather than the bytes [`build_artifact`]
+/// produces. The zip is a container: its byte identity depends on the `zip` crate's
+/// version, its compression level, and its header defaults, so an upgraded dependency
+/// would silently change every image name and orphan every reuse. The inputs are what a
+/// build actually consumes, and two builds with equal inputs produce interchangeable
+/// images — which is the property content-addressed reuse rests on.
 ///
 /// Each input is length-prefixed before hashing, so `(binary="ab", dockerfile="c")` and
 /// `(binary="a", dockerfile="bc")` are different hashes rather than one concatenation.
-pub fn artifact_content_hash(binary: &[u8], dockerfile: &str) -> String {
+/// A project file contributes its entry **name and bytes**, both length-prefixed, so the
+/// same bytes under a different ecosystem — `Cargo.lock` and `package-lock.json` holding
+/// identical text — are different identities too.
+///
+/// # `None` is the historical digest, deliberately
+///
+/// With no project files the digest stream is byte-identical to what this function
+/// produced before #74, so every projectless image name in every account survives the
+/// change — the alternative orphans exactly the reuse this hash exists to serve. The
+/// pinned vector in the tests is what holds that fixed. This is #74's key: two projects
+/// with identical lockfiles share an image, and a lockfile edit is a new name and a
+/// fresh build.
+pub fn artifact_content_hash(
+    binary: &[u8],
+    dockerfile: &str,
+    project: Option<&ProjectFiles>,
+) -> String {
     use sha2::{Digest as _, Sha256};
 
     let mut hasher = Sha256::new();
@@ -217,6 +234,17 @@ pub fn artifact_content_hash(binary: &[u8], dockerfile: &str) -> String {
     hasher.update(binary);
     hasher.update((dockerfile.len() as u64).to_be_bytes());
     hasher.update(dockerfile.as_bytes());
+    if let Some(project) = project {
+        for (name, bytes) in [
+            (project.ecosystem.manifest_name(), &project.manifest),
+            (project.ecosystem.lockfile_name(), &project.lockfile),
+        ] {
+            hasher.update((name.len() as u64).to_be_bytes());
+            hasher.update(name.as_bytes());
+            hasher.update((bytes.len() as u64).to_be_bytes());
+            hasher.update(bytes);
+        }
+    }
     const_hex::encode(hasher.finalize())
 }
 
@@ -947,10 +975,10 @@ mod tests {
     /// inputs, which is the exact hazard the hash exists to close.
     #[test]
     fn the_content_hash_follows_the_inputs_and_only_the_inputs() {
-        let hash = artifact_content_hash(b"binary-bytes", "FROM scratch\n");
+        let hash = artifact_content_hash(b"binary-bytes", "FROM scratch\n", None);
         assert_eq!(
             hash,
-            artifact_content_hash(b"binary-bytes", "FROM scratch\n")
+            artifact_content_hash(b"binary-bytes", "FROM scratch\n", None)
         );
         assert_eq!(hash.len(), 64, "sha256 as lowercase hex");
         assert!(
@@ -960,16 +988,84 @@ mod tests {
 
         assert_ne!(
             hash,
-            artifact_content_hash(b"other-bytes", "FROM scratch\n")
+            artifact_content_hash(b"other-bytes", "FROM scratch\n", None)
         );
         assert_ne!(
             hash,
-            artifact_content_hash(b"binary-bytes", "FROM scratch\nRUN true\n")
+            artifact_content_hash(b"binary-bytes", "FROM scratch\nRUN true\n", None)
         );
         assert_ne!(
-            artifact_content_hash(b"ab", "c"),
-            artifact_content_hash(b"a", "bc"),
+            artifact_content_hash(b"ab", "c", None),
+            artifact_content_hash(b"a", "bc", None),
             "the input boundary is part of the identity"
+        );
+
+        // The projectless digest is pinned to the exact value this function produced
+        // before #74. Every image name `build --reuse` ever derived embeds this digest's
+        // first twelve characters, so changing the no-project stream silently orphans
+        // every existing reuse — the module docs call that hazard out for the zip's own
+        // bytes, and it applies to the algorithm the same way. Recomputed independently
+        // (Python hashlib, 2026-08-31) rather than pasted from this function's output.
+        assert_eq!(
+            hash, "90a0ef925a4696b0c0f142241b2c714e63f40071d0d02951e26cb2a1d8bb24fc",
+            "the no-project digest must stay what it was before #74"
+        );
+    }
+
+    /// **#74 step 3, the key.** The project files are part of the artifact identity:
+    /// identical pairs agree, a lockfile edit is a new identity (and so a fresh image
+    /// name and a fresh build), and the entry names count — the same bytes under a
+    /// different ecosystem are a different identity, because the Dockerfile that consumes
+    /// them installs a different environment.
+    ///
+    /// **Falsification** — run 2026-08-31 and again 2026-09-02: the lockfile's
+    /// `hasher.update` lines were dropped from `artifact_content_hash` and the
+    /// lockfile-edit assertion went red (two different lockfiles, one hash — the
+    /// stale-reuse hazard verbatim); restored.
+    #[test]
+    fn the_content_hash_keys_on_the_lockfile() {
+        let project = |ecosystem, lockfile: &[u8]| ProjectFiles {
+            ecosystem,
+            manifest: b"[project]".to_vec(),
+            lockfile: lockfile.to_vec(),
+        };
+        let hash = artifact_content_hash(
+            b"binary",
+            "FROM scratch\n",
+            Some(&project(Ecosystem::Uv, b"version = 1")),
+        );
+        assert_eq!(
+            hash,
+            artifact_content_hash(
+                b"binary",
+                "FROM scratch\n",
+                Some(&project(Ecosystem::Uv, b"version = 1")),
+            ),
+            "identical dependency files share an image"
+        );
+        assert_ne!(
+            hash,
+            artifact_content_hash(
+                b"binary",
+                "FROM scratch\n",
+                Some(&project(Ecosystem::Uv, b"version = 2")),
+            ),
+            "a lockfile edit is a new image name and a fresh build"
+        );
+        assert_ne!(
+            hash,
+            artifact_content_hash(b"binary", "FROM scratch\n", None),
+            "carrying a layer is a different identity from carrying none"
+        );
+        assert_ne!(
+            artifact_content_hash(
+                b"binary",
+                "FROM scratch\n",
+                Some(&project(Ecosystem::Npm, b"version = 1")),
+            ),
+            hash,
+            "the entry names count: the same bytes under another ecosystem install a \
+             different environment"
         );
     }
 

@@ -1346,7 +1346,8 @@ pub async fn build<O: std::io::Write, E: std::io::Write>(
             // The derived default group and a null stream, whatever the flags said: no
             // build ran, so no stream was resolved, and the group the *original* build
             // wrote to is not observable from a listing — the reuse identity is
-            // binary+Dockerfile only, so the earlier build's logging config may differ.
+            // binary+Dockerfile+project files only, so the earlier build's logging config
+            // may differ.
             return Ok(render_build(
                 &existing.image_arn,
                 &name,

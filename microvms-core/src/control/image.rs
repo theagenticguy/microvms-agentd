@@ -1122,7 +1122,11 @@ impl ControlPlane {
                 request.project_files.as_ref().map(|files| files.ecosystem),
             ),
         };
-        artifact::artifact_content_hash(&request.binary, &dockerfile)
+        artifact::artifact_content_hash(
+            &request.binary,
+            &dockerfile,
+            request.project_files.as_ref(),
+        )
     }
 
     /// Deletes every version but the first, then the image, retrying.
