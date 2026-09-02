@@ -41,6 +41,9 @@ Versions are [semantic](https://semver.org/spec/v2.0.0.html); the wire contract 
   the workspace. `--watch` (the `notify` crate) keeps the loop alive on
   debounced filesystem events — events only wake a re-hash, the hash compare
   decides whether bytes move — and Ctrl-C resolves into the summary envelope.
+  The watcher is armed before the first pass, so an edit that lands while the
+  initial upload is in flight is not lost until the next save (a window wide
+  enough that the macOS FSEvents backend hit it in CI).
   `--full` forces a whole-tree upload when a workload has edited the workspace
   behind sync's back. The daemon's disk-pressure refusal (507) surfaces as
   `ERR_PLATFORM` with the byte counts and the free-space remedy, never as

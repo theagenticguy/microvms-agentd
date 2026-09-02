@@ -1342,6 +1342,44 @@ pub(crate) fn watch_relevant(root: &std::path::Path, path: &std::path::Path) -> 
     })
 }
 
+/// Starts the `notify` watcher over `dir` and returns it with the channel it feeds.
+///
+/// The watcher is returned rather than leaked so the caller's binding keeps it alive for
+/// exactly the loop it wakes; dropping it stops the stream.
+fn start_watcher(
+    dir: &std::path::Path,
+) -> Result<
+    (
+        notify::RecommendedWatcher,
+        tokio::sync::mpsc::UnboundedReceiver<Vec<std::path::PathBuf>>,
+    ),
+    CliError,
+> {
+    use notify::Watcher as _;
+    let (sender, events) = tokio::sync::mpsc::unbounded_channel::<Vec<std::path::PathBuf>>();
+    let mut watcher =
+        notify::recommended_watcher(move |event: Result<notify::Event, notify::Error>| {
+            if let Ok(event) = event {
+                let _ = sender.send(event.paths);
+            }
+        })
+        .map_err(|error| {
+            CliError::new(
+                Exit::Precondition,
+                format!("could not start the filesystem watcher: {error}"),
+            )
+        })?;
+    watcher
+        .watch(dir, notify::RecursiveMode::Recursive)
+        .map_err(|error| {
+            CliError::new(
+                Exit::Precondition,
+                format!("could not watch {}: {error}", dir.display()),
+            )
+        })?;
+    Ok((watcher, events))
+}
+
 /// Syncs a project directory into a running VM's workspace, incrementally.
 ///
 /// The incremental half of issue #71. The batch half (`run <DIR>`, issue #72) is
@@ -1384,6 +1422,18 @@ pub async fn sync<O: std::io::Write, E: std::io::Write>(
     }
     let (session, microvm_id) = attach(ctx, &args.region, &args.attach).await?;
 
+    // Armed before the first pass, not after it: an edit that lands while the initial
+    // upload is in flight must wake the loop too. Registering the watcher afterwards
+    // leaves a window in which a save is silently lost until the next one, and the
+    // window is wide enough to hit on macOS, where an FSEvents stream takes longer to
+    // start than inotify does. Events the first pass itself provokes are harmless: they
+    // wake one re-hash that diffs to an empty delta.
+    let watch = if args.watch {
+        Some(start_watcher(&args.dir)?)
+    } else {
+        None
+    };
+
     let baseline = if args.full {
         None
     } else {
@@ -1393,31 +1443,8 @@ pub async fn sync<O: std::io::Write, E: std::io::Write>(
 
     let mut passes = 1usize;
     let mut totals = SyncPass { ..first };
-    if args.watch {
+    if let Some((_watcher, mut events)) = watch {
         report_pass(ctx, &totals);
-        let (sender, mut events) =
-            tokio::sync::mpsc::unbounded_channel::<Vec<std::path::PathBuf>>();
-        use notify::Watcher as _;
-        let mut watcher =
-            notify::recommended_watcher(move |event: Result<notify::Event, notify::Error>| {
-                if let Ok(event) = event {
-                    let _ = sender.send(event.paths);
-                }
-            })
-            .map_err(|error| {
-                CliError::new(
-                    Exit::Precondition,
-                    format!("could not start the filesystem watcher: {error}"),
-                )
-            })?;
-        watcher
-            .watch(&args.dir, notify::RecursiveMode::Recursive)
-            .map_err(|error| {
-                CliError::new(
-                    Exit::Precondition,
-                    format!("could not watch {}: {error}", args.dir.display()),
-                )
-            })?;
         ctx.out.progress(&format!(
             "watching {} — Ctrl-C stops and reports the totals",
             args.dir.display()
