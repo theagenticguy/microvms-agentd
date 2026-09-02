@@ -1,0 +1,38 @@
+# SPDX-License-Identifier: Apache-2.0
+# Project config for the code-server example. `run.sh` passes it with
+# `--config`, and `microvm doctor --config` validates the same file through
+# the same loader.
+
+# An IDE with language servers is a steadier workload than a peaky agent
+# session, so this pins the 2048 default rather than the low minimum the
+# coding-agents example picks: an 8 GiB always-present ceiling that survives
+# a real build or test suite. The minimum you request is your bill floor
+# (25% of provisioned capacity); drop to 1024 if your projects are light.
+memory = 2048
+
+# git clone, package registries, and the extension marketplace all need
+# outbound network.
+egress = true
+
+# Launch shell-capable ([HTTP_INGRESS, SHELL_INGRESS]), so
+# `microvm shell --name code-server-dev` can open a real PTY beside the IDE.
+shell = true
+
+# The remote-dev loop: no inbound traffic for max-idle-sec suspends the VM
+# (frozen, not stopped — filesystem, processes, and unsaved editor state all
+# survive), and auto-resume brings it back on the next request through the
+# endpoint. An open editor tab holds a live WebSocket, which counts as
+# inbound traffic and keeps the VM running (docs/PLATFORM.md measured that
+# even a health poll resets the idle timer); close the tab and the VM
+# suspends about 15 minutes later.
+auto-resume = true
+max-idle-sec = 900
+
+# The launch environment reaches every process the daemon spawns. HOME is
+# where code-server (running demoted, uid 1000) writes settings and
+# extensions; PATH is the lesson from the coding-agents example — the daemon
+# spawns execs with a minimal environment, and without an explicit PATH
+# subshells find nothing.
+[env]
+HOME = "/workspace"
+PATH = "/usr/local/bin:/usr/bin:/bin"

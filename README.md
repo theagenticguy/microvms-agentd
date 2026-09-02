@@ -280,6 +280,31 @@ of rediscovered per integration.
 [docs/HARNESS-CAPABILITIES.md](docs/HARNESS-CAPABILITIES.md) maps their
 contracts onto this platform and ranks what is still missing.
 
+### Remote dev: code-server over `port-forward`
+
+[examples/code-server-remote-dev](examples/code-server-remote-dev/) runs
+VS Code in the browser against a MicroVM: one script builds an image carrying
+code-server, launches a named VM that idle-suspends and auto-resumes, and
+forwards local port 8080 to it. Re-running the script reattaches instead of
+relaunching, and `microvm shell` opens a real PTY beside the IDE:
+
+```bash
+bash examples/code-server-remote-dev/run.sh
+```
+
+### Prefetching S3 content into the image snapshot
+
+[examples/s3-prefetch-at-build](examples/s3-prefetch-at-build/) bakes an S3
+prefix into the image at build time — the fetch runs in the snapshot VM
+before the snapshot is captured, so every launched VM starts with the data on
+disk and makes no S3 call at all (the demo launches without `--egress` to
+prove it). Issue #81 records the measured 5–10 second first-S3-call penalty
+this sidesteps:
+
+```bash
+PREFETCH_URI=s3://my-bucket/models/ bash examples/s3-prefetch-at-build/run.sh
+```
+
 ### Calling it from code
 
 The same lifecycle is available as a library, with the same defaults and the

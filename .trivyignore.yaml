@@ -18,12 +18,14 @@ misconfigurations:
   - id: AVD-DS-0002
     paths:
       - examples/coding-agents-on-bedrock/Dockerfile
+      - examples/code-server-remote-dev/Dockerfile
+      - examples/s3-prefetch-at-build/Dockerfile
     statement: >-
       The daemon runs as root in the guest deliberately, and the trust contract
       says so: the control API grants root by design, so a token holder and a
       root workload are the same principal (docs/TRUST.md, "One boundary is out
       of scope"). Isolation comes from the MicroVM, which is one tenant per
       Firecracker VM with its own kernel, rather than from a uid inside it. A
-      USER line would also break the example: agentd must chmod uploaded files
+      USER line would also break the examples: agentd must chmod uploaded files
       and demote execs to the uid a caller names through `exec --user`, both of
       which need root. Revisit if the daemon ever stops needing to demote.
