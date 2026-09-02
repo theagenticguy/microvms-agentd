@@ -271,6 +271,12 @@ impl ControlPlane {
             // The artifact carries the daemon unconditionally; a Dockerfile that never runs
             // it builds cleanly and fails as a run-hook timeout naming nothing (issue #46).
             artifact::require_daemon_cmd(dockerfile)?;
+            // Same shape for the project files (#74): they enter the artifact
+            // unconditionally, and a Dockerfile that ignores them bakes no layer while
+            // building cleanly.
+            if let Some(project) = &request.project_files {
+                artifact::require_project_install(project, dockerfile)?;
+            }
         }
 
         // Pinned only when the caller asked for it, and refused locally when they asked for
@@ -334,9 +340,14 @@ impl ControlPlane {
     pub fn build_artifact_for(&self, request: &CreateImageRequest) -> Result<Vec<u8>, Error> {
         let dockerfile = match request.dockerfile.as_deref() {
             Some(dockerfile) => dockerfile.to_string(),
-            None => artifact::default_dockerfile(self.port, None, &request.base_image),
+            None => artifact::default_dockerfile(
+                self.port,
+                None,
+                &request.base_image,
+                request.project_files.as_ref().map(|files| files.ecosystem),
+            ),
         };
-        artifact::build_artifact(&request.binary, &dockerfile)
+        artifact::build_artifact(&request.binary, &dockerfile, request.project_files.as_ref())
     }
 
     /// Polls until the image is usable, distinguishing a stalled build from a slow one.
@@ -1104,9 +1115,18 @@ impl ControlPlane {
     pub fn artifact_content_hash_for(&self, request: &CreateImageRequest) -> String {
         let dockerfile = match request.dockerfile.as_deref() {
             Some(dockerfile) => dockerfile.to_string(),
-            None => artifact::default_dockerfile(self.port, None, &request.base_image),
+            None => artifact::default_dockerfile(
+                self.port,
+                None,
+                &request.base_image,
+                request.project_files.as_ref().map(|files| files.ecosystem),
+            ),
         };
-        artifact::artifact_content_hash(&request.binary, &dockerfile)
+        artifact::artifact_content_hash(
+            &request.binary,
+            &dockerfile,
+            request.project_files.as_ref(),
+        )
     }
 
     /// Deletes every version but the first, then the image, retrying.
@@ -3452,6 +3472,7 @@ mod tests {
             9000,
             Some("/workspace"),
             &custom.base_image,
+            None,
         ));
         assert_ne!(
             hash,

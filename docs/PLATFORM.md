@@ -1456,3 +1456,47 @@ The same applies when the Dockerfile names no port at all: an unset `AGENTD_PORT
 leaves the daemon on its own default of 9000, so a client that moved off 9000
 produces this failure with nothing in the Dockerfile to point at. Both halves are
 now refused before the billable call (`require_matching_agentd_port`).
+
+## A baked environment layer removes the guest's env init, measured with `build --project`
+
+Measured 2026-09-02, us-east-1, API version `2025-09-09`, base image `al2023-1` /
+`public.ecr.aws/amazonlinux/amazonlinux:2023-minimal`, baseline memory 1024 MiB. The
+project was the smallest thing `--project` accepts: a `pyproject.toml` with one pure-Python
+dependency (`attrs`, `requires-python >= 3.12`) and the `uv.lock` uv 0.12.1 wrote for it.
+Every figure is one run of the real `microvm` binary from the #74 branch; wall clock is the
+CLI invocation timed from the shell, `runningSeconds` and `buildSeconds` are the envelope's.
+
+| Step | Measured |
+|---|---|
+| `build --project --reuse`, first time (`w4-proj-e1a980660956`) | 126.6 s wall clock, `reused: false` |
+| The same command again, files unchanged | 0.48 s wall clock, `reused: true`, same name, no build |
+| `build --project --reuse` after a lockfile-only edit (`w4-proj-174a7d39d989`) | 125.1 s, `reused: false` |
+| The default projectless image, for comparison (`run <agentd>`) | `buildSeconds` 110.1 s |
+| Fresh VM from the project image, no `--egress`, `--exec` importing from the venv | 11.6 s wall / 11.13 s `runningSeconds`; a second VM 12.9 s / 12.44 s |
+| The same import on the warm VM (`microvm exec`, three calls) | 1.5 s, 1.7 s, 1.6 s |
+| Fresh VM from the plain image, `--egress`, `--exec` bootstrapping in-guest then importing | 31.85 s `runningSeconds` |
+
+The in-guest bootstrap on the plain VM, timed with `date` inside the exec: `dnf install
+python3.12 python3.12-pip` 21.6 s, `pip3.12 install uv` 1.4 s, `uv sync --locked` 0.7 s —
+23.6 s of environment init in a 31.85-second run, and it needs `--egress` to exist at all.
+The project image spends none of it at launch: the VM answers the import in 11.1–12.4 s
+with no network, so the launch-to-first-import delta for this project is **about 20 s, or
+roughly 65% of the run**, paid for once by a build that is about 15 s longer (110 s to
+126 s). dnf's share dominates here, so this is the floor of the delta rather than a typical
+value: a project with more or heavier dependencies moves the `uv sync` line, which is the
+one the layer removes entirely.
+
+Two things the run showed that the numbers alone do not:
+
+- **The lockfile is the identity, and the layer follows it.** The edit between the first and
+  third rows changed only `uv.lock` (attrs 26.1.0 to 25.4.0; `pyproject.toml` byte-identical),
+  the content hash moved from `e1a980660956` to `174a7d39d989`, and a VM launched from the
+  second image imported `attrs 25.4.0` where the first imported `26.1.0`.
+- **The exec environment carries no `PATH` and no `HOME`.** `env` inside an exec printed
+  neither. `sh` still finds `dnf`, `pip3.12` and `uv` through its built-in default search
+  path, but uv's interpreter discovery reads `PATH`, saw no system interpreter, and
+  downloaded a managed CPython 3.14.7 (28.8 MiB) for the from-scratch `uv sync` — while the
+  same command inside the image build, where Docker sets `PATH`, created the venv on
+  `/usr/bin`'s 3.12.14 (`pyvenv.cfg`: `home = /usr/bin`). The baked layer is therefore on
+  the interpreter the Dockerfile installed. A caller running Python in the guest should
+  call `/project/.venv/bin/python` directly, or pass a `PATH` through `--launch-env`.

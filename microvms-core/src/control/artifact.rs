@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
-//! The build artifact: a zip of the daemon binary and a Dockerfile.
+//! The build artifact: a zip of the daemon binary, a Dockerfile, and — when the caller
+//! passes [`ProjectFiles`] — the project's dependency files.
 //!
 //! What `CreateMicrovmImage`'s `codeArtifact.uri` points at (`sandbox.py:523`
-//! `build_artifact`). Two entries, and both of them carry a measured constraint.
+//! `build_artifact`). Two entries always, both carrying a measured constraint, plus an
+//! ecosystem-named manifest/lockfile pair when the image bakes an environment layer (#74).
 //!
 //! # The execute bit has to be in the zip entry
 //!
@@ -38,11 +40,117 @@ const AGENTD_ENTRY: &str = "agentd";
 /// See the module docs: a non-executable binary here becomes a run-hook timeout later.
 const AGENTD_MODE: u32 = 0o755;
 
-/// Zips `binary` with `dockerfile` into the bytes `codeArtifact.uri` will point at.
+/// An ecosystem whose dependency files may enter the build artifact (#74).
+///
+/// The variant fixes **both entry names**. That is the TRAP-5 half of the design: the
+/// artifact is a shared image snapshot, so what may enter it is an allowlist of
+/// dependency-defining files, not a caller-named list — there is no field anywhere in this
+/// module a caller could put `.env` or a credentials file's name into. The byte-scan test
+/// at the bottom of this file covers the entries this type admits.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Ecosystem {
+    /// Python under uv: `pyproject.toml` + `uv.lock`.
+    Uv,
+    /// Node under npm: `package.json` + `package-lock.json`.
+    Npm,
+    /// Rust under cargo: `Cargo.toml` + `Cargo.lock`.
+    Cargo,
+}
+
+impl Ecosystem {
+    /// Every ecosystem, in detection order.
+    pub const ALL: [Self; 3] = [Self::Uv, Self::Npm, Self::Cargo];
+
+    /// The manifest's file name, which is also its zip entry name.
+    pub fn manifest_name(self) -> &'static str {
+        match self {
+            Self::Uv => "pyproject.toml",
+            Self::Npm => "package.json",
+            Self::Cargo => "Cargo.toml",
+        }
+    }
+
+    /// The lockfile's file name, which is also its zip entry name — and the file the
+    /// environment layer is keyed on (#74).
+    pub fn lockfile_name(self) -> &'static str {
+        match self {
+            Self::Uv => "uv.lock",
+            Self::Npm => "package-lock.json",
+            Self::Cargo => "Cargo.lock",
+        }
+    }
+
+    /// The whole `RUN` line that installs the environment layer: toolchain bootstrap on
+    /// the managed al2023 base, then the lockfile-faithful install.
+    ///
+    /// # The install commands are the lockfile-faithful spellings
+    ///
+    /// `uv sync --locked`, `npm ci`, and `cargo fetch --locked` each **refuse** a lockfile
+    /// that disagrees with its manifest rather than quietly re-resolving — which is what
+    /// keeps the baked layer the thing the content hash says it is. `uv sync` without
+    /// `--locked`, `npm install`, or a bare `cargo fetch` would install *something* and
+    /// the hash would then name an environment the build did not produce.
+    ///
+    /// # The bootstrap packages are measured, the full build is not yet
+    ///
+    /// The managed base is al2023-minimal and ships no toolchain, so each line installs
+    /// its own. Package names and the binaries they land were verified against the
+    /// Amazon Linux 2023 repos (2026-08-31): `python3.12-pip` puts `pip3.12` on PATH,
+    /// `nodejs22-npm` puts `npm` and `node` on PATH, `cargo` puts `cargo` on PATH.
+    /// `install_weak_deps=0` keeps the layer minimal. A full in-guest build of each line
+    /// is the live-conformance scenario #74's acceptance defers to — see the issue.
+    ///
+    /// Cargo is the one that needs a stub: `cargo fetch` refuses a package with no
+    /// targets, so the line creates an empty `src/main.rs` first. The working tree synced
+    /// at launch lands over it.
+    pub fn install_run_line(self) -> &'static str {
+        match self {
+            Self::Uv => {
+                "RUN dnf -y --setopt=install_weak_deps=0 install python3.12 python3.12-pip \
+                 && dnf clean all && pip3.12 install --no-cache-dir uv && uv sync --locked"
+            }
+            Self::Npm => {
+                "RUN dnf -y --setopt=install_weak_deps=0 install nodejs22-npm \
+                 && dnf clean all && npm ci"
+            }
+            Self::Cargo => {
+                "RUN dnf -y --setopt=install_weak_deps=0 install cargo \
+                 && dnf clean all && mkdir -p src && touch src/main.rs \
+                 && cargo fetch --locked"
+            }
+        }
+    }
+}
+
+/// A project's dependency files: the lockfile plus the manifest that owns it.
+///
+/// Bytes rather than paths, for the reason [`build_artifact`]'s `binary` is bytes: the
+/// caller owns the read, and this module keeps no filesystem behaviour to stub in a test.
+/// The entry names come from [`Ecosystem`], never from the caller — see the type's docs
+/// for why that is a TRAP-5 property rather than a convenience.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProjectFiles {
+    /// Which ecosystem's pair this is, fixing both entry names.
+    pub ecosystem: Ecosystem,
+    /// The manifest's bytes (`pyproject.toml`, `package.json`, `Cargo.toml`).
+    pub manifest: Vec<u8>,
+    /// The lockfile's bytes (`uv.lock`, `package-lock.json`, `Cargo.lock`).
+    pub lockfile: Vec<u8>,
+}
+
+/// Zips `binary` with `dockerfile` — and, when given, the project's dependency files —
+/// into the bytes `codeArtifact.uri` will point at.
 ///
 /// `binary` is the daemon's bytes rather than a path, so the caller owns the read and this
-/// function has no filesystem behaviour to stub in a test.
-pub fn build_artifact(binary: &[u8], dockerfile: &str) -> Result<Vec<u8>, Error> {
+/// function has no filesystem behaviour to stub in a test. `project` adds exactly two more
+/// entries, named by its [`Ecosystem`], at the archive root beside the Dockerfile — which
+/// is the build context root, so a `COPY pyproject.toml uv.lock …` in the Dockerfile finds
+/// them.
+pub fn build_artifact(
+    binary: &[u8],
+    dockerfile: &str,
+    project: Option<&ProjectFiles>,
+) -> Result<Vec<u8>, Error> {
     use zip::write::{SimpleFileOptions, ZipWriter};
 
     let mut writer = ZipWriter::new(std::io::Cursor::new(Vec::new()));
@@ -63,6 +171,18 @@ pub fn build_artifact(binary: &[u8], dockerfile: &str) -> Result<Vec<u8>, Error>
 
     write_entry(DOCKERFILE_ENTRY, dockerfile.as_bytes(), deflated)?;
     write_entry(AGENTD_ENTRY, binary, deflated.unix_permissions(AGENTD_MODE))?;
+    if let Some(project) = project {
+        write_entry(
+            project.ecosystem.manifest_name(),
+            &project.manifest,
+            deflated,
+        )?;
+        write_entry(
+            project.ecosystem.lockfile_name(),
+            &project.lockfile,
+            deflated,
+        )?;
+    }
 
     let bytes = writer
         .finish()
@@ -76,20 +196,37 @@ pub fn build_artifact(binary: &[u8], dockerfile: &str) -> Result<Vec<u8>, Error>
     Ok(bytes)
 }
 
-/// The sha256 of the artifact's two inputs, as lowercase hex.
+/// The sha256 of the artifact's inputs, as lowercase hex.
 ///
 /// # What is hashed, and why not the zip
 ///
-/// The **inputs** — the daemon binary's bytes and the Dockerfile text — rather than the
-/// bytes [`build_artifact`] produces. The zip is a container: its byte identity depends on
-/// the `zip` crate's version, its compression level, and its header defaults, so an
-/// upgraded dependency would silently change every image name and orphan every reuse. The
-/// inputs are what a build actually consumes, and two builds with equal inputs produce
-/// interchangeable images — which is the property content-addressed reuse rests on.
+/// The **inputs** — the daemon binary's bytes, the Dockerfile text, and the project
+/// files when the artifact carries them — rather than the bytes [`build_artifact`]
+/// produces. The zip is a container: its byte identity depends on the `zip` crate's
+/// version, its compression level, and its header defaults, so an upgraded dependency
+/// would silently change every image name and orphan every reuse. The inputs are what a
+/// build actually consumes, and two builds with equal inputs produce interchangeable
+/// images — which is the property content-addressed reuse rests on.
 ///
 /// Each input is length-prefixed before hashing, so `(binary="ab", dockerfile="c")` and
 /// `(binary="a", dockerfile="bc")` are different hashes rather than one concatenation.
-pub fn artifact_content_hash(binary: &[u8], dockerfile: &str) -> String {
+/// A project file contributes its entry **name and bytes**, both length-prefixed, so the
+/// same bytes under a different ecosystem — `Cargo.lock` and `package-lock.json` holding
+/// identical text — are different identities too.
+///
+/// # `None` is the historical digest, deliberately
+///
+/// With no project files the digest stream is byte-identical to what this function
+/// produced before #74, so every projectless image name in every account survives the
+/// change — the alternative orphans exactly the reuse this hash exists to serve. The
+/// pinned vector in the tests is what holds that fixed. This is #74's key: two projects
+/// with identical lockfiles share an image, and a lockfile edit is a new name and a
+/// fresh build.
+pub fn artifact_content_hash(
+    binary: &[u8],
+    dockerfile: &str,
+    project: Option<&ProjectFiles>,
+) -> String {
     use sha2::{Digest as _, Sha256};
 
     let mut hasher = Sha256::new();
@@ -97,6 +234,17 @@ pub fn artifact_content_hash(binary: &[u8], dockerfile: &str) -> String {
     hasher.update(binary);
     hasher.update((dockerfile.len() as u64).to_be_bytes());
     hasher.update(dockerfile.as_bytes());
+    if let Some(project) = project {
+        for (name, bytes) in [
+            (project.ecosystem.manifest_name(), &project.manifest),
+            (project.ecosystem.lockfile_name(), &project.lockfile),
+        ] {
+            hasher.update((name.len() as u64).to_be_bytes());
+            hasher.update(name.as_bytes());
+            hasher.update((bytes.len() as u64).to_be_bytes());
+            hasher.update(bytes);
+        }
+    }
     const_hex::encode(hasher.finalize())
 }
 
@@ -170,6 +318,14 @@ impl Default for BaseImage {
     }
 }
 
+/// Where the environment layer lives when the caller named no workdir of their own.
+///
+/// A constant rather than `/` because the install commands resolve everything against the
+/// current directory — `uv sync` writes `.venv` beside the manifest, `npm ci` writes
+/// `node_modules` — and the working tree synced at launch has to land in the same place
+/// for the layer to be *its* environment.
+pub const DEFAULT_PROJECT_WORKDIR: &str = "/project";
+
 /// A Dockerfile that makes the daemon the container `CMD`.
 ///
 /// `ENTRYPOINT []` plus `CMD ["/agentd"]` is the deployment invariant the trust boundary
@@ -180,18 +336,46 @@ impl Default for BaseImage {
 /// The `FROM` is derived from `base` rather than written here, so it cannot disagree with
 /// the `baseImageArn` the create call sends.
 ///
+/// `project` bakes the environment layer (#74): the manifest+lockfile pair is copied into
+/// the working directory — `workdir` when given, [`DEFAULT_PROJECT_WORKDIR`] otherwise —
+/// and the ecosystem's [`Ecosystem::install_run_line`] installs from the lockfile. Without
+/// it the derived Dockerfile installs nothing, which was the measured state this closes:
+/// every launch then pays dependency installation inside the guest, the 31–48% of launch
+/// time `docs/STRATEGY.md` attributes to environment init.
+///
 /// The invariant is *unenforced*: a base image that starts its own background process
 /// before bootstrap breaks it, and enforcing that belongs to whoever builds the image
 /// (`docs/PROTOCOL.md`, "Trust boundary").
-pub fn default_dockerfile(port: u16, workdir: Option<&str>, base: &BaseImage) -> String {
+pub fn default_dockerfile(
+    port: u16,
+    workdir: Option<&str>,
+    base: &BaseImage,
+    project: Option<Ecosystem>,
+) -> String {
     let mut lines = vec![
         format!("FROM {}", base.docker_ref),
         "COPY agentd /agentd".to_string(),
         "RUN chmod 0755 /agentd".to_string(),
     ];
-    if let Some(workdir) = workdir.filter(|dir| !dir.is_empty()) {
+    let workdir = match (workdir.filter(|dir| !dir.is_empty()), project) {
+        (Some(dir), _) => Some(dir),
+        // The layer needs a directory to live in even when the caller named none.
+        (None, Some(_)) => Some(DEFAULT_PROJECT_WORKDIR),
+        (None, None) => None,
+    };
+    if let Some(workdir) = workdir {
         lines.push(format!("RUN mkdir -p {workdir}"));
         lines.push(format!("WORKDIR {workdir}"));
+    }
+    if let Some(ecosystem) = project {
+        // Relative destination, resolving against the WORKDIR set above — the same
+        // directory the install command runs in.
+        lines.push(format!(
+            "COPY {} {} ./",
+            ecosystem.manifest_name(),
+            ecosystem.lockfile_name(),
+        ));
+        lines.push(ecosystem.install_run_line().to_string());
     }
     lines.extend([
         format!("ENV AGENTD_PORT={port}"),
@@ -513,6 +697,39 @@ pub fn require_daemon_cmd(dockerfile: &str) -> Result<(), Error> {
     }
 }
 
+/// Rejects a caller Dockerfile that never mentions the lockfile the request carries.
+///
+/// The project files enter the artifact unconditionally once the request holds them, so a
+/// custom Dockerfile that ignores them builds cleanly and produces an image with **no
+/// environment layer** — and the symptom appears at launch, as every dependency
+/// installing inside the guest, with nothing anywhere naming the `COPY` that was never
+/// written. That is the silent-degradation shape: the caller asked for the layer, paid
+/// the build, and got an image indistinguishable from one that never asked.
+///
+/// Weak-form on purpose, like [`require_daemon_cmd`]: a substring test for the lockfile's
+/// name rather than parsing `COPY` syntax, because the check exists to catch a Dockerfile
+/// that plainly ignores the files, not to validate how it consumes them.
+pub fn require_project_install(project: &ProjectFiles, dockerfile: &str) -> Result<(), Error> {
+    let lockfile = project.ecosystem.lockfile_name();
+    if dockerfile.contains(lockfile) {
+        return Ok(());
+    }
+    Err(Error::invalid_arg(format!(
+        "the request carries project files ({lockfile} and {manifest}) but the Dockerfile \
+         never mentions {lockfile}, so the image would bake no environment layer: the build \
+         succeeds, and every launch still installs dependencies inside the guest with \
+         nothing naming the COPY that was never written. Copy the pair and install from \
+         the lockfile ({install}), or build with default_dockerfile, which derives both \
+         lines — or drop the project files if the layer is not wanted.",
+        manifest = project.ecosystem.manifest_name(),
+        install = match project.ecosystem {
+            Ecosystem::Uv => "uv sync --locked",
+            Ecosystem::Npm => "npm ci",
+            Ecosystem::Cargo => "cargo fetch --locked",
+        },
+    )))
+}
+
 /// Rejects a Dockerfile whose `FROM` is not the selected base image.
 ///
 /// The build runs the Dockerfile *on top of* the base named in `baseImageArn`, so the two
@@ -559,7 +776,7 @@ mod tests {
     /// looks for them.
     #[test]
     fn the_artifact_holds_a_dockerfile_and_the_daemon() {
-        let bytes = build_artifact(b"\x7fELF fake daemon", "FROM scratch\n").expect("zips");
+        let bytes = build_artifact(b"\x7fELF fake daemon", "FROM scratch\n", None).expect("zips");
         let mut archive =
             zip::ZipArchive::new(std::io::Cursor::new(bytes)).expect("a readable zip");
 
@@ -582,7 +799,7 @@ mod tests {
     /// is a test that would have sent someone to debug the writer.
     #[test]
     fn the_daemon_entry_carries_the_execute_bit() {
-        let bytes = build_artifact(b"binary", "FROM scratch\n").expect("zips");
+        let bytes = build_artifact(b"binary", "FROM scratch\n", None).expect("zips");
         let mut archive =
             zip::ZipArchive::new(std::io::Cursor::new(bytes)).expect("a readable zip");
         let mode = archive
@@ -611,7 +828,7 @@ mod tests {
         // Deliberately includes a NUL and a high byte, which is what a real ELF has and
         // what a text-mode write would mangle.
         let binary: Vec<u8> = (0u8..=255).cycle().take(4096).collect();
-        let bytes = build_artifact(&binary, "FROM scratch\n").expect("zips");
+        let bytes = build_artifact(&binary, "FROM scratch\n", None).expect("zips");
         let mut archive =
             zip::ZipArchive::new(std::io::Cursor::new(bytes)).expect("a readable zip");
         let mut read = Vec::new();
@@ -624,28 +841,37 @@ mod tests {
     }
 
     /// **AC-2-3, the byte-scan guard.** The agent token must not appear anywhere in the
-    /// artifact's raw bytes.
+    /// artifact's raw bytes — including the project-file entries #74 added.
     ///
     /// A byte scan rather than an API review, because the leak this guards against is a
     /// *value* turning up somewhere — in the Dockerfile as an `ENV`, in a baked config
     /// file, in a stray argument — not a parameter being declared. Scanning the compressed
     /// bytes and the decompressed entries both, since deflate would hide a literal from a
-    /// naive scan of the archive.
+    /// naive scan of the archive. The artifact under scan carries a full project-file
+    /// pair, and the entry count is asserted so the scan cannot silently sweep fewer
+    /// members than the artifact holds.
     ///
     /// **Falsification** — add the token to the Dockerfile (`ENV AGENT_TOKEN=…`, the
-    /// plausible mistake) and the decompressed scan fails.
+    /// plausible mistake) and the decompressed scan fails. Re-run for the #74 members
+    /// (2026-08-31): append the token to the lockfile entry inside `build_artifact` and
+    /// the per-entry scan fails naming `uv.lock`; it was restored.
     #[test]
     fn the_artifact_never_carries_the_agent_token() {
         use std::io::Read as _;
 
         let token = "s3cr3t-agent-token-do-not-bake-me";
-        let dockerfile = default_dockerfile(9000, Some("/opt/work"), &BaseImage::al2023());
+        let dockerfile = default_dockerfile(9000, Some("/opt/work"), &BaseImage::al2023(), None);
         assert!(
             !dockerfile.contains(token),
             "the default Dockerfile must not mention a token"
         );
 
-        let bytes = build_artifact(b"binary", &dockerfile).expect("zips");
+        let project = ProjectFiles {
+            ecosystem: Ecosystem::Uv,
+            manifest: b"[project]\nname = \"demo\"\n".to_vec(),
+            lockfile: b"version = 1\n".to_vec(),
+        };
+        let bytes = build_artifact(b"binary", &dockerfile, Some(&project)).expect("zips");
         assert!(
             !bytes
                 .windows(token.len())
@@ -655,6 +881,11 @@ mod tests {
 
         let mut archive =
             zip::ZipArchive::new(std::io::Cursor::new(bytes)).expect("a readable zip");
+        assert_eq!(
+            archive.len(),
+            4,
+            "the scan below must sweep every member this artifact can hold"
+        );
         for index in 0..archive.len() {
             let mut entry = archive.by_index(index).expect("entry");
             let name = entry.name().to_string();
@@ -670,6 +901,70 @@ mod tests {
         }
     }
 
+    /// **#74, the build-context half.** A project's manifest and lockfile enter the
+    /// archive under their ecosystem's fixed names, at the root beside the Dockerfile —
+    /// the build context root, where the generated `COPY` finds them — and their bytes
+    /// survive the round trip.
+    #[test]
+    fn project_files_enter_the_artifact_under_their_ecosystem_names() {
+        use std::io::Read as _;
+
+        for (ecosystem, manifest_name, lockfile_name) in [
+            (Ecosystem::Uv, "pyproject.toml", "uv.lock"),
+            (Ecosystem::Npm, "package.json", "package-lock.json"),
+            (Ecosystem::Cargo, "Cargo.toml", "Cargo.lock"),
+        ] {
+            let project = ProjectFiles {
+                ecosystem,
+                manifest: b"manifest-bytes".to_vec(),
+                lockfile: b"lockfile-bytes".to_vec(),
+            };
+            let bytes = build_artifact(b"binary", "FROM scratch\n", Some(&project)).expect("zips");
+            let mut archive =
+                zip::ZipArchive::new(std::io::Cursor::new(bytes)).expect("a readable zip");
+
+            let mut names: Vec<String> = (0..archive.len())
+                .map(|index| archive.by_index(index).expect("entry").name().to_string())
+                .collect();
+            names.sort();
+            let mut expected = vec![
+                "Dockerfile".to_string(),
+                "agentd".to_string(),
+                manifest_name.to_string(),
+                lockfile_name.to_string(),
+            ];
+            expected.sort();
+            assert_eq!(names, expected, "{ecosystem:?}");
+
+            let mut lockfile = Vec::new();
+            archive
+                .by_name(lockfile_name)
+                .expect("the lockfile entry")
+                .read_to_end(&mut lockfile)
+                .expect("reads");
+            assert_eq!(lockfile, b"lockfile-bytes", "{ecosystem:?}");
+        }
+    }
+
+    /// **#74's TRAP-5 design guard, the compile surface.** [`ProjectFiles`] has no field
+    /// that could carry an entry *name* — the names come from the [`Ecosystem`] variant —
+    /// so a caller cannot put `.env` or a credentials file into the shared snapshot
+    /// through this type. Asserted by destructuring, the same shape as TRAP-1's
+    /// `no_request_type_carries_a_caller_supplied_client_token`: a `name`/`path` field
+    /// added later fails to compile this test.
+    #[test]
+    fn project_files_carry_no_caller_named_entry() {
+        let ProjectFiles {
+            ecosystem: _,
+            manifest: _,
+            lockfile: _,
+        } = ProjectFiles {
+            ecosystem: Ecosystem::Npm,
+            manifest: Vec::new(),
+            lockfile: Vec::new(),
+        };
+    }
+
     /// The content hash is a pure function of the two inputs: equal inputs agree, either
     /// input changing changes it, and the boundary between the two inputs is part of the
     /// identity.
@@ -680,10 +975,10 @@ mod tests {
     /// inputs, which is the exact hazard the hash exists to close.
     #[test]
     fn the_content_hash_follows_the_inputs_and_only_the_inputs() {
-        let hash = artifact_content_hash(b"binary-bytes", "FROM scratch\n");
+        let hash = artifact_content_hash(b"binary-bytes", "FROM scratch\n", None);
         assert_eq!(
             hash,
-            artifact_content_hash(b"binary-bytes", "FROM scratch\n")
+            artifact_content_hash(b"binary-bytes", "FROM scratch\n", None)
         );
         assert_eq!(hash.len(), 64, "sha256 as lowercase hex");
         assert!(
@@ -693,16 +988,84 @@ mod tests {
 
         assert_ne!(
             hash,
-            artifact_content_hash(b"other-bytes", "FROM scratch\n")
+            artifact_content_hash(b"other-bytes", "FROM scratch\n", None)
         );
         assert_ne!(
             hash,
-            artifact_content_hash(b"binary-bytes", "FROM scratch\nRUN true\n")
+            artifact_content_hash(b"binary-bytes", "FROM scratch\nRUN true\n", None)
         );
         assert_ne!(
-            artifact_content_hash(b"ab", "c"),
-            artifact_content_hash(b"a", "bc"),
+            artifact_content_hash(b"ab", "c", None),
+            artifact_content_hash(b"a", "bc", None),
             "the input boundary is part of the identity"
+        );
+
+        // The projectless digest is pinned to the exact value this function produced
+        // before #74. Every image name `build --reuse` ever derived embeds this digest's
+        // first twelve characters, so changing the no-project stream silently orphans
+        // every existing reuse — the module docs call that hazard out for the zip's own
+        // bytes, and it applies to the algorithm the same way. Recomputed independently
+        // (Python hashlib, 2026-08-31) rather than pasted from this function's output.
+        assert_eq!(
+            hash, "90a0ef925a4696b0c0f142241b2c714e63f40071d0d02951e26cb2a1d8bb24fc",
+            "the no-project digest must stay what it was before #74"
+        );
+    }
+
+    /// **#74 step 3, the key.** The project files are part of the artifact identity:
+    /// identical pairs agree, a lockfile edit is a new identity (and so a fresh image
+    /// name and a fresh build), and the entry names count — the same bytes under a
+    /// different ecosystem are a different identity, because the Dockerfile that consumes
+    /// them installs a different environment.
+    ///
+    /// **Falsification** — run 2026-08-31 and again 2026-09-02: the lockfile's
+    /// `hasher.update` lines were dropped from `artifact_content_hash` and the
+    /// lockfile-edit assertion went red (two different lockfiles, one hash — the
+    /// stale-reuse hazard verbatim); restored.
+    #[test]
+    fn the_content_hash_keys_on_the_lockfile() {
+        let project = |ecosystem, lockfile: &[u8]| ProjectFiles {
+            ecosystem,
+            manifest: b"[project]".to_vec(),
+            lockfile: lockfile.to_vec(),
+        };
+        let hash = artifact_content_hash(
+            b"binary",
+            "FROM scratch\n",
+            Some(&project(Ecosystem::Uv, b"version = 1")),
+        );
+        assert_eq!(
+            hash,
+            artifact_content_hash(
+                b"binary",
+                "FROM scratch\n",
+                Some(&project(Ecosystem::Uv, b"version = 1")),
+            ),
+            "identical dependency files share an image"
+        );
+        assert_ne!(
+            hash,
+            artifact_content_hash(
+                b"binary",
+                "FROM scratch\n",
+                Some(&project(Ecosystem::Uv, b"version = 2")),
+            ),
+            "a lockfile edit is a new image name and a fresh build"
+        );
+        assert_ne!(
+            hash,
+            artifact_content_hash(b"binary", "FROM scratch\n", None),
+            "carrying a layer is a different identity from carrying none"
+        );
+        assert_ne!(
+            artifact_content_hash(
+                b"binary",
+                "FROM scratch\n",
+                Some(&project(Ecosystem::Npm, b"version = 1")),
+            ),
+            hash,
+            "the entry names count: the same bytes under another ecosystem install a \
+             different environment"
         );
     }
 
@@ -710,7 +1073,7 @@ mod tests {
     #[test]
     fn the_default_dockerfile_derives_its_from_from_the_base_image() {
         let base = BaseImage::al2023();
-        let dockerfile = default_dockerfile(9000, None, &base);
+        let dockerfile = default_dockerfile(9000, None, &base, None);
         assert_eq!(
             dockerfile_from_ref(&dockerfile),
             Some(base.docker_ref.as_str())
@@ -729,14 +1092,117 @@ mod tests {
     #[test]
     fn a_workdir_is_created_and_set_or_absent_entirely() {
         let base = BaseImage::al2023();
-        let with = default_dockerfile(9000, Some("/opt/baked-workdir"), &base);
+        let with = default_dockerfile(9000, Some("/opt/baked-workdir"), &base, None);
         assert!(with.contains("RUN mkdir -p /opt/baked-workdir"));
         assert!(with.contains("WORKDIR /opt/baked-workdir"));
 
         for none in [None, Some("")] {
-            let without = default_dockerfile(9000, none, &base);
+            let without = default_dockerfile(9000, none, &base, None);
             assert!(!without.contains("WORKDIR"), "{without}");
         }
+    }
+
+    /// **#74 step 2, the install.** A project Dockerfile copies the ecosystem's pair into
+    /// the working directory and installs from the lockfile with the lockfile-faithful
+    /// spelling — `uv sync --locked`, `npm ci`, `cargo fetch --locked` — where the
+    /// projectless Dockerfile installs nothing (the measured pre-#74 state).
+    ///
+    /// **Falsification** — run 2026-08-31: the `COPY` line was dropped from
+    /// `default_dockerfile` and the copies-its-pair assertion went red for all three
+    /// ecosystems; restored.
+    #[test]
+    fn a_project_dockerfile_installs_from_the_lockfile_it_can_see() {
+        let base = BaseImage::al2023();
+        for (ecosystem, install) in [
+            (Ecosystem::Uv, "uv sync --locked"),
+            (Ecosystem::Npm, "npm ci"),
+            (Ecosystem::Cargo, "cargo fetch --locked"),
+        ] {
+            let dockerfile = default_dockerfile(9000, None, &base, Some(ecosystem));
+            assert!(
+                dockerfile.contains(&format!(
+                    "COPY {} {} ./",
+                    ecosystem.manifest_name(),
+                    ecosystem.lockfile_name(),
+                )),
+                "copies its pair: {dockerfile}"
+            );
+            assert!(dockerfile.contains(install), "{dockerfile}");
+            // The layer needs a directory even when the caller named none, because the
+            // install resolves everything against the current directory.
+            assert!(
+                dockerfile.contains(&format!("WORKDIR {DEFAULT_PROJECT_WORKDIR}")),
+                "{dockerfile}"
+            );
+
+            // A caller-named workdir is where the layer lives instead.
+            let placed = default_dockerfile(9000, Some("/srv/app"), &base, Some(ecosystem));
+            assert!(placed.contains("WORKDIR /srv/app"), "{placed}");
+            assert!(!placed.contains(DEFAULT_PROJECT_WORKDIR), "{placed}");
+        }
+
+        let without = default_dockerfile(9000, None, &base, None);
+        for install in ["uv sync", "npm ci", "cargo fetch", "COPY pyproject"] {
+            assert!(!without.contains(install), "{without}");
+        }
+    }
+
+    /// The project Dockerfile passes every guard the plain one does: the `FROM` matches
+    /// its base, the port agrees, the daemon stays the `CMD`, and the pair it copies
+    /// satisfies [`require_project_install`]. A derived Dockerfile that failed its own
+    /// preflight would refuse every `--project` build at the door.
+    #[test]
+    fn the_project_dockerfile_passes_its_own_guards() {
+        let base = BaseImage::al2023();
+        for ecosystem in Ecosystem::ALL {
+            let dockerfile = default_dockerfile(9000, None, &base, Some(ecosystem));
+            require_matching_from(&base, &dockerfile).expect("its FROM is its base");
+            require_matching_agentd_port(9000, &dockerfile).expect("its port agrees");
+            require_daemon_cmd(&dockerfile).expect("the daemon is still the CMD");
+            let project = ProjectFiles {
+                ecosystem,
+                manifest: Vec::new(),
+                lockfile: Vec::new(),
+            };
+            require_project_install(&project, &dockerfile)
+                .expect("it copies the pair it was derived for");
+        }
+    }
+
+    /// **#74's silent-degradation guard.** A caller Dockerfile that never mentions the
+    /// lockfile bakes no environment layer while building cleanly — the symptom is every
+    /// launch still installing dependencies, with nothing naming the missing `COPY` — so
+    /// it is refused up front, naming the lockfile, the install command, and both ways
+    /// out.
+    ///
+    /// **Falsification** — run 2026-08-31: the `contains` check was inverted and both
+    /// halves went red (the ignoring Dockerfile passed, the copying one was refused);
+    /// restored.
+    #[test]
+    fn a_dockerfile_that_ignores_the_project_files_is_refused() {
+        let project = ProjectFiles {
+            ecosystem: Ecosystem::Npm,
+            manifest: b"{}".to_vec(),
+            lockfile: b"{}".to_vec(),
+        };
+        let error = require_project_install(
+            &project,
+            "FROM public.ecr.aws/amazonlinux/amazonlinux:2023-minimal\n\
+             COPY agentd /agentd\n\
+             ENTRYPOINT []\nCMD [\"/agentd\"]\n",
+        )
+        .expect_err("no mention of the lockfile bakes no layer");
+        assert_eq!(error.kind(), ErrorKind::InvalidArg);
+        let message = error.to_string();
+        assert!(message.contains("package-lock.json"), "{message}");
+        assert!(message.contains("npm ci"), "{message}");
+        assert!(message.contains("no environment layer"), "{message}");
+
+        require_project_install(
+            &project,
+            "FROM x\nCOPY package.json package-lock.json ./\nRUN npm ci\nCMD [\"/agentd\"]\n",
+        )
+        .expect("a Dockerfile that copies the pair agrees");
     }
 
     /// `FROM` parsing tolerates the decoration a real Dockerfile carries: lowercase,
@@ -770,7 +1236,7 @@ mod tests {
             "{message}"
         );
 
-        require_matching_from(&base, &default_dockerfile(9000, None, &base))
+        require_matching_from(&base, &default_dockerfile(9000, None, &base, None))
             .expect("the derived Dockerfile agrees with its own base");
     }
 
@@ -837,6 +1303,7 @@ mod tests {
                 crate::control::DEFAULT_AGENT_PORT,
                 Some("/work"),
                 &BaseImage::al2023(),
+                None,
             ),
         )
         .expect("the derived Dockerfile agrees with the port it was derived from");
@@ -940,6 +1407,7 @@ mod tests {
                 crate::control::DEFAULT_AGENT_PORT,
                 Some("/work"),
                 &BaseImage::al2023(),
+                None,
             ),
         )
         .expect("the derived Dockerfile sets no keepalive");
@@ -992,6 +1460,7 @@ mod tests {
             9000,
             Some("/work"),
             &BaseImage::al2023(),
+            None,
         ))
         .expect("the derived Dockerfile is the invariant");
         require_daemon_cmd("FROM x\nENTRYPOINT []\nCMD [\"/agentd\"]\n").expect("the invariant");

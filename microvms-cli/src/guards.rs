@@ -285,6 +285,7 @@ fn aws_commands(binary: &std::path::Path) -> Vec<(&'static str, Command, Door)> 
                 name: Some("img".into()),
                 memory: MemoryMib::Mib2048,
                 dockerfile: None,
+                project: None,
                 repair_identity: false,
                 log_group: None,
                 log_stream: None,
@@ -1771,8 +1772,9 @@ fn expected_reuse_name(prefix: &str, binary: &std::path::Path) -> String {
         9000,
         None,
         &microvms_core::control::BaseImage::al2023(),
+        None,
     );
-    let hash = microvms_core::control::artifact_content_hash(&bytes, &dockerfile);
+    let hash = microvms_core::control::artifact_content_hash(&bytes, &dockerfile, None);
     format!("{prefix}-{}", &hash[..12])
 }
 
@@ -1811,6 +1813,7 @@ async fn a_reuse_build_whose_hash_name_exists_skips_the_build_entirely() {
         name: Some("coding-agents".into()),
         memory: MemoryMib::Mib2048,
         dockerfile: None,
+        project: None,
         repair_identity: false,
         log_group: None,
         log_stream: None,
@@ -1897,6 +1900,7 @@ async fn a_reuse_build_whose_hash_name_is_absent_builds_under_the_derived_name()
         name: Some("coding-agents".into()),
         memory: MemoryMib::Mib2048,
         dockerfile: None,
+        project: None,
         repair_identity: false,
         log_group: None,
         log_stream: None,
@@ -1956,6 +1960,7 @@ fn build_args_without_binary(state_dir: std::path::PathBuf) -> BuildArgs {
         name: Some("prov".into()),
         memory: MemoryMib::Mib2048,
         dockerfile: None,
+        project: None,
         repair_identity: false,
         log_group: None,
         log_stream: None,
@@ -2134,6 +2139,7 @@ async fn a_plain_build_never_lists_and_reports_reused_false() {
         name: Some("img".into()),
         memory: MemoryMib::Mib2048,
         dockerfile: None,
+        project: None,
         repair_identity: false,
         log_group: None,
         log_stream: None,
@@ -2193,6 +2199,7 @@ async fn a_locally_refused_dockerfile_costs_no_upload_and_no_call() {
         name: Some("refused".into()),
         memory: MemoryMib::Mib2048,
         dockerfile: Some(dockerfile_path.clone()),
+        project: None,
         repair_identity: false,
         log_group: None,
         log_stream: None,
@@ -2284,6 +2291,7 @@ async fn a_pinned_base_image_version_reaches_the_create_body_from_the_build_flag
         name: Some("img".into()),
         memory: MemoryMib::Mib2048,
         dockerfile: None,
+        project: None,
         repair_identity: false,
         log_group: None,
         log_stream: None,
@@ -2356,6 +2364,7 @@ async fn a_build_log_stream_reaches_the_wire_suffixed_and_the_envelope_reports_i
         name: Some("img".into()),
         memory: MemoryMib::Mib2048,
         dockerfile: None,
+        project: None,
         repair_identity: false,
         log_group: Some("/aws/lambda-microvms/conformance-builds".into()),
         log_stream: Some("img-ci".into()),
@@ -2434,6 +2443,7 @@ async fn a_build_without_logging_flags_emits_no_logging_member_and_a_null_stream
         name: Some("img".into()),
         memory: MemoryMib::Mib2048,
         dockerfile: None,
+        project: None,
         repair_identity: false,
         log_group: None,
         log_stream: None,

@@ -67,7 +67,7 @@
 
 use std::time::Duration;
 
-use microvms_core::control::{ControlPlane, CreateImageRequest, WaitOpts};
+use microvms_core::control::{ControlPlane, CreateImageRequest, ProjectFiles, WaitOpts};
 use microvms_core::sandbox::{RunRequest, Sandbox, TeardownOpts, TeardownReport};
 use microvms_core::{Error, ErrorKind};
 use serde_json::{Map, json};
@@ -1311,6 +1311,7 @@ pub async fn build<O: std::io::Write, E: std::io::Write>(
             size,
             binary: &binary,
             dockerfile: args.dockerfile.as_deref(),
+            project: args.project.as_deref(),
             repair_identity: args.repair_identity,
             artifact_uri: args.artifact_uri.as_deref(),
             base_image_version: args.base_image_version.as_deref(),
@@ -1345,7 +1346,8 @@ pub async fn build<O: std::io::Write, E: std::io::Write>(
             // The derived default group and a null stream, whatever the flags said: no
             // build ran, so no stream was resolved, and the group the *original* build
             // wrote to is not observable from a listing — the reuse identity is
-            // binary+Dockerfile only, so the earlier build's logging config may differ.
+            // binary+Dockerfile+project files only, so the earlier build's logging config
+            // may differ.
             return Ok(render_build(
                 &existing.image_arn,
                 &name,
@@ -1476,6 +1478,12 @@ struct BuildSpec<'a> {
     pub binary: &'a std::path::Path,
     /// A Dockerfile to use instead of the library's default. Its FROM must match the base.
     pub dockerfile: Option<&'a std::path::Path>,
+    /// A project directory whose manifest+lockfile pair bakes an environment layer (#74).
+    ///
+    /// `run` always passes `None` for the same reason it passes no base version: its
+    /// build is the build-and-throw-away shape, and an environment layer is a property
+    /// of a durable, reusable image.
+    pub project: Option<&'a std::path::Path>,
     /// Whether to widen the guest so `sethostname` and the boot_id bind mount work.
     pub repair_identity: bool,
     /// Where the artifact already is, or `None` to derive a key under `--bucket`.
@@ -1510,6 +1518,9 @@ fn build_request<'a, O: std::io::Write, E: std::io::Write>(
             size,
             binary,
             dockerfile: args.dockerfile.as_deref(),
+            // See the field: an environment layer is a property of a durable image, and
+            // `run`'s is thrown away.
+            project: None,
             repair_identity: args.repair_identity,
             artifact_uri: args.artifact_uri.as_deref(),
             // See the field: `run`'s image is thrown away, so there is nothing to pin for.
@@ -1536,6 +1547,7 @@ fn build_request_from<O: std::io::Write, E: std::io::Write>(
         size,
         binary,
         dockerfile,
+        project,
         repair_identity,
         artifact_uri,
         base_image_version,
@@ -1596,7 +1608,110 @@ fn build_request_from<O: std::io::Write, E: std::io::Write>(
             .with_source(error)
         })?);
     }
+    if let Some(dir) = project {
+        request.project_files = Some(read_project_files(dir)?);
+    }
     Ok(request)
+}
+
+/// Reads the one manifest+lockfile pair `--project` names into [`ProjectFiles`].
+///
+/// Exactly one ecosystem, and both halves of its pair, because each miss has a different
+/// remedy and the error should name it:
+///
+/// * **No pair at all** — the directory is not a project this feature understands; the
+///   message lists all three pairs it looked for.
+/// * **A manifest without its lockfile** — the environment layer is *keyed on the
+///   lockfile* (#74), so there is nothing to key on; the message names the command that
+///   writes one (`uv lock`, `npm install --package-lock-only`, `cargo generate-lockfile`).
+/// * **A lockfile without its manifest** — the install step reads both, so the layer
+///   could never build; most likely a partial copy.
+/// * **Two ecosystems at once** — one image bakes one layer; the caller has to say which,
+///   and no flag exists yet to say it with, so the refusal names both findings rather
+///   than picking one silently.
+fn read_project_files(dir: &std::path::Path) -> Result<ProjectFiles, Error> {
+    use microvms_core::control::Ecosystem;
+
+    let mut found = Vec::new();
+    for ecosystem in Ecosystem::ALL {
+        let manifest = dir.join(ecosystem.manifest_name());
+        let lockfile = dir.join(ecosystem.lockfile_name());
+        match (manifest.is_file(), lockfile.is_file()) {
+            (true, true) => found.push(ecosystem),
+            (true, false) => {
+                let write_one = match ecosystem {
+                    Ecosystem::Uv => "uv lock",
+                    Ecosystem::Npm => "npm install --package-lock-only",
+                    Ecosystem::Cargo => "cargo generate-lockfile",
+                };
+                return Err(Error::new(
+                    ErrorKind::Precondition,
+                    format!(
+                        "{} has {} but no {} — the environment layer is keyed on the \
+                         lockfile, so there is nothing to key on. Write one with `{write_one}` \
+                         and rebuild.",
+                        dir.display(),
+                        ecosystem.manifest_name(),
+                        ecosystem.lockfile_name(),
+                    ),
+                ));
+            }
+            (false, true) => {
+                return Err(Error::new(
+                    ErrorKind::Precondition,
+                    format!(
+                        "{} has {} but no {} — the install step reads both, so the layer \
+                         could never build. This usually means a partial copy of the project.",
+                        dir.display(),
+                        ecosystem.lockfile_name(),
+                        ecosystem.manifest_name(),
+                    ),
+                ));
+            }
+            (false, false) => {}
+        }
+    }
+    match found.as_slice() {
+        [ecosystem] => {
+            let read = |name: &str| {
+                std::fs::read(dir.join(name)).map_err(|error| {
+                    Error::new(
+                        ErrorKind::Precondition,
+                        format!("could not read {}: {error}", dir.join(name).display()),
+                    )
+                    .with_source(error)
+                })
+            };
+            Ok(ProjectFiles {
+                ecosystem: *ecosystem,
+                manifest: read(ecosystem.manifest_name())?,
+                lockfile: read(ecosystem.lockfile_name())?,
+            })
+        }
+        [] => Err(Error::new(
+            ErrorKind::Precondition,
+            format!(
+                "{} has no dependency files --project understands. It looks for one \
+                 manifest+lockfile pair: pyproject.toml+uv.lock, \
+                 package.json+package-lock.json, or Cargo.toml+Cargo.lock.",
+                dir.display(),
+            ),
+        )),
+        several => Err(Error::new(
+            ErrorKind::Precondition,
+            format!(
+                "{} has dependency files for more than one ecosystem ({}), and one image \
+                 bakes one environment layer. Point --project at the directory that owns \
+                 the layer you want baked.",
+                dir.display(),
+                several
+                    .iter()
+                    .map(|ecosystem| ecosystem.lockfile_name())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            ),
+        )),
+    }
 }
 
 /// Puts the artifact where the create request says it is, unless the caller already did.
@@ -2252,5 +2367,68 @@ mod tests {
         assert_eq!(wait_opts(-5.0).timeout, Duration::ZERO);
         assert_eq!(wait_opts(300.0).timeout, Duration::from_secs(300));
         assert_eq!(wait_opts(300.0).poll_interval, Duration::from_secs(5));
+    }
+
+    /// **#74, `--project` detection.** A directory with exactly one manifest+lockfile pair
+    /// reads as that ecosystem, and both files' bytes come back verbatim.
+    #[test]
+    fn a_project_dir_with_one_pair_reads_as_its_ecosystem() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        std::fs::write(dir.path().join("pyproject.toml"), b"[project]").expect("writes");
+        std::fs::write(dir.path().join("uv.lock"), b"version = 1").expect("writes");
+
+        let files = read_project_files(dir.path()).expect("one pair, one ecosystem");
+        assert_eq!(
+            files.ecosystem,
+            microvms_core::control::Ecosystem::Uv,
+            "uv is the pair on disk"
+        );
+        assert_eq!(files.manifest, b"[project]");
+        assert_eq!(files.lockfile, b"version = 1");
+    }
+
+    /// **#74, the refusals — each names its remedy.** A manifest without its lockfile has
+    /// nothing to key the layer on, and the message names the command that writes one. A
+    /// lockfile without its manifest could never install. No pair at all lists what was
+    /// looked for. Two ecosystems at once names both, because picking one silently bakes
+    /// a layer the caller did not choose.
+    ///
+    /// **Falsification** — run 2026-08-31: `(true, false)` was flipped to also push
+    /// instead of refusing, and the manifest-without-lockfile assertion went red on the
+    /// missing `uv lock` remedy; restored.
+    #[test]
+    fn a_project_dir_that_cannot_key_a_layer_is_refused_naming_the_remedy() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let error = read_project_files(dir.path()).expect_err("nothing to detect");
+        let message = error.to_string();
+        assert!(message.contains("pyproject.toml+uv.lock"), "{message}");
+        assert!(
+            message.contains("package.json+package-lock.json"),
+            "{message}"
+        );
+        assert!(message.contains("Cargo.toml+Cargo.lock"), "{message}");
+
+        // A manifest alone: the layer is keyed on the lockfile, so the remedy is to
+        // write one.
+        std::fs::write(dir.path().join("pyproject.toml"), b"[project]").expect("writes");
+        let error = read_project_files(dir.path()).expect_err("no lockfile to key on");
+        let message = error.to_string();
+        assert!(message.contains("uv lock"), "{message}");
+        assert!(message.contains("keyed on the lockfile"), "{message}");
+
+        // A lockfile alone: the install step reads both.
+        std::fs::remove_file(dir.path().join("pyproject.toml")).expect("removes");
+        std::fs::write(dir.path().join("uv.lock"), b"version = 1").expect("writes");
+        let error = read_project_files(dir.path()).expect_err("no manifest to install with");
+        assert!(error.to_string().contains("partial copy"), "{}", error);
+
+        // Two ecosystems at once: the refusal names both lockfiles.
+        std::fs::write(dir.path().join("pyproject.toml"), b"[project]").expect("writes");
+        std::fs::write(dir.path().join("package.json"), b"{}").expect("writes");
+        std::fs::write(dir.path().join("package-lock.json"), b"{}").expect("writes");
+        let error = read_project_files(dir.path()).expect_err("two layers, one image");
+        let message = error.to_string();
+        assert!(message.contains("uv.lock"), "{message}");
+        assert!(message.contains("package-lock.json"), "{message}");
     }
 }

@@ -861,6 +861,20 @@ pub struct BuildArgs {
     #[arg(long)]
     pub dockerfile: Option<PathBuf>,
 
+    /// A project directory whose dependency files bake an environment layer into the
+    /// image (#74).
+    ///
+    /// Exactly one ecosystem's manifest+lockfile pair must be present in the directory:
+    /// pyproject.toml+uv.lock, package.json+package-lock.json, or Cargo.toml+Cargo.lock.
+    /// The pair is zipped into the build context beside the Dockerfile — nothing else in
+    /// the directory enters the shared image snapshot — and the derived Dockerfile
+    /// installs from the lockfile (`uv sync --locked`, `npm ci`, `cargo fetch`), so
+    /// launches skip dependency installation. With --reuse, the pair joins the content
+    /// hash: two projects with identical dependency files share an image, and a lockfile
+    /// edit builds a fresh one.
+    #[arg(long, value_name = "DIR")]
+    pub project: Option<PathBuf>,
+
     /// Pin the managed base image to one version instead of taking the service's default.
     ///
     /// Without this a build floats. The managed base's version list is not static —
@@ -906,7 +920,8 @@ pub struct BuildArgs {
     /// name can serve a stale snapshot (measured — the same hazard class as the
     /// clientToken replay in docs/PLATFORM.md). Keying the name to the content hash gives
     /// both properties at once: unchanged inputs reuse their image, changed inputs get a
-    /// fresh name and therefore a fresh build. The match is on binary+Dockerfile only —
+    /// fresh name and therefore a fresh build. The match is on binary+Dockerfile (plus
+    /// the --project pair when given) —
     /// `--memory` is not part of the identity, so a reused image keeps the size class it
     /// was created with.
     #[arg(long)]

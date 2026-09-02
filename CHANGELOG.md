@@ -8,6 +8,26 @@ Versions are [semantic](https://semver.org/spec/v2.0.0.html); the wire contract 
 
 ### Added
 
+- **`build --project` — lockfile-keyed environment layers (#74).** The build
+  artifact gains the project's manifest+lockfile pair (`pyproject.toml`+
+  `uv.lock`, `package.json`+`package-lock.json`, or `Cargo.toml`+`Cargo.lock`),
+  entry names fixed by the ecosystem so nothing else can enter the shared image
+  snapshot. The derived Dockerfile copies the pair and installs from the
+  lockfile (`uv sync --locked` / `npm ci` / `cargo fetch --locked`); it
+  previously installed nothing. The content hash behind `--reuse` now covers
+  the pair — two projects with identical dependency files share an image, a
+  lockfile edit builds a fresh one — while the projectless digest is pinned
+  byte-identical to its pre-#74 value so existing reuse names survive. A caller
+  Dockerfile that never mentions the lockfile is refused before the artifact
+  upload, because it would bake no layer while building cleanly. Measured
+  2026-09-02, us-east-1 (`docs/PLATFORM.md`): a fresh VM from the project
+  image answers its first import in 11.1–12.4 s with no `--egress`, against
+  31.8 s for a plain VM that bootstraps the toolchain and syncs in-guest —
+  about 20 s (roughly 65% of the run) per launch for a one-dependency project,
+  paid for once by a build about 15 s longer (110 s to 126 s); a `--reuse` hit
+  takes 0.5 s. `conformance/run_rs.py` gains `drive_project_build`, seven
+  named checks on the same round trip.
+
 - **`cost --max-cost <USD> --on-breach <warn|abort>` (#77).** A budget gate over
   the report's total. The compared figure is the priced total, which is a *lower
   bound* whenever any line is unpriced — a detected breach has therefore already
