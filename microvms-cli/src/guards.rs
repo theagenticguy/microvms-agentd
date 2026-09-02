@@ -4088,6 +4088,44 @@ fn the_watch_filter_ignores_the_skip_list_and_the_manifest_and_nothing_else() {
     );
 }
 
+/// **The watch filter accepts the kernel's spelling of the root, not only the caller's.**
+///
+/// macOS reproduces this unaided: `$TMPDIR` is `/var/folders/…`, FSEvents reports
+/// `/private/var/folders/…`, and the first cut of `--watch` dropped every event as outside
+/// the tree — the watch guard above failed on macos-latest and nowhere else, with the edit
+/// never "delivered". Linux has no such default symlink, so the shape is built by hand: a
+/// symlink is the caller's spelling, its target is what the kernel reports. The first
+/// assertion is the falsification: the bare filter cannot see through the symlink.
+#[cfg(unix)]
+#[test]
+fn the_watch_filter_accepts_the_kernels_spelling_of_a_symlinked_root() {
+    let real = TempDir::new("watch-real");
+    let holder = TempDir::new("watch-link");
+    let link = holder.0.join("project");
+    std::os::unix::fs::symlink(&real.0, &link).expect("symlinks");
+    let kernel_root = std::fs::canonicalize(&real.0).expect("resolves");
+    let reported = kernel_root.join("src/main.rs");
+
+    assert!(
+        !crate::commands::attached::watch_relevant(&link, &reported),
+        "the bare filter drops the kernel's spelling — the miss WatchRoot exists to close"
+    );
+    let root = crate::commands::attached::WatchRoot::new(&link);
+    assert!(root.relevant(&reported), "the kernel's spelling is ours");
+    assert!(
+        root.relevant(&link.join("src/main.rs")),
+        "so is the caller's"
+    );
+    assert!(
+        !root.relevant(&kernel_root.join("target/debug/x")),
+        "the skip list applies under either spelling"
+    );
+    assert!(
+        !root.relevant(std::path::Path::new("/elsewhere/f")),
+        "a path outside both spellings is never ours"
+    );
+}
+
 /// **`microvm health` reports the two identity flags and warns about a degraded one.**
 ///
 /// The three facts no other command reports. `identityDegraded` is the one with a measurement

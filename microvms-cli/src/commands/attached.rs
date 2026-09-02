@@ -1342,6 +1342,39 @@ pub(crate) fn watch_relevant(root: &std::path::Path, path: &std::path::Path) -> 
     })
 }
 
+/// The watched root in both spellings the OS may use for it.
+///
+/// `notify` reports paths as the kernel spells them, not as the caller typed them. On macOS
+/// that is the resolved path: a tree under `/var/folders/…` comes back as
+/// `/private/var/folders/…`, and a filter that strips only the caller's spelling drops
+/// every event as "outside the tree" — the watch looks alive and never re-syncs. Both
+/// spellings are accepted. The canonical one is computed once; if the root cannot be
+/// resolved, or resolves to itself, there is only the one spelling.
+pub(crate) struct WatchRoot {
+    given: std::path::PathBuf,
+    canonical: Option<std::path::PathBuf>,
+}
+
+impl WatchRoot {
+    pub(crate) fn new(dir: &std::path::Path) -> Self {
+        let canonical = std::fs::canonicalize(dir)
+            .ok()
+            .filter(|resolved| resolved != dir);
+        Self {
+            given: dir.to_path_buf(),
+            canonical,
+        }
+    }
+
+    pub(crate) fn relevant(&self, path: &std::path::Path) -> bool {
+        watch_relevant(&self.given, path)
+            || self
+                .canonical
+                .as_deref()
+                .is_some_and(|root| watch_relevant(root, path))
+    }
+}
+
 /// Starts the `notify` watcher over `dir` and returns it with the channel it feeds.
 ///
 /// The watcher is returned rather than leaked so the caller's binding keeps it alive for
@@ -1424,10 +1457,9 @@ pub async fn sync<O: std::io::Write, E: std::io::Write>(
 
     // Armed before the first pass, not after it: an edit that lands while the initial
     // upload is in flight must wake the loop too. Registering the watcher afterwards
-    // leaves a window in which a save is silently lost until the next one, and the
-    // window is wide enough to hit on macOS, where an FSEvents stream takes longer to
-    // start than inotify does. Events the first pass itself provokes are harmless: they
-    // wake one re-hash that diffs to an empty delta.
+    // leaves a window in which a save is silently lost until the next one. Events the
+    // first pass itself provokes are harmless: they wake one re-hash that diffs to an
+    // empty delta.
     let watch = if args.watch {
         Some(start_watcher(&args.dir)?)
     } else {
@@ -1444,6 +1476,7 @@ pub async fn sync<O: std::io::Write, E: std::io::Write>(
     let mut passes = 1usize;
     let mut totals = SyncPass { ..first };
     if let Some((_watcher, mut events)) = watch {
+        let root = WatchRoot::new(&args.dir);
         report_pass(ctx, &totals);
         ctx.out.progress(&format!(
             "watching {} — Ctrl-C stops and reports the totals",
@@ -1457,13 +1490,13 @@ pub async fn sync<O: std::io::Write, E: std::io::Write>(
                 () = &mut interrupt => break,
             };
             let Some(batch) = batch else { break };
-            let mut relevant = batch.iter().any(|path| watch_relevant(&args.dir, path));
+            let mut relevant = batch.iter().any(|path| root.relevant(path));
             // The debounce: one save fans out into create/modify/rename events, and one
             // sync pass should absorb them all. A quarter second of quiet is the line.
             while let Ok(Some(more)) =
                 tokio::time::timeout(Duration::from_millis(250), events.recv()).await
             {
-                relevant |= more.iter().any(|path| watch_relevant(&args.dir, path));
+                relevant |= more.iter().any(|path| root.relevant(path));
             }
             if !relevant {
                 continue;
