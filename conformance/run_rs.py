@@ -938,24 +938,24 @@ def drive_local_commands(cli: Cli, results: Results) -> None:
         f"{len(commands)} commands",
     )
 
-    # `logs` FAILS by design and the distinction is load-bearing: an empty `lines`
-    # array is the wire shape for "the group exists and has no events", which is
-    # exactly what a wrong build-role prefix produces. Asserting the refusal is
-    # asserting that the two stay distinguishable.
-    try:
-        cli.call("logs", "agentd-conformance")
-    except KindError as exc:
-        results.check(
-            "logs names the group and refuses to imply it is empty",
-            exc.code == "ERR_PRECONDITION" and exc.envelope.data.get("lines") is None,
-            f"{exc.code}, lines={exc.envelope.data.get('lines')!r}",
-        )
-    else:
-        results.check(
-            "logs names the group and refuses to imply it is empty",
-            False,
-            "logs succeeded, which would mean it read CloudWatch",
-        )
+    # `logs` succeeds since #79 (PR #115), and the distinction the old refusal carried
+    # now rides the envelope: `data.lines` is explicitly `null`, never `[]`, because an
+    # empty array is the wire shape for "the group exists and has no events", which is
+    # exactly what a wrong build-role prefix produces, and this client did not read the
+    # group (no CloudWatch reader; both thinness guards pin that). The runnable read
+    # command is the success payload, so it is asserted beside the null. Asserted live
+    # because the first full-suite run after #115 (2026-09-03) failed here: the check
+    # still expected the pre-#79 `ERR_PRECONDITION`.
+    logs = cli.call("logs", "agentd-conformance")
+    results.check(
+        "logs names the group and refuses to imply it is empty",
+        "agentd-conformance" in str(logs.data.get("logGroup"))
+        and "lines" in logs.data
+        and logs.data.get("lines") is None
+        and "aws logs tail" in str(logs.data.get("tailCommand")),
+        f"logGroup={logs.data.get('logGroup')!r} lines={logs.data.get('lines')!r} "
+        f"tailCommand={logs.data.get('tailCommand')!r}",
+    )
 
 
 def drive_lifecycle(
