@@ -421,10 +421,10 @@ protocol/        daemon↔client wire types; drift is a compile error
 agentd/          the in-VM daemon: exec, file transfer, one-shot bootstrap
 model/           stateright models of the daemon and client lifecycle
 microvms-core/   the client library: control plane, session, cost, sandbox
-microvms-cli/    the microvm binary: 20 commands, JSON envelopes, a manifest
+microvms-cli/    the microvm binary: 24 commands, JSON envelopes, a manifest
 microvms-py/     Python binding (PyO3)
 microvms-js/     Node binding (napi-rs)
-conformance/     the live suite: 113 checks against real AWS, via the CLI
+conformance/     the live suite: 136 checks against real AWS, via the CLI
 spec/            57 formal requirements in symspec, checked with Z3
 ```
 
@@ -449,7 +449,7 @@ conformance suite. The live tier is separate because it creates real MicroVMs
 and costs money:
 
 ```bash
-mise run live            # conformance + rates + leak check, ~5 min
+mise run live            # paths, versions, conformance, rates, leak check; ~15 min
 mise run live:destroy    # tear the Terraform stack back down
 ```
 

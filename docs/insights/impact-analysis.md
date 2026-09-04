@@ -410,7 +410,7 @@ that guarantee is what makes it useful to an agent.
 | `conformance/run_rs.py` | test | yes | `:816` calls `microvm manifest` and `:817`-`:819` assert the suite drives every command it lists; `:751` takes a fixture value out of the manifest rather than writing it down; `:205` reads `apiVersion` back |
 | `microvms-cli/tests/manifest.rs` | test | yes | `:46`, `:90`, `:161` as above; `:195` asserts a bare invocation emits JSON |
 | `microvms-cli/src/manifest.rs` (own tests) | test | yes | `:265` asserts the command list equals the clap tree exactly; `:426` asserts every command declares a response type and its keys; `:450` asserts every command publishes a summary from its doc comment |
-| `docs/reference/cli.md` | config | likely | `:3` states seventeen subcommands and cites the clap enum at `microvms-cli/src/cli.rs:93-229`, so it restates by hand what the manifest generates |
+| `docs/reference/cli.md` | config | likely | `:3` states twenty-four subcommands and cites the clap enum in `microvms-cli/src/cli.rs`, so it restates by hand what the manifest generates |
 
 ### Blast-radius notes
 

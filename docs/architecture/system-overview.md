@@ -43,16 +43,17 @@ field private so the Z3 proofs are proofs about the code
 (`microvms-core/src/sandbox.rs:11-17`); `cost` treats unpriced as a distinct variant rather
 than zero (`microvms-core/src/cost.rs:22-27`).
 
-`microvms-cli` ships `microvm` with seventeen subcommands
-(`microvms-cli/src/cli.rs:93-229`, 1,723 LOC), each invocation writing exactly one JSON
+`microvms-cli` ships `microvm` with twenty-four subcommands
+(`microvms-cli/src/cli.rs:95-307`, 2,681 LOC), each invocation writing exactly one JSON
 envelope to stdout and progress to stderr (`microvms-cli/src/envelope.rs:4-11`). It has no
-lib target (`microvms-cli/Cargo.toml:10-20`) and exactly six direct dependencies, asserted
-against `cargo metadata` (`microvms-cli/Cargo.toml:22-43`). `microvms-py` and `microvms-js`
+lib target (`microvms-cli/Cargo.toml:21-23`) and no second path to AWS: a twelve-crate denylist
+of HTTP clients, signers, and credential chains is asserted against `cargo metadata`
+(`microvms-cli/tests/thinness.rs:49-96`). `microvms-py` and `microvms-js`
 wrap the same core and never the CLI (`microvms-py/Cargo.toml:22-26`,
 `microvms-js/Cargo.toml:20-21`). Verification sits outside the product graph: `model` has
 one dependency and no workspace edge, modelling the protocol rather than importing it
-(`model/Cargo.toml:9-10`), and `conformance/run_rs.py` drives the built CLI through 77 named
-checks against real AWS (`conformance/run_rs.py:9`, 2,355 LOC). Start at
+(`model/Cargo.toml:9-10`), and `conformance/run_rs.py` drives the built CLI through 136 named
+checks against real AWS (`conformance/run_rs.py:9`, 3,890 LOC). Start at
 `agentd/src/lib.rs:9-29` for the trust boundary, then `microvms-core/src/lib.rs:21-40` for
 the trap ladder.
 

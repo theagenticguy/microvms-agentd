@@ -262,7 +262,7 @@ Z3 and `stateright` proofs proofs about *this struct's* reachable states
 | ARCH-3 / ARCH-4 / BIND-1: `cli -> core -> protocol`, bindings depend only on core, core depends on neither | Test over `cargo_metadata` | `microvms-cli/tests/dependency_direction.rs:68`, `:95`, `:219` |
 | ARCH-5: the CLI exports no library target at all | Test over `cargo_metadata` | `microvms-cli/tests/dependency_direction.rs:126` |
 | CLI-2: the CLI reaches the control plane and the endpoint proxy only through core, and the guard names *which* seam door was entered | Injected refusing seam | `microvms-cli/src/guards.rs:403`, `:487`; source scan at `microvms-cli/tests/thinness.rs:426` |
-| The CLI's direct dependency set is exactly the six allowlisted crates | Test over `cargo_metadata` | `microvms-cli/tests/thinness.rs:145` |
+| The CLI's direct dependency set contains none of the twelve denylisted transport and signing crates | Test over `cargo_metadata` | `microvms-cli/tests/thinness.rs:96` |
 | Only the envelope module and two named exceptions in `main` write to stdout | Source scan | `microvms-cli/tests/thinness.rs:503` |
 | CLI-4: one JSON envelope per invocation on stdout, on success, on failure, and on a stream that died before its first event | Spawned-binary test | `microvms-cli/tests/exit_codes.rs:154`, `:198`, `:233` |
 | BIND-5: both bindings preserve provenance-labelled durations, estimate-typed dollars, and the distinct `Unpriced` value | Application, by absent constructors | `microvms-py/src/cost.rs:9`, `:23-27`, `:220-241`; `microvms-js/src/cost.rs:20-31`, `:52-57`. `new Duration(3600)` is a `TypeError`, `Amount.usd` is null for an unpriced line, and `to_json`/`to_dict` omit the key entirely rather than emitting a null anything permissive sums as zero |
