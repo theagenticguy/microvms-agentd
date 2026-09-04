@@ -79,10 +79,10 @@ wire types through here instead of depending on the contract crate
 
 ## microvms-cli
 
-`microvms-cli` builds the `microvm` binary: seventeen subcommands in lifecycle order over
+`microvms-cli` builds the `microvm` binary: twenty-four subcommands in lifecycle order over
 `microvms-core`, and nothing the library does not do (`microvms-cli/src/cli.rs:83`,
 `microvms-cli/src/main.rs:2`). Thinness is checked three ways rather than intended — the direct
-dependency set is an exact nine-crate allowlist, no source file here names a transport or a
+dependency set contains none of twelve denylisted transport and signing crates, no source file here names a transport or a
 control-plane operation, and every AWS-touching command must fail when the library seam is made
 to refuse (`microvms-cli/src/main.rs:10-13`, `microvms-cli/tests/thinness.rs:66`). A coding agent
 is a first-class consumer, so `microvm manifest` emits the whole command tree with its option

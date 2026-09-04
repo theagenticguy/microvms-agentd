@@ -132,27 +132,19 @@ CLI" a property rather than a request (`microvms-cli/tests/dependency_direction.
 included, carry `clap`, `ratatui`, and a multi-thread tokio runtime
 (`microvms-cli/tests/dependency_direction.rs:63-65`).
 
-## The CLI's dependency set is an allowlist under test
+## The CLI's dependency set is a denylist under test
 
-`microvms-cli` declares exactly six direct dependencies and there cannot be a seventh:
-`microvms-core`, `clap`, `ratatui`, `serde`, `serde_json`, `tokio`
-(`microvms-cli/Cargo.toml:44-75`). `microvms-cli/tests/thinness.rs:66` holds
-`const ALLOWED: [(&str, &str); 6]` and asserts the direct set equals it, with a prose reason per
-entry that the test checks is a real sentence
-(`microvms-cli/tests/thinness.rs:61-65`). A companion
-`const FORBIDDEN: [&str; 12]` names `reqwest`, `hyper`, `hyper-util`, `http`, `aws-config`,
-`aws-sdk-s3`, `aws-sdk-sts`, `aws-sigv4`, `aws-credential-types`, `aws-smithy-runtime`,
-`rusoto_core`, and `ureq` (`microvms-cli/tests/thinness.rs:99-112`). An allowlist rather than a
-denylist, because a denylist is defeated by the one crate nobody thought to write down
-(`microvms-cli/Cargo.toml:26-30`).
-
-It was seven for a while. `futures-util` was named so `exec --stream` could call `poll_next`,
-since `Stream` is not in `std`; core grew `ExecHandle::for_each_event`, whose signature
-`FnMut(ExecEvent) -> ControlFlow<()>` is entirely `std`, and the entry came out
-(`microvms-cli/Cargo.toml:32-40`). `microvms-cli/tests/thinness.rs:53-59` keeps that as
-`const RETIRED` so the removal is recorded where the count is asserted. Both bindings retired
-the same entry for the same reason (`microvms-py/Cargo.toml:44-49`,
-`microvms-js/Cargo.toml:55-60`).
+`microvms-cli` takes the maintained crates it needs, thirteen direct dependencies today
+(`microvms-cli/Cargo.toml:35-128`), and nothing polices that count: the manifest's own comment
+states the rule as "dependencies are otherwise welcome" (`microvms-cli/Cargo.toml:25-34`). What is
+under test is the hazard. `microvms-cli/tests/thinness.rs:49` holds `const FORBIDDEN: [&str; 12]`,
+naming `reqwest`, `hyper`, `hyper-util`, `http`, `aws-config`, `aws-sdk-s3`, `aws-sdk-sts`,
+`aws-sigv4`, `aws-credential-types`, `aws-smithy-runtime`, `rusoto_core`, and `ureq`, and
+`no_direct_dependency_is_a_second_path_to_aws` (`microvms-cli/tests/thinness.rs:96`) reads the
+manifest through `cargo metadata` and fails if any of them appears as a normal or dev dependency.
+The earlier six-crate allowlist, and the `RETIRED` record of `futures-util` leaving it, were
+removed with it: a cap on the manifest asserted a size, while the denylist asserts the property
+CLI-2 names, that every AWS call goes through `microvms-core`.
 
 ## Absent edges that carry weight
 
