@@ -62,13 +62,13 @@ jobs:
       # step follows the one above rather than leading.
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          # The HIGHEST floor in play, not Astro's. `astro@7` declares node >=22.12.0 and it is
-          # tempting to pin that; pnpm 11.21 declares >=22.13 and fails this job outright with
-          # `This version of pnpm requires at least Node.js v22.13` the moment `cache: pnpm` asks it
-          # for the store path. `site/package.json`'s `engines.node` carries the same floor, and
-          # `tests/toolchain.test.ts` asserts this pin satisfies it — two places that must agree,
-          # with something checking that they do.
-          node-version: '22.13'
+          # The HIGHEST floor in play, not Astro's. `astro@7` declares node >=22.12.0 and pnpm 11.21
+          # declares >=22.13, and both were satisfied by a 22.13 pin until cspell 10.2 arrived: it
+          # refuses to start below 22.18 (`Unsupported NodeJS version (22.13.1); >=22.18.0 is
+          # required`, measured on this workflow 2026-09-05). `site/package.json`'s `engines.node`
+          # carries the same floor, and `tests/toolchain.test.ts` asserts this pin satisfies it: two
+          # places that must agree, with something checking that they do.
+          node-version: '22.18'
           cache: pnpm
           cache-dependency-path: site/pnpm-lock.yaml
 

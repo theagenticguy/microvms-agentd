@@ -29,7 +29,15 @@ The constraints the platform enforces at runtime are shapes these packages refus
 `microvms-py/examples/typed_usage.py` is a typed consumer that exists so a checker has something to be right about. Its value and cost surface runs with no AWS account. These functions are quoted from it:
 
 ```python
-from microvms import CostReport, Duration, EstimatedUsd, SizeClass, Total, estimate_run, run_report
+from microvms import (
+    CostReport,
+    Duration,
+    EstimatedUsd,
+    SizeClass,
+    Total,
+    estimate_run,
+    run_report,
+)
 
 
 def size_for(baseline_mib: int) -> SizeClass:

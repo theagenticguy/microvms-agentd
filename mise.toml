@@ -136,12 +136,24 @@ depends = ["sbom"]
 # lane the others lack: grype reads the SBOM (so it audits what we publish),
 # trivy adds IaC misconfig and its own secret pass over the tree, osv-scanner
 # reads the lockfiles against OSV directly. Every accepted finding lives in
+# .vex/microvms-agentd.openvex.json (dependency vulnerabilities; grype reads it
+# through --vex and trivy through TRIVY_VEX, exactly as ci.yml passes them) or in
 # .trivyignore.yaml / osv-scanner.toml WITH its reason — an ignore without a
-# reason is a finding someone silenced.
+# reason is a finding someone silenced. The VEX flags were absent here until the
+# first npm acceptance landed (2026-09-05), so this task failed on a finding CI
+# accepted; the two invocations now agree. trivy skips the same installed trees the
+# SBOM task excludes: CI scans a fresh checkout with no node_modules, while a local
+# tree carries a dependency's bundled example lockfiles (starlight-base-path ships
+# two bun.lock files naming an old astro), which reported twelve HIGH findings that
+# describe nothing this repository installs or ships.
 run = [
-  "grype sbom:sbom/microvms-agentd.cdx.json --fail-on high -q",
-  "trivy fs --scanners vuln,misconfig,secret --skip-dirs conformance/infra/.terraform --skip-dirs target --exit-code 1 --severity HIGH,CRITICAL --ignorefile .trivyignore.yaml -q .",
-  "osv-scanner scan source -r .",
+  "grype sbom:sbom/microvms-agentd.cdx.json --fail-on high -q --vex .vex/microvms-agentd.openvex.json",
+  "TRIVY_VEX=.vex/microvms-agentd.openvex.json trivy fs --scanners vuln,misconfig,secret --skip-dirs conformance/infra/.terraform --skip-dirs target --skip-dirs site/node_modules --skip-dirs site/dist --skip-dirs microvms-js/node_modules --exit-code 1 --severity HIGH,CRITICAL --ignorefile .trivyignore.yaml -q .",
+  # `--config` is required, not decorative: osv-scanner applies a config file only to the
+  # lockfiles in its own directory, so without it the root file governs Cargo.lock and
+  # nothing governs site/pnpm-lock.yaml (measured 2026-09-05: the extract-zip ignore was
+  # reported as unused while the finding it names failed the scan).
+  "osv-scanner scan source -r . --config osv-scanner.toml",
 ]
 
 [tasks.test]

@@ -16,3 +16,12 @@ id = "RUSTSEC-2026-0235"
 # cannot be reached from any built artifact. Re-check if rust_decimal's
 # `rkyv` feature is ever turned on.
 reason = "optional rust_decimal feature, never enabled; not compiled into any artifact"
+
+[[IgnoredVulns]]
+id = "GHSA-jmr9-qjv8-65gv"
+# extract-zip 2.0.1 sits in site/pnpm-lock.yaml under @lhci/cli -> lighthouse -> puppeteer-core ->
+# @puppeteer/browsers, which uses it to unpack browser archives its own downloader fetches. The
+# docs site's Lighthouse tier runs lhci against the Chromium playwright installed (CHROME_PATH), so
+# that downloader never runs and nothing is ever extracted; the package is a devDependency that
+# ships in no artifact, and no fixed release exists to override to. Mirrors the VEX statement.
+reason = "puppeteer's browser downloader is never invoked (CHROME_PATH); devDependency of the docs site only; no fixed release"

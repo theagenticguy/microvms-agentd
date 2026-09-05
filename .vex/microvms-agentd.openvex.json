@@ -2,8 +2,8 @@
   "@context": "https://openvex.dev/ns/v0.2.0",
   "@id": "https://github.com/theagenticguy/microvms-agentd/blob/main/.vex/microvms-agentd.openvex.json",
   "author": "theagenticguy/microvms-agentd maintainers",
-  "timestamp": "2026-08-31T21:19:00Z",
-  "version": 1,
+  "timestamp": "2026-09-05T15:30:00Z",
+  "version": 2,
   "statements": [
     {
       "vulnerability": {
@@ -18,6 +18,20 @@
       "status": "not_affected",
       "justification": "vulnerable_code_not_present",
       "impact_statement": "rkyv 0.7 appears in Cargo.lock only as an optional dependency of rust_decimal whose feature this workspace never enables. `cargo tree -i rkyv` prints 'nothing to print': no crate depends on it and it is never compiled into any artifact. The lockfile records optional dependencies regardless. Re-check if rust_decimal's `rkyv` feature is ever turned on."
+    },
+    {
+      "vulnerability": {
+        "name": "GHSA-jmr9-qjv8-65gv",
+        "description": "extract-zip: path traversal when extracting a crafted archive"
+      },
+      "products": [
+        {
+          "@id": "pkg:npm/extract-zip@2.0.1"
+        }
+      ],
+      "status": "not_affected",
+      "justification": "vulnerable_code_not_in_execute_path",
+      "impact_statement": "extract-zip reaches site/pnpm-lock.yaml only through @lhci/cli -> lighthouse -> puppeteer-core -> @puppeteer/browsers, where it unpacks browser archives that puppeteer's own downloader fetches. This repository never runs that downloader: `pnpm run test:budget` points lhci at the Chromium playwright installed (CHROME_PATH), so no archive is ever extracted, and the package is a devDependency of the docs site that ships in no artifact. No fixed release exists to override to. Re-check if lhci is ever run without CHROME_PATH or if a fixed extract-zip is published."
     }
   ]
 }

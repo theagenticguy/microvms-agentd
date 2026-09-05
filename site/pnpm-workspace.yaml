@@ -8,3 +8,13 @@ allowBuilds:
 minimumReleaseAgeExclude:
   - '@astrojs/starlight@0.41.9'
   - astro@7.2.7
+# Vulnerable transitives under @lhci/cli, forced onto their fixed releases. Measured by grype over
+# the SBOM on 2026-09-05: tmp 0.0.33/0.1.0 (GHSA-ph9p-34f9-6g65, High, via inquirer and directly),
+# qs 6.15.3 (GHSA-x5fp-wj9c-mxmx and GHSA-4mjr-xmp4-gh2g, via express), uuid 8.3.2
+# (GHSA-w5hq-g745-h8pq). Each override is a floor rather than a pin so a later fix is taken
+# without editing this file. extract-zip 2.0.1 (GHSA-jmr9-qjv8-65gv) has no fixed release and is
+# accepted in .vex/microvms-agentd.openvex.json instead, with its reason.
+overrides:
+  tmp: '>=0.2.6'
+  qs: '>=6.16.0'
+  'uuid@<11': '>=11.1.1'
