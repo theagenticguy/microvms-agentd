@@ -18,6 +18,20 @@
  * So the title is derived here, written onto the copy, and the tree stays read-only. This script opens
  * no file under the source for writing and refuses to run at all when the target is inside the source.
  *
+ * ## Three tiers, and where the tree lands in them
+ *
+ * The site is Diátaxis-shaped: Learn, Reference, Internals. The tree fills one and a half of them.
+ * Every hand-written root document and five of ccu's six categories are the reasoning about the system,
+ * so they publish under `internals/`. ccu's `reference/` category keeps the route it always had, beside
+ * the pages `scripts/gen-reference.mjs` derives from `microvm manifest` — that script runs AFTER this
+ * one in the `sync` npm script and owns its own manifest, so nothing here writes into `reference/`
+ * beyond those three copies. The authored pages (`authored/**`) are copied recursively at their own
+ * relative paths, which is where the cover page, the agent page, the Learn tier, the Internals index,
+ * and the glossary come from.
+ *
+ * Every tree page that moved keeps its old route as a redirect. The old-to-new map is written into the
+ * manifest so `astro.config.ts` can hand it to Astro's `redirects` rather than restate it.
+ *
  * ## The target is generated, and gitignored
  *
  * Commit the target and a reader sees ordinary editable pages, edits one, and the next sync overwrites
@@ -50,8 +64,57 @@ const AUTHORED = "authored"
 const REPO_ROOT = ".."
 const REPO_URL = "https://github.com/theagenticguy/microvms-agentd"
 
+/**
+ * The GitHub edit URL for an authored source file, for the pencil link on an authored page.
+ *
+ * Authored pages are the ONE kind of page under the target whose edit link points at a file a person
+ * can edit and keep: the copy is regenerated from `authored/`, so an edit made through this link lands
+ * in the source rather than in the copy the next sync discards. Tree pages keep `editUrl: false`, because
+ * their source is itself generated. `main` rather than the pinned commit, because an edit link opens an
+ * editor on a branch, and a SHA is not a branch.
+ */
+const EDIT_URL_BASE = `${REPO_URL}/edit/main/site/${AUTHORED}/`
+
 /** The manifest of files this tool owns in the target, so a prune can never reach a foreign page. */
 const MANIFEST = ".sync-manifest.json"
+
+/**
+ * Where the generated Reference pages come from, in two places, tried in this order.
+ *
+ * The agent page's read-next table must name every built page, and the Reference pages are written by
+ * `scripts/gen-reference.mjs`, which runs AFTER this script in the `sync` npm script and records what it
+ * wrote in its own manifest. On every run but the first that manifest is on disk from the previous run,
+ * so the rows are read off it — the page ids it owns, and each page's own `title` — and a Reference
+ * page that script adds reaches the table without an edit here.
+ *
+ * On a first run against an empty target the reference manifest does not exist yet, so the rows fall
+ * back to the CLI's own contract: one command page per `data.commands[].name`, plus the fixed contract
+ * pages. The run says which source it used. Absent both, the rows are absent and the run says that.
+ */
+const REFERENCE_MANIFEST = "reference/.reference-manifest.json"
+const CLI_MANIFEST = "../docs/manifest.json"
+
+/**
+ * Where the tree is published, per tree directory.
+ *
+ * `reference/` is the one category that stays at its historical route, because the Reference tier is
+ * where a reader looks a surface up and ccu's three annotated pages belong beside the generated ones.
+ * Everything else — every root document and the other five categories — goes under `internals/`.
+ */
+const INTERNALS = "internals"
+const KEPT_IN_PLACE = new Set(["reference"])
+
+/**
+ * The generated Reference pages that are not command pages, for the CLI-manifest fallback only. Fixed by
+ * the site's URL plan; the reference manifest, when present, supersedes this list entirely.
+ */
+const GENERATED_REFERENCE = [
+  ["reference", "Reference"],
+  ["reference/exit-codes", "Exit codes"],
+  ["reference/envelope", "The envelope"],
+  ["reference/response-types", "Response types"],
+  ["reference/wire-schema", "Wire schema"]
+]
 
 /**
  * ccu's reading order for its six category directories, offset past the root pages.
@@ -351,7 +414,23 @@ const normalizeSlashes = (path) => {
  * A relative link is base-agnostic. It is NOT case-agnostic. Making the filename the slug is what closes
  * that, because then there is no second spelling for anything to disagree about.
  */
-const contentPathOf = (treePath) => treePath.toLowerCase()
+const legacyContentPathOf = (treePath) => treePath.toLowerCase()
+
+/**
+ * Where a tree page is written NOW: under `internals/`, unless its category is one that keeps its
+ * place. The relative links between tree pages are rewritten against this map, so a link from
+ * `reference/cli.md` to `../EMBEDDING.md` comes out as `../internals/embedding.md` with no edit to
+ * the tree.
+ */
+const contentPathOf = (treePath) => {
+  const lower = legacyContentPathOf(treePath)
+  const [head] = lower.split("/")
+  return lower.includes("/") && KEPT_IN_PLACE.has(head) ? lower : `${INTERNALS}/${lower}`
+}
+
+/** A content path as the route it is served at: `internals/platform.md` -> `/internals/platform/`. */
+const routeOf = (contentPath) =>
+  `/${contentPath.slice(0, -".md".length)}/`.replace(/\/index\/$/, "/")
 
 /**
  * Rewrites a relative link so it resolves on BOTH surfaces, or into a commit-pinned repository permalink
@@ -428,6 +507,117 @@ const readNextTable = (pages) =>
     "| --------- | ------------ |",
     ...pages.map(({ id, title }) => `| [${title}](/${id}/) | [\`${id}.md\`](/${id}.md) |`)
   ].join("\n")
+
+/**
+ * The tier a route belongs to, for ordering the read-next table the way the sidebar is ordered.
+ * Anything outside the three tiers — the glossary — sorts last.
+ */
+const TIER_ORDER = ["learn", "reference", "internals"]
+const tierOf = (id) => {
+  const at = TIER_ORDER.indexOf(id.split("/")[0])
+  return at === -1 ? TIER_ORDER.length : at
+}
+
+/**
+ * Within a tier, the tier's own index first, then its sections in the order a reader meets them:
+ * tutorials before operations, the generated command pages before the annotated ones. A section not
+ * listed sorts after the listed ones.
+ */
+const SECTION_ORDER = ["tutorial", "operations", "commands"]
+const sectionOf = (id) => {
+  const segments = id.split("/")
+  if (segments.length < 2) return -1
+  const at = SECTION_ORDER.indexOf(segments[1])
+  return at === -1 ? SECTION_ORDER.length : at
+}
+
+/**
+ * The `title` an authored page declares, read off its frontmatter for the read-next table. Authored
+ * pages carry their own frontmatter, so the title is theirs rather than derived.
+ */
+const authoredTitleOf = (body, relPath) => {
+  const match = /^---\r?\n([\s\S]*?)\r?\n---/.exec(body)
+  const line = match?.[1].split(/\r?\n/).find((entry) => /^title:/.test(entry))
+  if (line === undefined) fail(`authored/${relPath} declares no title, which Starlight requires`)
+  return line
+    .replace(/^title:\s*/, "")
+    .trim()
+    .replace(/^"(.*)"$/, "$1")
+    .replace(/^'(.*)'$/, "$1")
+    .replaceAll('\\"', '"')
+}
+
+/**
+ * The `sidebar.order` an authored page declares, so the read-next table lists a tier's pages in the
+ * order its author chose rather than alphabetically. Zero when the page declares none.
+ */
+const authoredOrderOf = (body) => {
+  const match = /^---\r?\n([\s\S]*?)\r?\n---/.exec(body)
+  const line = match?.[1].split(/\r?\n/).find((entry) => /^\s+order:\s*\d+\s*$/.test(entry))
+  return line === undefined ? 0 : Number(/\d+/.exec(line)?.[0] ?? 0)
+}
+
+/**
+ * An authored page's frontmatter with `editUrl` set to its own source file on GitHub.
+ *
+ * Replaces an `editUrl` the author wrote (the pages predating the tiers carried `editUrl: false`) and
+ * adds one where there was none, so every authored page gets the same treatment whoever wrote it.
+ */
+const withEditUrl = (body, relPath) => {
+  const match = /^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/.exec(body)
+  if (match === null)
+    fail(`authored/${relPath} opens with no frontmatter, and Starlight requires a title`)
+  const editUrl = `editUrl: ${yamlString(`${EDIT_URL_BASE}${relPath}`)}`
+  const lines = match[1].split(/\r?\n/)
+  const at = lines.findIndex((line) => /^editUrl:/.test(line))
+  if (at === -1) lines.push(editUrl)
+  else lines[at] = editUrl
+  return `---\n${lines.join("\n")}\n---\n${body.slice(match[0].length)}`
+}
+
+/**
+ * The generated Reference pages as read-next rows, with the source they came from, or `undefined` when
+ * neither source exists.
+ *
+ * From the reference manifest: every owned page that is still on disk, with its own `title` and
+ * `sidebar.order`. A page the manifest names but the disk lacks is skipped rather than linked, because
+ * a row pointing at a page the next `gen-reference` run may not write is a 404 in a table that claims
+ * to be complete.
+ */
+const generatedReferencePages = (target) => {
+  const referenceManifest = join(target, REFERENCE_MANIFEST)
+  if (existsSync(referenceManifest)) {
+    const parsed = JSON.parse(readFileSync(referenceManifest, "utf8"))
+    const owned = Array.isArray(parsed?.owned) ? parsed.owned : []
+    const rows = owned
+      .filter((path) => typeof path === "string" && path.endsWith(".md"))
+      .filter((path) => existsSync(join(target, path)))
+      .map((path) => {
+        const body = readFileSync(join(target, path), "utf8")
+        return {
+          id: routeOf(path).slice(1, -1),
+          title: authoredTitleOf(body, path),
+          order: authoredOrderOf(body)
+        }
+      })
+    if (rows.length > 0) return { source: REFERENCE_MANIFEST, rows }
+  }
+  if (!existsSync(CLI_MANIFEST)) return undefined
+  const parsed = JSON.parse(readFileSync(CLI_MANIFEST, "utf8"))
+  const commands = parsed?.data?.commands
+  if (!Array.isArray(commands)) fail(`${CLI_MANIFEST} carries no data.commands array`)
+  return {
+    source: CLI_MANIFEST,
+    rows: [
+      ...GENERATED_REFERENCE.map(([id, title]) => ({ id, title, order: 0 })),
+      ...commands
+        .map((command) => command?.name)
+        .filter((name) => typeof name === "string" && /^[a-z][a-z0-9-]*$/.test(name))
+        .sort()
+        .map((name) => ({ id: `reference/commands/${name}`, title: `microvm ${name}`, order: 0 }))
+    ]
+  }
+}
 
 const main = () => {
   const argv = process.argv.slice(2)
@@ -569,16 +759,42 @@ const main = () => {
    * nothing strips it — and the agent page additionally gets the derived read-next table substituted for
    * its marker, which is why it is generated into the target rather than living there.
    */
-  const readNextRows = pages
-    .slice()
-    .sort((a, b) => (a.order ?? 0) - (b.order ?? 0) || a.id.localeCompare(b.id))
-  for (const name of readdirSync(authored).sort()) {
-    if (!name.endsWith(".md")) continue
-    const body = readFileSync(join(authored, name), "utf8")
-    if (name === "agents.md" && !body.includes(READ_NEXT_MARKER)) {
-      fail(`authored/agents.md carries no ${READ_NEXT_MARKER}: the read-next table has nowhere to go`)
+  const authoredPages = markdownUnder(authored).map((relPath) => ({
+    relPath,
+    body: withEditUrl(readFileSync(join(authored, relPath), "utf8"), relPath)
+  }))
+  for (const { relPath } of authoredPages) {
+    if (contentPaths.has(relPath) || [...contentPaths.values()].includes(relPath)) {
+      fail(
+        `authored/${relPath} and a tree page both publish as ${relPath}. One would overwrite the other.`
+      )
     }
-    emit(name, body.replace(READ_NEXT_MARKER, readNextTable(readNextRows)))
+  }
+  const generatedReference = generatedReferencePages(target)
+  const readNextRows = [
+    ...pages.map(({ id, title, order }) => ({ id, title, order })),
+    ...authoredPages
+      .filter(({ relPath }) => relPath !== "agents.md" && relPath !== "index.md")
+      .map(({ relPath, body }) => ({
+        id: routeOf(relPath).slice(1, -1),
+        title: authoredTitleOf(body, relPath),
+        order: authoredOrderOf(body)
+      })),
+    ...(generatedReference?.rows ?? [])
+  ].sort(
+    (a, b) =>
+      tierOf(a.id) - tierOf(b.id) ||
+      sectionOf(a.id) - sectionOf(b.id) ||
+      (a.order ?? 0) - (b.order ?? 0) ||
+      a.id.localeCompare(b.id)
+  )
+  for (const { relPath, body } of authoredPages) {
+    if (relPath === "agents.md" && !body.includes(READ_NEXT_MARKER)) {
+      fail(
+        `authored/agents.md carries no ${READ_NEXT_MARKER}: the read-next table has nowhere to go`
+      )
+    }
+    emit(relPath, body.replace(READ_NEXT_MARKER, readNextTable(readNextRows)))
   }
 
   for (const [treeAsset, destination] of ASSETS) {
@@ -597,19 +813,34 @@ const main = () => {
   const sidebar = [...AUTHORITATIVE]
     .filter(([treePath]) => contentPaths.has(treePath))
     .sort(([, a], [, b]) => a.order - b.order)
-    .map(([treePath, named]) => ({
-      label: named.label,
-      link: `/${contentPathOf(treePath).slice(0, -".md".length)}/`
-    }))
+    .map(([treePath, named]) => ({ label: named.label, link: routeOf(contentPathOf(treePath)) }))
     .concat(
       unnamed
         .slice()
         .sort()
         .map((treePath) => {
           const id = contentPathOf(treePath).slice(0, -".md".length)
-          return { label: pages.find((page) => page.id === id)?.title ?? id, link: `/${id}/` }
+          return {
+            label: pages.find((page) => page.id === id)?.title ?? id,
+            link: routeOf(contentPathOf(treePath))
+          }
         })
     )
+
+  /*
+   * Tree path -> route, for the citation rewriter: a `docs/PLATFORM.md:12` citation has to land on
+   * `/internals/platform/`, and the rewriter's default of lowercasing the tree path stopped being the
+   * route when the tiers arrived. Old route -> new route, for Astro's `redirects`: every page that moved
+   * keeps answering at the address it had, so an inbound link written before the tiers still resolves.
+   */
+  const routes = Object.fromEntries(
+    published.map((treePath) => [treePath, routeOf(contentPathOf(treePath))])
+  )
+  const redirects = Object.fromEntries(
+    published
+      .map((treePath) => [routeOf(legacyContentPathOf(treePath)), routeOf(contentPathOf(treePath))])
+      .filter(([from, to]) => from !== to)
+  )
 
   // Only a path this tool wrote on a previous run is a prune candidate, so a hand-authored page sharing
   // the target survives and a first run against a populated directory removes nothing.
@@ -626,6 +857,8 @@ const main = () => {
           commit,
           owned: [...generated].sort(),
           publishedTreePaths: published.slice().sort(),
+          routes,
+          redirects,
           sidebar
         },
         undefined,
@@ -648,12 +881,23 @@ const main = () => {
   for (const treePath of unnamed) {
     out.write(`  unnamed root page  ${treePath}  (name it in AUTHORITATIVE for a short label)\n`)
   }
+  if (generatedReference === undefined) {
+    out.write(
+      `  neither ${REFERENCE_MANIFEST} nor ${CLI_MANIFEST}: the read-next table names no generated ` +
+        "Reference page this run\n"
+    )
+  } else {
+    out.write(
+      `  ${generatedReference.rows.length} generated Reference rows in the read-next table, ` +
+        `from ${generatedReference.source}\n`
+    )
+  }
   out.write(
     `${dryRun ? "dry run: " : ""}${generated.size} pages at ${commit.slice(0, 12)}, ` +
       `${written.length} ${verb}, ${unchanged.length} unchanged, ${stale.length} stale, ` +
       `${UNPUBLISHED.size} unpublished, ${rewrittenLinks.length} links pinned, ` +
       `${renamedLinks.length} links re-pointed at a route, ` +
-      `${fallbacks.length} fallback titles\n`
+      `${Object.keys(redirects).length} redirects, ${fallbacks.length} fallback titles\n`
   )
   if (fallbacks.length > 0) {
     out.write(

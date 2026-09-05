@@ -180,13 +180,26 @@ const readDist = (relative: string): string => {
 const served = (path: string): string =>
   path.startsWith(segment) ? path.slice(segment.length) : path.replace(/^\/+/, "")
 
+/**
+ * Whether an emitted `index.html` is one of Astro's redirect stubs rather than a page.
+ *
+ * `astro.config.ts` hands every route a tree page had before the tiers to Astro's `redirects`, and a
+ * static build answers each with a document holding only a `<meta http-equiv="refresh">`. That document
+ * has no twin, no discovery block, no navigation, and no heading, and none of that is a defect: it is
+ * the whole of what a redirect is. The census below therefore skips it, or every probe over "every
+ * built page" reports the redirects as broken pages.
+ */
+const isRedirectStub = (path: string): boolean =>
+  /<meta http-equiv="refresh"/i.test(readFileSync(path, "utf8").slice(0, 512))
+
 /** Every page directory the build emitted, as the site-absolute paths a browser would request. */
 const builtPages = (): ReadonlyArray<string> => {
   const walk = (directory: string, prefix: string): ReadonlyArray<string> =>
     readdirSync(directory, { withFileTypes: true }).flatMap((entry) => {
       if (entry.name.startsWith("_") || entry.name === "pagefind") return []
       if (entry.isDirectory()) return walk(join(directory, entry.name), `${prefix}${entry.name}/`)
-      return entry.name === "index.html" ? [prefix] : []
+      if (entry.name !== "index.html") return []
+      return isRedirectStub(join(directory, entry.name)) ? [] : [prefix]
     })
   return walk(dist, segment)
 }
@@ -302,7 +315,9 @@ describe("the deep-link format lock", () => {
   it("refuses to ship a truncated prompt when even the reference form overflows", () => {
     const [first] = DEEP_LINK_TARGETS
     if (first === undefined) throw new Error("the target table is empty")
-    expect(() => deepLink({ ...first, vendorLimit: 40 }, page, "body")).toThrow(/over the 40 ceiling/)
+    expect(() => deepLink({ ...first, vendorLimit: 40 }, page, "body")).toThrow(
+      /over the 40 ceiling/
+    )
   })
 
   it("names the page and this corpus in every prompt, so a prefill is never contextless", () => {
@@ -440,7 +455,9 @@ describe("the raw-Markdown route", () => {
     const unreachable = twins.filter((twin) =>
       twin
         .split("/")
-        .some((segment) => segment.startsWith(".") || (segment.startsWith("_") && segment !== "_astro"))
+        .some(
+          (segment) => segment.startsWith(".") || (segment.startsWith("_") && segment !== "_astro")
+        )
     )
     expect(unreachable).toEqual([])
   })
@@ -478,6 +495,63 @@ describe("the raw-Markdown route", () => {
       (twin) => !pages.has(twin) && !CONFIG.twinsWithoutPages.includes(twin as never)
     )
     expect(orphans).toEqual([])
+  })
+})
+
+/* =================================================================================================
+ * The redirect stubs.
+ * ================================================================================================= */
+
+describe("every redirect stub", () => {
+  /**
+   * The stubs are excluded from the page census above, so this is the one place they are asserted on
+   * their own terms: each points at a page that exists in the build, and the set of them is exactly
+   * what the sync declared. A stub whose target is missing is a redirect into a 404, and it is the one
+   * defect the link validator cannot see, because a stub carries no link the validator reads.
+   */
+  const stubs = (): ReadonlyArray<{ readonly from: string; readonly to: string }> => {
+    const walk = (directory: string, prefix: string): ReadonlyArray<string> =>
+      readdirSync(directory, { withFileTypes: true }).flatMap((entry) => {
+        if (entry.name.startsWith("_") || entry.name === "pagefind") return []
+        if (entry.isDirectory()) return walk(join(directory, entry.name), `${prefix}${entry.name}/`)
+        if (entry.name !== "index.html") return []
+        return isRedirectStub(join(directory, entry.name)) ? [prefix] : []
+      })
+    return walk(dist, segment).map((from) => {
+      const target = /<meta http-equiv="refresh" content="\d+;url=([^"]+)"/i.exec(
+        pageHtml(from)
+      )?.[1]
+      return { from, to: target ?? "" }
+    })
+  }
+
+  const declared = (): Readonly<Record<string, string>> =>
+    (
+      JSON.parse(readFileSync(join(content, ".sync-manifest.json"), "utf8")) as {
+        readonly redirects: Readonly<Record<string, string>>
+      }
+    ).redirects
+
+  it("points at a page that exists in the build, under the base", () => {
+    const all = stubs()
+    expect(all.length).toBeGreaterThan(0)
+    for (const { from, to } of all) {
+      expect(to.startsWith(segment), `${from} redirects outside the base: ${to}`).toBe(true)
+      expect(existsSync(join(dist, served(to), "index.html")), `${from} -> ${to} is a 404`).toBe(
+        true
+      )
+    }
+  })
+
+  it("is exactly the set the sync declared, one stub per old route", () => {
+    const emitted = Object.fromEntries(
+      stubs().map(({ from, to }) => [
+        served(from).replace(/^\/?/, "/"),
+        served(to).replace(/^\/?/, "/")
+      ])
+    )
+    const expected = Object.fromEntries(Object.entries(declared()).map(([from, to]) => [from, to]))
+    expect(emitted).toEqual(expected)
   })
 })
 
@@ -770,7 +844,8 @@ describe("no agent-addressed content is hidden from human readers", () => {
 
 describe("the agent page's own entry points", () => {
   /** What a writer typed, which is the subject of the authorship probes. */
-  const authoredSource = (): string => readFileSync(join(authored, `${CONFIG.agentPage}.md`), "utf8")
+  const authoredSource = (): string =>
+    readFileSync(join(authored, `${CONFIG.agentPage}.md`), "utf8")
 
   it("is the first entry `llms.txt` lists", () => {
     const listed = [...readDist("llms.txt").matchAll(/^- \[[^\]]+\]\(([^)]+)\)/gm)].map(

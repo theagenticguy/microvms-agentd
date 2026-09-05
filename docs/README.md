@@ -15,6 +15,10 @@ lands on the wrong line still reads as authoritative. Regenerate the tree after 
 substantial refactor rather than editing a stale file in place, and treat a
 hand-written document as winning wherever the two disagree.
 
+This directory is published as the Internals tier of
+<https://theagenticguy.github.io/microvms-agentd/>, beside a Learn tier of
+tutorials and a Reference tier generated from `microvm manifest`.
+
 ## Hand-written and authoritative
 
 - [PLATFORM.md](PLATFORM.md) — every measured claim about AWS Lambda MicroVMs,

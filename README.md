@@ -474,16 +474,22 @@ starting with the
 [debugging guide](docs/insights/debugging-guide.md).
 
 The same documentation is published at
-**<https://theagenticguy.github.io/microvms-agentd/>**, built from `docs/` by
-`site/` and deployed by `.github/workflows/docs.yml`. Every page is also
-served as raw Markdown at its own path with `.md` appended, the whole corpus
-comes as `llms.txt`, `llms-full.txt` and `llms-small.txt`, every `path:line`
-citation is a commit-pinned link into this repository, and the Mermaid
-diagrams are rendered to SVG at build time so they are present in a fetch that
-runs no JavaScript.
+**<https://theagenticguy.github.io/microvms-agentd/>**, built by `site/` and
+deployed by `.github/workflows/docs.yml`, in three tiers: Learn (tutorials and
+task-shaped how-tos, authored under `site/authored/learn/`), Reference
+(generated from `microvm manifest`, one page per command plus the exit codes,
+envelope, response types, and wire schema), and Internals (`docs/`: the
+hand-written platform findings and design documents, then the tree generated
+from the source). Every page is also served as raw Markdown at its own path
+with `.md` appended, the whole corpus comes as `llms.txt`, `llms-full.txt` and
+`llms-small.txt`, every `path:line` citation is a commit-pinned link into this
+repository, and the Mermaid diagrams are rendered to SVG at build time so they
+are present in a fetch that runs no JavaScript.
 [For agents](https://theagenticguy.github.io/microvms-agentd/agents/) is the
 page that names which surface answers which question. `mise run docs:check`
-builds and gates it locally.
+builds and gates it locally, and the gates over the built output cover
+accessibility, layout stability, a Lighthouse budget, link and census checks,
+spelling, and lint beside the existing probes.
 
 ## License
 
