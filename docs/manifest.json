@@ -1,0 +1,2713 @@
+{
+  "apiVersion": "1",
+  "data": {
+    "apiVersion": "1",
+    "cli": "microvm",
+    "commands": [
+      {
+        "alternateResponse": null,
+        "name": "run",
+        "parameters": [
+          {
+            "choices": null,
+            "default": null,
+            "help": "A directory to sync (issue #72), or an agentd binary to bake in",
+            "name": "binary",
+            "positional": true,
+            "required": false,
+            "type": "path"
+          },
+          {
+            "choices": null,
+            "default": null,
+            "help": "Launch this existing image instead of building one. Takes an ARN or a name",
+            "name": "image",
+            "positional": false,
+            "required": false,
+            "type": "string"
+          },
+          {
+            "choices": null,
+            "default": null,
+            "help": "Launch this exact image version instead of the image's latest active one",
+            "name": "image-version",
+            "positional": false,
+            "required": false,
+            "type": "string"
+          },
+          {
+            "choices": null,
+            "default": null,
+            "help": "Where the build artifact already is, as an s3:// URI",
+            "name": "artifact-uri",
+            "positional": false,
+            "required": false,
+            "type": "string"
+          },
+          {
+            "choices": null,
+            "default": null,
+            "help": "A shell command to run in the VM",
+            "name": "exec",
+            "positional": false,
+            "required": false,
+            "type": "string"
+          },
+          {
+            "choices": null,
+            "default": null,
+            "help": "Image name. Defaults to a per-invocation name, because reusing one is how a clientToken replay wedges an image",
+            "name": "name",
+            "positional": false,
+            "required": false,
+            "type": "string"
+          },
+          {
+            "choices": [
+              "512",
+              "1024",
+              "2048",
+              "4096",
+              "8192"
+            ],
+            "default": "2048",
+            "help": "Baseline MiB, which selects a documented size class",
+            "name": "memory",
+            "positional": false,
+            "required": false,
+            "type": "enum"
+          },
+          {
+            "choices": null,
+            "default": null,
+            "help": "A Dockerfile to use instead of the library's default. Its FROM must match the base",
+            "name": "dockerfile",
+            "positional": false,
+            "required": false,
+            "type": "path"
+          },
+          {
+            "choices": null,
+            "default": null,
+            "help": "CloudWatch log group for the build's logs, instead of the service-created `/aws/lambda-microvms/<image-name>`",
+            "name": "log-group",
+            "positional": false,
+            "required": false,
+            "type": "string"
+          },
+          {
+            "choices": null,
+            "default": null,
+            "help": "Log stream name prefix inside --log-group. The client appends `/<16 hex>` per build attempt, and the resolved exact name is on the envelope as `logStream`",
+            "name": "log-stream",
+            "positional": false,
+            "required": false,
+            "type": "string"
+          },
+          {
+            "choices": null,
+            "default": null,
+            "help": "Widen the guest so `sethostname` and the boot_id bind mount work",
+            "name": "repair-identity",
+            "positional": false,
+            "required": false,
+            "type": "boolean"
+          },
+          {
+            "choices": null,
+            "default": null,
+            "help": "Give the VM outbound network. Omitted by default — a daemon needs none",
+            "name": "egress",
+            "positional": false,
+            "required": false,
+            "type": "boolean"
+          },
+          {
+            "choices": null,
+            "default": null,
+            "help": "Launch shell-capable, so `microvm shell` can attach later",
+            "name": "shell",
+            "positional": false,
+            "required": false,
+            "type": "boolean"
+          },
+          {
+            "choices": null,
+            "default": null,
+            "help": "Set one launch-environment variable for every exec in the VM, as KEY=VALUE. Repeatable",
+            "name": "launch-env",
+            "positional": false,
+            "required": false,
+            "type": "string"
+          },
+          {
+            "choices": null,
+            "default": null,
+            "help": "Numeric uid to run --exec's command as. Omitted runs as the daemon's own user",
+            "name": "user",
+            "positional": false,
+            "required": false,
+            "type": "string"
+          },
+          {
+            "choices": null,
+            "default": null,
+            "help": "Numeric gid to run --exec's command as. Omitted keeps the daemon's own group",
+            "name": "group",
+            "positional": false,
+            "required": false,
+            "type": "string"
+          },
+          {
+            "choices": null,
+            "default": null,
+            "help": "Leave the VM and image running. You are then paying for them",
+            "name": "keep",
+            "positional": false,
+            "required": false,
+            "type": "boolean"
+          },
+          {
+            "choices": null,
+            "default": null,
+            "help": "Generate a per-VM identity, so `tunnel --verify-identity` can prove the far end",
+            "name": "identity",
+            "positional": false,
+            "required": false,
+            "type": "boolean"
+          },
+          {
+            "choices": null,
+            "default": null,
+            "help": "Register a local name for the kept VM, so later commands can say `--name <NAME>` instead of pasting the endpoint/agent-token/microvm-id triple",
+            "name": "vm-name",
+            "positional": false,
+            "required": false,
+            "type": "string"
+          },
+          {
+            "choices": null,
+            "default": "300",
+            "help": "How long to wait for the exec, in seconds",
+            "name": "timeout",
+            "positional": false,
+            "required": false,
+            "type": "string"
+          },
+          {
+            "choices": null,
+            "default": "600",
+            "help": "Suspend the VM after this much inbound-traffic idleness",
+            "name": "max-idle-sec",
+            "positional": false,
+            "required": false,
+            "type": "string"
+          },
+          {
+            "choices": null,
+            "default": "600",
+            "help": "Terminate the VM after this long suspended. A resume past it cannot work",
+            "name": "suspended-sec",
+            "positional": false,
+            "required": false,
+            "type": "string"
+          },
+          {
+            "choices": null,
+            "default": null,
+            "help": "Let the platform resume a suspended VM on an incoming request",
+            "name": "auto-resume",
+            "positional": false,
+            "required": false,
+            "type": "boolean"
+          },
+          {
+            "choices": null,
+            "default": "3600",
+            "help": "Hard ceiling on the VM's life. Refused above 28800 (eight hours) before any call",
+            "name": "max-duration-sec",
+            "positional": false,
+            "required": false,
+            "type": "string"
+          },
+          {
+            "choices": null,
+            "default": null,
+            "help": "The daemon's port inside the guest",
+            "name": "port",
+            "positional": false,
+            "required": false,
+            "type": "string"
+          },
+          {
+            "choices": null,
+            "default": null,
+            "help": "Where the run ledger is written. Defaults to $MICROVM_STATE_DIR or ~/.microvm/runs",
+            "name": "state-dir",
+            "positional": false,
+            "required": false,
+            "type": "path"
+          },
+          {
+            "choices": null,
+            "default": null,
+            "help": "Read this project config file instead of ./microvm.toml",
+            "name": "config",
+            "positional": false,
+            "required": false,
+            "type": "path"
+          },
+          {
+            "choices": null,
+            "default": null,
+            "help": "Ignore any microvm.toml, even a malformed one. Flags and defaults apply",
+            "name": "no-config",
+            "positional": false,
+            "required": false,
+            "type": "boolean"
+          },
+          {
+            "choices": [
+              "us-east-1",
+              "us-east-2",
+              "us-west-2",
+              "eu-west-1",
+              "ap-northeast-1"
+            ],
+            "default": null,
+            "help": "AWS region. Defaults to $AWS_REGION, then $AWS_DEFAULT_REGION, then us-east-1",
+            "name": "region",
+            "positional": false,
+            "required": false,
+            "type": "enum"
+          },
+          {
+            "choices": null,
+            "default": null,
+            "help": "Use a region this client has not seen carry MicroVMs. Costs you the diagnostic",
+            "name": "unlisted-region",
+            "positional": false,
+            "required": false,
+            "type": "string"
+          },
+          {
+            "choices": null,
+            "default": null,
+            "help": "S3 bucket for the build artifact. Defaults to $MICROVM_BUCKET",
+            "name": "bucket",
+            "positional": false,
+            "required": false,
+            "type": "string"
+          },
+          {
+            "choices": null,
+            "default": null,
+            "help": "Build role ARN. Defaults to $MICROVM_BUILD_ROLE_ARN",
+            "name": "build-role-arn",
+            "positional": false,
+            "required": false,
+            "type": "string"
+          },
+          {
+            "choices": null,
+            "default": null,
+            "help": "Execution role ARN. Defaults to $MICROVM_EXECUTION_ROLE_ARN",
+            "name": "execution-role-arn",
+            "positional": false,
+            "required": false,
+            "type": "string"
+          }
+        ],
+        "responseKeys": [
+          "imageIdentifier",
+          "imageName",
+          "microvmId",
+          "endpoint",
+          "agentToken",
+          "execExitCode",
+          "stdout",
+          "stderr",
+          "truncated",
+          "buildSeconds",
+          "runningSeconds",
+          "kept",
+          "vmName",
+          "leaked",
+          "cost",
+          "resolvedConfig",
+          "configPath",
+          "sync",
+          "agentd"
+        ],
+        "responseType": "microvm.run",
+        "summary": "Build an image, launch a VM, run a command, report the cost, tear it down",
+        "supportsJson": true
+      },
+      {
+        "alternateResponse": null,
+        "name": "quickstart",
+        "parameters": [
+          {
+            "choices": null,
+            "default": "echo hello from a microvm",
+            "help": "The command to run inside the first VM",
+            "name": "exec",
+            "positional": false,
+            "required": false,
+            "type": "string"
+          },
+          {
+            "choices": null,
+            "default": null,
+            "help": "Where the run ledger and the provisioned-daemon cache live. Defaults to $MICROVM_STATE_DIR or ~/.microvm/runs",
+            "name": "state-dir",
+            "positional": false,
+            "required": false,
+            "type": "path"
+          },
+          {
+            "choices": [
+              "us-east-1",
+              "us-east-2",
+              "us-west-2",
+              "eu-west-1",
+              "ap-northeast-1"
+            ],
+            "default": null,
+            "help": "AWS region. Defaults to $AWS_REGION, then $AWS_DEFAULT_REGION, then us-east-1",
+            "name": "region",
+            "positional": false,
+            "required": false,
+            "type": "enum"
+          },
+          {
+            "choices": null,
+            "default": null,
+            "help": "Use a region this client has not seen carry MicroVMs. Costs you the diagnostic",
+            "name": "unlisted-region",
+            "positional": false,
+            "required": false,
+            "type": "string"
+          },
+          {
+            "choices": null,
+            "default": null,
+            "help": "S3 bucket for the build artifact. Defaults to $MICROVM_BUCKET",
+            "name": "bucket",
+            "positional": false,
+            "required": false,
+            "type": "string"
+          },
+          {
+            "choices": null,
+            "default": null,
+            "help": "Build role ARN. Defaults to $MICROVM_BUILD_ROLE_ARN",
+            "name": "build-role-arn",
+            "positional": false,
+            "required": false,
+            "type": "string"
+          },
+          {
+            "choices": null,
+            "default": null,
+            "help": "Execution role ARN. Defaults to $MICROVM_EXECUTION_ROLE_ARN",
+            "name": "execution-role-arn",
+            "positional": false,
+            "required": false,
+            "type": "string"
+          }
+        ],
+        "responseKeys": [
+          "imageIdentifier",
+          "imageName",
+          "microvmId",
+          "endpoint",
+          "agentToken",
+          "execExitCode",
+          "stdout",
+          "stderr",
+          "truncated",
+          "buildSeconds",
+          "runningSeconds",
+          "kept",
+          "vmName",
+          "leaked",
+          "cost",
+          "resolvedConfig",
+          "configPath",
+          "sync",
+          "agentd"
+        ],
+        "responseType": "microvm.run",
+        "summary": "Zero to a live exec: provision the daemon, build, launch, run, report, tear down",
+        "supportsJson": true
+      },
+      {
+        "alternateResponse": null,
+        "name": "build",
+        "parameters": [
+          {
+            "choices": null,
+            "default": null,
+            "help": "The aarch64 agentd binary to bake in as the image CMD",
+            "name": "binary",
+            "positional": true,
+            "required": false,
+            "type": "path"
+          },
+          {
+            "choices": null,
+            "default": null,
+            "help": "Where the provisioned-daemon cache lives. Defaults to $MICROVM_STATE_DIR or ~/.microvm/runs — the same directory `run`'s ledger uses, so the two commands share one cache",
+            "name": "state-dir",
+            "positional": false,
+            "required": false,
+            "type": "path"
+          },
+          {
+            "choices": null,
+            "default": null,
+            "help": "Where the build artifact already is, as an s3:// URI. See `run --artifact-uri`",
+            "name": "artifact-uri",
+            "positional": false,
+            "required": false,
+            "type": "string"
+          },
+          {
+            "choices": null,
+            "default": null,
+            "help": "Image name. Defaults to a per-invocation name",
+            "name": "name",
+            "positional": false,
+            "required": false,
+            "type": "string"
+          },
+          {
+            "choices": [
+              "512",
+              "1024",
+              "2048",
+              "4096",
+              "8192"
+            ],
+            "default": "2048",
+            "help": "Baseline MiB, selecting a documented size class",
+            "name": "memory",
+            "positional": false,
+            "required": false,
+            "type": "enum"
+          },
+          {
+            "choices": null,
+            "default": null,
+            "help": "A Dockerfile to use instead of the library's default",
+            "name": "dockerfile",
+            "positional": false,
+            "required": false,
+            "type": "path"
+          },
+          {
+            "choices": null,
+            "default": null,
+            "help": "A project directory whose dependency files bake an environment layer into the image (#74)",
+            "name": "project",
+            "positional": false,
+            "required": false,
+            "type": "path"
+          },
+          {
+            "choices": null,
+            "default": null,
+            "help": "Pin the managed base image to one version instead of taking the service's default",
+            "name": "base-image-version",
+            "positional": false,
+            "required": false,
+            "type": "string"
+          },
+          {
+            "choices": null,
+            "default": null,
+            "help": "CloudWatch log group for the build's logs, instead of the service-created `/aws/lambda-microvms/<image-name>`. See `run --log-group`",
+            "name": "log-group",
+            "positional": false,
+            "required": false,
+            "type": "string"
+          },
+          {
+            "choices": null,
+            "default": null,
+            "help": "Log stream name prefix inside --log-group. The client appends `/<16 hex>` per build attempt and the envelope reports the resolved exact name as `logStream`. See `run --log-stream`. Requires --log-group — `build` reads no config file, so the flag is the only place a group can come from",
+            "name": "log-stream",
+            "positional": false,
+            "required": false,
+            "type": "string"
+          },
+          {
+            "choices": null,
+            "default": null,
+            "help": "Widen the guest so `sethostname` and the boot_id bind mount work",
+            "name": "repair-identity",
+            "positional": false,
+            "required": false,
+            "type": "boolean"
+          },
+          {
+            "choices": null,
+            "default": null,
+            "help": "Reuse an existing image whose build inputs match, instead of building",
+            "name": "reuse",
+            "positional": false,
+            "required": false,
+            "type": "boolean"
+          },
+          {
+            "choices": null,
+            "default": null,
+            "help": "The daemon's port inside the guest",
+            "name": "port",
+            "positional": false,
+            "required": false,
+            "type": "string"
+          },
+          {
+            "choices": [
+              "us-east-1",
+              "us-east-2",
+              "us-west-2",
+              "eu-west-1",
+              "ap-northeast-1"
+            ],
+            "default": null,
+            "help": "AWS region. Defaults to $AWS_REGION, then $AWS_DEFAULT_REGION, then us-east-1",
+            "name": "region",
+            "positional": false,
+            "required": false,
+            "type": "enum"
+          },
+          {
+            "choices": null,
+            "default": null,
+            "help": "Use a region this client has not seen carry MicroVMs. Costs you the diagnostic",
+            "name": "unlisted-region",
+            "positional": false,
+            "required": false,
+            "type": "string"
+          },
+          {
+            "choices": null,
+            "default": null,
+            "help": "S3 bucket for the build artifact. Defaults to $MICROVM_BUCKET",
+            "name": "bucket",
+            "positional": false,
+            "required": false,
+            "type": "string"
+          },
+          {
+            "choices": null,
+            "default": null,
+            "help": "Build role ARN. Defaults to $MICROVM_BUILD_ROLE_ARN",
+            "name": "build-role-arn",
+            "positional": false,
+            "required": false,
+            "type": "string"
+          },
+          {
+            "choices": null,
+            "default": null,
+            "help": "Execution role ARN. Defaults to $MICROVM_EXECUTION_ROLE_ARN",
+            "name": "execution-role-arn",
+            "positional": false,
+            "required": false,
+            "type": "string"
+          }
+        ],
+        "responseKeys": [
+          "imageIdentifier",
+          "imageName",
+          "buildLogGroup",
+          "logStream",
+          "size",
+          "reused",
+          "agentd"
+        ],
+        "responseType": "microvm.image",
+        "summary": "Build a MicroVM image and wait for it to be usable",
+        "supportsJson": true
+      },
+      {
+        "alternateResponse": {
+          "responseKeys": [
+            "execId",
+            "events",
+            "bytes",
+            "nextOffset",
+            "exitCode",
+            "truncated",
+            "gaps"
+          ],
+          "responseType": "microvm.exec.stream",
+          "stdout": "ndjson — one event object per line, then this envelope as the final line. The documented exception to the one-envelope rule: stream chunks are the command's output, not progress, so they cannot go on stderr.",
+          "when": "--stream"
+        },
+        "name": "exec",
+        "parameters": [
+          {
+            "choices": null,
+            "default": null,
+            "help": "A shell command to run in the VM. Omitted only with --poll",
+            "name": "command",
+            "positional": true,
+            "required": false,
+            "type": "string"
+          },
+          {
+            "choices": null,
+            "default": "300",
+            "help": "How long to wait for the command, in seconds",
+            "name": "timeout",
+            "positional": false,
+            "required": false,
+            "type": "string"
+          },
+          {
+            "choices": null,
+            "default": null,
+            "help": "Working directory",
+            "name": "cwd",
+            "positional": false,
+            "required": false,
+            "type": "string"
+          },
+          {
+            "choices": null,
+            "default": null,
+            "help": "Set one environment variable for the command, as KEY=VALUE. Repeatable",
+            "name": "env",
+            "positional": false,
+            "required": false,
+            "type": "string"
+          },
+          {
+            "choices": null,
+            "default": null,
+            "help": "Numeric uid to run the command as. Omitted runs as the daemon's own user",
+            "name": "user",
+            "positional": false,
+            "required": false,
+            "type": "string"
+          },
+          {
+            "choices": null,
+            "default": null,
+            "help": "Numeric gid to run the command as. Omitted keeps the daemon's own group",
+            "name": "group",
+            "positional": false,
+            "required": false,
+            "type": "string"
+          },
+          {
+            "choices": null,
+            "default": null,
+            "help": "Use this exec id instead of a fresh one, making a retry idempotent",
+            "name": "exec-id",
+            "positional": false,
+            "required": false,
+            "type": "string"
+          },
+          {
+            "choices": null,
+            "default": null,
+            "help": "Read an existing exec's status and output instead of starting anything",
+            "name": "poll",
+            "positional": false,
+            "required": false,
+            "type": "string"
+          },
+          {
+            "choices": null,
+            "default": null,
+            "help": "Start the command and return immediately, without waiting and **without acking**",
+            "name": "detach",
+            "positional": false,
+            "required": false,
+            "type": "boolean"
+          },
+          {
+            "choices": null,
+            "default": null,
+            "help": "Stream output as it arrives rather than waiting for the whole thing",
+            "name": "stream",
+            "positional": false,
+            "required": false,
+            "type": "boolean"
+          },
+          {
+            "choices": null,
+            "default": null,
+            "help": "Resume a stream at this byte offset. Only with --stream",
+            "name": "from-offset",
+            "positional": false,
+            "required": false,
+            "type": "string"
+          },
+          {
+            "choices": null,
+            "default": null,
+            "help": "Give the command a stdin pipe and feed it this process's stdin, then close it",
+            "name": "stdin",
+            "positional": false,
+            "required": false,
+            "type": "boolean"
+          },
+          {
+            "choices": null,
+            "default": null,
+            "help": "The VM's endpoint, as reported by `run`",
+            "name": "endpoint",
+            "positional": false,
+            "required": false,
+            "type": "string"
+          },
+          {
+            "choices": null,
+            "default": null,
+            "help": "The agent token delivered to the VM at launch",
+            "name": "agent-token",
+            "positional": false,
+            "required": false,
+            "type": "string"
+          },
+          {
+            "choices": null,
+            "default": null,
+            "help": "The MicroVM id, needed to mint the endpoint proxy token",
+            "name": "microvm-id",
+            "positional": false,
+            "required": false,
+            "type": "string"
+          },
+          {
+            "choices": null,
+            "default": null,
+            "help": "The name `run --keep --vm-name` registered, standing in for the whole triple",
+            "name": "name",
+            "positional": false,
+            "required": false,
+            "type": "string"
+          },
+          {
+            "choices": null,
+            "default": null,
+            "help": "The daemon's port inside the guest",
+            "name": "port",
+            "positional": false,
+            "required": false,
+            "type": "string"
+          },
+          {
+            "choices": null,
+            "default": null,
+            "help": "Where the local state lives — the name registry, and exec's per-VM history. Defaults to $MICROVM_STATE_DIR or ~/.microvm/runs",
+            "name": "state-dir",
+            "positional": false,
+            "required": false,
+            "type": "path"
+          },
+          {
+            "choices": [
+              "us-east-1",
+              "us-east-2",
+              "us-west-2",
+              "eu-west-1",
+              "ap-northeast-1"
+            ],
+            "default": null,
+            "help": "AWS region. Defaults to $AWS_REGION, then $AWS_DEFAULT_REGION, then us-east-1",
+            "name": "region",
+            "positional": false,
+            "required": false,
+            "type": "enum"
+          },
+          {
+            "choices": null,
+            "default": null,
+            "help": "Use a region this client has not seen carry MicroVMs. Costs you the diagnostic",
+            "name": "unlisted-region",
+            "positional": false,
+            "required": false,
+            "type": "string"
+          }
+        ],
+        "responseKeys": [
+          "execId",
+          "exitCode",
+          "stdout",
+          "stderr",
+          "truncated",
+          "phase"
+        ],
+        "responseType": "microvm.exec",
+        "summary": "Run one command in a MicroVM that is already running",
+        "supportsJson": true
+      },
+      {
+        "alternateResponse": null,
+        "name": "health",
+        "parameters": [
+          {
+            "choices": null,
+            "default": null,
+            "help": "The VM's endpoint, as reported by `run`",
+            "name": "endpoint",
+            "positional": false,
+            "required": false,
+            "type": "string"
+          },
+          {
+            "choices": null,
+            "default": null,
+            "help": "The agent token delivered to the VM at launch",
+            "name": "agent-token",
+            "positional": false,
+            "required": false,
+            "type": "string"
+          },
+          {
+            "choices": null,
+            "default": null,
+            "help": "The MicroVM id, needed to mint the endpoint proxy token",
+            "name": "microvm-id",
+            "positional": false,
+            "required": false,
+            "type": "string"
+          },
+          {
+            "choices": null,
+            "default": null,
+            "help": "The name `run --keep --vm-name` registered, standing in for the whole triple",
+            "name": "name",
+            "positional": false,
+            "required": false,
+            "type": "string"
+          },
+          {
+            "choices": null,
+            "default": null,
+            "help": "The daemon's port inside the guest",
+            "name": "port",
+            "positional": false,
+            "required": false,
+            "type": "string"
+          },
+          {
+            "choices": null,
+            "default": null,
+            "help": "Where the local state lives — the name registry, and exec's per-VM history. Defaults to $MICROVM_STATE_DIR or ~/.microvm/runs",
+            "name": "state-dir",
+            "positional": false,
+            "required": false,
+            "type": "path"
+          },
+          {
+            "choices": [
+              "us-east-1",
+              "us-east-2",
+              "us-west-2",
+              "eu-west-1",
+              "ap-northeast-1"
+            ],
+            "default": null,
+            "help": "AWS region. Defaults to $AWS_REGION, then $AWS_DEFAULT_REGION, then us-east-1",
+            "name": "region",
+            "positional": false,
+            "required": false,
+            "type": "enum"
+          },
+          {
+            "choices": null,
+            "default": null,
+            "help": "Use a region this client has not seen carry MicroVMs. Costs you the diagnostic",
+            "name": "unlisted-region",
+            "positional": false,
+            "required": false,
+            "type": "string"
+          }
+        ],
+        "responseKeys": [
+          "version",
+          "bootstrapped",
+          "identityDegraded",
+          "identityRepaired",
+          "diskAvailableBytes",
+          "diskUnderPressure",
+          "busy",
+          "execs",
+          "hooks",
+          "hooksDropped"
+        ],
+        "responseType": "microvm.health",
+        "summary": "Ask a running MicroVM's daemon whether it is up, and what its identity repair did",
+        "supportsJson": true
+      },
+      {
+        "alternateResponse": null,
+        "name": "ack",
+        "parameters": [
+          {
+            "choices": null,
+            "default": null,
+            "help": "The exec whose output to release",
+            "name": "exec_id",
+            "positional": true,
+            "required": true,
+            "type": "string"
+          },
+          {
+            "choices": null,
+            "default": null,
+            "help": "The VM's endpoint, as reported by `run`",
+            "name": "endpoint",
+            "positional": false,
+            "required": false,
+            "type": "string"
+          },
+          {
+            "choices": null,
+            "default": null,
+            "help": "The agent token delivered to the VM at launch",
+            "name": "agent-token",
+            "positional": false,
+            "required": false,
+            "type": "string"
+          },
+          {
+            "choices": null,
+            "default": null,
+            "help": "The MicroVM id, needed to mint the endpoint proxy token",
+            "name": "microvm-id",
+            "positional": false,
+            "required": false,
+            "type": "string"
+          },
+          {
+            "choices": null,
+            "default": null,
+            "help": "The name `run --keep --vm-name` registered, standing in for the whole triple",
+            "name": "name",
+            "positional": false,
+            "required": false,
+            "type": "string"
+          },
+          {
+            "choices": null,
+            "default": null,
+            "help": "The daemon's port inside the guest",
+            "name": "port",
+            "positional": false,
+            "required": false,
+            "type": "string"
+          },
+          {
+            "choices": null,
+            "default": null,
+            "help": "Where the local state lives — the name registry, and exec's per-VM history. Defaults to $MICROVM_STATE_DIR or ~/.microvm/runs",
+            "name": "state-dir",
+            "positional": false,
+            "required": false,
+            "type": "path"
+          },
+          {
+            "choices": [
+              "us-east-1",
+              "us-east-2",
+              "us-west-2",
+              "eu-west-1",
+              "ap-northeast-1"
+            ],
+            "default": null,
+            "help": "AWS region. Defaults to $AWS_REGION, then $AWS_DEFAULT_REGION, then us-east-1",
+            "name": "region",
+            "positional": false,
+            "required": false,
+            "type": "enum"
+          },
+          {
+            "choices": null,
+            "default": null,
+            "help": "Use a region this client has not seen carry MicroVMs. Costs you the diagnostic",
+            "name": "unlisted-region",
+            "positional": false,
+            "required": false,
+            "type": "string"
+          }
+        ],
+        "responseKeys": [
+          "execId",
+          "phase",
+          "exitCode",
+          "stdout",
+          "stderr",
+          "truncated"
+        ],
+        "responseType": "microvm.exec",
+        "summary": "Release a finished exec's buffered output, which starts its collection clock",
+        "supportsJson": true
+      },
+      {
+        "alternateResponse": null,
+        "name": "stdin",
+        "parameters": [
+          {
+            "choices": null,
+            "default": null,
+            "help": "The exec to write to. Must have been started with `exec --stdin`",
+            "name": "exec_id",
+            "positional": true,
+            "required": true,
+            "type": "string"
+          },
+          {
+            "choices": null,
+            "default": null,
+            "help": "What to write. `-` reads this process's stdin; omitted writes nothing",
+            "name": "data",
+            "positional": false,
+            "required": false,
+            "type": "string"
+          },
+          {
+            "choices": null,
+            "default": null,
+            "help": "Close stdin after any --data is written",
+            "name": "eof",
+            "positional": false,
+            "required": false,
+            "type": "boolean"
+          },
+          {
+            "choices": null,
+            "default": null,
+            "help": "The VM's endpoint, as reported by `run`",
+            "name": "endpoint",
+            "positional": false,
+            "required": false,
+            "type": "string"
+          },
+          {
+            "choices": null,
+            "default": null,
+            "help": "The agent token delivered to the VM at launch",
+            "name": "agent-token",
+            "positional": false,
+            "required": false,
+            "type": "string"
+          },
+          {
+            "choices": null,
+            "default": null,
+            "help": "The MicroVM id, needed to mint the endpoint proxy token",
+            "name": "microvm-id",
+            "positional": false,
+            "required": false,
+            "type": "string"
+          },
+          {
+            "choices": null,
+            "default": null,
+            "help": "The name `run --keep --vm-name` registered, standing in for the whole triple",
+            "name": "name",
+            "positional": false,
+            "required": false,
+            "type": "string"
+          },
+          {
+            "choices": null,
+            "default": null,
+            "help": "The daemon's port inside the guest",
+            "name": "port",
+            "positional": false,
+            "required": false,
+            "type": "string"
+          },
+          {
+            "choices": null,
+            "default": null,
+            "help": "Where the local state lives — the name registry, and exec's per-VM history. Defaults to $MICROVM_STATE_DIR or ~/.microvm/runs",
+            "name": "state-dir",
+            "positional": false,
+            "required": false,
+            "type": "path"
+          },
+          {
+            "choices": [
+              "us-east-1",
+              "us-east-2",
+              "us-west-2",
+              "eu-west-1",
+              "ap-northeast-1"
+            ],
+            "default": null,
+            "help": "AWS region. Defaults to $AWS_REGION, then $AWS_DEFAULT_REGION, then us-east-1",
+            "name": "region",
+            "positional": false,
+            "required": false,
+            "type": "enum"
+          },
+          {
+            "choices": null,
+            "default": null,
+            "help": "Use a region this client has not seen carry MicroVMs. Costs you the diagnostic",
+            "name": "unlisted-region",
+            "positional": false,
+            "required": false,
+            "type": "string"
+          }
+        ],
+        "responseKeys": [
+          "execId",
+          "written",
+          "eof"
+        ],
+        "responseType": "microvm.stdin",
+        "summary": "Write to a running exec's stdin, and optionally close it",
+        "supportsJson": true
+      },
+      {
+        "alternateResponse": null,
+        "name": "cp",
+        "parameters": [
+          {
+            "choices": null,
+            "default": null,
+            "help": "Source. `vm:/path` reads from the VM, anything else is a local path",
+            "name": "src",
+            "positional": true,
+            "required": true,
+            "type": "string"
+          },
+          {
+            "choices": null,
+            "default": null,
+            "help": "Destination. `vm:/path` writes to the VM, anything else is a local path",
+            "name": "dst",
+            "positional": true,
+            "required": true,
+            "type": "string"
+          },
+          {
+            "choices": null,
+            "default": null,
+            "help": "Move a whole directory tree, as an uncompressed tar archive",
+            "name": "tar",
+            "positional": false,
+            "required": false,
+            "type": "boolean"
+          },
+          {
+            "choices": null,
+            "default": null,
+            "help": "Permissions for an uploaded file, octal as a string (`644`, `0755`)",
+            "name": "mode",
+            "positional": false,
+            "required": false,
+            "type": "string"
+          },
+          {
+            "choices": null,
+            "default": null,
+            "help": "The VM's endpoint, as reported by `run`",
+            "name": "endpoint",
+            "positional": false,
+            "required": false,
+            "type": "string"
+          },
+          {
+            "choices": null,
+            "default": null,
+            "help": "The agent token delivered to the VM at launch",
+            "name": "agent-token",
+            "positional": false,
+            "required": false,
+            "type": "string"
+          },
+          {
+            "choices": null,
+            "default": null,
+            "help": "The MicroVM id, needed to mint the endpoint proxy token",
+            "name": "microvm-id",
+            "positional": false,
+            "required": false,
+            "type": "string"
+          },
+          {
+            "choices": null,
+            "default": null,
+            "help": "The name `run --keep --vm-name` registered, standing in for the whole triple",
+            "name": "name",
+            "positional": false,
+            "required": false,
+            "type": "string"
+          },
+          {
+            "choices": null,
+            "default": null,
+            "help": "The daemon's port inside the guest",
+            "name": "port",
+            "positional": false,
+            "required": false,
+            "type": "string"
+          },
+          {
+            "choices": null,
+            "default": null,
+            "help": "Where the local state lives — the name registry, and exec's per-VM history. Defaults to $MICROVM_STATE_DIR or ~/.microvm/runs",
+            "name": "state-dir",
+            "positional": false,
+            "required": false,
+            "type": "path"
+          },
+          {
+            "choices": [
+              "us-east-1",
+              "us-east-2",
+              "us-west-2",
+              "eu-west-1",
+              "ap-northeast-1"
+            ],
+            "default": null,
+            "help": "AWS region. Defaults to $AWS_REGION, then $AWS_DEFAULT_REGION, then us-east-1",
+            "name": "region",
+            "positional": false,
+            "required": false,
+            "type": "enum"
+          },
+          {
+            "choices": null,
+            "default": null,
+            "help": "Use a region this client has not seen carry MicroVMs. Costs you the diagnostic",
+            "name": "unlisted-region",
+            "positional": false,
+            "required": false,
+            "type": "string"
+          }
+        ],
+        "responseKeys": [
+          "direction",
+          "bytes",
+          "local",
+          "remote",
+          "tar"
+        ],
+        "responseType": "microvm.copy",
+        "summary": "Copy a file or a tar archive between here and a running MicroVM",
+        "supportsJson": true
+      },
+      {
+        "alternateResponse": null,
+        "name": "sync",
+        "parameters": [
+          {
+            "choices": null,
+            "default": null,
+            "help": "The project directory to sync. Packed with `run <DIR>`'s rules: `.git`, `target`, `node_modules` and `.venv` stay home, symlinks travel as links, and the daemon's body and member budgets are enforced during the walk",
+            "name": "dir",
+            "positional": true,
+            "required": true,
+            "type": "path"
+          },
+          {
+            "choices": null,
+            "default": null,
+            "help": "Keep syncing on filesystem changes until Ctrl-C",
+            "name": "watch",
+            "positional": false,
+            "required": false,
+            "type": "boolean"
+          },
+          {
+            "choices": null,
+            "default": null,
+            "help": "Upload the whole tree even when the guest manifest claims members are unchanged",
+            "name": "full",
+            "positional": false,
+            "required": false,
+            "type": "boolean"
+          },
+          {
+            "choices": null,
+            "default": "60",
+            "help": "How long the in-guest deletion of locally-removed paths may take, in seconds",
+            "name": "timeout",
+            "positional": false,
+            "required": false,
+            "type": "string"
+          },
+          {
+            "choices": null,
+            "default": null,
+            "help": "The VM's endpoint, as reported by `run`",
+            "name": "endpoint",
+            "positional": false,
+            "required": false,
+            "type": "string"
+          },
+          {
+            "choices": null,
+            "default": null,
+            "help": "The agent token delivered to the VM at launch",
+            "name": "agent-token",
+            "positional": false,
+            "required": false,
+            "type": "string"
+          },
+          {
+            "choices": null,
+            "default": null,
+            "help": "The MicroVM id, needed to mint the endpoint proxy token",
+            "name": "microvm-id",
+            "positional": false,
+            "required": false,
+            "type": "string"
+          },
+          {
+            "choices": null,
+            "default": null,
+            "help": "The name `run --keep --vm-name` registered, standing in for the whole triple",
+            "name": "name",
+            "positional": false,
+            "required": false,
+            "type": "string"
+          },
+          {
+            "choices": null,
+            "default": null,
+            "help": "The daemon's port inside the guest",
+            "name": "port",
+            "positional": false,
+            "required": false,
+            "type": "string"
+          },
+          {
+            "choices": null,
+            "default": null,
+            "help": "Where the local state lives — the name registry, and exec's per-VM history. Defaults to $MICROVM_STATE_DIR or ~/.microvm/runs",
+            "name": "state-dir",
+            "positional": false,
+            "required": false,
+            "type": "path"
+          },
+          {
+            "choices": [
+              "us-east-1",
+              "us-east-2",
+              "us-west-2",
+              "eu-west-1",
+              "ap-northeast-1"
+            ],
+            "default": null,
+            "help": "AWS region. Defaults to $AWS_REGION, then $AWS_DEFAULT_REGION, then us-east-1",
+            "name": "region",
+            "positional": false,
+            "required": false,
+            "type": "enum"
+          },
+          {
+            "choices": null,
+            "default": null,
+            "help": "Use a region this client has not seen carry MicroVMs. Costs you the diagnostic",
+            "name": "unlisted-region",
+            "positional": false,
+            "required": false,
+            "type": "string"
+          }
+        ],
+        "responseKeys": [
+          "microvmId",
+          "workdir",
+          "uploadedBytes",
+          "uploadedMembers",
+          "deleted",
+          "full",
+          "unchanged",
+          "passes",
+          "watched"
+        ],
+        "responseType": "microvm.sync",
+        "summary": "Sync a project directory into a running MicroVM's /workspace, uploading only what changed",
+        "supportsJson": true
+      },
+      {
+        "alternateResponse": null,
+        "name": "attach",
+        "parameters": [
+          {
+            "choices": null,
+            "default": null,
+            "help": "A name record as the registry writes it (`<state-dir>/names/<name>.json`), or `-` for stdin",
+            "name": "from",
+            "positional": false,
+            "required": false,
+            "type": "path"
+          },
+          {
+            "choices": null,
+            "default": null,
+            "help": "The name to register. Required with the explicit triple; renames a `--from` record",
+            "name": "name",
+            "positional": false,
+            "required": false,
+            "type": "string"
+          },
+          {
+            "choices": null,
+            "default": null,
+            "help": "The VM's endpoint, as reported by `run` on the machine that launched it",
+            "name": "endpoint",
+            "positional": false,
+            "required": false,
+            "type": "string"
+          },
+          {
+            "choices": null,
+            "default": null,
+            "help": "The agent token delivered to the VM at launch. Never echoed in the envelope",
+            "name": "agent-token",
+            "positional": false,
+            "required": false,
+            "type": "string"
+          },
+          {
+            "choices": null,
+            "default": null,
+            "help": "The MicroVM id, needed to mint the endpoint proxy token",
+            "name": "microvm-id",
+            "positional": false,
+            "required": false,
+            "type": "string"
+          },
+          {
+            "choices": null,
+            "default": null,
+            "help": "The launching host's identity secret, base64, from `run --identity`'s envelope",
+            "name": "identity-host-seed",
+            "positional": false,
+            "required": false,
+            "type": "string"
+          },
+          {
+            "choices": null,
+            "default": null,
+            "help": "The VM's public key, base64, from `run --identity`'s envelope. The pin",
+            "name": "identity-vm-public-key",
+            "positional": false,
+            "required": false,
+            "type": "string"
+          },
+          {
+            "choices": null,
+            "default": null,
+            "help": "Prove the far end is the VM the record was created for, before writing anything",
+            "name": "verify-identity",
+            "positional": false,
+            "required": false,
+            "type": "boolean"
+          },
+          {
+            "choices": null,
+            "default": null,
+            "help": "The daemon's port inside the guest, for the probe. Not recorded",
+            "name": "port",
+            "positional": false,
+            "required": false,
+            "type": "string"
+          },
+          {
+            "choices": null,
+            "default": null,
+            "help": "Where the local state lives — the registry this record is written into. Defaults to $MICROVM_STATE_DIR or ~/.microvm/runs",
+            "name": "state-dir",
+            "positional": false,
+            "required": false,
+            "type": "path"
+          },
+          {
+            "choices": [
+              "us-east-1",
+              "us-east-2",
+              "us-west-2",
+              "eu-west-1",
+              "ap-northeast-1"
+            ],
+            "default": null,
+            "help": "AWS region. Defaults to $AWS_REGION, then $AWS_DEFAULT_REGION, then us-east-1",
+            "name": "region",
+            "positional": false,
+            "required": false,
+            "type": "enum"
+          },
+          {
+            "choices": null,
+            "default": null,
+            "help": "Use a region this client has not seen carry MicroVMs. Costs you the diagnostic",
+            "name": "unlisted-region",
+            "positional": false,
+            "required": false,
+            "type": "string"
+          }
+        ],
+        "responseKeys": [
+          "name",
+          "microvmId",
+          "endpoint",
+          "region",
+          "verifiedIdentity",
+          "replaced",
+          "statePath"
+        ],
+        "responseType": "microvm.attach",
+        "summary": "Register a name for a running MicroVM this state directory did not launch",
+        "supportsJson": true
+      },
+      {
+        "alternateResponse": null,
+        "name": "tunnel",
+        "parameters": [
+          {
+            "choices": null,
+            "default": null,
+            "help": "The ports, as `LOCAL[:GUEST]`. A single number uses it on both sides",
+            "name": "ports",
+            "positional": true,
+            "required": true,
+            "type": "string"
+          },
+          {
+            "choices": null,
+            "default": "127.0.0.1",
+            "help": "The local address to bind. Loopback by default, deliberately",
+            "name": "bind",
+            "positional": false,
+            "required": false,
+            "type": "string"
+          },
+          {
+            "choices": null,
+            "default": null,
+            "help": "Stop after this many connections, instead of running until Ctrl-C",
+            "name": "max-connections",
+            "positional": false,
+            "required": false,
+            "type": "string"
+          },
+          {
+            "choices": null,
+            "default": null,
+            "help": "Prove the far end is the VM this record was created for, before relaying a byte",
+            "name": "verify-identity",
+            "positional": false,
+            "required": false,
+            "type": "boolean"
+          },
+          {
+            "choices": null,
+            "default": null,
+            "help": "The launching host's identity secret, base64, from `run --identity`'s envelope",
+            "name": "identity-host-seed",
+            "positional": false,
+            "required": false,
+            "type": "string"
+          },
+          {
+            "choices": null,
+            "default": null,
+            "help": "The VM's public key, base64, from `run --identity`'s envelope. The pin",
+            "name": "identity-vm-public-key",
+            "positional": false,
+            "required": false,
+            "type": "string"
+          },
+          {
+            "choices": null,
+            "default": null,
+            "help": "The VM's endpoint, as reported by `run`",
+            "name": "endpoint",
+            "positional": false,
+            "required": false,
+            "type": "string"
+          },
+          {
+            "choices": null,
+            "default": null,
+            "help": "The agent token delivered to the VM at launch",
+            "name": "agent-token",
+            "positional": false,
+            "required": false,
+            "type": "string"
+          },
+          {
+            "choices": null,
+            "default": null,
+            "help": "The MicroVM id, needed to mint the endpoint proxy token",
+            "name": "microvm-id",
+            "positional": false,
+            "required": false,
+            "type": "string"
+          },
+          {
+            "choices": null,
+            "default": null,
+            "help": "The name `run --keep --vm-name` registered, standing in for the whole triple",
+            "name": "name",
+            "positional": false,
+            "required": false,
+            "type": "string"
+          },
+          {
+            "choices": null,
+            "default": null,
+            "help": "The daemon's port inside the guest",
+            "name": "port",
+            "positional": false,
+            "required": false,
+            "type": "string"
+          },
+          {
+            "choices": null,
+            "default": null,
+            "help": "Where the local state lives — the name registry, and exec's per-VM history. Defaults to $MICROVM_STATE_DIR or ~/.microvm/runs",
+            "name": "state-dir",
+            "positional": false,
+            "required": false,
+            "type": "path"
+          },
+          {
+            "choices": [
+              "us-east-1",
+              "us-east-2",
+              "us-west-2",
+              "eu-west-1",
+              "ap-northeast-1"
+            ],
+            "default": null,
+            "help": "AWS region. Defaults to $AWS_REGION, then $AWS_DEFAULT_REGION, then us-east-1",
+            "name": "region",
+            "positional": false,
+            "required": false,
+            "type": "enum"
+          },
+          {
+            "choices": null,
+            "default": null,
+            "help": "Use a region this client has not seen carry MicroVMs. Costs you the diagnostic",
+            "name": "unlisted-region",
+            "positional": false,
+            "required": false,
+            "type": "string"
+          }
+        ],
+        "responseKeys": [
+          "microvmId",
+          "localPort",
+          "localAddress",
+          "guestPort",
+          "connectionsServed",
+          "connectionsRefused",
+          "proxyTokenMints",
+          "interrupted"
+        ],
+        "responseType": "microvm.tunnel",
+        "summary": "Tunnel arbitrary TCP to a guest port, so `psql` or `ssh` here reaches a server in the VM",
+        "supportsJson": true
+      },
+      {
+        "alternateResponse": null,
+        "name": "port-forward",
+        "parameters": [
+          {
+            "choices": null,
+            "default": null,
+            "help": "The ports, as `LOCAL[:GUEST]`. A single number uses it on both sides",
+            "name": "ports",
+            "positional": true,
+            "required": true,
+            "type": "string"
+          },
+          {
+            "choices": null,
+            "default": "127.0.0.1",
+            "help": "The local address to bind. Loopback by default, deliberately",
+            "name": "bind",
+            "positional": false,
+            "required": false,
+            "type": "string"
+          },
+          {
+            "choices": null,
+            "default": null,
+            "help": "Stop after serving this many connections, instead of running until Ctrl-C",
+            "name": "max-connections",
+            "positional": false,
+            "required": false,
+            "type": "string"
+          },
+          {
+            "choices": null,
+            "default": null,
+            "help": "The VM's endpoint, as reported by `run`",
+            "name": "endpoint",
+            "positional": false,
+            "required": false,
+            "type": "string"
+          },
+          {
+            "choices": null,
+            "default": null,
+            "help": "The agent token delivered to the VM at launch",
+            "name": "agent-token",
+            "positional": false,
+            "required": false,
+            "type": "string"
+          },
+          {
+            "choices": null,
+            "default": null,
+            "help": "The MicroVM id, needed to mint the endpoint proxy token",
+            "name": "microvm-id",
+            "positional": false,
+            "required": false,
+            "type": "string"
+          },
+          {
+            "choices": null,
+            "default": null,
+            "help": "The name `run --keep --vm-name` registered, standing in for the whole triple",
+            "name": "name",
+            "positional": false,
+            "required": false,
+            "type": "string"
+          },
+          {
+            "choices": null,
+            "default": null,
+            "help": "The daemon's port inside the guest",
+            "name": "port",
+            "positional": false,
+            "required": false,
+            "type": "string"
+          },
+          {
+            "choices": null,
+            "default": null,
+            "help": "Where the local state lives — the name registry, and exec's per-VM history. Defaults to $MICROVM_STATE_DIR or ~/.microvm/runs",
+            "name": "state-dir",
+            "positional": false,
+            "required": false,
+            "type": "path"
+          },
+          {
+            "choices": [
+              "us-east-1",
+              "us-east-2",
+              "us-west-2",
+              "eu-west-1",
+              "ap-northeast-1"
+            ],
+            "default": null,
+            "help": "AWS region. Defaults to $AWS_REGION, then $AWS_DEFAULT_REGION, then us-east-1",
+            "name": "region",
+            "positional": false,
+            "required": false,
+            "type": "enum"
+          },
+          {
+            "choices": null,
+            "default": null,
+            "help": "Use a region this client has not seen carry MicroVMs. Costs you the diagnostic",
+            "name": "unlisted-region",
+            "positional": false,
+            "required": false,
+            "type": "string"
+          }
+        ],
+        "responseKeys": [
+          "microvmId",
+          "localPort",
+          "localAddress",
+          "guestPort",
+          "connectionsServed",
+          "connectionsRefused",
+          "upgrades",
+          "proxyTokenMints",
+          "interrupted"
+        ],
+        "responseType": "microvm.port-forward",
+        "summary": "Serve a guest port on localhost, so a browser here reaches a server in the VM",
+        "supportsJson": true
+      },
+      {
+        "alternateResponse": null,
+        "name": "shell",
+        "parameters": [
+          {
+            "choices": null,
+            "default": null,
+            "help": "The VM's endpoint, as reported by `run`",
+            "name": "endpoint",
+            "positional": false,
+            "required": false,
+            "type": "string"
+          },
+          {
+            "choices": null,
+            "default": null,
+            "help": "The MicroVM id, needed to mint the shell token",
+            "name": "microvm-id",
+            "positional": false,
+            "required": false,
+            "type": "string"
+          },
+          {
+            "choices": null,
+            "default": null,
+            "help": "The name `run --keep --vm-name` registered, standing in for endpoint and id",
+            "name": "name",
+            "positional": false,
+            "required": false,
+            "type": "string"
+          },
+          {
+            "choices": null,
+            "default": null,
+            "help": "Where the local state lives — the name registry. Defaults to $MICROVM_STATE_DIR or ~/.microvm/runs, the same resolution the attached commands use",
+            "name": "state-dir",
+            "positional": false,
+            "required": false,
+            "type": "path"
+          },
+          {
+            "choices": [
+              "us-east-1",
+              "us-east-2",
+              "us-west-2",
+              "eu-west-1",
+              "ap-northeast-1"
+            ],
+            "default": null,
+            "help": "AWS region. Defaults to $AWS_REGION, then $AWS_DEFAULT_REGION, then us-east-1",
+            "name": "region",
+            "positional": false,
+            "required": false,
+            "type": "enum"
+          },
+          {
+            "choices": null,
+            "default": null,
+            "help": "Use a region this client has not seen carry MicroVMs. Costs you the diagnostic",
+            "name": "unlisted-region",
+            "positional": false,
+            "required": false,
+            "type": "string"
+          }
+        ],
+        "responseKeys": [
+          "microvmId",
+          "sessionId",
+          "end",
+          "closeReason"
+        ],
+        "responseType": "microvm.shell",
+        "summary": "Open an interactive root shell in a running MicroVM — a real PTY, with job control, signals, and resize",
+        "supportsJson": true
+      },
+      {
+        "alternateResponse": null,
+        "name": "suspend",
+        "parameters": [
+          {
+            "choices": null,
+            "default": null,
+            "help": "The MicroVM to freeze",
+            "name": "microvm_id",
+            "positional": true,
+            "required": true,
+            "type": "string"
+          },
+          {
+            "choices": null,
+            "default": "300",
+            "help": "How long to wait for the state transition, in seconds",
+            "name": "timeout",
+            "positional": false,
+            "required": false,
+            "type": "string"
+          },
+          {
+            "choices": null,
+            "default": null,
+            "help": "Where the VM's history is appended. Defaults to $MICROVM_STATE_DIR or ~/.microvm/runs",
+            "name": "state-dir",
+            "positional": false,
+            "required": false,
+            "type": "path"
+          },
+          {
+            "choices": [
+              "us-east-1",
+              "us-east-2",
+              "us-west-2",
+              "eu-west-1",
+              "ap-northeast-1"
+            ],
+            "default": null,
+            "help": "AWS region. Defaults to $AWS_REGION, then $AWS_DEFAULT_REGION, then us-east-1",
+            "name": "region",
+            "positional": false,
+            "required": false,
+            "type": "enum"
+          },
+          {
+            "choices": null,
+            "default": null,
+            "help": "Use a region this client has not seen carry MicroVMs. Costs you the diagnostic",
+            "name": "unlisted-region",
+            "positional": false,
+            "required": false,
+            "type": "string"
+          }
+        ],
+        "responseKeys": [
+          "microvmId",
+          "state"
+        ],
+        "responseType": "microvm.state",
+        "summary": "Freeze a MicroVM. It keeps its memory, filesystem, token, and endpoint",
+        "supportsJson": true
+      },
+      {
+        "alternateResponse": null,
+        "name": "resume",
+        "parameters": [
+          {
+            "choices": null,
+            "default": null,
+            "help": "The MicroVM to thaw",
+            "name": "microvm_id",
+            "positional": true,
+            "required": true,
+            "type": "string"
+          },
+          {
+            "choices": null,
+            "default": "300",
+            "help": "How long to wait for RUNNING, in seconds",
+            "name": "timeout",
+            "positional": false,
+            "required": false,
+            "type": "string"
+          },
+          {
+            "choices": null,
+            "default": null,
+            "help": "Where the VM's history is appended. Defaults to $MICROVM_STATE_DIR or ~/.microvm/runs",
+            "name": "state-dir",
+            "positional": false,
+            "required": false,
+            "type": "path"
+          },
+          {
+            "choices": [
+              "us-east-1",
+              "us-east-2",
+              "us-west-2",
+              "eu-west-1",
+              "ap-northeast-1"
+            ],
+            "default": null,
+            "help": "AWS region. Defaults to $AWS_REGION, then $AWS_DEFAULT_REGION, then us-east-1",
+            "name": "region",
+            "positional": false,
+            "required": false,
+            "type": "enum"
+          },
+          {
+            "choices": null,
+            "default": null,
+            "help": "Use a region this client has not seen carry MicroVMs. Costs you the diagnostic",
+            "name": "unlisted-region",
+            "positional": false,
+            "required": false,
+            "type": "string"
+          }
+        ],
+        "responseKeys": [
+          "microvmId",
+          "state",
+          "endpoint"
+        ],
+        "responseType": "microvm.state",
+        "summary": "Thaw a suspended MicroVM and report its endpoint",
+        "supportsJson": true
+      },
+      {
+        "alternateResponse": null,
+        "name": "terminate",
+        "parameters": [
+          {
+            "choices": null,
+            "default": null,
+            "help": "The MicroVM to terminate",
+            "name": "microvm_id",
+            "positional": true,
+            "required": true,
+            "type": "string"
+          },
+          {
+            "choices": null,
+            "default": null,
+            "help": "The image to delete, if --delete-image is given",
+            "name": "image-identifier",
+            "positional": false,
+            "required": false,
+            "type": "string"
+          },
+          {
+            "choices": null,
+            "default": null,
+            "help": "The image's name, needed to name its build log group",
+            "name": "image-name",
+            "positional": false,
+            "required": false,
+            "type": "string"
+          },
+          {
+            "choices": null,
+            "default": null,
+            "help": "Also delete the image, and name its build log group",
+            "name": "delete-image",
+            "positional": false,
+            "required": false,
+            "type": "boolean"
+          },
+          {
+            "choices": null,
+            "default": null,
+            "help": "Wait for TERMINATED rather than returning as soon as the call is accepted",
+            "name": "wait",
+            "positional": false,
+            "required": false,
+            "type": "boolean"
+          },
+          {
+            "choices": null,
+            "default": null,
+            "help": "Where the VM's history is appended. Defaults to $MICROVM_STATE_DIR or ~/.microvm/runs",
+            "name": "state-dir",
+            "positional": false,
+            "required": false,
+            "type": "path"
+          },
+          {
+            "choices": [
+              "us-east-1",
+              "us-east-2",
+              "us-west-2",
+              "eu-west-1",
+              "ap-northeast-1"
+            ],
+            "default": null,
+            "help": "AWS region. Defaults to $AWS_REGION, then $AWS_DEFAULT_REGION, then us-east-1",
+            "name": "region",
+            "positional": false,
+            "required": false,
+            "type": "enum"
+          },
+          {
+            "choices": null,
+            "default": null,
+            "help": "Use a region this client has not seen carry MicroVMs. Costs you the diagnostic",
+            "name": "unlisted-region",
+            "positional": false,
+            "required": false,
+            "type": "string"
+          }
+        ],
+        "responseKeys": [
+          "microvmId",
+          "imageIdentifier",
+          "leaked",
+          "undeletedLogGroups",
+          "state"
+        ],
+        "responseType": "microvm.teardown",
+        "summary": "Tear down a MicroVM, and optionally its image and build log group",
+        "supportsJson": true
+      },
+      {
+        "alternateResponse": null,
+        "name": "ls",
+        "parameters": [
+          {
+            "choices": null,
+            "default": null,
+            "help": "Where the ledgers live. Defaults to $MICROVM_STATE_DIR or ~/.microvm/runs",
+            "name": "state-dir",
+            "positional": false,
+            "required": false,
+            "type": "path"
+          },
+          {
+            "choices": null,
+            "default": null,
+            "help": "Re-read the ledger on an interval until Ctrl-C, port-forward style (#78)",
+            "name": "watch",
+            "positional": false,
+            "required": false,
+            "type": "boolean"
+          },
+          {
+            "choices": null,
+            "default": "2",
+            "help": "Seconds between ledger re-reads under `--watch`; default 2",
+            "name": "interval-sec",
+            "positional": false,
+            "required": false,
+            "type": "string"
+          },
+          {
+            "choices": null,
+            "default": null,
+            "help": "Stop after this many snapshots instead of on Ctrl-C",
+            "name": "max-refreshes",
+            "positional": false,
+            "required": false,
+            "type": "string"
+          }
+        ],
+        "responseKeys": [
+          "runs",
+          "watch"
+        ],
+        "responseType": "microvm.runs",
+        "summary": "List what this CLI created and could not confirm it deleted",
+        "supportsJson": true
+      },
+      {
+        "alternateResponse": null,
+        "name": "history",
+        "parameters": [
+          {
+            "choices": null,
+            "default": null,
+            "help": "The MicroVM whose history to print",
+            "name": "microvm_id",
+            "positional": true,
+            "required": true,
+            "type": "string"
+          },
+          {
+            "choices": null,
+            "default": null,
+            "help": "Where the histories live. Defaults to $MICROVM_STATE_DIR or ~/.microvm/runs",
+            "name": "state-dir",
+            "positional": false,
+            "required": false,
+            "type": "path"
+          }
+        ],
+        "responseKeys": [
+          "microvmId",
+          "events"
+        ],
+        "responseType": "microvm.history",
+        "summary": "Print what was asked of one MicroVM and what the platform reported back",
+        "supportsJson": true
+      },
+      {
+        "alternateResponse": null,
+        "name": "logs",
+        "parameters": [
+          {
+            "choices": null,
+            "default": null,
+            "help": "The image whose log group to name",
+            "name": "image_name",
+            "positional": true,
+            "required": true,
+            "type": "string"
+          },
+          {
+            "choices": [
+              "us-east-1",
+              "us-east-2",
+              "us-west-2",
+              "eu-west-1",
+              "ap-northeast-1"
+            ],
+            "default": null,
+            "help": "AWS region. Defaults to $AWS_REGION, then $AWS_DEFAULT_REGION, then us-east-1",
+            "name": "region",
+            "positional": false,
+            "required": false,
+            "type": "enum"
+          },
+          {
+            "choices": null,
+            "default": null,
+            "help": "Use a region this client has not seen carry MicroVMs. Costs you the diagnostic",
+            "name": "unlisted-region",
+            "positional": false,
+            "required": false,
+            "type": "string"
+          }
+        ],
+        "responseKeys": [
+          "logGroup",
+          "lines",
+          "streams",
+          "tailCommand",
+          "tailRequires"
+        ],
+        "responseType": "microvm.logs",
+        "summary": "Name an image's build log group and print the `aws logs tail` command that reads it",
+        "supportsJson": true
+      },
+      {
+        "alternateResponse": null,
+        "name": "cost",
+        "parameters": [
+          {
+            "choices": null,
+            "default": null,
+            "help": "Treat the durations as a plan rather than as timings",
+            "name": "estimate",
+            "positional": false,
+            "required": false,
+            "type": "boolean"
+          },
+          {
+            "choices": null,
+            "default": null,
+            "help": "Also print running versus suspended for the same hold, with the break-even",
+            "name": "compare",
+            "positional": false,
+            "required": false,
+            "type": "boolean"
+          },
+          {
+            "choices": [
+              "512",
+              "1024",
+              "2048",
+              "4096",
+              "8192"
+            ],
+            "default": "2048",
+            "help": "Baseline MiB, selecting a documented size class",
+            "name": "memory",
+            "positional": false,
+            "required": false,
+            "type": "enum"
+          },
+          {
+            "choices": null,
+            "default": "0",
+            "help": "Seconds the VM spent, or will spend, RUNNING",
+            "name": "running-sec",
+            "positional": false,
+            "required": false,
+            "type": "string"
+          },
+          {
+            "choices": null,
+            "default": "0",
+            "help": "Seconds spent suspended. Storage only — no compute line at all",
+            "name": "suspended-sec",
+            "positional": false,
+            "required": false,
+            "type": "string"
+          },
+          {
+            "choices": null,
+            "default": "0",
+            "help": "Seconds the image build took",
+            "name": "build-sec",
+            "positional": false,
+            "required": false,
+            "type": "string"
+          },
+          {
+            "choices": null,
+            "default": null,
+            "help": "Image size in GB. Adds storage with its one-week minimum retention",
+            "name": "image-gb",
+            "positional": false,
+            "required": false,
+            "type": "string"
+          },
+          {
+            "choices": null,
+            "default": "1",
+            "help": "Suspend/resume cycles, each paying a snapshot write plus a read",
+            "name": "cycles",
+            "positional": false,
+            "required": false,
+            "type": "string"
+          },
+          {
+            "choices": null,
+            "default": "3600",
+            "help": "The hold to compare running against suspended over, in seconds",
+            "name": "hold-sec",
+            "positional": false,
+            "required": false,
+            "type": "string"
+          },
+          {
+            "choices": null,
+            "default": null,
+            "help": "A budget in USD the report's total is checked against (#77)",
+            "name": "max-cost",
+            "positional": false,
+            "required": false,
+            "type": "string"
+          },
+          {
+            "choices": [
+              "warn",
+              "abort"
+            ],
+            "default": null,
+            "help": "What a `--max-cost` breach does: warn and exit 0, or abort with ERR_PRECONDITION (exit 12)",
+            "name": "on-breach",
+            "positional": false,
+            "required": false,
+            "type": "enum"
+          }
+        ],
+        "responseKeys": [
+          "report",
+          "comparison",
+          "budget"
+        ],
+        "responseType": "microvm.cost",
+        "summary": "What a run cost, or what a plan will cost. Every figure labelled",
+        "supportsJson": true
+      },
+      {
+        "alternateResponse": null,
+        "name": "doctor",
+        "parameters": [
+          {
+            "choices": null,
+            "default": null,
+            "help": "The agentd binary to check the architecture of",
+            "name": "binary",
+            "positional": false,
+            "required": false,
+            "type": "path"
+          },
+          {
+            "choices": null,
+            "default": null,
+            "help": "The Terraform stack directory. Defaults to ./conformance/infra",
+            "name": "infra-dir",
+            "positional": false,
+            "required": false,
+            "type": "path"
+          },
+          {
+            "choices": null,
+            "default": null,
+            "help": "Read this project config file instead of ./microvm.toml",
+            "name": "config",
+            "positional": false,
+            "required": false,
+            "type": "path"
+          },
+          {
+            "choices": null,
+            "default": null,
+            "help": "Ignore any microvm.toml, even a malformed one. Flags and defaults apply",
+            "name": "no-config",
+            "positional": false,
+            "required": false,
+            "type": "boolean"
+          },
+          {
+            "choices": [
+              "us-east-1",
+              "us-east-2",
+              "us-west-2",
+              "eu-west-1",
+              "ap-northeast-1"
+            ],
+            "default": null,
+            "help": "AWS region. Defaults to $AWS_REGION, then $AWS_DEFAULT_REGION, then us-east-1",
+            "name": "region",
+            "positional": false,
+            "required": false,
+            "type": "enum"
+          },
+          {
+            "choices": null,
+            "default": null,
+            "help": "Use a region this client has not seen carry MicroVMs. Costs you the diagnostic",
+            "name": "unlisted-region",
+            "positional": false,
+            "required": false,
+            "type": "string"
+          },
+          {
+            "choices": null,
+            "default": null,
+            "help": "S3 bucket for the build artifact. Defaults to $MICROVM_BUCKET",
+            "name": "bucket",
+            "positional": false,
+            "required": false,
+            "type": "string"
+          },
+          {
+            "choices": null,
+            "default": null,
+            "help": "Build role ARN. Defaults to $MICROVM_BUILD_ROLE_ARN",
+            "name": "build-role-arn",
+            "positional": false,
+            "required": false,
+            "type": "string"
+          },
+          {
+            "choices": null,
+            "default": null,
+            "help": "Execution role ARN. Defaults to $MICROVM_EXECUTION_ROLE_ARN",
+            "name": "execution-role-arn",
+            "positional": false,
+            "required": false,
+            "type": "string"
+          }
+        ],
+        "responseKeys": [
+          "checks",
+          "ok"
+        ],
+        "responseType": "microvm.doctor",
+        "summary": "Check every prerequisite and say which one is wrong",
+        "supportsJson": true
+      },
+      {
+        "alternateResponse": null,
+        "name": "manifest",
+        "parameters": [],
+        "responseKeys": [
+          "apiVersion",
+          "cli",
+          "version",
+          "commands",
+          "exitCodes",
+          "envelope",
+          "conventions"
+        ],
+        "responseType": "microvm.manifest",
+        "summary": "Emit the whole command surface, its exit codes, and its envelope schema",
+        "supportsJson": true
+      },
+      {
+        "alternateResponse": null,
+        "name": "constants",
+        "parameters": [
+          {
+            "choices": null,
+            "default": null,
+            "help": "Emit the raw constants object, unwrapped by an envelope",
+            "name": "emit-json",
+            "positional": false,
+            "required": false,
+            "type": "boolean"
+          }
+        ],
+        "responseKeys": [
+          "constants"
+        ],
+        "responseType": "microvm.constants",
+        "summary": "Emit every service constraint this client believes, for the drift gate",
+        "supportsJson": true
+      },
+      {
+        "alternateResponse": null,
+        "name": "dockerfile",
+        "parameters": [
+          {
+            "choices": null,
+            "default": null,
+            "help": "The image ref for the FROM line. Defaults to the managed al2023 base's pair",
+            "name": "from",
+            "positional": false,
+            "required": false,
+            "type": "string"
+          },
+          {
+            "choices": null,
+            "default": "9000",
+            "help": "The port agentd listens on inside the guest",
+            "name": "port",
+            "positional": false,
+            "required": false,
+            "type": "string"
+          },
+          {
+            "choices": null,
+            "default": null,
+            "help": "A working directory to create and set. Strongly recommended",
+            "name": "workdir",
+            "positional": false,
+            "required": false,
+            "type": "string"
+          }
+        ],
+        "responseKeys": [
+          "stanza",
+          "baseImageName",
+          "baseImageDockerRef",
+          "port",
+          "workdir"
+        ],
+        "responseType": "microvm.dockerfile",
+        "summary": "Print the Dockerfile stanza that wraps any base image with agentd",
+        "supportsJson": true
+      }
+    ],
+    "conventions": [
+      "exactly one envelope object on stdout per invocation; progress is on stderr",
+      "branch on `code`, never on `error`",
+      "dollar figures are estimates derived from published rates, never an invoice",
+      "an unpriced line item omits `usd` rather than reporting zero",
+      "`data.kind` carries the daemon's own status name when the exit code is coarser than the failure (ERR_PROTOCOL covers five)",
+      "`exec --stream` is the one exception to the line above: it writes NDJSON — one event object per line — and this envelope as the final line, with the discriminant `microvm.exec.stream` rather than `microvm.exec`. Every other invocation writes exactly one object"
+    ],
+    "envelope": {
+      "discriminator": "status",
+      "error": {
+        "apiVersion": "string",
+        "code": "string — stable, branch on this",
+        "data": "object — partial results, e.g. leaked identifiers, and `kind` naming the daemon status when one produced the failure",
+        "error": "string — human readable, may be reworded between releases",
+        "exitCode": "integer — matches the process exit code",
+        "finding": "string — the docs/PLATFORM.md section, or empty",
+        "status": "error",
+        "suggestions": "array of string"
+      },
+      "ok": {
+        "apiVersion": "string",
+        "data": "object — keys per responseKeys",
+        "status": "ok",
+        "type": "string — one of responseType above"
+      }
+    },
+    "exitCodes": [
+      {
+        "code": null,
+        "exit": 0,
+        "finding": "",
+        "meaning": "the command did what it said"
+      },
+      {
+        "code": "ERR_UNEXPECTED",
+        "exit": 1,
+        "finding": "",
+        "meaning": "an exception no handler claimed — a bug in this CLI, not the platform"
+      },
+      {
+        "code": "ERR_INVALID_ARG",
+        "exit": 2,
+        "finding": "",
+        "meaning": "the request was refused locally, before any AWS call"
+      },
+      {
+        "code": "ERR_RETRYABLE",
+        "exit": 3,
+        "finding": "Endpoint authentication",
+        "meaning": "a transient condition; run the identical command again"
+      },
+      {
+        "code": "ERR_CREDENTIALS",
+        "exit": 4,
+        "finding": "",
+        "meaning": "an identity is wrong or absent; waiting will not fix it"
+      },
+      {
+        "code": "ERR_PROTOCOL",
+        "exit": 5,
+        "finding": "",
+        "meaning": "the daemon rejected the request on its merits"
+      },
+      {
+        "code": "ERR_BUILD_WEDGED",
+        "exit": 6,
+        "finding": "`clientToken` is a permanent idempotency key",
+        "meaning": "the image build was never scheduled — the clientToken replay signature"
+      },
+      {
+        "code": "ERR_LAUNCH_DIED",
+        "exit": 7,
+        "finding": "`runHookPayload` arrives wrapped, not as the body",
+        "meaning": "the MicroVM reached a terminal state before RUNNING; read stateReason"
+      },
+      {
+        "code": "ERR_WINDOW_CLOSED",
+        "exit": 8,
+        "finding": "`idlePolicy`",
+        "meaning": "the launch-time suspended window passed, so there is nothing to resume"
+      },
+      {
+        "code": "ERR_PLATFORM",
+        "exit": 9,
+        "finding": "",
+        "meaning": "a control-plane failure with no more specific class"
+      },
+      {
+        "code": "ERR_TIMEOUT",
+        "exit": 10,
+        "finding": "",
+        "meaning": "a client-side deadline elapsed; the VM and the exec are untouched"
+      },
+      {
+        "code": "ERR_INTERRUPTED",
+        "exit": 11,
+        "finding": "The build log group survives Terraform",
+        "meaning": "interrupted after launch; teardown ran and any leak is named in the payload"
+      },
+      {
+        "code": "ERR_PRECONDITION",
+        "exit": 12,
+        "finding": "",
+        "meaning": "a prerequisite is missing — run `microvm doctor`"
+      },
+      {
+        "code": "ERR_EXEC_FAILED",
+        "exit": 13,
+        "finding": "",
+        "meaning": "the sandbox worked and the command in it exited non-zero"
+      },
+      {
+        "code": "ERR_NAME_TAKEN",
+        "exit": 14,
+        "finding": "",
+        "meaning": "the VM name is registered to a live VM; refused locally, before any AWS call"
+      },
+      {
+        "code": "ERR_CONFIG",
+        "exit": 15,
+        "finding": "",
+        "meaning": "the project config file is missing, malformed, or out of domain; refused locally — fix the file, or pass --no-config"
+      },
+      {
+        "code": "ERR_SYNC",
+        "exit": 16,
+        "finding": "",
+        "meaning": "run <DIR> could not pack the directory or write an artifact back; the failure is on this machine's filesystem, not the platform's"
+      }
+    ],
+    "version": "0.6.0"
+  },
+  "status": "ok",
+  "type": "microvm.manifest"
+}
