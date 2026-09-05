@@ -12,7 +12,7 @@ reading over your shoulder can read it too. Every claim on it points at behavior
 ## 1. `microvm manifest` outranks this page
 
 `microvm manifest` prints the binary's whole contract in one call: every command, its arguments and
-flags, its response type, the envelope schema, and the exit-code catalogue a caller branches `$?` on.
+flags, its response type, the envelope schema, and the exit-code catalog a caller branches `$?` on.
 It is always JSON — the dispatcher forces that for this subcommand whatever `--json` says — and it needs
 no credentials, no AWS region, and no network, so it doubles as a liveness check on your build.
 
@@ -33,15 +33,19 @@ page adds what a schema cannot state: what a silence means, and which surface yo
 
 Each of these is a place where this project behaves unlike the system you are pattern-matching it to.
 
-- **Two tiers of document live on this site and they are not equally reliable.** The hand-written tier —
-  Platform, Protocol, Trust, Embedding, Strategy, Harness capabilities — carries measured findings and
-  design rationale, and it wins any disagreement. Everything under Architecture, Reference, Behavior,
-  Analysis, Diagrams and Insights was generated per-file from the source tree; every factual claim there
-  carries a `path:line` citation that was machine-verified at generation time, and every citation on this
-  site links to that line pinned to a commit. A pin is not freshness: the citation was true at that
-  commit and the line may hold different code in the checkout you are editing.
+- **Three tiers, and the reliability rule inside one of them.** [Learn](/learn/) is task-shaped.
+  [Reference](/reference/) is generated from `microvm manifest`: one page per command at
+  `/reference/commands/<name>/`, the [exit codes](/reference/exit-codes/), the envelope, the response
+  types, and the wire schema, so a flag or code there is the one the binary ships. [Internals](/internals/)
+  is the reasoning, and two kinds of document live there that are not equally reliable. The hand-written
+  documents (Platform, Protocol, Trust, Embedding, Strategy, Harness capabilities) carry measured
+  findings and design rationale, and they win any disagreement. The generated categories (Architecture,
+  Behavior, Analysis, Diagrams, Insights) were produced per-file from the source tree; every factual
+  claim there carries a `path:line` citation that was machine-verified at generation time, and every
+  citation on this site links to that line pinned to a commit. A pin is not freshness: the citation was
+  true at that commit and the line may hold different code in the checkout you are editing.
 
-- **Branch on the exit code, never on the message.** The catalogue is append-only and is the contract;
+- **Branch on the exit code, never on the message.** The catalog is append-only and is the contract;
   the prose beside each code is rewritten freely. A matcher over the prose breaks on a wording change
   that broke nothing. `ERR_EXEC_FAILED` in particular means the sandbox worked and your command inside
   it exited non-zero — a successful platform interaction with a failing payload, which is not the same
@@ -75,7 +79,7 @@ failure — every test below is free.
 | ----------------------------------------------------------- | --------- | ------------------------------------------------------------------ |
 | a `microvm` binary is on `PATH`, or you can run `mise`       | CLI       | `microvm manifest`, then the command you need                      |
 | you are editing Rust, Python, or Node inside this workspace  | library   | `microvms-core`, or the thin bindings over it                      |
-| you hold a running VM's endpoint and its control token       | wire      | `GET /v1/schema`, then the route                                   |
+| you hold a running VM's endpoint and its agent token         | wire      | `GET /v1/schema`, then the route                                   |
 | none of those                                                | read-only | you are reading documentation. Fetch the Markdown, not the HTML.   |
 
 The three active surfaces share one implementation, so a fact learned on any of them transfers: the CLI
@@ -93,28 +97,29 @@ It is the only entry point that answers with the whole contract and costs nothin
 
 ## 4. The shortest path to a working integration
 
-There is nothing to install from a package registry yet, so the build below is the install. It produces
-two binaries: the daemon, cross-compiled to `aarch64-unknown-linux-musl` because Lambda MicroVMs are
-ARM64-only, and the `microvm` CLI for your own host.
+One artifact gets you running: the `microvm` CLI. The daemon binary that gets baked into VM images is
+the CLI's own component, and `run`, `build`, and `quickstart` provision the release asset for their own
+version, verify it, and cache it under `~/.microvm`. It is a static `aarch64-unknown-linux-musl` build
+because Lambda MicroVMs are ARM64-only.
 
 ```bash
-mise install                                   # Rust with the aarch64-musl target, Terraform
-mise run build && mise run install:cli         # the guest daemon, then `microvm` into ~/.cargo/bin
-export AGENTD=target/aarch64-unknown-linux-musl/release/agentd
-microvm doctor --binary $AGENTD                # credentials, region, the three env values, the arch
-microvm run $AGENTD --exec "uname -a && echo hello from inside"
+cargo binstall microvms-cli           # installs the `microvm` binary, prebuilt
+microvm doctor                        # credentials, region, the three environment values
+microvm quickstart                    # build, launch, run a hello-world, report the cost, tear down
 ```
 
 `doctor` is the step to run before anything bills: it names the broken prerequisite and suggests the fix
-rather than failing partway through a build. The `run` above builds an image, launches a VM from it,
-executes the command, reports the cost, and tears the VM down — teardown is the default so an
-interrupted session leaves no billable VM behind. Expect the first run to take minutes, almost all of it
-the image build; the snapshot carries a one-week minimum retention, so reuse it with `--image` rather
-than rebuilding.
+rather than failing partway through a build. `quickstart` is exactly
+`microvm run --exec "echo hello from a microvm"`: it builds an image, launches a VM from it, executes
+the command, reports the cost, and tears the VM down. Teardown is the default, so an interrupted session
+leaves no billable VM behind. Expect the first run to take minutes, almost all of it the image build;
+the snapshot carries a one-week minimum retention, so reuse it with `--image` rather than rebuilding.
 
 A real MicroVM image build needs an S3 bucket, a build role, and an execution role. `mise run live:infra`
-creates exactly those three and nothing else, and Embedding is the page to read when you are baking the
-daemon into your own task image instead.
+creates exactly those three and nothing else; [Install](/learn/tutorial/install/) walks it, and
+[Embedding](/internals/embedding/) is the page to read when you are baking the daemon into your own
+task image instead. Building from source stays one task, `mise install && mise run build`, for a custom
+daemon or an airgapped machine.
 
 Two habits change the shape of what you get back. `--json` wraps every response in the envelope the
 manifest declares, and it is what makes output parseable without a schema of your own. `--stream` on
@@ -134,17 +139,18 @@ exception to the envelope, declared in the manifest under its own response type.
   read `${PIPESTATUS[0]}`.
 
 - **Grepping for `TODO`, `HACK`, or `FIXME`.** No Rust or Python file in this repository carries one, so
-  the search finds nothing and proves nothing. Tech debt is registered on its own page, declined scope
-  lives in Strategy, and defect classes already paid for live in `.erpaval/solutions/`.
+  the search finds nothing and proves nothing. Tech debt is registered on its own page under Internals,
+  and declined scope lives in [Strategy](/internals/strategy/).
 
 - **Acting on a `path:line` citation without opening it.** Follow the link. It is pinned to the commit
   the page was generated from, which is what makes it verifiable and also what makes it capable of
   disagreeing with your working tree.
 
-- **Editing a page under Architecture, Reference, Behavior, Analysis, Diagrams, or Insights.** Those are
-  generated from `docs/`, and `docs/` is generated from the source tree. An edit there is discarded by
-  the next build with no diff to show for it. Regenerate the affected file instead, and let a
-  hand-written document win any disagreement.
+- **Editing a generated page.** The Internals categories (Architecture, Behavior, Analysis, Diagrams,
+  Insights) and the annotated reference pages are generated from `docs/`, and `docs/` is generated
+  from the source tree. The rest of Reference is generated from `microvm manifest`. An edit to any of
+  them is discarded by the next build with no diff to show for it. Regenerate the affected file
+  instead, and let a hand-written document win any disagreement.
 
 - **Passing `ruff` a list of directories.** It discovers by extension when it walks one, so naming
   directories silently lints a fraction of the tree and reports success. The selection lives in
@@ -152,7 +158,8 @@ exception to the envelope, declared in the manifest under its own response type.
 
 ## 6. Read next
 
-Every published page, with its rendered URL beside the raw Markdown twin an agent should fetch instead.
+Every published page, tier by tier, with its rendered URL beside the raw Markdown twin an agent should
+fetch instead.
 
 <!--READ-NEXT-->
 

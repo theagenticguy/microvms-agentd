@@ -91,6 +91,23 @@ something was proven wrong. If you add a requirement whose wording shares
 vocabulary with no peer, symspec says so. The usual fix is a glossary link
 committed in the document rather than a looser gate.
 
+The documentation site has its own pair of gates, outside `check` because they
+need a `pnpm install`:
+
+```bash
+mise run docs:check   # fast, offline: lint + spell, brace gate, build, typecheck, dist probes
+mise run docs:gate    # docs:check plus axe, layout stability and Lighthouse. What CI runs.
+mise run docs:browsers  # once per machine: the Chromium the browser tiers drive
+mise run docs:lint    # biome + cspell alone
+mise run docs:links   # every external link in the built site. Reports; never gates.
+```
+
+`site/src/gates.ts` declares what the browser tiers audit and what they tolerate.
+Its baselines are ratchets: a violation outside `KNOWN_A11Y_FAILURES` fails, and
+an entry there that stops firing fails too, so a fix cannot leave its suppression
+behind. `DENYLIST` in the same file names the tokens that must never reach a
+public page, and the node tier scans every built page and twin for them.
+
 CI (`.github/workflows/ci.yml`) runs fmt, clippy, the test tiers on three
 platforms, the schema staleness check, the security job (semgrep, betterleaks
 over history, license headers, cargo-deny, actionlint), the SBOM and

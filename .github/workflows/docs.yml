@@ -62,13 +62,13 @@ jobs:
       # step follows the one above rather than leading.
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          # The HIGHEST floor in play, not Astro's. `astro@7` declares node >=22.12.0 and it is
-          # tempting to pin that; pnpm 11.21 declares >=22.13 and fails this job outright with
-          # `This version of pnpm requires at least Node.js v22.13` the moment `cache: pnpm` asks it
-          # for the store path. `site/package.json`'s `engines.node` carries the same floor, and
-          # `tests/toolchain.test.ts` asserts this pin satisfies it — two places that must agree,
-          # with something checking that they do.
-          node-version: '22.13'
+          # The HIGHEST floor in play, not Astro's. `astro@7` declares node >=22.12.0 and pnpm 11.21
+          # declares >=22.13, and both were satisfied by a 22.13 pin until cspell 10.2 arrived: it
+          # refuses to start below 22.18 (`Unsupported NodeJS version (22.13.1); >=22.18.0 is
+          # required`, measured on this workflow 2026-09-05). `site/package.json`'s `engines.node`
+          # carries the same floor, and `tests/toolchain.test.ts` asserts this pin satisfies it: two
+          # places that must agree, with something checking that they do.
+          node-version: '22.18'
           cache: pnpm
           cache-dependency-path: site/pnpm-lock.yaml
 
@@ -77,6 +77,13 @@ jobs:
       - name: install
         working-directory: site
         run: pnpm install --frozen-lockfile
+
+      # biome over the site's TypeScript and JSON, then cspell over the authored pages. Before
+      # the build on purpose: a misspelling or an unused import is the cheapest thing in this
+      # job to report, and the whole job stays short when it stops here.
+      - name: lint and spell-check
+        working-directory: site
+        run: pnpm run lint
 
       # Where the site will actually be served, derived rather than hardcoded, so a fork
       # builds URLs for its own origin instead of this one. The rule is GitHub's own: a
@@ -163,6 +170,37 @@ jobs:
           DOCS_SITE: ${{ vars.DOCS_SITE || steps.target.outputs.origin }}
           DOCS_BASE: ${{ vars.DOCS_BASE || steps.target.outputs.base }}
         run: pnpm exec vitest run
+
+      # The browser tiers. Chrome for Testing is fetched here rather than at install, because
+      # Playwright ships no install script and the download is ~150 MB the node tier above never
+      # needs. `--with-deps` pulls the shared libraries a headless Chromium wants on the runner.
+      # One binary serves axe (through Playwright) and Lighthouse (through CHROME_PATH), so both
+      # tiers measure the same engine.
+      - name: fetch Chromium for the browser tiers
+        working-directory: site
+        run: pnpm exec playwright install --with-deps chromium
+
+      # WCAG 2.2 AA through axe plus the four probes axe lacks, and the layout-stability probe,
+      # over the pages `site/src/gates.ts` names. The baselines there are ratchets: a
+      # violation outside them fails, and an entry that stops firing fails too. Same variable
+      # pair as the build, for the same reason as the step above: the static server mounts
+      # `dist/` under the base the build used.
+      - name: accessibility and layout stability
+        working-directory: site
+        env:
+          DOCS_SITE: ${{ vars.DOCS_SITE || steps.target.outputs.origin }}
+          DOCS_BASE: ${{ vars.DOCS_BASE || steps.target.outputs.base }}
+        run: pnpm run test:a11y
+
+      # Lighthouse category floors and the byte budget, three runs per page, desktop preset.
+      # Performance aggregates optimistically because a loaded runner can only depress a static
+      # page's score; layout shift is gated by the probe above, not by Lighthouse's own reading.
+      - name: performance budget
+        working-directory: site
+        env:
+          DOCS_SITE: ${{ vars.DOCS_SITE || steps.target.outputs.origin }}
+          DOCS_BASE: ${{ vars.DOCS_BASE || steps.target.outputs.base }}
+        run: pnpm run test:budget
 
       - name: upload the Pages artifact
         uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5

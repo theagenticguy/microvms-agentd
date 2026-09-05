@@ -272,7 +272,10 @@ jobs:
           curl -sSfL -o osv-scanner https://github.com/google/osv-scanner/releases/download/v2.5.0/osv-scanner_linux_amd64
           echo "edcfc41d257db36148f065055655fe3fcfc434b0b423ea67468a84c207524e0c  osv-scanner" | sha256sum -c -
           chmod +x osv-scanner && sudo mv osv-scanner /usr/local/bin/
-          osv-scanner scan source -r .
+          # `--config` is required: osv-scanner applies a config file only to the lockfiles in
+          # its own directory, so without it nothing governs site/pnpm-lock.yaml and an accepted
+          # finding there fails the scan while the ignore reads as unused.
+          osv-scanner scan source -r . --config osv-scanner.toml
       # The SBOMs are the artifact consumers actually want from this job —
       # attached per-run so any commit's inventory is downloadable, 90-day
       # default retention.

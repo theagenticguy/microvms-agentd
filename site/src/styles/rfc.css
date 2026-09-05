@@ -1,0 +1,480 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+/*
+ * The site reads as an Internet standards document: an IETF RFC or a W3C Recommendation. Every color
+ * pair below is computed rather than picked, and every ratio is stated so a later edit can see what it
+ * would be spending. Ported from memhtml-public's apps/docs/src/styles/rfc.css and re-measured for this
+ * palette with a WCAG 2.x relative-luminance script (/tmp/mva-branding/contrast.mjs at port time; the
+ * same arithmetic lives in tests/branding.test.ts so the figures stated here cannot drift silently).
+ *
+ * The classic browser link colors are used literally because they hold up: #0000EE measures 9.08:1 on
+ * this ground and #551A8B measures 10.64:1, both clearing AAA. The accent is this project's own: a deep
+ * teal, #0A5450, at 8.46:1 on paper. It is not memhtml's standards red, and it is deliberately far from
+ * the link blue so an accent and a link are never confused for one another.
+ *
+ * Loads AFTER docs.css (astro.config.ts lists both in customCss, this one second), so the few rules at
+ * the end that restyle docs.css's own classes win on order at equal specificity.
+ */
+
+:root {
+  /* Warm paper rather than pure white: the ground a printed specification is read on. */
+  --docs-paper: #fcfbf7;
+  --docs-ink: #1a1a18; /* 16.83:1 on paper */
+  --docs-ink-secondary: #6b6862; /* 5.36:1 on paper, 4.83:1 on the inline-code tint */
+  --docs-link: #0000ee; /* 9.08:1 on paper */
+  --docs-visited: #551a8b; /* 10.64:1 on paper */
+  --docs-rule: #c9c5b8; /* 1.67:1: a hairline, never text */
+  --docs-accent: #0a5450; /* 8.46:1 on paper, 7.62:1 on the inline-code tint, 6.95:1 on accent-low */
+
+  /*
+   * Ordered by measured metric compatibility, not by name. Liberation Serif, Tinos and Nimbus Roman
+   * match Times New Roman on every advance to four decimal places, so a Linux box degrades exactly
+   * rather than approximately. The bare `serif` keyword is the failure mode and not the safety net: it
+   * resolves to DejaVu Serif at +27% per character, or Noto Serif at +18%.
+   */
+  --sl-font: "Times New Roman", Tinos, "Liberation Serif", "Nimbus Roman", "TeX Gyre Termes", Times,
+    serif;
+
+  /*
+   * A ui-monospace stack rather than Courier. Courier's stem is 0.051em against Times' 0.084em, a 39%
+   * deficit that no font-size corrects, so code set in Courier beside this body face reads as faded.
+   */
+  --sl-font-mono: ui-monospace, SFMono-Regular, Menlo, Consolas, "Cascadia Mono", "Liberation Mono",
+    Cousine, "DejaVu Sans Mono", monospace;
+
+  --docs-font-sans: Helvetica, Arial, Arimo, "Liberation Sans", "Nimbus Sans", sans-serif;
+}
+
+:root[data-theme="light"] {
+  /*
+   * Every `--docs-` token is RESTATED here, and the restatement is the whole point.
+   *
+   * `:root` above declares the light values and the dark block below declares its own on a
+   * `:root, :root[data-theme="dark"]` selector list. A selector list takes each selector's specificity
+   * separately, so that bare `:root` ties with the one above it and wins on order alone, which means
+   * every `var(--docs-*)` reference in THIS block would resolve to the dark value. Measured on this
+   * site before the fix, in a light-theme screenshot: body text, inline code and the sidebar's current
+   * entry rendered in the dark theme's #e9e7e1 on warm paper, 1.19:1, while the declaration
+   * meters above said 16.83:1. memhtml hit the same trap with its link color (2.19:1 measured). An
+   * attribute selector outranks a bare `:root`, so declaring them here settles it by specificity rather
+   * than by ordering, and the dark block below overrides every one of these seven, so all seven are
+   * restated rather than the three memhtml needed.
+   */
+  --docs-paper: #fcfbf7;
+  --docs-ink: #1a1a18; /* 16.83:1 on paper */
+  --docs-ink-secondary: #6b6862; /* 5.36:1 on paper */
+  --docs-link: #0000ee; /* 9.08:1 on paper */
+  --docs-visited: #551a8b; /* 10.64:1 on paper */
+  --docs-rule: #c9c5b8;
+  --docs-accent: #0a5450; /* 8.46:1 on paper */
+
+  --sl-color-bg: var(--docs-paper);
+  --sl-color-bg-nav: var(--docs-paper);
+  --sl-color-bg-sidebar: var(--docs-paper);
+  --sl-color-text: var(--docs-ink);
+  --sl-color-text-accent: var(--docs-link);
+  --sl-color-gray-2: var(--docs-ink-secondary);
+  --sl-color-gray-3: var(--docs-ink-secondary);
+  --sl-color-hairline: var(--docs-rule);
+  --sl-color-hairline-light: var(--docs-rule);
+  --sl-color-hairline-shade: var(--docs-rule);
+  --sl-color-bg-inline-code: #f2efe6; /* ink on it: 15.16:1 */
+  --sl-color-accent: var(--docs-link);
+  --sl-color-accent-high: var(--docs-ink);
+  --sl-color-accent-low: #e8e5da; /* ink on it: 13.82:1 */
+}
+
+:root,
+:root[data-theme="dark"] {
+  --sl-color-bg: #121211;
+  --sl-color-bg-nav: #121211;
+  --sl-color-bg-sidebar: #121211;
+  --sl-color-text: #e9e7e1; /* 15.16:1 on #121211, 13.50:1 on the inline-code tint */
+  --sl-color-text-accent: #8da9ff; /* 8.26:1 on #121211, 7.36:1 on the inline-code tint */
+  --sl-color-gray-2: #b9b6ae; /* 9.25:1 on #121211, 8.24:1 on the inline-code tint */
+  --sl-color-gray-3: #97948d; /* 6.19:1 on #121211, 5.52:1 on the inline-code tint */
+  --sl-color-hairline: #35342f; /* 1.50:1: a hairline, never text */
+  --sl-color-hairline-light: #35342f;
+  --sl-color-hairline-shade: #35342f;
+  --sl-color-bg-inline-code: #1e1e1c;
+  --sl-color-accent: #8da9ff;
+  --sl-color-accent-high: #e9e7e1;
+  --sl-color-accent-low: #23231f; /* text on it: 12.75:1 */
+  /*
+   * The seven `--docs-` tokens, in their dark values. Every rule below that names a token reads these
+   * in dark mode, which is what keeps a table rule, a blockquote rule and an aside label on the
+   * measured dark pairs rather than on the light values leaking through.
+   */
+  --docs-paper: #121211;
+  --docs-ink: #e9e7e1; /* 15.16:1 on #121211 */
+  --docs-ink-secondary: #b9b6ae; /* 9.25:1 on #121211 */
+  --docs-link: #8da9ff; /* 8.26:1 on #121211 */
+  --docs-visited: #c8a6e9; /* 9.00:1 on #121211 */
+  --docs-rule: #35342f;
+  --docs-accent: #7fd1c7; /* 10.57:1 on #121211, 9.42:1 on the inline-code tint, 8.90:1 on accent-low */
+}
+
+/*
+ * font-size-adjust equalizes x-height when the primary face is absent, cutting the substitution error
+ * on a box without the MS core fonts from +18 to 27% down to +0.7%. The bare-number form is
+ * deliberate: it reaches back to Firefox 3, where the two-value form does not.
+ */
+body {
+  font-size-adjust: 0.45;
+}
+
+/*
+ * A wider column than Starlight's 45rem, because a specification carries tables and code samples and
+ * both need the room.
+ *
+ * `:root:root` and not `:root`. Starlight declares this on a bare `:root` too and its stylesheet is
+ * bundled AFTER this one, so an equal-specificity declaration here loses on order and silently does
+ * nothing. Repeating the selector raises specificity to 0,0,2 without reaching for !important.
+ */
+:root:root {
+  --sl-content-width: 50rem;
+}
+
+/*
+ * Body text is larger than Starlight's default because this site sets it in Times, whose x-height is
+ * small: 16px Times reads about a size smaller than 16px in a sans face.
+ *
+ * The size goes here rather than on `--sl-text-body`, which Starlight defines and never applies as a
+ * font-size, so overriding that token changes nothing.
+ */
+.sl-markdown-content {
+  font-size: 1.125rem;
+}
+
+/*
+ * The measure applies to PROSE, and only to prose.
+ *
+ * Character count follows the em measure and not the pixel width: prose advance is 0.398em per
+ * character in this face, so 32em is about 80 characters. Elements that carry their own structure (a
+ * table, a code block, a figure, a diagram) get the full column; capping them at the prose measure is
+ * what makes a wide table scroll sideways for no reason.
+ */
+.sl-markdown-content :is(p, ul, ol, blockquote, dl, .rfc-toc) {
+  max-width: 32em;
+}
+
+.sl-markdown-content :is(table, pre, figure, img, .expressive-code, .docs-mermaid) {
+  max-width: 100%;
+}
+
+/* Links are underlined, so color is never the only signal that something is a link (SC 1.4.1). */
+.sl-markdown-content a:not(:where(.not-content *)) {
+  color: var(--docs-link);
+  text-decoration: underline;
+  text-underline-offset: 0.15em;
+}
+
+.sl-markdown-content a:not(:where(.not-content *)):visited {
+  color: var(--docs-visited);
+}
+
+/*
+ * Headings carry weight and a touch of negative tracking, and nothing else. A monochrome page has one
+ * axis of emphasis available, how black a line is, so a heading may not also change color or face.
+ */
+.sl-markdown-content :is(h2, h3, h4) {
+  font-weight: 700;
+  letter-spacing: -0.01em;
+}
+
+/*
+ * Hanging section numbers: the number sits at the measure's left edge and the heading's own words are
+ * inset past it, so a heading that wraps puts its second line under its first word rather than under
+ * its number. The numbers then read as a column down the left of a monochrome page.
+ *
+ * The numbers themselves are authored into the Markdown rather than generated here. A CSS counter is
+ * invisible to the table of contents, to Pagefind, to llms.txt and to the raw `.md` route this site
+ * serves to agents, so a human citing section 3.2 and an agent reading the Markdown would disagree
+ * about which section that is.
+ *
+ * The rule goes on the anchor-link WRAPPER wherever Starlight added one, and on the heading itself
+ * where it did not. Starlight sets a wrapped heading to `display: inline` so the anchor icon stays on
+ * the last line, and `text-indent` has no effect on an inline box, so the wrapper is the element that
+ * has to take it.
+ *
+ * The hang is per level, because the number it has to clear is a different width at each: `3.` is two
+ * characters and `3.12.1.` is seven. It is stated in `em` against the heading's own size.
+ *
+ * It engages from 72rem because the inset is bought out of the measure, and a narrow viewport has
+ * nothing to spend.
+ */
+@media (min-width: 72rem) {
+  .sl-markdown-content :is(.sl-heading-wrapper.level-h2, h2:not(.sl-heading-wrapper *)) {
+    padding-inline-start: 1.7em;
+    text-indent: -1.7em;
+  }
+
+  .sl-markdown-content :is(.sl-heading-wrapper.level-h3, h3:not(.sl-heading-wrapper *)) {
+    padding-inline-start: 2.7em;
+    text-indent: -2.7em;
+  }
+
+  .sl-markdown-content :is(.sl-heading-wrapper.level-h4, h4:not(.sl-heading-wrapper *)) {
+    padding-inline-start: 3.6em;
+    text-indent: -3.6em;
+  }
+}
+
+/*
+ * Plain bordered tables, in the register of a specification rather than a data grid.
+ *
+ * `tabular-nums` is not cosmetic here: the Reference tier is exit codes, byte budgets and field
+ * widths, and Times' proportional figures make a column of them ragged. The heavier rule under the
+ * head is the one visual weight a specification table carries.
+ */
+.sl-markdown-content table {
+  border-collapse: collapse;
+  font-size: var(--sl-text-body-sm);
+  font-variant-numeric: tabular-nums;
+}
+
+.sl-markdown-content :is(th, td) {
+  border: 1px solid var(--docs-rule);
+  padding: 0.35em 0.6em;
+  text-align: start;
+  vertical-align: top;
+}
+
+.sl-markdown-content thead th {
+  border-block-end: 2px solid var(--docs-ink);
+  font-family: var(--docs-font-sans);
+  font-size: var(--sl-text-xs);
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+/* A row header, the first cell of a body row, stays serif but takes the weight. */
+.sl-markdown-content tbody th {
+  font-weight: 700;
+}
+
+.sl-markdown-content caption {
+  caption-side: bottom;
+  font-size: var(--sl-text-xs);
+  padding-block-start: 0.5rem;
+  text-align: start;
+}
+
+/*
+ * A quotation is set the way a specification quotes a normative source: indented off the measure and
+ * marked by a rule, with no quotation glyphs and no italics. Italics would change the voice of the
+ * quoted text, which is the one thing a quotation may not do.
+ */
+.sl-markdown-content blockquote {
+  border-inline-start: 2px solid var(--docs-rule);
+  color: inherit;
+  font-style: normal;
+  margin-inline-start: 0;
+  padding-inline-start: 1.25em;
+}
+
+.sl-markdown-content blockquote :last-child {
+  margin-block-end: 0;
+}
+
+/*
+ * A rule between sections, not a decorative divider: one hairline at the full measure. Starlight's
+ * default is a 1px border on all four sides, which draws a 1px box rather than a rule.
+ */
+.sl-markdown-content hr {
+  border: 0;
+  border-block-start: 1px solid var(--docs-rule);
+  margin-block: 2.5rem;
+}
+
+/*
+ * Footnotes, in the apparatus register: smaller, and labelled in sans like every other piece of
+ * furniture on this site. The heading stays in the document rather than being hidden: it is the only
+ * thing that tells a screen-reader user that the region below is notes and not more prose.
+ */
+.sl-markdown-content .footnotes {
+  font-size: var(--sl-text-body-sm);
+}
+
+.sl-markdown-content .footnotes > h2 {
+  font-family: var(--docs-font-sans);
+  font-size: var(--sl-text-xs);
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+/*
+ * A footnote reference is a target inside a sentence, so SC 2.5.8's inline exception applies and it
+ * cannot be grown to 24px without opening the line. The padding enlarges the hit area within the line
+ * box instead.
+ */
+.sl-markdown-content [data-footnote-ref] {
+  padding-inline: 0.15em;
+}
+
+/* Square, like every other frame on this site. A radius is the browser's default, not a decision. */
+.sl-markdown-content :not(pre) > code {
+  border-radius: 0;
+  font-size: 0.9em;
+}
+
+/*
+ * Starlight's asides ship as four tinted panels, each in a hue (blue, purple, orange, red) that
+ * belongs to no value in this palette, with a 0.25rem radius. A specification carries a note as a
+ * ruled block on the same tint an inline code span sits on. The two cautionary kinds take the accent
+ * on the rule and the label, which is the only place the accent appears as a signal rather than as
+ * furniture. Every label color here is a measured pair: ink at 15.16:1 and the accent at 7.62:1 on
+ * the light tint; text at 13.50:1 and the accent at 9.42:1 on the dark one.
+ */
+.sl-markdown-content .starlight-aside {
+  --sl-color-asides-text-accent: var(--docs-ink);
+  --sl-color-asides-border: var(--docs-ink-secondary);
+  background-color: var(--sl-color-bg-inline-code);
+  border-inline-start-width: 2px;
+  border-radius: 0;
+}
+
+.sl-markdown-content :is(.starlight-aside--caution, .starlight-aside--danger) {
+  --sl-color-asides-text-accent: var(--docs-accent);
+  --sl-color-asides-border: var(--docs-accent);
+}
+
+.sl-markdown-content .starlight-aside__title {
+  font-family: var(--docs-font-sans);
+  font-size: var(--sl-text-xs);
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+/* A link inside a note is a link: it keeps the link color rather than borrowing the note's label color. */
+.sl-markdown-content .starlight-aside__content a {
+  color: var(--docs-link);
+}
+
+/*
+ * The memo title and the brand line beneath it, centered as a specification's title block is
+ * centered. This is the only centered type on the site, which is what makes it read as a title block
+ * rather than as a page that lost its alignment. The letterspacing is authored on already-uppercase
+ * text, no `text-transform`, so the words are uppercase in the Markdown this site serves to agents.
+ */
+.rfc-title-block {
+  margin-block: 2rem 2.5rem;
+  text-align: center;
+}
+
+/*
+ * The prose measure does not apply here, because `em` resolves against each element's own font size:
+ * the brand line's 32em at --sl-text-xs is a box narrower than the column that sits flush left, so its
+ * centered text would land left of the title's axis. Display type centers on the column.
+ */
+.sl-markdown-content .rfc-title-block > p {
+  max-width: none;
+}
+
+.rfc-title-block .rfc-memo-title {
+  font-size: var(--sl-text-h3);
+  font-weight: 400;
+  letter-spacing: -0.01em;
+  margin-block: 0;
+}
+
+.rfc-brand {
+  font-family: var(--docs-font-sans);
+  font-size: var(--sl-text-xs);
+  letter-spacing: 0.26em;
+  margin-block: 0.35rem 0;
+  /* The tracking is applied to the right of each glyph, so the last one carries a trailing space
+     that would knock a centered line off center by half of it. */
+  margin-inline-start: 0.26em;
+}
+
+/*
+ * The table of contents, as a specification numbers one: the numbers hang outside the text so the
+ * hierarchy is readable down the left edge, and the list markers are suppressed because the numbers
+ * ARE the markers. The numbers are authored into the link text for the same reason the section numbers
+ * in every heading are authored: this page is served as raw Markdown to agents.
+ */
+.rfc-toc ul {
+  list-style: none;
+  padding-inline-start: 0;
+}
+
+/*
+ * Two stops, and only two. Each level's indent equals the width of the number it has to clear, so a
+ * wrapped entry's second line starts under its own first word rather than under its number.
+ */
+.rfc-toc li {
+  line-height: 1.75;
+  padding-inline-start: 1.9em;
+  text-indent: -1.9em;
+}
+
+/*
+ * The line-height above and the padding here exist for SC 2.5.8 rather than for the look: a contents
+ * entry's link is an inline box short of the 24px target minimum, and block padding on an inline box
+ * grows the hit area without moving a character.
+ */
+.rfc-toc a {
+  padding-block: 0.2em;
+}
+
+.rfc-toc > ul > li {
+  margin-block-start: 1rem;
+}
+
+.rfc-toc > ul > li > ul {
+  margin-block-start: 0.25rem;
+  padding-inline-start: 1.9em;
+}
+
+.rfc-toc > ul > li > ul > li {
+  color: var(--docs-ink-secondary);
+  font-size: var(--sl-text-body-sm);
+  padding-inline-start: 2.4em;
+  text-indent: -2.4em;
+}
+
+/*
+ * Starlight's own furniture, squared. Each of these is a default the theme ships and none is a
+ * decision this site made: the previous/next cards carry a 0.5rem radius and a drop shadow, the
+ * sidebar's current-page highlight and the search button a 0.25rem radius. Starlight scopes its
+ * component styles with `:where()`, which contributes no specificity, so a plain global rule wins.
+ */
+.pagination-links a {
+  border-radius: 0;
+  box-shadow: none;
+}
+
+.sidebar-content a[aria-current="page"],
+.sidebar-content a[aria-current="page"]:hover,
+.sidebar-content a[aria-current="page"]:focus {
+  border-radius: 0;
+  background-color: var(--sl-color-accent-low);
+  color: var(--sl-color-text);
+  font-weight: 700;
+}
+
+site-search > button {
+  border-radius: 0;
+}
+
+/*
+ * docs.css's own controls, in this register. docs.css keeps its constraints (the 24px target floor,
+ * the double and dashed outcome borders) and this file only takes the radius off, sets the border to
+ * the same hairline every rule on the page uses, and puts the label in the sans face every other
+ * control on the site wears. These win on order: rfc.css is listed after docs.css.
+ */
+.docs-page-action {
+  border-color: var(--docs-rule);
+  border-radius: 0;
+  font-family: var(--docs-font-sans);
+}
+
+.docs-page-action:hover,
+.docs-page-action:focus-visible {
+  border-color: var(--sl-color-text);
+  color: var(--sl-color-text);
+}
+
+.docs-agent-note {
+  border-color: var(--docs-rule);
+}

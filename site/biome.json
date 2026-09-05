@@ -1,0 +1,64 @@
+{
+  "$schema": "https://biomejs.dev/schemas/2.5.11/schema.json",
+  "vcs": { "enabled": true, "clientKind": "git", "useIgnoreFile": true, "root": ".." },
+  "files": {
+    "includes": [
+      "src/**/*.ts",
+      "tests/**/*.ts",
+      "tests/**/*.mjs",
+      "scripts/**/*.mjs",
+      "astro.config.ts",
+      "vitest.config.ts",
+      "vitest.a11y.config.ts",
+      "cspell.json",
+      "lighthouserc.json",
+      "!dist",
+      "!dist-typecheck-probe",
+      "!.astro",
+      "!node_modules",
+      "!src/content"
+    ]
+  },
+  "formatter": {
+    "enabled": true,
+    "indentStyle": "space",
+    "indentWidth": 2,
+    "lineWidth": 100
+  },
+  "linter": {
+    "enabled": true,
+    "rules": {
+      "preset": "recommended",
+      "correctness": {
+        "noUnusedVariables": "error",
+        "noUnusedImports": "error"
+      },
+      "suspicious": {
+        "noExplicitAny": "error"
+      },
+      "style": {
+        "useConst": "error",
+        "noNonNullAssertion": "error"
+      }
+    }
+  },
+  "javascript": {
+    "formatter": {
+      "quoteStyle": "double",
+      "semicolons": "asNeeded",
+      "trailingCommas": "none"
+    }
+  },
+  "overrides": [
+    {
+      "includes": ["scripts/**", "tests/static-server.ts"],
+      "linter": {
+        "rules": {
+          "suspicious": {
+            "noUndeclaredEnvVars": "off"
+          }
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,51 @@
+{
+  "$schema": "https://raw.githubusercontent.com/streetsidesoftware/cspell/main/cspell.schema.json",
+  "version": "0.2",
+  "language": "en",
+  "files": ["authored/**/*.md", "authored/**/*.mdx"],
+  "dictionaryDefinitions": [
+    {
+      "name": "microvms-agentd",
+      "path": "./cspell-words.txt",
+      "description": "This project's own vocabulary. One term per line; sections carry their reason.",
+      "addWords": false
+    }
+  ],
+  "dictionaries": ["microvms-agentd"],
+  "flagWords": [
+    "colour->color",
+    "colours->colors",
+    "centred->centered",
+    "centre->center",
+    "centres->centers",
+    "centring->centering",
+    "neighbour->neighbor",
+    "neighbourhood->neighborhood",
+    "distil->distill",
+    "behaviour->behavior",
+    "behaviours->behaviors",
+    "behavioural->behavioral",
+    "organise->organize",
+    "organisation->organization",
+    "recognise->recognize",
+    "normalise->normalize",
+    "minimise->minimize",
+    "analyse->analyze",
+    "artefact->artifact",
+    "favour->favor",
+    "favours->favors",
+    "honour->honor",
+    "honours->honors",
+    "whilst->while",
+    "grey->gray",
+    "licence->license",
+    "catalogue->catalog",
+    "catalogues->catalogs",
+    "recognises->recognizes",
+    "recognised->recognized",
+    "neighbouring->neighboring",
+    "neighbours->neighbors"
+  ],
+  "ignoreRegExpList": ["HexDigitsPrefix", "SHA", "Base64MultiLine"],
+  "useGitignore": true
+}

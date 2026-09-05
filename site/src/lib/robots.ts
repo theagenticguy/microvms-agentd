@@ -35,7 +35,9 @@ import type { AstroIntegration } from "astro"
  * @param sitemap the absolute URL of the sitemap index. Must be absolute: a root-relative path is
  *   ignored, silently.
  */
-export const robotsPolicy = (sitemap: string): string => `# The AI-crawler policy for microvms-agentd's documentation.
+export const robotsPolicy = (
+  sitemap: string
+): string => `# The AI-crawler policy for microvms-agentd's documentation.
 #
 # This corpus is public source documentation for a source-only project. Being read is the reason it
 # exists, so every class below is allowed — and allowed EXPLICITLY, because the alternative is the same

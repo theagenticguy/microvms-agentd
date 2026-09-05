@@ -1,19 +1,23 @@
 // SPDX-License-Identifier: Apache-2.0
 import { readFileSync } from "node:fs"
-import { fileURLToPath } from "node:url"
 import { resolve } from "node:path"
+import { fileURLToPath } from "node:url"
 
 import { satteri } from "@astrojs/markdown-satteri"
 import starlight from "@astrojs/starlight"
-import { defineConfig } from "astro/config"
+import { pluginCollapsibleSections } from "@expressive-code/plugin-collapsible-sections"
+import { pluginLineNumbers } from "@expressive-code/plugin-line-numbers"
+import { defineConfig, passthroughImageService } from "astro/config"
 import { starlightBasePath } from "starlight-base-path"
 import starlightLinksValidator from "starlight-links-validator"
 import starlightLlmsTxt from "starlight-llms-txt"
 import starlightMdTxt from "starlight-md-txt"
+import starlightScrollToTop from "starlight-scroll-to-top"
 
 import { agentNotePlugin } from "./src/lib/agent-note.js"
 import { baseRawLinks } from "./src/lib/base-raw-links.js"
 import { citationLinks } from "./src/lib/citation-links.js"
+import { focusableScrollers } from "./src/lib/focusable-scrollers.js"
 import mermaid from "./src/lib/mermaid.js"
 import { robotsPolicyFile } from "./src/lib/robots.js"
 import { rootTwin } from "./src/lib/root-twin.js"
@@ -40,7 +44,8 @@ const SITE = new URL(process.env.DOCS_SITE ?? "https://theagenticguy.github.io")
  * host. Normalizing here means the env var may be `/x`, `/x/`, `x`, or `/` and the rest of this file has
  * one shape to reason about.
  */
-const normalizeBase = (value: string): string => `/${value.replace(/^\/+|\/+$/g, "")}/`.replace(/^\/{2,}/, "/")
+const normalizeBase = (value: string): string =>
+  `/${value.replace(/^\/+|\/+$/g, "")}/`.replace(/^\/{2,}/, "/")
 
 const BASE = normalizeBase(process.env.DOCS_BASE ?? "/microvms-agentd/")
 
@@ -67,10 +72,17 @@ const MANIFEST = "src/content/docs/.sync-manifest.json"
  *
  * The commit comes from here too, so every permalink on the site — the ones the sync wrote into link
  * targets and the ones this config's plugin writes into citations — pins the same SHA.
+ *
+ * `routes` and `redirects` arrived with the tiers. A tree page is no longer served at its lowercased
+ * tree path — `PLATFORM.md` is `/internals/platform/` — so the citation rewriter reads the route off
+ * the same map the sync wrote the page with, and every old route is handed to Astro as a redirect
+ * rather than listed here by hand.
  */
 interface SyncManifest {
   readonly commit: string
   readonly publishedTreePaths: ReadonlyArray<string>
+  readonly routes: Readonly<Record<string, string>>
+  readonly redirects: Readonly<Record<string, string>>
   readonly sidebar: ReadonlyArray<{ readonly label: string; readonly link: string }>
 }
 
@@ -106,12 +118,16 @@ const llmsDetails = [
   "",
   `- [For agents](${new URL(`${BASE}agents.md`, SITE).href})`,
   "",
-  "Two tiers of document live here and they are not equally reliable. The hand-written documents —",
-  "Platform, Protocol, Trust, Embedding, Strategy, Harness capabilities — carry measured findings and",
-  "design rationale, and they win any disagreement. Everything else was generated per-file from the",
-  "source tree, and every factual claim in those pages carries a `path:line` citation that was",
-  "machine-verified against the source at generation time. Those citations anchor to line numbers, so",
-  "they rot when the cited code moves while still reading as authoritative.",
+  "The site has three tiers. Learn (`/learn/`) is task-shaped: the tutorials in order, then how-tos.",
+  "Reference (`/reference/`) is generated from `microvm manifest`, the binary's own statement of every",
+  "command, exit code, and response type, so a page there is the contract the binary ships. Internals",
+  "(`/internals/`) is the reasoning, in two kinds of document that are not equally reliable. The",
+  "hand-written documents — Platform, Protocol, Trust, Embedding, Strategy, Harness capabilities —",
+  "carry measured findings and design rationale, and they win any disagreement. The generated",
+  "categories — Architecture, Behavior, Analysis, Diagrams, Insights — were produced per-file from the",
+  "source tree, and every factual claim there carries a `path:line` citation pinned to the commit the",
+  "site was built from. Those citations anchor to line numbers, so they rot when the cited code moves",
+  "while still reading as authoritative.",
   "",
   "Any page is available as Markdown: append `.md` to its path."
 ].join("\n")
@@ -127,6 +143,44 @@ export default defineConfig({
    */
   build: { format: "directory" },
   trailingSlash: "always",
+
+  /*
+   * Every route a tree page had before the tiers, answering with a redirect to where the page is now.
+   * Derived by the sync from the same rule that placed the pages, so a category that moves later
+   * carries its redirects with it. Astro emits each as a static page holding a meta refresh, which is
+   * what a static host can serve.
+   *
+   * The destination carries the base and the source does not, and that asymmetry is measured rather
+   * than assumed. Astro prefixes the base onto the SOURCE pattern itself, and when the destination
+   * names a route it knows, it regenerates the location from that route's segments — which hold no
+   * base — so `dist/platform/index.html` refreshed to `/internals/platform/`, one segment short of the
+   * page, on a host that serves the site under `/microvms-agentd/`. A destination the route map does
+   * not recognise is emitted verbatim, so spelling it with the base here is what reaches the page.
+   */
+  redirects: Object.fromEntries(
+    Object.entries(manifest.redirects).map(([from, to]) => [
+      from,
+      `${BASE}${to.replace(/^\//, "")}`
+    ])
+  ),
+
+  /*
+   * pnpm's isolated node_modules puts sharp out of reach of a resolve from this app's root, so Astro's
+   * default image service exits 1 with MissingSharp on the first raster image — a latent failure that a
+   * build with no images does not reveal. This site optimises no images; the social cards are drawn
+   * by their own route. Ported from memhtml-public's config.
+   */
+  image: { service: passthroughImageService() },
+
+  /*
+   * `canvaskit-wasm` stays out of the SSR bundle, and it is a DIRECT dependency of this package for the
+   * same reason. It ships as UMD and reads `__dirname`, which is not defined in the ESM chunk Vite would
+   * otherwise inline it into — the social-card route then fails at render with a `ReferenceError` that
+   * names neither the package nor the cause. Left external it is required at run time as CommonJS,
+   * where `__dirname` exists, and its own `createRequire` locates the wasm binary beside it. Ported
+   * from memhtml-public's config.
+   */
+  vite: { ssr: { external: ["canvaskit-wasm"] } },
 
   markdown: {
     /*
@@ -154,9 +208,24 @@ export default defineConfig({
            * `/microvms-agentd/microvms-agentd/platform/`.
            */
           siteBase: "",
-          published: new Set(manifest.publishedTreePaths)
+          published: new Set(manifest.publishedTreePaths),
+          /*
+           * The route comes from the sync manifest rather than from the plugin's default, which lowercases
+           * the tree path. That default was the route until the tiers arrived; now `PLATFORM.md` is served
+           * at `/internals/platform/` and `reference/cli.md` stays at `/reference/cli/`, and only the sync
+           * knows which rule placed which page. The fallback is the default, for a tree path the manifest
+           * does not name — which `published` above already keeps from reaching here.
+           */
+          intraSiteHref: (target) =>
+            (target.treePath === undefined ? undefined : manifest.routes[target.treePath]) ??
+            `/${target.slug}/`
         })
-      ]
+      ],
+      /*
+       * Starlight PUSHES its own hast plugins after these, so this runs first and its `tabindex`
+       * survives whatever Starlight adds afterwards. See the plugin for the SC 2.1.1 finding it closes.
+       */
+      hastPlugins: [focusableScrollers()]
     })
   },
 
@@ -214,7 +283,58 @@ export default defineConfig({
         PageTitle: "./src/components/PageTitle.astro"
       },
 
-      customCss: ["./src/styles/docs.css"],
+      /*
+       * `rfc.css` is the specification register — serif body, warm paper, one accent — and it is where
+       * `--docs-rule` is defined. `docs.css` carries the page-action controls, the agent note, and the
+       * diagram styles, and it stays independent of the register so a register change cannot break a
+       * control's target size.
+       */
+      customCss: ["./src/styles/docs.css", "./src/styles/rfc.css"],
+
+      /*
+       * A code block is the one place on this site where a second typeface appears, so it is framed
+       * rather than tinted: square corners and a hairline rule in the same value the tables use, which
+       * is what keeps it reading as a figure inside a specification instead of a widget dropped onto
+       * the page. Expressive Code's defaults are a 0.3rem radius and a drop shadow, and both are wrong
+       * against a serif body. `codeFontSize` is 0.85em rather than 1em because the mono stack's
+       * x-height runs ahead of the serif's at equal size; the two only look like one document at this
+       * ratio. Ported from memhtml-public's config.
+       */
+      expressiveCode: {
+        plugins: [pluginLineNumbers(), pluginCollapsibleSections()],
+        /*
+         * A ```mermaid fence is a figure source, not a code sample: the `mermaid()` integration above
+         * claims it at mdast and replaces the block with an SVG. Expressive Code would still see the
+         * fence first if it ever reached hast, find no highlighter for `mermaid`, and warn once per
+         * figure. Aliasing it to plain text says what is true: nothing here needs highlighting.
+         */
+        shiki: { langAlias: { mermaid: "txt" } },
+        styleOverrides: {
+          borderRadius: "0",
+          borderColor: "var(--docs-rule)",
+          borderWidth: "1px",
+          // The same tint an inline code span already sits on, so a block and a span are one material.
+          // The bundled themes ship a violet-cast ground that belongs to no value in this palette.
+          codeBackground: "var(--sl-color-bg-inline-code)",
+          codeFontFamily: "var(--sl-font-mono)",
+          codeFontSize: "0.85em",
+          /*
+           * The gutter's own foreground, per theme. Expressive Code's light default measured 2.34:1
+           * (#90a7b2 on this site's #f2efe6 code ground) in `tests/a11y.test.ts`, twelve nodes on the
+           * Platform page alone; a line number is body-size text, so SC 1.4.3 wants 4.5:1. Measured:
+           * #4a5560 on #f2efe6 is 6.62:1; the same value on the dark ground #1e1e1c is 2.19:1, so the
+           * dark theme takes rfc.css's dark secondary ink #b9b6ae, 8.24:1 there.
+           */
+          lineNumbers: {
+            foreground: ({ theme }) => (theme.type === "dark" ? "#b9b6ae" : "#4a5560")
+          },
+          frames: {
+            shadowColor: "transparent",
+            editorTabBorderRadius: "0",
+            frameBoxShadowCssValue: "none"
+          }
+        }
+      },
 
       /*
        * Read from git so the JSON-LD `dateModified` and the page footer describe the SOURCE file's last
@@ -231,43 +351,107 @@ export default defineConfig({
        * reason, and the change belongs in `docs/` or in `site/authored/`.
        */
 
+      /*
+       * Diátaxis, three tiers: Learn is task-shaped, Reference is derived from `microvm manifest`, and
+       * Internals is the reasoning. An `autogenerate` entry has to sit inside `items` — a group carrying
+       * it directly is rejected — and `collapsed` does not cascade, so each group states its own.
+       */
       sidebar: [
         // First, above everything: an agent arriving at this site should not have to find this page.
         { label: "For agents", link: "/agents/" },
         {
           /*
-           * Derived from the sync manifest, because these documents predate the generated tree and win
-           * any disagreement with it — so the rail has to list all of them, and a hand-written list here
-           * would silently omit the next one.
+           * Explicit rather than one `autogenerate` over `learn`: Starlight would label the two
+           * subgroups from their directory names, lowercase, and sort them alphabetically, which puts
+           * the how-tos above the tutorials they assume. The order here is the reading order.
            */
-          label: "Authoritative",
+          label: "Learn",
           collapsed: false,
-          items: [...manifest.sidebar]
-        },
-        // ccu's own reading order across the six categories, rather than alphabetical.
-        {
-          label: "Architecture",
-          collapsed: false,
-          items: [{ autogenerate: { directory: "architecture" } }]
-        },
-        { label: "Reference", collapsed: true, items: [{ autogenerate: { directory: "reference" } }] },
-        { label: "Behavior", collapsed: true, items: [{ autogenerate: { directory: "behavior" } }] },
-        { label: "Analysis", collapsed: true, items: [{ autogenerate: { directory: "analysis" } }] },
-        {
-          /*
-           * Each subgroup is named explicitly. ccu nests diagrams one level deeper than the other five
-           * categories, so autogenerating `diagrams` as one directory produces a subgroup labelled
-           * "architecture" beside the top-level Architecture group — two rail entries with one name.
-           */
-          label: "Diagrams",
-          collapsed: true,
           items: [
-            { label: "Components", items: [{ autogenerate: { directory: "diagrams/architecture" } }] },
-            { label: "Structure", items: [{ autogenerate: { directory: "diagrams/structural" } }] },
-            { label: "Sequences", items: [{ autogenerate: { directory: "diagrams/behavioral" } }] }
+            { label: "Overview", link: "/learn/" },
+            { label: "Tutorials", items: [{ autogenerate: { directory: "learn/tutorial" } }] },
+            { label: "How-to", items: [{ autogenerate: { directory: "learn/operations" } }] }
           ]
         },
-        { label: "Insights", collapsed: true, items: [{ autogenerate: { directory: "insights" } }] }
+        {
+          label: "Reference",
+          collapsed: true,
+          items: [
+            { label: "Overview", link: "/reference/" },
+            // The four contract pages first: they are what a caller branches on, and they are short.
+            { label: "Envelope", link: "/reference/envelope/" },
+            { label: "Exit codes", link: "/reference/exit-codes/" },
+            { label: "Response types", link: "/reference/response-types/" },
+            { label: "Wire schema", link: "/reference/wire-schema/" },
+            {
+              /*
+               * One page per `microvm` subcommand, written by `scripts/gen-reference.mjs` from the CLI's
+               * own manifest, so the rail lists a command on the run that publishes its page. Collapsed,
+               * because the list is as long as the command surface.
+               */
+              label: "Commands",
+              collapsed: true,
+              items: [{ autogenerate: { directory: "reference/commands" } }]
+            },
+            {
+              // ccu's three reference pages: generated too, but from the source tree rather than the
+              // manifest, and carrying `path:line` citations the manifest cannot.
+              label: "Annotated",
+              items: [
+                { label: "CLI", link: "/reference/cli/" },
+                { label: "Public API", link: "/reference/public-api/" },
+                { label: "RPC tools", link: "/reference/rpc-tools/" }
+              ]
+            }
+          ]
+        },
+        {
+          label: "Internals",
+          collapsed: true,
+          items: [
+            { label: "Overview", link: "/internals/" },
+            {
+              /*
+               * Derived from the sync manifest, because these documents predate the generated tree and
+               * win any disagreement with it — so the rail has to list all of them, and a hand-written
+               * list here would silently omit the next one.
+               */
+              label: "Authoritative",
+              items: [...manifest.sidebar]
+            },
+            // ccu's own reading order across its categories, rather than alphabetical.
+            {
+              label: "Architecture",
+              items: [{ autogenerate: { directory: "internals/architecture" } }]
+            },
+            { label: "Behavior", items: [{ autogenerate: { directory: "internals/behavior" } }] },
+            { label: "Analysis", items: [{ autogenerate: { directory: "internals/analysis" } }] },
+            {
+              /*
+               * Each subgroup is named explicitly. ccu nests diagrams one level deeper than the other
+               * categories, so autogenerating `diagrams` as one directory produces a subgroup labelled
+               * "architecture" beside the Architecture group — two rail entries with one name.
+               */
+              label: "Diagrams",
+              items: [
+                {
+                  label: "Components",
+                  items: [{ autogenerate: { directory: "internals/diagrams/architecture" } }]
+                },
+                {
+                  label: "Structure",
+                  items: [{ autogenerate: { directory: "internals/diagrams/structural" } }]
+                },
+                {
+                  label: "Sequences",
+                  items: [{ autogenerate: { directory: "internals/diagrams/behavioral" } }]
+                }
+              ]
+            },
+            { label: "Insights", items: [{ autogenerate: { directory: "internals/insights" } }] }
+          ]
+        },
+        { label: "Glossary", link: "/glossary/" }
       ],
 
       plugins: [
@@ -290,7 +474,13 @@ export default defineConfig({
         starlightLlmsTxt({
           projectName: SITE_TITLE,
           description: SITE_DESCRIPTION,
-          details: llmsDetails
+          details: llmsDetails,
+          /*
+           * A separate lever on a separate file: `promote` orders page bodies inside `llms-full.txt`,
+           * where the default is `['index*']` alone. Listing `agents` after it keeps the cover page
+           * first and puts the agent page immediately behind it.
+           */
+          promote: ["index*", "agents"]
         }),
 
         /*
@@ -319,7 +509,10 @@ export default defineConfig({
            * against the twin's own directory, which already carries the base.
            */
           errorOnRelativeLinks: false
-        })
+        }),
+
+        // A return-to-top control on long pages; Platform alone runs past a thousand lines of source.
+        starlightScrollToTop()
       ]
     })
   ]

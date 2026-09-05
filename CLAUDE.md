@@ -16,8 +16,13 @@ mise run check       # THE definition of done: lint, security, test, schema:chec
                      #   stubs:check, model:check, live:check, build. Offline, free.
 mise run live        # real-AWS conformance + rates + leak check. BILLABLE (~15 min).
                      #   Never run casually; never wire to a hook.
-mise run docs:check  # the docs site: install, brace gate, build, typecheck, dist probes.
-                     #   Offline, free, ~20s. NOT inside `check`.
+mise run docs:check  # the docs site, fast and offline: install, lint + spell, brace gate,
+                     #   build, typecheck, the node probes over dist/. NOT inside `check`.
+mise run docs:gate   # docs:check plus the browser tiers: axe + probes, layout stability,
+                     #   Lighthouse floors and byte budget. What docs.yml runs. Needs
+                     #   `mise run docs:browsers` once per machine.
+mise run docs:lint   # biome + cspell alone, while editing site/ or site/authored/
+mise run docs:links  # every EXTERNAL link in the built site, via lychee. Reports; never gates.
 mise tasks           # everything else
 ```
 
@@ -34,12 +39,18 @@ Two names in that list mean less than they look like:
   which is how a transitive RUSTSEC hit surfaces. Fix those with `cargo update -p <crate>`
   and read the resulting `Cargo.lock` diff before committing — a targeted bump in this
   workspace also re-resolves neighbouring edges.
-- `check` also says nothing about the docs site. `docs:check` is out of its `depends` for
-  the reason `spec` is out: it needs a `pnpm install`, and a gate that fails on a fresh
-  clone is a gate people learn to skip. `.github/workflows/docs.yml` runs the same tiers on
-  every push and pull request, with no path filter — a change under `agentd/src/` can break
-  that build, because the site resolves every `path:line` citation against git at a pinned
-  commit and fails when a cited path is gone.
+- `check` also says nothing about the docs site. `docs:check` and `docs:gate` are out of its
+  `depends` for the reason `spec` is out: they need a `pnpm install`, and a gate that fails
+  on a fresh clone is a gate people learn to skip. `.github/workflows/docs.yml` runs
+  `docs:gate`'s tiers on every push and pull request, with no path filter — a change under
+  `agentd/src/` can break that build, because the site resolves every `path:line` citation
+  against git at a pinned commit and fails when a cited path is gone. The browser tiers carry
+  declared baselines in `site/src/gates.ts` (`KNOWN_A11Y_FAILURES`, `KNOWN_LAYOUT_SHIFTS`)
+  and they are ratchets, not exemptions: a finding outside the list fails, and an entry that
+  stops firing fails too. The same file holds `DENYLIST`, the tokens that must never reach a
+  public page, and the byte budget beside its measurement. External links are
+  `docs:links` and the weekly `links.yml`, which report and never gate: a link that rotted
+  overnight is not a defect in the commit being pushed.
 
 Individual tiers:
 
