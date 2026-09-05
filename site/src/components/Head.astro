@@ -1,9 +1,10 @@
 ---
 // SPDX-License-Identifier: Apache-2.0
 /**
- * Starlight's `<head>`, extended with the two things it does not emit: the block that points a machine
- * reader at this page's raw Markdown route and at the site's machine surfaces, and the JSON-LD graph
- * that states the same relationship in a vocabulary a different consumer reads.
+ * Starlight's `<head>`, extended with four things it does not emit: the raster icons, this page's
+ * social card, the block that points a machine reader at this page's raw Markdown route and at the
+ * site's machine surfaces, and the JSON-LD graph that states the same relationship in a vocabulary a
+ * different consumer reads.
  *
  * One component owns every machine hint on the page, which is what stops the canonical URL and the
  * JSON-LD `url` from disagreeing with nothing to catch it.
@@ -12,9 +13,11 @@
  * even llmstxt.org itself; and any visually-hidden agent-directed block, which is content served to
  * machines and hidden from every human. That is cloaking wearing an accessibility class name.
  *
- * Also absent: raster icons and social-card metas. This site ships neither a `.ico` nor a card
- * generator, and a `<link>` or an `og:image` naming a file the build does not emit is worse than the
- * absent tag — a crawler follows it and attributes the 404 here.
+ * The icons and the card are emitted only because the build emits the files they name: `public/`
+ * carries the four icons `src/branding/write-icons.ts` writes, and `src/pages/og/[...slug].png.ts`
+ * renders one card per collection entry. A `<link>` or an `og:image` naming a file the build does not
+ * emit is worse than the absent tag, because a crawler follows it and attributes the 404 here;
+ * `tests/branding.test.ts` is what keeps the committed icons equal to the generator.
  *
  * Every URL is built with `new URL()`, never by concatenating strings. `Astro.site` EXCLUDES the base —
  * for this site it is `https://theagenticguy.github.io` — so resolving a path against it directly drops
@@ -23,7 +26,9 @@
  */
 import Default from "@astrojs/starlight/components/Head.astro"
 
-import { discoveryLinks } from "../lib/agent-surface.js"
+import { APPLE_TOUCH_SIZE, ICO_SIZES, ICON_PNG_SIZE } from "../branding/mark.js"
+import { OG_HEIGHT, OG_WIDTH, ogAlt, ogSlug } from "../branding/og-card.js"
+import { discoveryLinks, siteUrl } from "../lib/agent-surface.js"
 import { jsonLdGraph, jsonLdText, type SiteDescription } from "../lib/jsonld.js"
 
 /**
@@ -57,6 +62,21 @@ const { entry } = route
 
 const links = discoveryLinks(entry.id, context)
 
+/*
+ * An icon is a same-site asset and stays root-relative, so a preview build served from another host
+ * does not fetch its icons from production. `siteUrl` resolves under the base segment exactly as the
+ * discovery links do, and only the pathname is read back out: still a URL resolution rather than a
+ * concatenation, so the base segment can be neither doubled nor dropped.
+ */
+const asset = (file: string): string => siteUrl(file, context).pathname
+
+/* `og:image` is the one URL that must be absolute: a crawler resolves it against nothing. */
+const card = siteUrl(`og/${ogSlug(entry.id)}`, context)
+const cardAlt = ogAlt(entry.data.title)
+
+const icoSizes = ICO_SIZES.map((size) => `${size}x${size}`).join(" ")
+const appleTouch = `${APPLE_TOUCH_SIZE}x${APPLE_TOUCH_SIZE}`
+
 const graph = jsonLdGraph(
   {
     entryId: entry.id,
@@ -76,9 +96,36 @@ const graph = jsonLdGraph(
 )
 ---
 
+{/*
+  The raster icons come BEFORE the default head on purpose. Starlight sorts its own
+  `<link rel="shortcut icon">` (the SVG) to the end so a browser choosing between equally applicable
+  icons takes the SVG, which stays sharp at any scale; a PNG declared after it would win that choice
+  instead. Ported from memhtml-public's Head.astro.
+*/}
+<link rel="icon" href={asset("favicon.ico")} sizes={icoSizes} />
+<link
+  rel="icon"
+  type="image/png"
+  href={asset(`icon-${ICON_PNG_SIZE}.png`)}
+  sizes={`${ICON_PNG_SIZE}x${ICON_PNG_SIZE}`}
+/>
+<link rel="apple-touch-icon" href={asset("apple-touch-icon.png")} sizes={appleTouch} />
+
 {/* The default is delegated to, never replaced: replacing it drops the canonical link and the sitemap
     reference, and both are silent losses. */}
 <Default {...Astro.props}><slot /></Default>
+
+{/*
+  Starlight emits `twitter:card: summary_large_image` and no image (read from its `utils/head.ts`), so
+  these are additions and not a second `og:image` beside a default one.
+*/}
+<meta property="og:image" content={card.href} />
+<meta property="og:image:type" content="image/png" />
+<meta property="og:image:width" content={String(OG_WIDTH)} />
+<meta property="og:image:height" content={String(OG_HEIGHT)} />
+<meta property="og:image:alt" content={cardAlt} />
+<meta name="twitter:image" content={card.href} />
+<meta name="twitter:image:alt" content={cardAlt} />
 
 {
   links.map((link) => (
