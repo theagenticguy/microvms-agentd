@@ -66,7 +66,7 @@ fi
 # ── 4. the forward ──────────────────────────────────────────────────────────
 echo "code-server: http://127.0.0.1:$LOCAL_PORT"
 echo "  a shell beside it:  microvm shell --name $VM_NAME --region $REGION"
-echo "  pause it now:       microvm suspend --name $VM_NAME --region $REGION"
-echo "  tear it down:       microvm terminate --name $VM_NAME --region $REGION"
+echo "  pause it now:       microvm suspend $VM_NAME --region $REGION"
+echo "  tear it down:       microvm terminate $VM_NAME --region $REGION"
 echo "(Ctrl-C stops this forward, not the VM)"
 exec microvm port-forward "$LOCAL_PORT:8080" --name "$VM_NAME" --region "$REGION"

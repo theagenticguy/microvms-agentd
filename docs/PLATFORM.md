@@ -1253,7 +1253,7 @@ two cannot be compared as strings and a caller should not try.
 
 ## Every field `GetMicrovm` returns for a running VM
 
-Measured 2026-08-15, us-east-1, API version `2025-09-09`. Recorded verbatim so the client
+Measured 2026-08-15, us-east-1, API version `2025-09-09`. Recorded verbatim, with the account id redacted, so the client
 can be audited for fields it ignores. A VM launched from a custom image with both
 connectors:
 
@@ -1262,9 +1262,9 @@ connectors:
     "microvmId": "microvm-a991cd0b-3321-3e2c-a982-d5c4db52b17a",
     "state": "RUNNING",
     "endpoint": "30d00336-db07-f4f5-79c1-8571c22bef9e.lambda-microvm.us-east-1.on.aws",
-    "imageArn": "arn:aws:lambda:us-east-1:392583147479:microvm-image:coding-agents-b8ea1298a3b2",
+    "imageArn": "arn:aws:lambda:us-east-1:123456789012:microvm-image:coding-agents-b8ea1298a3b2",
     "imageVersion": "1.0",
-    "executionRoleArn": "arn:aws:iam::392583147479:role/agentd-conformance-exec-b2111c56",
+    "executionRoleArn": "arn:aws:iam::123456789012:role/agentd-conformance-exec-b2111c56",
     "idlePolicy": {
         "maxIdleDurationSeconds": 1800,
         "suspendedDurationSeconds": 600,
