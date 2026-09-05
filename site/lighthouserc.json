@@ -14,7 +14,8 @@
       "numberOfRuns": 3,
       "settings": {
         "preset": "desktop",
-        "skipAudits": ["uses-http2", "canonical"]
+        "skipAudits": ["uses-http2", "canonical"],
+        "chromeFlags": "--no-sandbox"
       }
     },
     "assert": {

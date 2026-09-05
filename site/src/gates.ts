@@ -164,6 +164,15 @@ export const KNOWN_A11Y_FAILURES: ReadonlyArray<{
 ]
 
 /** Where `astro build` writes, relative to the package root. */
+/**
+ * `lighthouserc.json` launches Chrome with `--no-sandbox`. Measured 2026-09-05 on GitHub's
+ * ubuntu-24.04 runner: Chrome's zygote aborted with "No usable sandbox!" because the image
+ * restricts unprivileged user namespaces through AppArmor, and Lighthouse reported "Unable to
+ * connect to Chrome" after fifteen seconds of waiting. Playwright's own launcher already passes the
+ * equivalent flag, which is why the accessibility tier ran on the same runner without it. The flag
+ * disables a defense for a browser that only ever loads this repository's own built pages from a
+ * loopback server, and JSON carries no comments, so the reason lives here.
+ */
 export const DIST_DIR = "dist"
 
 /**
