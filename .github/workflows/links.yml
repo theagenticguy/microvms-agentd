@@ -1,0 +1,100 @@
+# External link checking for the docs site. Deliberately NOT part of `docs.yml`, and not because it is
+# unimportant: an outbound link breaks when somebody else edits their own site, so a gate would fail
+# whichever commit happened to be pushed that morning and would teach everyone to ignore it. Internal
+# links are the opposite case and they do gate: `starlight-links-validator` fails the docs build on a
+# broken one, on every pull request, and `site/tests/authored-links.test.ts` fails the node tier.
+#
+# So this reports. It runs weekly, it can be run by hand, and its findings arrive as a job summary and
+# an artifact rather than as a red mark on an unrelated change. `fail: false` on the lychee step plus
+# `continue-on-error` is the whole mechanism: lychee records the dead links, and the job still succeeds.
+#
+# Action versions follow `ci.yml`'s recorded rule: every `uses:` here resolves to a Node 24 action,
+# pinned by SHA. The checkout, pnpm and node steps are `docs.yml`'s, for the reasons it records.
+name: links
+
+on:
+  schedule:
+    # Mondays, 07:17 UTC. An odd minute so it does not land on the top-of-hour crowd.
+    - cron: "17 7 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  external:
+    name: report every external link in the built site
+    runs-on: ubuntu-latest
+    steps:
+      # The whole history, as in `docs.yml`: `sync-docs.mjs` resolves every cited path with
+      # `git ls-tree` at the pinned commit and stamps each page's `lastUpdated` from the source
+      # file's last commit, and a shallow clone degrades both silently.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
+        with:
+          package_json_file: site/package.json
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '22.13'
+          cache: pnpm
+          cache-dependency-path: site/pnpm-lock.yaml
+
+      - name: install
+        working-directory: site
+        run: pnpm install --frozen-lockfile
+
+      # The links to check are the ones the OUTPUT contains rather than the ones the sources mention:
+      # the Reference tier is generated, and its links exist only after a build. The site is built for
+      # its production origin so every internal href resolves under `lychee.toml`'s `base_url` and is
+      # then excluded there; only the external ones are fetched.
+      - name: build the site
+        working-directory: site
+        env:
+          DOCS_SITE: ${{ vars.DOCS_SITE || 'https://theagenticguy.github.io' }}
+          DOCS_BASE: ${{ vars.DOCS_BASE || '/microvms-agentd/' }}
+        run: |
+          pnpm run sync
+          pnpm run braces
+          pnpm exec astro build
+
+      # `fail: false` so a dead link is a finding and not a failed job; `continue-on-error` in case the
+      # action itself cannot run (a download failure is not a link failure either). The action writes
+      # the markdown report to the job summary itself and to `lychee/out.md`.
+      - id: lychee
+        continue-on-error: true
+        uses: lycheeverse/lychee-action@e7477775783ea5526144ba13e8db5eec57747ce8 # v2.9.0
+        with:
+          args: --config lychee.toml --no-progress 'site/dist/**/*.html'
+          format: markdown
+          output: lychee/out.md
+          fail: false
+          jobSummary: true
+
+      - if: always()
+        run: |
+          {
+            echo "## External links"
+            echo
+            if [ "${{ steps.lychee.outcome }}" = "success" ]; then
+              echo "The check ran. Dead or unreachable links, if any, are listed above: each one is"
+              echo "somebody's site changing, not a defect in a commit. Fix the link, or add it to"
+              echo "\`lychee.toml\`'s exclusions with the reason."
+            else
+              echo "The lychee step itself failed to run; read its log rather than this summary."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: lychee-report
+          path: lychee/out.md
+          if-no-files-found: ignore

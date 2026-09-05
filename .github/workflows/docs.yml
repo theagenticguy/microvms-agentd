@@ -78,6 +78,13 @@ jobs:
         working-directory: site
         run: pnpm install --frozen-lockfile
 
+      # biome over the site's TypeScript and JSON, then cspell over the authored pages. Before
+      # the build on purpose: a misspelling or an unused import is the cheapest thing in this
+      # job to report, and the whole job stays short when it stops here.
+      - name: lint and spell-check
+        working-directory: site
+        run: pnpm run lint
+
       # Where the site will actually be served, derived rather than hardcoded, so a fork
       # builds URLs for its own origin instead of this one. The rule is GitHub's own: a
       # repository named `<owner>.github.io` is served at the origin root and everything
@@ -163,6 +170,37 @@ jobs:
           DOCS_SITE: ${{ vars.DOCS_SITE || steps.target.outputs.origin }}
           DOCS_BASE: ${{ vars.DOCS_BASE || steps.target.outputs.base }}
         run: pnpm exec vitest run
+
+      # The browser tiers. Chrome for Testing is fetched here rather than at install, because
+      # Playwright ships no install script and the download is ~150 MB the node tier above never
+      # needs. `--with-deps` pulls the shared libraries a headless Chromium wants on the runner.
+      # One binary serves axe (through Playwright) and Lighthouse (through CHROME_PATH), so both
+      # tiers measure the same engine.
+      - name: fetch Chromium for the browser tiers
+        working-directory: site
+        run: pnpm exec playwright install --with-deps chromium
+
+      # WCAG 2.2 AA through axe plus the four probes axe lacks, and the layout-stability probe,
+      # over the pages `site/src/gates.ts` names. The baselines there are ratchets: a
+      # violation outside them fails, and an entry that stops firing fails too. Same variable
+      # pair as the build, for the same reason as the step above: the static server mounts
+      # `dist/` under the base the build used.
+      - name: accessibility and layout stability
+        working-directory: site
+        env:
+          DOCS_SITE: ${{ vars.DOCS_SITE || steps.target.outputs.origin }}
+          DOCS_BASE: ${{ vars.DOCS_BASE || steps.target.outputs.base }}
+        run: pnpm run test:a11y
+
+      # Lighthouse category floors and the byte budget, three runs per page, desktop preset.
+      # Performance aggregates optimistically because a loaded runner can only depress a static
+      # page's score; layout shift is gated by the probe above, not by Lighthouse's own reading.
+      - name: performance budget
+        working-directory: site
+        env:
+          DOCS_SITE: ${{ vars.DOCS_SITE || steps.target.outputs.origin }}
+          DOCS_BASE: ${{ vars.DOCS_BASE || steps.target.outputs.base }}
+        run: pnpm run test:budget
 
       - name: upload the Pages artifact
         uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5

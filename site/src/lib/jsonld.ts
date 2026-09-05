@@ -26,7 +26,7 @@
  * present one as asserted.
  */
 
-import { siteUrl, type SiteContext } from "./agent-surface.js"
+import { type SiteContext, siteUrl } from "./agent-surface.js"
 
 /**
  * The site node, described once.
@@ -135,11 +135,7 @@ export const websiteNode = (site: SiteDescription, context: SiteContext) => {
 }
 
 /** One page's article node. */
-export const articleNode = (
-  page: PageDescription,
-  site: SiteDescription,
-  context: SiteContext
-) => {
+export const articleNode = (page: PageDescription, site: SiteDescription, context: SiteContext) => {
   const url = pageUrl(page.entryId, context).href
   const isPartOf: Referenced = { "@id": websiteId(context) }
   return {
@@ -166,7 +162,11 @@ export const articleNode = (
 }
 
 /** The whole graph for one page: its article, and the site it belongs to. */
-export const jsonLdGraph = (page: PageDescription, site: SiteDescription, context: SiteContext) => ({
+export const jsonLdGraph = (
+  page: PageDescription,
+  site: SiteDescription,
+  context: SiteContext
+) => ({
   "@context": "https://schema.org",
   "@graph": [articleNode(page, site, context), websiteNode(site, context)]
 })
@@ -183,7 +183,4 @@ export const jsonLdGraph = (page: PageDescription, site: SiteDescription, contex
  * `&quot;` entities that no `application/ld+json` parser accepts.
  */
 export const jsonLdText = (graph: unknown): string =>
-  JSON.stringify(graph)
-    .replace(/</g, "\\u003c")
-    .replace(/>/g, "\\u003e")
-    .replace(/&/g, "\\u0026")
+  JSON.stringify(graph).replace(/</g, "\\u003c").replace(/>/g, "\\u003e").replace(/&/g, "\\u0026")

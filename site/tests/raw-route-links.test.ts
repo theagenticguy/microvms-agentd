@@ -133,7 +133,9 @@ describe("the raw Markdown routes", () => {
       rootRelativeTargets(readFileSync(file, "utf8"))
         .filter((target) => target.startsWith(segment) && !target.includes("#"))
         .map((target) => target.slice(segment.length))
-        .filter((path) => !(isFile(join(distDir, path)) || isFile(join(distDir, path, "index.html"))))
+        .filter(
+          (path) => !(isFile(join(distDir, path)) || isFile(join(distDir, path, "index.html")))
+        )
         .map((path) => `${file.slice(distDir.length)} -> ${segment}${path}`)
     )
     expect(missing).toEqual([])
@@ -145,7 +147,9 @@ describe("the raw Markdown routes", () => {
       return relativeTargets(readFileSync(file, "utf8"))
         .map((target) => posix.normalize(posix.join(here, (target.split("#")[0] ?? "").trim())))
         .filter((path) => path !== "" && path !== ".")
-        .filter((path) => !(isFile(join(distDir, path)) || isFile(join(distDir, path, "index.html"))))
+        .filter(
+          (path) => !(isFile(join(distDir, path)) || isFile(join(distDir, path, "index.html")))
+        )
         .map((path) => `${file.slice(distDir.length)} -> ${path}`)
     })
     expect(missing).toEqual([])

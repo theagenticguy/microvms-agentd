@@ -58,7 +58,9 @@ export const rootTwin = (): AstroIntegration => ({
       }
 
       await rename(from, to)
-      logger.info(`moved the landing page's twin from ${INJECTED} to ${SERVED} (a host serves no dotfile)`)
+      logger.info(
+        `moved the landing page's twin from ${INJECTED} to ${SERVED} (a host serves no dotfile)`
+      )
     }
   }
 })

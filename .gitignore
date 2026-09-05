@@ -54,3 +54,6 @@ site/src/content/docs/
 # The wire schema, copied out of docs/ so the site can serve it at a stable URL. The
 # committed original is docs/schema.json, which a gate byte-compares against the daemon.
 site/public/schema.json
+# Lighthouse output and the typecheck-gate probe build, both produced by `mise run docs:gate`.
+site/.lighthouseci/
+site/dist-typecheck-probe/

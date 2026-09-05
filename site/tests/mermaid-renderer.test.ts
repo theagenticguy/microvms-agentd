@@ -50,19 +50,18 @@ describe("the mermaid renderer covers this corpus", () => {
     expect(corpus.length).toBeGreaterThan(0)
   })
 
-  it.each(fences().map((fence, index) => [`${fence.file}#${index} ${fence.header}`, fence] as const))(
-    "renders %s to an SVG",
-    (_label, fence) => {
-      const svg = beautifulMermaid({ bg: "var(--sl-color-bg)", fg: "var(--sl-color-text)" })({
-        source: fence.source,
-        meta: undefined,
-        index: 0,
-        label: fence.file
-      })
-      expect(svg.trimStart().startsWith("<svg")).toBe(true)
-      expect(svg).toContain("</svg>")
-    }
-  )
+  it.each(
+    fences().map((fence, index) => [`${fence.file}#${index} ${fence.header}`, fence] as const)
+  )("renders %s to an SVG", (_label, fence) => {
+    const svg = beautifulMermaid({ bg: "var(--sl-color-bg)", fg: "var(--sl-color-text)" })({
+      source: fence.source,
+      meta: undefined,
+      index: 0,
+      label: fence.file
+    })
+    expect(svg.trimStart().startsWith("<svg")).toBe(true)
+    expect(svg).toContain("</svg>")
+  })
 
   it("strips the webfont import the renderer writes unconditionally", () => {
     /*
@@ -83,7 +82,12 @@ describe("the mermaid renderer covers this corpus", () => {
      */
     const render = beautifulMermaid()
     expect(() =>
-      render({ source: "gantt\n  title A\n  section S\n  T :a1, 2020-01-01, 30d", meta: undefined, index: 0, label: "probe" })
+      render({
+        source: "gantt\n  title A\n  section S\n  T :a1, 2020-01-01, 30d",
+        meta: undefined,
+        index: 0,
+        label: "probe"
+      })
     ).toThrow()
     expect(() => render({ source: "", meta: undefined, index: 0, label: "probe" })).toThrow()
   })
@@ -98,12 +102,17 @@ describe("the plugin", () => {
     const code = plugin.code
     if (typeof code !== "function") throw new Error("the plugin declares no `code` visitor")
 
-    const claimed = code({ type: "code", lang: MERMAID_LANG, value: "graph TD\n A-->B" } as never, context)
+    const claimed = code(
+      { type: "code", lang: MERMAID_LANG, value: "graph TD\n A-->B" } as never,
+      context
+    )
     expect(claimed).toMatchObject({ type: "html" })
 
     // A `rust` fence is the overwhelming majority of this corpus; claiming it would replace every code
     // block on the site with an SVG.
-    expect(code({ type: "code", lang: "rust", value: "fn main() {}" } as never, context)).toBeUndefined()
+    expect(
+      code({ type: "code", lang: "rust", value: "fn main() {}" } as never, context)
+    ).toBeUndefined()
   })
 
   it("throws rather than returning the node when the renderer fails", () => {
@@ -138,7 +147,10 @@ describe("the plugin", () => {
     const plugin = mermaidPlugin({ renderer: () => "<svg></svg>" })
     const code = plugin.code
     if (typeof code !== "function") throw new Error("the plugin declares no `code` visitor")
-    const result = code({ type: "code", lang: MERMAID_LANG, value: "graph TD\n A-->B" } as never, context)
+    const result = code(
+      { type: "code", lang: MERMAID_LANG, value: "graph TD\n A-->B" } as never,
+      context
+    )
     expect(result).not.toBeInstanceOf(Promise)
   })
 })

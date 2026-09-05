@@ -1,0 +1,98 @@
+# The vocabulary the authored pages write in, and nothing else. A word belongs here when it is a
+# term of art, an identifier quoted from source or from `microvm manifest`, or a dependency's name,
+# never because a spelling was inconvenient to fix. The pages write US English: `cspell.json`
+# carries a `flagWords` list that rejects the recurring British forms (`behaviour`, `colour`,
+# `catalogue`) with their US replacements.
+#
+# cspell splits on case and on `-`/`_`/`.`, so a compound like `runHookPayload` needs no entry and
+# `microvms-core` needs only `microvms`.
+#
+# Only `site/authored/**` is checked. The `docs/` tree is a generated codebase-understanding pass
+# whose edits ccu discards, and the Reference tier is generated from `docs/manifest.json`.
+
+# --- the project's own nouns --------------------------------------------------------------
+agentd
+microvm
+microvms
+# `MicroVM` and `MicroVMs` are AWS's own spelling of the product; cspell sees `Micro` + `VM`.
+MicroVM
+MicroVMs
+Firecracker
+
+# --- identifiers quoted from the CLI, the daemon and the workspace ------------------------
+# The stateright model-checking crate, which `model/` is built on.
+stateright
+# napi-rs, the Node binding layer under `microvms-js`.
+napi
+# PyO3, the Python binding layer under `microvms-py`.
+PyO3
+maturin
+# The `microvm` binary's subcommands and flags that are words cspell does not know.
+lifecycles
+
+# --- shell and platform vocabulary -----------------------------------------------------------
+# bash's array of per-stage exit codes, quoted where the agent page warns against piping a gate.
+PIPESTATUS
+musl
+aarch64
+rustup
+lefthook
+
+# --- machine-readable surfaces ----------------------------------------------------------------
+llms
+
+# --- Learn pages: tools and formats quoted in commands and prose ---------------------------
+# Python packaging and test tooling named in the run-a-project tutorial and the live-suite page.
+venv
+pyproject
+pytest
+botocore
+# Docker vocabulary in the guest-Dockerfile operation: `docker buildx`, the `amazonlinux` base
+# image, `binfmt` for cross-architecture emulation, the `findutils`/`procps` packages it installs.
+buildx
+amazonlinux
+binfmt
+findutils
+procps
+Dockerfiles
+# `cargo binstall`, the prebuilt-binary installer the install tutorial offers.
+binstall
+# Shell vocabulary: `set -o pipefail`, zsh's `setopt`, the `openat` syscall, subshells.
+pipefail
+setopt
+openat
+subshells
+# The GitHub owner, quoted in clone URLs and image names.
+theagenticguy
+# `terraform.tfstate`, named where the live-suite page says what `terraform destroy` leaves behind.
+tfstate
+# Filesystem nouns the run-a-project tutorial uses for what a sync skips.
+fifos
+hardlinks
+# Protocol vocabulary: the `ack` command's verb forms, the idle keepalive, a VM that can suspend.
+acked
+acking
+keepalive
+KEEPALIVE
+suspendable
+# `ENVFILE` is the placeholder variable the Bedrock operation page has the reader export.
+ENVFILE
+# An installation with no network path out, as the install tutorial describes it.
+airgapped
+# A parser's verdict on input it cannot read, quoted from the CLI's own error text.
+unparseable
+# The AWS CLI package name as `dnf` spells it.
+awscli
+
+# --- quoted from something outside these pages -------------------------------------------
+# `memroy` is a deliberate misspelling: `learn/operations/configure-the-project-file` shows the
+# typo the project file refuses by name, which is the point of the paragraph.
+memroy
+# The `openat2` resolve flag `RESOLVE_NO_MAGICLINKS`, quoted in the glossary's tar-confinement entry.
+MAGICLINKS
+# A harness named beside Harbor and the Vercel Sandbox on the Internals index.
+Omnigent
+# The build page names a snapshot pass per chipset generation.
+chipset
+# `terraform -chdir=…`, the flag the live-suite page quotes.
+chdir

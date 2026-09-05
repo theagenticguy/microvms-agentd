@@ -1,0 +1,11 @@
+---
+// SPDX-License-Identifier: Apache-2.0
+// A deliberate type error. tests/typecheck-gate.test.ts copies this into src/components/ as an
+// .astro file and asserts `astro check` fails on it, because `astro build` and `tsc --noEmit` both
+// exit 0 against exactly this input. Without that asymmetry proven, the package's typecheck task
+// could be swapped for `tsc` and nothing would notice.
+interface Props { readonly count: number }
+const { count } = Astro.props
+const wrong: string = count
+---
+<span>{wrong}</span>

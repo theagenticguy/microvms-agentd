@@ -173,6 +173,30 @@ description = "Fail if the committed schema no longer matches what is served"
 # serves.
 run = "cargo run -q -p agentd --bin schema -- --check"
 
+[tasks.manifest]
+description = "Regenerate docs/manifest.json from the CLI's own argument tree"
+# The docs site's Reference tier (`site/scripts/gen-reference.mjs`) is generated from this
+# file: one page per command, the exit codes, the envelope, the response types. It is what
+# `microvm manifest` prints, so the CLI and the site can only disagree by this file being stale.
+run = "cargo run -q -p microvms-cli -- manifest > docs/manifest.json"
+
+[tasks."manifest:check"]
+description = "Fail if the committed manifest no longer matches what the CLI emits"
+# `schema:check`'s argument, pointed at the command surface. A stale manifest publishes a
+# command table for a binary nobody ships, and it does so with a generated artifact's
+# authority: a reader trusts the page *because* nothing in it was typed by hand.
+#
+# The CLI has no `--check` flag of its own, so the comparison is done here: regenerate into
+# a temp file and `diff -u` against the committed one. `set -e` so a build failure fails the
+# gate rather than diffing the committed file against an empty one and calling that drift.
+run = """
+set -eu
+tmp=$(mktemp)
+trap 'rm -f "$tmp"' EXIT
+cargo run -q -p microvms-cli -- manifest > "$tmp"
+diff -u docs/manifest.json "$tmp"
+"""
+
 [tasks.stubs]
 description = "Regenerate microvms-py/microvms.pyi from the pyo3 surface"
 run = "./scripts/generate-py-stubs.py"
@@ -354,6 +378,7 @@ depends = [
   "security",
   "test",
   "schema:check",
+  "manifest:check",
   "stubs:check",
   "model:check",
   "publish:check",
@@ -613,34 +638,70 @@ run = "cargo install --path microvms-cli --locked"
 
 # ── the documentation site ──────────────────────────────────────────────────
 #
-# `site/` publishes `docs/` to GitHub Pages, and the reason it is a build rather than a
-# `docs/` directory someone browses on github.com is the machine surface: a raw `.md`
-# twin per page, the three `llms.txt` bundles, per-page discovery links, and diagrams
+# `site/` publishes `docs/` and `site/authored/` to GitHub Pages, and the reason it is a build
+# rather than a `docs/` directory someone browses on github.com is the machine surface: a raw
+# `.md` twin per page, the three `llms.txt` bundles, per-page discovery links, and diagrams
 # rendered to SVG at build time. An agent that scrapes rendered HTML pays for navigation
 # chrome, a search widget, and a theme toggle to read three paragraphs.
 #
-# NOT in `check`'s dependency list, for the reason `spec` and `spec:core` are out: it
-# needs a `pnpm install` on a fresh clone, and a gate that fails on a fresh clone is a
-# gate people learn to skip. `docs:check` depends on the install so it works from cold;
-# `.github/workflows/docs.yml` runs the same tiers on every push and pull request. Treat
+# Two tiers, split by what they need rather than by kind:
+#
+#   mise run docs:check   install, lint, spell, sync, brace gate, build, typecheck, the node
+#                         probes over dist/. Offline, free, no browser. Runs on every push.
+#   mise run docs:gate    docs:check plus the two browser tiers (axe + probes, Lighthouse).
+#                         Needs the Chromium `docs:browsers` downloads once. What CI runs.
+#
+# Neither is in `check`'s dependency list, for the reason `spec` and `spec:core` are out: they
+# need a `pnpm install` on a fresh clone, and a gate that fails on a fresh clone is a gate
+# people learn to skip. Both depend on the install so they work from cold;
+# `.github/workflows/docs.yml` runs `docs:gate`'s tiers on every push and pull request. Treat
 # a green `mise run check` as saying nothing about the site.
 #
-# `site/src/content/docs/` is GENERATED in full and gitignored. Edit `docs/` for the
-# published pages, or `site/authored/` for the landing page and the agent page; a change
-# made in the content directory is discarded by the next sync with no diff to show for it.
+# `site/src/content/docs/` is GENERATED in full and gitignored. Edit `docs/` for the published
+# Internals pages, `site/authored/` for the cover, Learn, glossary and agent pages, and
+# `docs/manifest.json` (through `mise run manifest`) for the Reference tier; a change made in
+# the content directory is discarded by the next sync with no diff to show for it.
 
 [tasks."docs:install"]
 description = "Install the docs site's dependencies (pnpm, into site/node_modules)"
 dir = "site"
 run = "pnpm install --frozen-lockfile"
 
+[tasks."docs:browsers"]
+description = "Fetch the pinned Chromium the accessibility and budget tiers drive (once per machine)"
+dir = "site"
+depends = ["docs:install"]
+# Playwright ships no install script, so `pnpm install` never fetches a browser; acquiring it is
+# an explicit step. The download lands in a per-user cache (~/.cache/ms-playwright on Linux)
+# keyed by Playwright's build number, so this is a no-op once the version is present. `chromium`
+# is Chrome for Testing: one binary serves axe through Playwright and Lighthouse through
+# CHROME_PATH, so both tiers measure the same engine as each other and as CI.
+run = "pnpm exec playwright install chromium"
+
+[tasks."docs:lint"]
+description = "biome over the site's TypeScript and JSON, then cspell over the authored pages"
+dir = "site"
+depends = ["docs:install"]
+# `pnpm run lint` is biome then spellcheck, so the gate needs no separate spell tier; `docs:spell`
+# exists to run the second half alone while editing prose. biome's file list lives in
+# `site/biome.json`: the generated content directory and `.astro` files are out of it, and the
+# spell check reads `site/authored/**` only, because the `docs/` tree is a generated pass whose
+# edits ccu discards and the Reference tier is generated from `docs/manifest.json`.
+run = "pnpm run lint"
+
+[tasks."docs:spell"]
+description = "Spell-check the authored pages against site/cspell-words.txt"
+dir = "site"
+depends = ["docs:install"]
+run = "pnpm run spellcheck"
+
 [tasks."docs:sync"]
 description = "Copy docs/ into the site's generated content directory and stamp frontmatter"
 dir = "site"
 # Reads `docs/` and never writes to it. Starlight requires a `title` in frontmatter and
-# offers no H1 fallback, while ccu forbids frontmatter on its outputs and strips it — so
+# offers no H1 fallback, while ccu forbids frontmatter on its outputs and strips it, so
 # the title is derived here and the tree stays read-only.
-run = "node scripts/sync-docs.mjs"
+run = "pnpm run sync"
 
 [tasks."docs:braces"]
 description = "Fail on a bare `{` outside a fence, which breaks the raw Markdown routes"
@@ -655,7 +716,7 @@ run = "node scripts/brace-gate.mjs src/content/docs"
 [tasks."docs:build"]
 description = "Build the site into site/dist (offline, free)"
 dir = "site"
-depends = ["docs:braces"]
+depends = ["docs:install", "docs:braces"]
 # The build is itself three gates: starlight-links-validator fails it on a broken
 # internal link, the citation rewriter fails it on a `path:line` that does not resolve at
 # the pinned commit, and the mermaid plugin fails it on a diagram it cannot render rather
@@ -663,18 +724,69 @@ depends = ["docs:braces"]
 run = "pnpm exec astro build"
 
 [tasks."docs:test"]
-description = "The dist/ probes: twins, discovery links, deep-link budget, cloaking, diagrams"
+description = "The node probes over dist/: twins, links, denylist, alt census, config drift, typecheck gate"
 dir = "site"
+depends = ["docs:build"]
 # Reads the built output rather than the inputs, because the inputs are what you already
 # believe: three of the four machine surfaces fail silently, and a check against a
-# component's props passes while the emitted href is wrong.
+# component's props passes while the emitted href is wrong. The two browser suites are
+# excluded by `vitest.config.ts`; `docs:a11y` runs them.
 run = "pnpm exec vitest run"
 
-[tasks."docs:check"]
-description = "The docs site's definition of done: install, gates, typecheck, build, probes"
-depends = ["docs:install", "docs:build"]
+[tasks."docs:a11y"]
+description = "WCAG 2.2 AA (axe + four probes) and layout stability over the audited pages"
 dir = "site"
+depends = ["docs:build"]
+# `site/src/gates.ts` names the pages and carries the declared baselines, which are ratchets:
+# a violation outside the baseline fails, and an entry that stops firing fails too. One
+# worker, never parallel (`vitest.a11y.config.ts`), because the layout probe measures WHEN
+# things move and a second browser on the same cores is a different answer, not noise.
+run = "pnpm run test:a11y"
+
+[tasks."docs:budget"]
+description = "Lighthouse category floors and the byte budget over the audited pages"
+dir = "site"
+depends = ["docs:build"]
+# Served by the same `tests/static-server.ts` the a11y tier uses, so both measure the same
+# bytes under the same base. `lighthouserc.json` carries the floors; the byte budget is
+# written there AND in `src/gates.ts` beside its measurement, and `tests/built-site.test.ts`
+# fails if the two disagree.
+run = "pnpm run test:budget"
+
+[tasks."docs:links"]
+description = "Check every EXTERNAL link in the built docs site (reports, never gates)"
+depends = ["docs:build"]
+# Not part of `docs:check`, and the workflow that runs it on a schedule says why: an outbound
+# link rots when its owner changes their site, which is not a property of the commit being
+# pushed. Internal links are a different question and DO gate: starlight-links-validator
+# fails the build on one, and `tests/authored-links.test.ts` fails the node tier before it.
+#
+# lychee is a per-task tool rather than a `[tools]` entry, because nothing else in the repo
+# needs it and `mise install` on a fresh clone should not fetch a link checker to run clippy.
+# `--offline` is absent on purpose: the whole point is the network. The exit code is preserved
+# so a human running it sees the failure; `.github/workflows/links.yml` is what declines to
+# gate.
+tools = { "aqua:lycheeverse/lychee" = "latest" }
+run = "lychee --config lychee.toml 'site/dist/**/*.html'"
+
+[tasks."docs:check"]
+description = "The docs site's fast definition of done: install, lint, spell, build, typecheck, node probes"
+depends = ["docs:install", "docs:lint", "docs:build"]
+dir = "site"
+# `astro check` and `vitest run` are two sequential commands rather than two parallel
+# dependencies, and the order matters for one test: `tests/typecheck-gate.test.ts`
+# writes a deliberately broken component into `src/components/` and asserts `astro check`
+# refuses it. Run beside a concurrent `astro check`, the real typecheck fails on the probe.
 run = ["pnpm exec astro check", "pnpm exec vitest run"]
+
+[tasks."docs:gate"]
+description = "docs:check plus the browser tiers (a11y, layout, Lighthouse). What CI runs"
+depends = ["docs:check"]
+dir = "site"
+# The two browser tiers run here as sequential commands after `docs:check`, not as parallel
+# dependencies: both drive a Chromium, and the layout probe's answer changes when another
+# browser shares its cores. Needs `mise run docs:browsers` once per machine.
+run = ["pnpm run test:a11y", "pnpm run test:budget"]
 
 [tasks."docs:dev"]
 description = "Serve the site locally with hot reload"

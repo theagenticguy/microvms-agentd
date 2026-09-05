@@ -107,7 +107,10 @@ const main = () => {
   }
 
   const findings = files.flatMap((file) =>
-    braceOffenders(readFileSync(file, "utf8")).map((offender) => ({ file: label(file), ...offender }))
+    braceOffenders(readFileSync(file, "utf8")).map((offender) => ({
+      file: label(file),
+      ...offender
+    }))
   )
 
   if (asJson) {

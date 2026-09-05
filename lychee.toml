@@ -1,0 +1,45 @@
+# External link checking for the built docs site. Reached through `mise run docs:links` and the
+# scheduled `links` workflow, never through `mise run check` or `docs:check`, because a link that rotted
+# overnight is not a defect in whichever commit is being pushed this morning.
+#
+# INTERNAL links are somebody else's job and they DO gate: `starlight-links-validator` fails the build on
+# a broken internal link, and `site/tests/authored-links.test.ts` fails the node tier on one before the
+# build. This config excludes them rather than checking them a third time with a third answer.
+#
+# Ported from memhtml-public's `lychee.toml`.
+
+# Every internal href in the output is site-absolute and host-less (`/microvms-agentd/…`), and lychee
+# cannot turn that into a URL without an origin: it warns on each one and checks none of them. So the
+# production origin is supplied purely so the links resolve, and then excluded below.
+base_url = "https://theagenticguy.github.io"
+exclude_path = ["site/dist/pagefind"]
+include_verbatim = false
+exclude_all_private = true
+
+exclude = [
+  "^https://theagenticguy\\.github\\.io/",
+  # The site has no edit links today (every page is generated and carries `editUrl: false`), and the
+  # exclusion stays so the day one is added does not turn into a hundred requests at one GitHub path.
+  "^https://github\\.com/theagenticguy/microvms-agentd/edit/",
+  # Every generated page carries commit-pinned `path:line` citation permalinks into this repository,
+  # hundreds of them per build. Each one was resolved with `git ls-tree` at the pinned commit when the
+  # page was synced, so the build already refuses a citation that names nothing, and asking GitHub the
+  # same question over HTTP for every line is what its rate limiter exists to stop.
+  "^https://github\\.com/theagenticguy/microvms-agentd/blob/",
+]
+
+# One retry, then believe it. A checker that retries five times over a growing corpus turns a scheduled
+# report into a twenty-minute job.
+max_retries = 1
+retry_wait_time = 2
+timeout = 20
+max_concurrency = 8
+
+# A 429 or a 403 from a site that dislikes robots is not a broken link.
+accept = ["200..=299", "403", "429"]
+
+# Follow `#anchor` into the fetched page: a link to a section somebody else renamed is the most common
+# way documentation goes quietly wrong, and the status code alone never reveals it.
+include_fragments = "anchor-only"
+
+user_agent = "microvms-agentd-docs-link-check"

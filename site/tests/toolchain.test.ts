@@ -53,7 +53,9 @@ const floor = (range: string): ReadonlyArray<number> => {
 const pinned = (version: string): ReadonlyArray<number> => {
   const parts = version.trim().split(".").map(Number)
   if (parts.length < 2 || parts.some((part) => !Number.isInteger(part))) {
-    throw new Error(`the workflow pins node-version \`${version}\`, which is not major.minor[.patch]`)
+    throw new Error(
+      `the workflow pins node-version \`${version}\`, which is not major.minor[.patch]`
+    )
   }
   return [parts[0] ?? 0, parts[1] ?? 0, parts[2] ?? 0]
 }

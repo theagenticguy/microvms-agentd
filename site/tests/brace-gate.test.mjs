@@ -28,7 +28,9 @@ describe("the brace gate", () => {
      * including the ones the build accepts — and the fix the message recommends would not clear it.
      */
     expect(braceOffenders("## GET `/v1/exec/{id}/stream`\n")).toEqual([])
-    expect(braceOffenders("A fence:\n\n```mermaid\ngraph TD\n  A{Decision} --> B\n```\n")).toEqual([])
+    expect(braceOffenders("A fence:\n\n```mermaid\ngraph TD\n  A{Decision} --> B\n```\n")).toEqual(
+      []
+    )
   })
 
   it("reports the line the brace is on, not the line it would be on with code deleted", () => {
@@ -37,7 +39,9 @@ describe("the brace gate", () => {
      * enough to answer "is there a brace", and it moves every later line so the report points at the
      * wrong one — which sends a reader to a line that looks fine.
      */
-    const body = ["# Title", "", "```json", '{ "a": 1 }', "```", "", "## GET /v1/x/{id}", ""].join("\n")
+    const body = ["# Title", "", "```json", '{ "a": 1 }', "```", "", "## GET /v1/x/{id}", ""].join(
+      "\n"
+    )
     expect(maskedBody(body).split("\n")).toHaveLength(body.split("\n").length)
     expect(braceOffenders(body).map((offender) => offender.line)).toEqual([7])
   })
